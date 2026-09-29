@@ -1,5 +1,7 @@
 -- regress_373_loop_lookup_eval_count: an __index snapshot must not be reevaluated by a loop header
 -- unluac: expect-ast-count [[while]] [[1]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[7]]
 
 local reads = 0
 local probe = setmetatable({}, {
@@ -25,3 +27,6 @@ while condition == true do
     end
 end
 assert(reads == 1)
+assert(turns == 2)
+assert(first == true and second == false and condition == true)
+print("loop-lookup-snapshot", reads, turns, first, second, condition)

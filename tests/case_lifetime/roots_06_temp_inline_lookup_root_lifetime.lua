@@ -1,4 +1,6 @@
 -- regress_356_temp_inline_lookup_root_lifetime: lookup snapshots remain roots after their first use
+-- unluac: expect-ast-count [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[function]] [[0]]
 
 local weak_values = setmetatable({}, { __mode = "v" })
 local holder = { weak = weak_values }
@@ -6,12 +8,14 @@ local holder = { weak = weak_values }
 do
     local owner = {}
     weak_values.key = owner
+    assert(weak_values.key == owner)
     owner = nil
 
     local weak_alias = holder.weak
     local root = weak_alias.key
+    assert(weak_alias == weak_values and root ~= nil)
     assigned = root
-    assert(assigned ~= nil)
+    assert(assigned == root)
 
     assigned = nil
     collectgarbage("collect")

@@ -1,11 +1,19 @@
 -- 同一 debug 作用域里的表与函数必须一起结束局部根的保活期。
 -- unluac: expect-ast-min [[do-block]] [[1]] [[@debug=retained]]
+-- unluac: expect-ast-count [[do-block]] [[3]]
+-- unluac: expect-ast-count [[local-binding]] [[9]]
+-- unluac: expect-ast-count [[function]] [[4]]
 local function make() return {} end
 local weak = setmetatable({}, { __mode = "k" })
+local calls = 0
 do
     local scoped = {}
     weak[scoped] = true
-    local function use(value) assert(value ~= nil) end
+    local function use(value)
+        collectgarbage("collect")
+        assert(value ~= nil and weak[value] == true)
+        calls = calls + 1
+    end
     use(scoped)
 end
 collectgarbage("collect")
@@ -14,7 +22,11 @@ assert(next(weak) == nil, "debug object scope stayed alive")
 do
     local scoped = make()
     weak[scoped] = true
-    local function use(value) assert(value ~= nil) end
+    local function use(value)
+        collectgarbage("collect")
+        assert(value ~= nil and weak[value] == true)
+        calls = calls + 1
+    end
     use(scoped)
 end
 collectgarbage("collect")
@@ -23,6 +35,7 @@ assert(next(weak) == nil, "debug call-result scope stayed alive")
 local function outer_use(value)
     collectgarbage("collect")
     assert(value ~= nil and weak[value] == true, "object died inside outer call")
+    calls = calls + 1
 end
 do
     local scoped = {}
@@ -31,4 +44,5 @@ do
 end
 collectgarbage("collect")
 assert(next(weak) == nil, "outer-callee object survived its scope")
+assert(calls == 3)
 print("regress_524_debug_scope_object_cohort", "closed")

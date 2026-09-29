@@ -1,6 +1,8 @@
 -- regress_306_luajit_method_protocol: LuaJIT split method setup保留receiver快照与call种类
 -- unluac: expect-contains [[:collect(1)]]
 -- unluac: expect-not-contains [[:dot_call(]]
+-- unluac: expect-ast-count [[function]] [[10]]
+-- unluac: expect-ast-max [[do-block]] [[0]]
 
 if arg[1] == "--dump-large-method" then
     local source = {}
@@ -59,12 +61,16 @@ if arg[1] == "--dump-bypassed-method" then
 end
 
 local object = {}
+local collected, pair_calls, lookups = 0, 0, 0
 
 function object:collect(...)
+    assert(self == object)
+    collected = collected + 1
     return ...
 end
 
 local function pair()
+    pair_calls = pair_calls + 1
     return 4, 5
 end
 
@@ -83,6 +89,7 @@ end
 local current
 local old = setmetatable({ tag = "old" }, {
     __index = function(_, key)
+        lookups = lookups + 1
         if key == "dot_call" or key == "method_call" then
             current = { tag = "new" }
             return function(self)
@@ -101,6 +108,13 @@ local open_method_result = current:method_call(pair())
 assert(dot_result == "new", dot_result)
 assert(method_result == "old", method_result)
 assert(open_method_result == "old", open_method_result)
+assert(lookups == 3 and pair_calls == 1)
+assert(fixed_tail(object) == 1)
+assert(short_tail(object, true) == 2)
+assert(short_tail(object, false) == 3)
+local first, second, extra = open_tail(object)
+assert(first == 4 and second == 5 and extra == nil)
+assert(collected == 4 and pair_calls == 2)
 print(
     "regress_306_luajit_method_protocol",
     fixed_tail(object),
@@ -108,3 +122,4 @@ print(
     short_tail(object, false),
     open_tail(object)
 )
+assert(collected == 8 and pair_calls == 3 and lookups == 3)

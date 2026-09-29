@@ -28,9 +28,9 @@ pub(super) fn validate_phis(
     }
     for candidate in &dataflow.phi_candidates {
         let phi = &plan.phis[candidate.id.index()];
-        if phi.loop_carried_input != super::super::loop_carried_input(plan, &phi.incomings) {
+        if phi.loop_carried != super::super::loop_carried_fact(plan, &phi.incomings) {
             return Err(StructureError::invalid(format!(
-                "{} loop-carried input certificate is stale",
+                "{} loop-carried owner/input certificate is stale",
                 candidate.id
             )));
         }

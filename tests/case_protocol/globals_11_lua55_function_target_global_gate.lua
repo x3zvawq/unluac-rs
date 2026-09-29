@@ -3,6 +3,10 @@
 -- unluac: expect-not-contains [[global<const> box]]
 -- unluac: expect-count [[global<const> *]] [[1]]
 -- unluac: expect-contains [[function box:read()]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[if]] [[1]]
+-- unluac: expect-ast-count [[error]] [[0]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=0]]
 
 box = { value = 11 }
 local function run(flag)
@@ -16,4 +20,8 @@ local function run(flag)
     return marker
 end
 
-run(true)
+assert(run(false) == 0 and box.f == nil and box.read == nil)
+_ENV.marker = nil
+assert(run(true) == 0 and box.f() == 7 and box:read() == 11)
+box.value = 17
+assert(box:read() == 17)

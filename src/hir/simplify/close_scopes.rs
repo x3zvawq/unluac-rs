@@ -144,6 +144,7 @@ pub(super) fn materialize_tbc_close_scopes_in_proto(
         local_debug_scopes: &proto.local_debug_scopes,
         temp_debug_scopes: &proto.temp_debug_scopes,
         debug_scopes: &proto.debug_scopes,
+        owned_origins: BTreeSet::new(),
     };
     let nested_changed = rewrite_stmts(&mut proto.body.stmts, &mut pass);
     let root_changed = materialize_block(
@@ -153,7 +154,29 @@ pub(super) fn materialize_tbc_close_scopes_in_proto(
         &proto.debug_scopes,
         safety,
         true,
+        &mut pass.owned_origins,
     );
+    // 已提交的词法 owner 承担原 goto 的资源退出；标签不能继续以待消费的
+    // cleanup 阻止无操作边整理。其它 origin 仍留给各自的原子作用域事务。
+    if !pass.owned_origins.is_empty() {
+        struct RetireLabelCleanup<'a>(&'a BTreeSet<InstrRef>);
+        impl HirRewritePass for RetireLabelCleanup<'_> {
+            fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
+                let HirStmt::Label(label) = stmt else {
+                    return false;
+                };
+                let before = label.entry_cleanup.len();
+                label
+                    .entry_cleanup
+                    .retain(|origin| !self.0.contains(origin));
+                before != label.entry_cleanup.len()
+            }
+        }
+        rewrite_stmts(
+            &mut proto.body.stmts,
+            &mut RetireLabelCleanup(&pass.owned_origins),
+        );
+    }
     nested_changed || root_changed
 }
 
@@ -212,6 +235,7 @@ fn collect_direct_pending_tbc_boundary_labels(
 }
 
 struct CloseScopePass<'a> {
+    owned_origins: BTreeSet<InstrRef>,
     safety: crate::hir::expr_safety::HirExprSafety,
     local_debug_scopes: &'a [Option<usize>],
     temp_debug_scopes: &'a [Option<usize>],
@@ -227,6 +251,7 @@ impl HirRewritePass for CloseScopePass<'_> {
             self.debug_scopes,
             self.safety,
             false,
+            &mut self.owned_origins,
         )
     }
 }
@@ -238,6 +263,7 @@ fn materialize_block(
     debug_scopes: &[Option<HirDebugScope>],
     safety: crate::hir::expr_safety::HirExprSafety,
     function_body: bool,
+    committed_origins: &mut BTreeSet<InstrRef>,
 ) -> bool {
     let facts = ScopeFacts::new(&block.stmts);
     let mut intervals =
@@ -316,6 +342,7 @@ fn materialize_block(
         &owned_origins,
     );
     remove_paired_frame_cleanup(&mut block.stmts);
+    committed_origins.extend(owned_origins);
     true
 }
 

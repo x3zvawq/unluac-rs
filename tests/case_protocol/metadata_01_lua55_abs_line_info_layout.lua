@@ -1,3 +1,8 @@
+-- unluac: expect-ast-count [[table-constructor]] [[1]]
+-- unluac: expect-ast-count [[table-list-field]] [[160]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[2]]
+-- unluac: expect-ast-count [[error]] [[0]]
 -- regress_161_lua55_abs_line_info_layout#1: Lua 5.5绝对行号项按原生int对读取
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
@@ -22,5 +27,8 @@ local values = {
     151, 152, 153, 154, 155, 156, 157, 158, 159, 160,
 }
 
+for index = 1, 160 do
+    assert(values[index] == index)
+end
 assert(#values == 160 and values[1] == 1 and values[160] == 160)
 print("regress_161_lua55_abs_line_info_layout#1", #values, values[1], values[160])

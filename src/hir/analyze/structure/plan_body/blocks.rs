@@ -22,25 +22,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let mut stmts = PlannedBlock::new();
         let terminator = self.block_terminator(owner, block)?.clone();
         let range = terminator.instrs;
-        let prefix_start = match self
-            .lowering
-            .structure
-            .plan()
-            .loop_exit_tail_for_block(block)
-        {
-            Some((_, tail))
-                if tail.block == block
-                    && tail.continuation == block
-                    && tail.range.start == range.start
-                    && tail.range.end() <= range.end() =>
-            {
-                tail.range.end()
-            }
-            Some(_) => {
-                return self.invalid_region(owner, "loop exit tail block range is stale");
-            }
-            None => range.start.index(),
-        };
+        let prefix_start = self.remaining_block_prefix_start(owner, block, range)?;
         let prefix_end = terminator.kind.instr().map_or(range.end(), InstrRef::index);
         let jump_edge = match terminator.kind {
             BlockTerminatorKind::Jump { edge, .. } => Some(edge),
@@ -184,15 +166,39 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             return self.invalid_region(owner, "condition block has no frozen branch terminator");
         };
         let mut stmts = PlannedBlock::new();
+        let prefix_start = self.remaining_block_prefix_start(owner, block, terminator.instrs)?;
         self.emit_label(block, LabelPlacement::BeforeBlock, &mut stmts)?;
         stmts.extend_plain(self.lower_unresolved_phis(owner, block)?);
-        stmts.append(self.lower_regular_range(
-            owner,
-            block,
-            terminator.instrs.start.index(),
-            instr.index(),
-        )?);
+        stmts.append(self.lower_regular_range(owner, block, prefix_start, instr.index())?);
         Ok(stmts)
+    }
+
+    /// 普通块或条件入口都只消费未交给 loop exit-tail 的指令前缀。
+    fn remaining_block_prefix_start(
+        &self,
+        owner: RegionId,
+        block: BlockRef,
+        range: crate::structure::InstrRange,
+    ) -> Result<usize, HirLowerError> {
+        match self
+            .lowering
+            .structure
+            .plan()
+            .loop_exit_tail_for_block(block)
+        {
+            Some((_, tail))
+                if tail.block == block
+                    && tail.continuation == block
+                    && tail.range.start == range.start
+                    && tail.range.end() <= range.end() =>
+            {
+                // exit-tail 已在原退出边发射；同一 block 的后续 predicate 不改变
+                // 这份所有权，否则会重复操作并在 close 之后再次读取内层资源。
+                Ok(tail.range.end())
+            }
+            Some(_) => self.invalid_region(owner, "loop exit tail block range is stale"),
+            None => Ok(range.start.index()),
+        }
     }
 
     /// 普通块和 loop syntax prefix 共用入口协议：AfterCleanup 先消费计划中的前缀，
@@ -306,6 +312,12 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     vec![HirLValue::Temp(holder)],
                     vec![self.lowering.bindings.expr_for_temp(source)],
                 ));
+                let HirLValue::Local(local) = self.lowering.bindings.lvalue_for_temp(source) else {
+                    return self.invalid_region(owner, "copy scope handoff has no source local");
+                };
+                // holder 已接过当前值，且该未捕获声明在此结束；清空旧槽，避免再编译
+                // 把交接留下的匿名副本再次提升为独立的跨轮 root。
+                output.push(HirStmt::LocalRootRelease(local));
             }
             self.end_lexical_scopes(consumed_end, &mut output);
             index = consumed_end;

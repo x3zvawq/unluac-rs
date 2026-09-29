@@ -800,7 +800,7 @@ fn apply_fold(
         values,
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
-        generic_for_dispatch_release: None,
+        root_release: None,
         method_rewrite_transaction: None,
     }));
     body.stmts.pop();

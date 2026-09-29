@@ -1,4 +1,4 @@
-//! 恢复连续字面量准备及全局写回的并列赋值帧。
+//! 恢复连续字面量准备及全局写回的赋值帧。
 //!
 //! 全局环境可能带写入元方法，写回次序不能交换；每项准备依赖原 use→Def，
 //! 方言的正序/逆序写回和末项 RK 规则在完整源码前缀事务内一起核对。
@@ -74,7 +74,9 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
         {
             index += 1;
         }
-        if index - first_write < 2 {
+        // 单目标写回也能消费完整准备区，原输入版本、槽位与求值顺序
+        // 仍由 candidate 统一核对，不依赖第二个全局写回提供证明。
+        if index == first_write {
             continue;
         }
         let definitions = flat[start..first_write]

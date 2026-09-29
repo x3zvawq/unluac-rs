@@ -37,9 +37,42 @@ impl EdgeSemantics {
             residual_continue_entries_by_target[edge.to.index()].push(residual.edge);
         }
         let layout_edges = layout_edge_facts(cfg, &arena.regions, &arena.navigation);
-        let loops = LoopQueryIndex::build(cfg, arena, input, partitions, &layout_edges)?;
+        let loops = LoopQueryIndex::build(cfg, arena, partitions, &layout_edges)?;
         let mut planned_breaks = vec![None; cfg.edges.len()];
+        let mut branch_terminals = vec![None; cfg.edges.len()];
+        let mut branch_completion_edges = vec![false; cfg.edges.len()];
+        // 按原 SSA 的同槽回写索引共享状态前缀，避免逐条 continue 扫描循环定义。
+        let mut carried_prefixes = BTreeSet::new();
+        for definition in &dataflow.defs {
+            for &consumer in &dataflow.def_phi_uses[definition.id.index()] {
+                if let Some(phi) = dataflow.phi_candidate(consumer)
+                    && phi.reg == definition.reg
+                {
+                    carried_prefixes.insert((definition.block, phi.block));
+                }
+            }
+        }
         for (spec_index, spec) in arena.specs.iter().enumerate() {
+            if let ContainerKind::Branch(id) = spec.kind
+                && let Some(condition) = input.branches[id.index()]
+                    .condition
+                    .and_then(|id| input.conditions.get(id.index()))
+                && let ShortCircuitExit::BranchExit { truthy, falsy } = condition.candidate.exit
+            {
+                for arc in &condition.arcs {
+                    if matches!(
+                        arc.target,
+                        crate::structure::ShortCircuitTarget::TruthyExit
+                            | crate::structure::ShortCircuitTarget::FalsyExit
+                    ) && let Some(edge) = arc.edges.last()
+                    {
+                        branch_terminals[edge.index()] = Some([truthy, falsy]);
+                        branch_completion_edges[edge.index()] =
+                            input.branches[id.index()].branch.merge
+                                == Some(cfg.edges[edge.index()].to);
+                    }
+                }
+            }
             let ContainerKind::Loop(loop_id) = spec.kind else {
                 continue;
             };
@@ -214,11 +247,11 @@ impl EdgeSemantics {
                             semantics.forward_routes.bind(*edge, route)?;
                         }
                     }
-                    let continue_reachable = loop_
+                    let continue_reachable = partition
                         .continue_target
                         .map(|target| body_blocks_reaching_target(cfg, &partition.body, target))
                         .unwrap_or_default();
-                    let continue_forward_index = loop_
+                    let continue_forward_index = partition
                         .continue_target
                         .map(|target| {
                             PureContinueForwardIndex::build(
@@ -231,7 +264,7 @@ impl EdgeSemantics {
                             )
                         })
                         .transpose()?;
-                    let direct_latch_edges = if let Some(target) = loop_.continue_target
+                    let direct_latch_edges = if let Some(target) = partition.continue_target
                         && target != loop_.header
                         && !matches!(
                             loop_.kind_hint,
@@ -254,7 +287,7 @@ impl EdgeSemantics {
                     let mut direct_latch_route = None;
                     let repeat_condition_route =
                         if loop_.kind_hint == crate::structure::LoopKindHint::RepeatLike {
-                            loop_
+                            partition
                                 .continue_target
                                 .and_then(|target| {
                                     repeat_continue_forwarding_route(
@@ -282,6 +315,11 @@ impl EdgeSemantics {
                             None
                         };
                     let mut repeat_condition_route_id = None;
+                    let ContainerSlots::Loop { body, .. } = arena.slots[index] else {
+                        return Err(StructureError::invalid(
+                            "loop container has no body region slot",
+                        ));
+                    };
                     for edge in &partition.continues {
                         if semantics.breaks[edge.index()].is_some_and(|owner| owner != region)
                             || semantics
@@ -296,7 +334,7 @@ impl EdgeSemantics {
                         if semantics.forward_routes.contains_edge(*edge) {
                             continue;
                         }
-                        let Some(target) = loop_.continue_target else {
+                        let Some(target) = partition.continue_target else {
                             continue;
                         };
                         let direct = cfg.edges[edge.index()].to == target;
@@ -314,14 +352,42 @@ impl EdgeSemantics {
                                 *candidate != *edge
                                     && continue_reachable.contains(&cfg.edges[candidate.index()].to)
                             });
+                        // 条件块还定义下一轮状态时，其前缀也是共享 body tail。末尾空 arm
+                        // 直接汇入它不应制造 continue 并迫使状态准备前移。纯条件入口
+                        // 仍保留原 continue 形态；已证明的语义 continue 和 Close/pad
+                        // 转发不在此处改写。
                         let natural_repeat_tail = loop_.kind_hint
                             == crate::structure::LoopKindHint::RepeatLike
                             && direct
-                            && semantics.layout_edges[edge.index()].natural;
+                            && (semantics.layout_edges[edge.index()].natural
+                                || branch_completion_edges[edge.index()]
+                                    && carried_prefixes.contains(&(target, loop_.header))
+                                    && !input.loops[id.index()]
+                                        .semantic_continue_edges
+                                        .contains(edge)
+                                    && arena.region_by_block[cfg.edges[edge.index()].from.index()]
+                                        .is_some_and(|source| {
+                                            arena.navigation.region_can_complete_from(
+                                                body,
+                                                source,
+                                                cfg.edges[edge.index()].from,
+                                            )
+                                        }));
+                        // 短路项的物理 sibling 仍属于同一条件，不能据此声称跳过正文。
+                        // 已选 DAG 的终端出口才表示两个语义 arm；普通单边 pad 沿原证明处理。
+                        let bypasses_body = branch_terminals[edge.index()].map_or_else(
+                            || continue_edge_bypasses_body(cfg, partition, *edge),
+                            |targets| {
+                                targets.into_iter().any(|target| {
+                                    target != cfg.edges[edge.index()].to
+                                        && partition.body.contains(&target)
+                                })
+                            },
+                        );
                         if !natural_repeat_tail
                             && reaches_target
                             && explicit_continue
-                            && (continue_edge_bypasses_body(cfg, partition, *edge)
+                            && (bypasses_body
                                 || (loop_.continue_edges.contains(edge)
                                     || input.loops[id.index()]
                                         .semantic_continue_edges
@@ -347,11 +413,9 @@ impl EdgeSemantics {
                                 }
                             }
                             if direct {
-                                if loop_.kind_hint == crate::structure::LoopKindHint::RepeatLike {
-                                    let Some((route, kind)) = repeat_condition_route.as_ref()
-                                    else {
-                                        continue;
-                                    };
+                                if loop_.kind_hint == crate::structure::LoopKindHint::RepeatLike
+                                    && let Some((route, kind)) = repeat_condition_route.as_ref()
+                                {
                                     let route_id = if let Some(route_id) = repeat_condition_route_id
                                     {
                                         route_id
@@ -368,10 +432,12 @@ impl EdgeSemantics {
                                     semantics.forward_routes.bind(*edge, route_id)?;
                                 } else if matches!(
                                     loop_.kind_hint,
-                                    crate::structure::LoopKindHint::NumericForLike
+                                    crate::structure::LoopKindHint::RepeatLike
+                                        | crate::structure::LoopKindHint::NumericForLike
                                         | crate::structure::LoopKindHint::GenericForLike
                                 ) {
-                                    // VM for 的 target 已由协议 lowering 吸收，不需要额外 route。
+                                    // 完整 repeat 条件 DAG 与 VM for 入口由循环协议 lowering
+                                    // 消费；进入条件不能强行转发某一个尚未求值的短路 arm。
                                 } else if target != loop_.header {
                                     let Some(edges) = direct_latch_edges.as_deref() else {
                                         continue;
@@ -402,7 +468,7 @@ impl EdgeSemantics {
                     // 跳到纯 latch pad，pad 到 header 的 phi copy 仍是同一轮必须执行的
                     // 动作。按 target 索引签发 ContinueLatch route，使它成为内部过渡，
                     // 防止后续的 `goto -> continue` 快路径绕过 pad 的动作。
-                    if let Some(target) = loop_.continue_target
+                    if let Some(target) = partition.continue_target
                         && let Some(entries) =
                             residual_continue_entries_by_target.get(target.index())
                         && !entries.is_empty()
@@ -459,17 +525,14 @@ impl EdgeSemantics {
                             }
                         }
                     }
-                    let ContainerSlots::Loop { body, .. } = arena.slots[index] else {
-                        return Err(StructureError::invalid(
-                            "loop container has no body region slot",
-                        ));
-                    };
                     for block in &partition.body {
                         let source = arena.region_by_block[block.index()].ok_or_else(|| {
                             StructureError::invalid("loop body block has no containment owner")
                         })?;
                         // 到达 latch 不代表已经走完源码 body：island [A, B] 中 A 的
                         // 条件边可能跳过 B 的 break，必须保留显式跳转到条件前缀。
+                        // VM-for 的 latch 同样如此；continue_10 的共享短路尾不能因
+                        // 其中一条边是物理 backedge 就丢掉尚未完成的条件 arm。
                         if !arena
                             .navigation
                             .region_can_complete_from(body, source, *block)
@@ -479,6 +542,8 @@ impl EdgeSemantics {
                                     && matches!(
                                         loop_.kind_hint,
                                         crate::structure::LoopKindHint::WhileLike
+                                            | crate::structure::LoopKindHint::NumericForLike
+                                            | crate::structure::LoopKindHint::GenericForLike
                                     )
                                 {
                                     semantics.non_tail_backedges[edge.index()] = true;

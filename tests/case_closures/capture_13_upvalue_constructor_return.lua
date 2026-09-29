@@ -1,4 +1,9 @@
 -- 构造器写入共享 cell 后重新读取并返回，不需要额外的 local 往返交接。
+-- unluac: expect-ast-count [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[table-constructor]] [[4]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
 -- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=1]]

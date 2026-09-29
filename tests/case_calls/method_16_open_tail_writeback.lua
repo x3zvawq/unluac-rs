@@ -1,6 +1,9 @@
 -- 开放尾参数、方法 lookup 和低槽写回保持原方言的求值顺序。
 -- unluac: expect-ast-count [[method-call]] [[2]] [[@proto=0]]
 -- unluac: expect-ast-count [[local-binding]] [[3]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[table-constructor]] [[3]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[assign]] [[2]] [[@proto=0]]
 
 local trace = {}
@@ -11,7 +14,9 @@ end
 local object = setmetatable({total = 0}, {__index = function(_, key)
     assert(key == "step")
     trace[#trace + 1] = "lookup"
-    return function(receiver, first, second)
+    return function(receiver, first, second, ...)
+        assert(select("#", ...) == 0)
+        assert(second == first + 10)
         trace[#trace + 1] = "dispatch"
         receiver.total = receiver.total + first + second
         return receiver

@@ -1,6 +1,6 @@
 //! 用安全短路条件证据细化 repeat 候选及嵌套 for 出口；依赖候选集合和 CFG，
 //! 不负责初始 natural-loop 发现；例如把伪 while header 恢复为 repeat 尾条件。
-//! 多叶条件必须同时冻结完整 DAG 根；最终叶只作为 continue target，不能替代完整条件。
+//! 多叶条件保留完整 DAG 根与候选末叶，最终分区再按完整条件冻结 continue 入口。
 
 use super::*;
 
@@ -64,9 +64,14 @@ pub(in crate::structure) fn refine_short_circuit_repeat_candidates(
     let mut shared_exit_workspace = SharedExitWorkspace::new(cfg.blocks.len());
 
     for (index, candidate) in candidates.iter_mut().enumerate() {
+        // 初始 RepeatLike 也可能只从 jump latch 识别到尾条件的最后一项。
+        // 完整 DAG 的入口仍须参与精化，否则跳入前置条件的 continue 会落成正文合流。
         if !matches!(
             candidate.kind_hint,
-            LoopKindHint::Unknown | LoopKindHint::WhileLike | LoopKindHint::WhileTrueLike
+            LoopKindHint::Unknown
+                | LoopKindHint::WhileLike
+                | LoopKindHint::WhileTrueLike
+                | LoopKindHint::RepeatLike
         ) {
             continue;
         }
@@ -242,6 +247,19 @@ pub(super) fn repeat_short_circuit_match<'a>(
         .iter()
         .copied()
         .filter_map(|short| {
+            if candidate.kind_hint == LoopKindHint::RepeatLike {
+                let tail = candidate.condition_header.or(candidate.continue_target)?;
+                // 已识别的 repeat 只能补齐原尾条件，不能用正文 break guard 替换它。
+                // 新入口须在正文 header 之后且无独立前缀；带 CALL/写入的尾 guard
+                // 仍由原 body/condition owner 保持求值位置，交给后续有序条件折叠。
+                if short.header == candidate.header
+                    || short.header == tail
+                    || !short.blocks.contains(&tail)
+                    || backedge_has_non_cleanup_prefix(proto, cfg, short.header)
+                {
+                    return None;
+                }
+            }
             ((owned_backedge_sources.is_none()
                 || backedge_sources
                     .iter()
@@ -362,6 +380,11 @@ pub(super) fn while_header_exit_rejoins_repeat_exit(
     let Some(header_exit) = header_exits.next() else {
         return false;
     };
+    if graph_facts.dominates(header_exit, candidate.header) {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：goto_06 的内层 while 出口是外层
+        // 回边；最终出口虽然后支配它，却不是本轮尾合流，不能将该路径吸收到 repeat。
+        return false;
+    }
 
     header_exits.next().is_none()
         && candidate.exits.contains(&header_exit)
@@ -422,9 +445,26 @@ pub(super) fn direct_branch_repeat_continue_target(
         return None;
     }
     // 标准 Lua 会让尾条件 exit 直接跳过 body 的 break pad；两条路径只在该 pad
-    // 已确认的 merge 重新汇合，因此这里消费 branch 候选关系，不按裸可达性猜测。
-    let merge = branch_by_header[header_exit.index()]?.merge?;
-    let exit_merge = repeat_exit_merge_after_guard(proto, cfg, graph_facts, repeat_exit, merge)?;
+    // 已确认的 merge 重新汇合。分支臂消费候选的 merge，其余臂要求完整后支配证书。
+    let exit_merge = branch_by_header[header_exit.index()]
+        .and_then(|branch| branch.merge)
+        .and_then(|merge| {
+            repeat_exit_merge_after_guard(proto, cfg, graph_facts, repeat_exit, merge)
+        })
+        .or_else(|| {
+            // 候选拒绝[LayerBoundary]：纯转发 pad 没有待认领的正文，继续由既有
+            // loop 出口值协议处理；不能仅因后支配关系改选并行快照的结构。
+            if cfg
+                .non_control_instr_range(&proto.instrs, header_exit)
+                .is_empty()
+            {
+                return None;
+            }
+            // 展开的退出臂未必有 BranchCandidate；共用短路 repeat 的后支配证明，
+            // 由 body scope 与最终分区保留臂内操作，不把它们移到带标记的循环外尾部。
+            while_header_exit_rejoins_repeat_exit(proto, cfg, graph_facts, candidate, repeat_exit)
+                .then_some(repeat_exit)
+        })?;
     if exit_merge == cfg.exit_block || candidate.blocks.contains(&exit_merge) {
         return None;
     }
@@ -457,10 +497,12 @@ pub(super) fn refine_ambiguous_repeat_candidates(
     candidates: &mut [LoopCandidate],
 ) {
     // repeat body 若进入 nested loop，natural-loop core 会把该入口误看成 header exit；
-    // 只有独立尾条件与 header 分支读取同一主体时，才能排除“真实 while + 尾部 break”。
+    // 独立尾条件与 header 分支读取同一主体，或尾条件直接完成祖先 for 的本轮迭代时，
+    // header 的另一臂可仍属于 repeat 正文；不能把尾条件出口当作内层 while 的空操作。
     // repeat 后再 break 外层 for 时，条件出口又会像 while true 的 terminal exit。
     // 两者都只能等候选齐全后用关系证据消歧，不能全局提高 repeat 启发式优先级。
     let mut for_owners = vec![Vec::new(); cfg.blocks.len()];
+    let mut for_backedges = vec![false; cfg.edges.len()];
     for (index, candidate) in candidates.iter().enumerate() {
         if !matches!(
             candidate.kind_hint,
@@ -470,6 +512,9 @@ pub(super) fn refine_ambiguous_repeat_candidates(
         }
         for block in &candidate.body_scope_blocks {
             for_owners[block.index()].push(index);
+        }
+        for edge in &candidate.backedges {
+            for_backedges[edge.index()] = true;
         }
     }
     let mut loop_entries = vec![Vec::new(); cfg.blocks.len()];
@@ -491,7 +536,11 @@ pub(super) fn refine_ambiguous_repeat_candidates(
         }
         let source = cfg.edges[candidate.backedges[0].index()].from;
         let Some(continue_target) =
-            repeat_continue_target_via_backedge_pad(proto, cfg, source, &candidate.blocks)
+            branch_has_header_and_exit(cfg, source, candidate.header, &candidate.blocks)
+                .then_some(source)
+                .or_else(|| {
+                    repeat_continue_target_via_backedge_pad(proto, cfg, source, &candidate.blocks)
+                })
         else {
             continue;
         };
@@ -509,12 +558,20 @@ pub(super) fn refine_ambiguous_repeat_candidates(
         let is_repeat = match candidate.kind_hint {
             LoopKindHint::WhileLike => {
                 continue_target != candidate.header
-                    && branch_conditions_share_subject(
+                    && (branch_conditions_share_subject(
                         proto,
                         cfg,
                         candidate.header,
                         continue_target,
-                    )
+                    ) || cfg.succs[continue_target.index()].iter().any(|edge| {
+                        let target = cfg.edges[edge.index()].to;
+                        // 该原边属于祖先 for 的回边，且确实离开当前 core。
+                        // 结合下方 nested body 的完整包含证明，按 repeat 保留两种出口：
+                        // 正常尾条件完成本轮，header 另一臂先执行嵌套正文再退出。
+                        for_backedges[edge.index()]
+                            && !candidate.blocks.contains(&target)
+                            && graph_facts.dominates(target, candidate.header)
+                    }))
                     && cfg
                         .branch_edges(candidate.header)
                         .into_iter()
@@ -524,7 +581,15 @@ pub(super) fn refine_ambiguous_repeat_candidates(
                         .flat_map(|target| loop_entries[target.index()].iter())
                         .copied()
                         .filter(|nested| *nested != index)
-                        .any(|nested| candidates[nested].blocks.is_subset(&repeat_body_scope))
+                        .any(|nested| {
+                            // 立即 break 的 for 仍保留不可达 latch 以证明 VM 协议，
+                            // 词法正文包含关系只约束可执行块，不把该 latch 当作额外出口。
+                            candidates[nested]
+                                .blocks
+                                .iter()
+                                .filter(|block| cfg.reachable_blocks.contains(block))
+                                .all(|block| repeat_body_scope.contains(block))
+                        })
             }
             LoopKindHint::WhileTrueLike => for_owners[candidate.header.index()]
                 .iter()

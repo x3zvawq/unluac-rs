@@ -1,4 +1,7 @@
 -- 运算元方法可以返回对象；最后一次活读不是独立 VM home 的 GC 终点。
+-- unluac: expect-ast-count [[function]] [[12]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[31]]
 local function binary(value, observe)
     local doubled = value * 2
     local shifted = doubled + 1
@@ -45,9 +48,10 @@ local function return_chain(value)
     return shifted * 2
 end
 
-local function check(run, mixed_comparison)
+local function check(run, mixed_comparison, comparison_result, expected_observations, done)
     local weak = setmetatable({}, {__mode = "v"})
     local observations = 0
+    local allocations, additions = 0, 0
     local function observe(expected)
         collectgarbage("collect")
         collectgarbage("collect")
@@ -57,7 +61,7 @@ local function check(run, mixed_comparison)
     local shifted = setmetatable({}, {
         __lt = function()
             observe(true)
-            return true
+            return comparison_result
         end,
         __mul = function()
             observe(true)
@@ -65,7 +69,11 @@ local function check(run, mixed_comparison)
         end,
     })
     local function make_intermediate()
-        local value = setmetatable({}, {__add = function() return shifted end})
+        allocations = allocations + 1
+        local value = setmetatable({}, {__add = function()
+            additions = additions + 1
+            return shifted
+        end})
         weak.intermediate = value
         return value
     end
@@ -82,16 +90,22 @@ local function check(run, mixed_comparison)
         assert(string.find(tostring(result), "compare", 1, true) ~= nil)
     else
         assert(ok, result)
-        assert(result == shifted or result == "done")
-        assert(observations > 0)
+        assert(result == (done and "done" or shifted))
+        assert(observations == expected_observations)
     end
+    assert(allocations == 1 and additions == 1)
+    -- 正常返回及受保护错误都已离开 run；独立 home 此时才结束其保活责任。
+    collectgarbage("collect")
+    collectgarbage("collect")
+    assert(weak.intermediate == nil)
     collectgarbage("restart")
     print("operator-root", ok, observations)
 end
 
-check(binary)
-check(unary)
-check(concat)
-check(overwrite)
-check(branch, true)
-check(return_chain)
+check(binary, false, nil, 1, false)
+check(unary, false, nil, 1, false)
+check(concat, false, nil, 1, false)
+check(overwrite, false, nil, 2, false)
+check(branch, true, true, 1, false)
+check(branch, true, false, 2, true)
+check(return_chain, false, nil, 1, true)

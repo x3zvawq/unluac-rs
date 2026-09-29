@@ -3,6 +3,9 @@
 -- unluac: expect-contains [[global unreachable_export]]
 -- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
 -- unluac: expect-contains [[global tail_export]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[if]] [[3]]
+-- unluac: expect-ast-max [[local-binding]] [[4]]
 
 local function unreachable_arm()
     if false then
@@ -28,6 +31,8 @@ end
 local direct = unreachable_arm()
 local nested = nested_unreachable_arm(true)
 assert(direct == 73 and nested == 79)
+assert(nested_unreachable_arm(false) == 89)
+assert(_ENV.unreachable_export == nil and _ENV.tail_export == nil)
 print(
     "regress339-diagnostic",
     direct,

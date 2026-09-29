@@ -1,4 +1,7 @@
 -- A recovered local reassigned to a collectable value must die before a moved single-pass tail.
+-- unluac: expect-ast-max [[local-binding]] [[12]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[function]] [[5]]
 
 local weak = setmetatable({}, { __mode = "v" })
 
@@ -19,6 +22,7 @@ local function run(skip)
 end
 
 assert(run(false) == false)
+assert(run(true) == nil)
 
 -- A call result can have different exact scalar overwrites on terminal branches.  The live
 -- `true` endpoint is harmless after promotion because its suffix returns without another GC
@@ -55,4 +59,7 @@ local function overwrite_on_terminal_branches(enabled)
 end
 
 assert(overwrite_on_terminal_branches(true))
+assert(overwrite_on_terminal_branches(false))
+collectgarbage("collect")
+assert(next(weak_keys) == nil)
 print("regress_441_repeat_tail_reassigned_root", "OK")

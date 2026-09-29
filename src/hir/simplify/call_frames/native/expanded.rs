@@ -14,9 +14,12 @@ use crate::hir::simplify::table_constructors::{ConstructorWrite, constructor_wri
 mod captured;
 mod conditional_methods;
 mod control;
+mod counter_while;
 mod factories;
 mod published_tables;
+mod repeat_prefix;
 mod returned_calls;
+mod stateful_generic;
 pub(super) use published_tables::is_publication as is_published_table_write;
 mod scalar;
 mod snapshots;
@@ -34,6 +37,7 @@ pub(in crate::hir::simplify::call_frames) struct Callee {
     factory: Option<factories::Factory>,
     returned_call: Option<returned_calls::Body>,
     conditional_method: Option<conditional_methods::Body>,
+    repeat_prefix: Option<repeat_prefix::Body>,
     readonly_captures: Vec<LocalId>,
 }
 
@@ -99,11 +103,28 @@ pub(in crate::hir::simplify) fn restore(
         .iter()
         .map(|proto| conditional_methods::body(proto, promotion.get(proto.id.index())?))
         .collect::<Vec<_>>();
+    let repeat_prefixes = module
+        .protos
+        .iter()
+        .map(|proto| repeat_prefix::body(proto, promotion.get(proto.id.index())?))
+        .collect::<Vec<_>>();
     let bodies = module
         .protos
         .iter()
         .map(|proto| {
             body_key(proto)
+                .or_else(|| counter_while::body_key(proto, promotion.get(proto.id.index())?))
+                .or_else(|| stateful_generic::body_key(proto, promotion.get(proto.id.index())?))
+                .or_else(|| {
+                    repeat_prefixes[proto.id.index()].as_ref().map(|_| {
+                        (
+                            HirLuauInliningBody::RepeatPrefix {
+                                template: proto.id.index(),
+                            },
+                            "".into(),
+                        )
+                    })
+                })
                 .or_else(|| {
                     conditional_methods[proto.id.index()].as_ref().map(|_| {
                         (
@@ -135,6 +156,7 @@ pub(in crate::hir::simplify) fn restore(
                 })
         })
         .collect::<Vec<_>>();
+
     let parameter_names = module
         .protos
         .iter()
@@ -163,12 +185,14 @@ pub(in crate::hir::simplify) fn restore(
         };
         let snapshot_candidate = callees(
             output,
+            original_facts,
             &bodies,
             &parameter_names,
             &result_names,
             &factories,
             &returned_calls,
             &conditional_methods,
+            &repeat_prefixes,
         )
         .values()
         .any(|callee| {
@@ -176,6 +200,8 @@ pub(in crate::hir::simplify) fn restore(
                 callee.body,
                 HirLuauInliningBody::SnapshotClosureFactory { .. }
                     | HirLuauInliningBody::CapturedCallablePair
+                    | HirLuauInliningBody::RepeatPrefix { .. }
+                    | HirLuauInliningBody::CounterWhile { .. }
             )
         });
         let mut prepared_facts = snapshot_candidate.then(|| original_facts.clone());
@@ -191,12 +217,14 @@ pub(in crate::hir::simplify) fn restore(
         let prepared_proto = prepared.as_ref().unwrap_or(output);
         let initial_callees = callees(
             prepared_proto,
+            facts,
             &bodies,
             &parameter_names,
             &result_names,
             &factories,
             &returned_calls,
             &conditional_methods,
+            &repeat_prefixes,
         );
         let scalar_draft = scalar::debug_updates(prepared_proto, facts, &initial_callees);
         let scalar_proto = scalar_draft
@@ -216,6 +244,8 @@ pub(in crate::hir::simplify) fn restore(
                     | HirStmt::LocalRootRelease(_)
                     | HirStmt::Block(_)
                     | HirStmt::NumericFor(_)
+                    | HirStmt::Repeat(_)
+                    | HirStmt::While(_)
                     | HirStmt::If(_)
                     | HirStmt::GenericFor(_)
                     | HirStmt::Return(_)
@@ -242,12 +272,14 @@ pub(in crate::hir::simplify) fn restore(
             .any(|stmt| matches!(stmt, HirStmt::NumericFor(_) | HirStmt::GenericFor(_)));
         let mut callees = callees(
             proto,
+            facts,
             &bodies,
             &parameter_names,
             &result_names,
             &factories,
             &returned_calls,
             &conditional_methods,
+            &repeat_prefixes,
         );
         callees.retain(|_, callee| !published.contains(&(proto.id, callee.local)));
         if structured {
@@ -268,6 +300,7 @@ pub(in crate::hir::simplify) fn restore(
             rk_literals: None,
             expanded_callees: Some(&callees),
             retired_roots: None,
+            root_seed_sources: None,
             proto,
             barred: &restrictions.barred,
             closed: &restrictions.closed,
@@ -335,6 +368,10 @@ pub(in crate::hir::simplify) fn restore(
         expanded.extend(factories::plans(context, facts));
         expanded.extend(returned_calls::plans(context, facts));
         expanded.extend(conditional_methods::plans(context, facts));
+        expanded.extend(repeat_prefix::plans(context, facts));
+        expanded.extend(counter_while::plans(context, facts));
+        expanded.extend(stateful_generic::plans(context, facts));
+
         expanded.extend(scalar::constant_comparisons(context, facts));
         let conditional_callees = callees
             .values()
@@ -342,6 +379,17 @@ pub(in crate::hir::simplify) fn restore(
             .map(|callee| callee.local)
             .collect::<BTreeSet<_>>();
         for plan in &mut expanded {
+            let loop_replays = plan
+                .replayed_effects
+                .iter()
+                .filter_map(|&index| {
+                    matches!(
+                        proto.body.stmts[index],
+                        HirStmt::Repeat(_) | HirStmt::While(_)
+                    )
+                    .then_some(root_indices[index]..root_indices[index + 1])
+                })
+                .collect::<Vec<_>>();
             plan.start = root_indices[plan.start];
             plan.sink = root_indices[plan.sink];
             for index in &mut plan.removed {
@@ -349,6 +397,10 @@ pub(in crate::hir::simplify) fn restore(
             }
             for index in &mut plan.replayed_effects {
                 *index = root_indices[*index];
+            }
+            for range in loop_replays {
+                plan.removed.extend(range.clone());
+                plan.replayed_effects.extend(range);
             }
             if matches!(plan.values.fixed.as_slice(), [HirExpr::Call(call)]
                 if matches!(call.callee, HirExpr::LocalRef(local) if conditional_callees.contains(&local)))
@@ -429,12 +481,27 @@ pub(in crate::hir::simplify) fn restore(
                             HirLuauInliningBody::SnapshotClosureFactory { .. }
                                 | HirLuauInliningBody::CapturedCallablePair
                                 | HirLuauInliningBody::ConditionalMethod { .. }
+                                | HirLuauInliningBody::RepeatPrefix { .. }
+                                | HirLuauInliningBody::CounterWhile { .. }
+                                | HirLuauInliningBody::StatefulGenericWhile { .. }
                         ) {
+                            // 计数循环位于 assert 比较的左输入，callee/Boolean 占据前两槽。
                             certificates
                                 .get_mut(&local)
                                 .unwrap()
                                 .result_frame_slots
-                                .insert(site, plan.base.slot());
+                                .insert(
+                                    site,
+                                    plan.base.slot()
+                                        + if matches!(
+                                            callee.body,
+                                            HirLuauInliningBody::CounterWhile { .. }
+                                        ) {
+                                            2
+                                        } else {
+                                            0
+                                        },
+                                );
                         }
                     }
                     false
@@ -485,8 +552,8 @@ pub(in crate::hir::simplify) fn restore(
         let Ok(mut preview) = build_preview(proto, facts, &plans, count) else {
             continue;
         };
-        // 展开体退休旧 epoch 后，同槽 CLOSURE 才能成为后继声明。它的初始化
-        // 没有再次改写，但必须在最终预览上补齐原槽前缀请求。
+        // 展开体退休旧 epoch 后，同槽 CALL/CLOSURE 等写入才能成为后继声明。
+        // 初始化没有再次改写，但必须在最终预览上补齐原槽前缀请求。
         let sinks = plans.iter().map(|plan| plan.sink).collect::<BTreeSet<_>>();
         let preview_context = NativeFrameContext {
             proto: &preview.proto,
@@ -497,7 +564,7 @@ pub(in crate::hir::simplify) fn restore(
                 && index >= first
                 && !preview.removed[index]
                 && !sinks.contains(&index)
-                && matches!(stmt, HirStmt::LocalDecl(decl) if matches!(decl.values.fixed.as_slice(), [HirExpr::Closure(_)]))
+                && matches!(stmt, HirStmt::LocalDecl(_))
                 && let Some(plan) =
                     standalone_initializer_frame(preview_context, facts, stmt, index)
             {
@@ -521,7 +588,7 @@ pub(in crate::hir::simplify) fn restore(
         }
         // 逐坐标重放后缀。结构化边界只能留下无 scratch 比较和原 local COPY，
         // 原控制槽、各分支声明及新闭包结果仍由完整 prefix 事务核对。
-        if !suffix_replayed(&preview, &plans, first, facts, &certificates, structured) {
+        if !suffix_replayed(&preview, &plans, first, facts, structured) {
             continue;
         }
         let Ok(mut preserved) = validate_plan_batch(
@@ -873,6 +940,33 @@ fn standalone_initializer_frame(
             removed: Vec::new(),
         });
     }
+    if let HirStmt::Assign(assign) = stmt
+        && let ([HirLValue::TableAccess(access)], [value], None) = (
+            assign.targets.as_slice(),
+            assign.values.fixed.as_slice(),
+            &assign.values.tail,
+        )
+        && let Some(base) = facts.luau_literal_table_write_frame(access, value)
+    {
+        // 原常量准备与字段写入已由 Promotion 配对；这里只补齐保持原位的前缀义务。
+        return Some(Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
+            start: index,
+            sink: index,
+            base,
+            values: vec![value.clone()].into(),
+            result_locals: Vec::new(),
+            discarded_result: None,
+            assignment_targets: Vec::new(),
+            luau_compound_global: false,
+            indexed_target: Some((**access).clone()),
+            continuing_root: None,
+            retained_copies: Vec::new(),
+            replayed_effects: Vec::new(),
+            removed: Vec::new(),
+        });
+    }
     let (local, value) = scalar_local(stmt)?;
     let base = facts.trusted_local_home_slot(local)?;
     if context.closed.contains(&base) {
@@ -902,8 +996,7 @@ fn standalone_initializer_frame(
         HirExpr::Closure(closure)
             if matches!(stmt, HirStmt::LocalDecl(_))
                 && closure.captures.iter().all(|capture|
-                    capture.mode == HirCaptureMode::ByValue
-                        && matches!(capture.binding, HirBinding::Local(local)
+                    matches!(capture.binding, HirBinding::Local(local)
                             if facts.trusted_local_home_slot(local).is_some_and(|home| home.slot() < base.slot())))
                 && closure.source_site.is_some_and(|source| {
                     facts.operation_result_home(source) == Some(base)
@@ -937,23 +1030,68 @@ fn standalone_initializer_frame(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "父级原始值身份与各 child 的已缓存函数体事实共同筛选候选，不重复构建分析"
+)]
 fn callees(
     proto: &HirProto,
+    facts: &ProtoPromotionFacts,
     bodies: &[Option<(HirLuauInliningBody, crate::LuaString)>],
     parameter_names: &[Option<String>],
     result_names: &[Option<String>],
     factories: &[Option<factories::Factory>],
     returned_calls: &[Option<returned_calls::Body>],
     conditional_methods: &[Option<conditional_methods::Body>],
+    repeat_prefixes: &[Option<repeat_prefix::Body>],
 ) -> BTreeMap<(HirLuauInliningBody, crate::LuaString), Callee> {
-    let mut reads = BTreeSet::new();
+    struct PcallInputs<'a> {
+        facts: &'a ProtoPromotionFacts,
+        globals: BTreeSet<TempId>,
+        calls: Vec<(TempId, LocalId)>,
+        inputs: BTreeMap<LocalId, usize>,
+    }
+    impl crate::hir::visit::HirVisitor<'_> for PcallInputs<'_> {
+        fn visit_expr(&mut self, expr: &HirExpr) {
+            if let HirExpr::GlobalRef(global) = expr
+                && global.key.as_utf8() == Some("pcall")
+                && let crate::hir::common::HirOperationSources::Single(source) = global.sources
+                && let Some(producer) = self.facts.operation_result_temp(source)
+            {
+                self.globals.insert(producer);
+            }
+        }
+        fn visit_call(&mut self, call: &HirCallExpr) {
+            // pcall 的首实参是函数值，不是编译器可额外内联的直接调用；
+            // 分离的全局读取按 CALL 的原 Def 连接，展示 Local 的复用不改变身份。
+            if !call.is_method()
+                && let Some(HirExpr::LocalRef(local)) = call.args.fixed.first()
+            {
+                if matches!(&call.callee, HirExpr::GlobalRef(global) if global.key.as_utf8() == Some("pcall"))
+                {
+                    *self.inputs.entry(*local).or_default() += 1;
+                } else if let HirExpr::LocalRef(callee) = call.callee
+                    && let Some(frame) = self.facts.native_call_frame(call)
+                    && self.facts.promoted_local_for_temp(frame.callee) == Some(callee)
+                {
+                    self.calls.push((frame.callee, *local));
+                }
+            }
+        }
+    }
+    let mut reads = BTreeMap::<LocalId, usize>::new();
     let mut writes = BTreeMap::<LocalId, usize>::new();
-    visit_stmts(
-        &proto.body.stmts,
-        &mut (
+    let mut collectors = (
+        PcallInputs {
+            facts,
+            globals: BTreeSet::new(),
+            calls: Vec::new(),
+            inputs: BTreeMap::new(),
+        },
+        (
             BindingReadCollector(|binding| {
                 if let HirBinding::Local(local) = binding {
-                    reads.insert(local);
+                    *reads.entry(local).or_default() += 1;
                 }
             }),
             BindingWriteCollector(|binding| {
@@ -963,6 +1101,13 @@ fn callees(
             }),
         ),
     );
+    visit_stmts(&proto.body.stmts, &mut collectors);
+    let (mut pcall_inputs, _) = collectors;
+    for (producer, local) in &pcall_inputs.calls {
+        if pcall_inputs.globals.contains(producer) {
+            *pcall_inputs.inputs.entry(*local).or_default() += 1;
+        }
+    }
     let mut candidates = BTreeMap::new();
     let mut ambiguous = BTreeSet::new();
     for (index, stmt) in proto.body.stmts.iter().enumerate() {
@@ -973,11 +1118,14 @@ fn callees(
             continue;
         };
         if !matches!(stmt, HirStmt::LocalDecl(_))
-            || (reads.contains(&local)
+            || (reads.get(&local) != pcall_inputs.inputs.get(&local)
                 && !matches!(
                     key.0,
                     HirLuauInliningBody::ClosureFactory { .. }
                         | HirLuauInliningBody::ConditionalMethod { .. }
+                        | HirLuauInliningBody::RepeatPrefix { .. }
+                        | HirLuauInliningBody::CounterWhile { .. }
+                        | HirLuauInliningBody::StatefulGenericWhile { .. }
                 ))
             || writes.get(&local) != Some(&1)
         {
@@ -1037,6 +1185,7 @@ fn callees(
                     factory: factories[closure.proto.index()].clone(),
                     returned_call: returned_calls[closure.proto.index()].clone(),
                     conditional_method: conditional_methods[closure.proto.index()].clone(),
+                    repeat_prefix: repeat_prefixes[closure.proto.index()].clone(),
                     readonly_captures: closure
                         .captures
                         .iter()
@@ -1620,14 +1769,9 @@ fn suffix_replayed(
     plans: &[Plan],
     first: usize,
     facts: &ProtoPromotionFacts,
-    certificates: &BTreeMap<LocalId, HirRequiredLuauInlining>,
     structured: bool,
 ) -> bool {
     let sinks = plans.iter().map(|plan| plan.sink).collect::<BTreeSet<_>>();
-    let captures = certificates
-        .values()
-        .filter_map(|certificate| certificate.capture)
-        .collect::<BTreeSet<_>>();
     let floor = plans
         .iter()
         .filter(|plan| plan.sink >= first)
@@ -1667,21 +1811,26 @@ fn suffix_replayed(
                 _ => {}
             }
         }
-        // 低槽 cell 的原字面量更新不使用 scratch；声明身份仍由同批 prefix 验证。
-        if matches!(stmt, HirStmt::Assign(_))
+        // 原低槽 COPY 不使用 scratch；常量直接写入已有 binding，也不占 freereg。
+        // 后者可以高于最早帧入口，声明身份与后继帧前缀仍由同批 prefix 验证。
+        let below_frame = |local| {
+            facts
+                .trusted_local_home_slot(local)
+                .is_some_and(|home| floor.is_some_and(|floor| home.slot() < floor))
+        };
+        if matches!(stmt, HirStmt::Assign(assign)
+            if !assign.is_phi_transfer && assign.initializer_merge_transaction.is_none())
             && scalar_local(stmt).is_some_and(|(local, value)| {
-                captures.contains(&local)
-                    && facts
-                        .trusted_local_home_slot(local)
-                        .is_some_and(|home| floor.is_some_and(|floor| home.slot() < floor))
-                    && matches!(
-                        value,
+                facts.trusted_local_home_slot(local).is_some()
+                    && match value {
+                        HirExpr::LocalRef(source) => below_frame(local) && below_frame(*source),
                         HirExpr::Nil
-                            | HirExpr::Boolean(_)
-                            | HirExpr::Integer(_)
-                            | HirExpr::Number(_)
-                            | HirExpr::String(_)
-                    )
+                        | HirExpr::Boolean(_)
+                        | HirExpr::Integer(_)
+                        | HirExpr::Number(_)
+                        | HirExpr::String(_) => true,
+                        _ => false,
+                    }
             })
         {
             return;

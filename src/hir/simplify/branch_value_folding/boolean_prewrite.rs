@@ -229,7 +229,7 @@ fn candidate(
                 || assign.is_phi_transfer
                 || assign.preserves_parallel_nil()
                 || assign.generic_for_initializer_producer.is_some()
-                || assign.generic_for_dispatch_release.is_some()
+                || assign.root_release.is_some()
                 || assign.method_rewrite_transaction.is_some()
         })
     {

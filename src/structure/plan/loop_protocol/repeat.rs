@@ -285,12 +285,16 @@ pub(super) fn repeat_normal_value_is_stable(
 ) -> bool {
     match value {
         SsaValue::Entry(_) => true,
-        SsaValue::Phi(phi) => plan
-            .phi_plan(phi)
-            .is_some_and(|phi| phi.block == condition_header),
+        SsaValue::Phi(phi) => plan.phi_plan(phi).is_some_and(|phi| {
+            phi.block == condition_header
+                || dataflow.block_entry_value(condition_header, phi.reg) == value
+        }),
         SsaValue::Def(def) => dataflow.defs.get(def.index()).is_some_and(|definition| {
             definition.block == condition_header
                 || dataflow.block_entry_value(loop_header, definition.reg) == value
+                // 正文产生的版本若沿所有入边仍抵达条件入口，暂存不会提前读取
+                // 未定义值；提前 continue 绕过定义时，入口 SSA 会是另一版本或 phi。
+                || dataflow.block_entry_value(condition_header, definition.reg) == value
         }),
     }
 }

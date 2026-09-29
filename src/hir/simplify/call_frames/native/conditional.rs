@@ -1,4 +1,4 @@
-//! 在原结果帧中恢复 Boolean 物化和 Luau 条件选值，避免合流 carrier 抬高源码前缀。
+//! 在原结果帧中恢复查表短路值、Boolean 物化与 Luau 条件选值。
 //! 分支内的准备事件由 FrameBuilder 消费，整个选择及后继条件由同一 native preview 提交。
 
 use super::*;
@@ -6,6 +6,102 @@ use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirDecisionTestSource,
 };
 use crate::hir::visit::for_each_nested_block;
+
+/// 仅在原结果槽内重发整棵值图，不把“允许控制极性恢复”误作单个旧根已结束。
+pub(super) fn lookup_value_plans(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+) -> (Vec<Plan>, usize) {
+    let mut plans = Vec::new();
+    let mut count = 0;
+    prefix::coordinates::visit(&context.proto.body, &mut count, &mut |index, kind, stmt| {
+        if kind != PointKind::Statement {
+            return;
+        }
+        let HirStmt::LocalDecl(decl) = stmt else {
+            return;
+        };
+        let ([local], [HirExpr::Decision(decision)], None) = (
+            decl.bindings.as_slice(),
+            decl.values.fixed.as_slice(),
+            &decl.values.tail,
+        ) else {
+            return;
+        };
+        let Some(home) = facts.trusted_local_home_slot(*local) else {
+            return;
+        };
+        if decision.emit_as_luau_if
+            || decl.initializer_merge_transaction.is_some()
+            || context.barred.contains(&home)
+            || context.closed.contains(&home)
+        {
+            return;
+        }
+        let Some(mut builder) = frame_builder(context, &[], facts, dialect, home.slot()) else {
+            return;
+        };
+        let valid_value = |value: &HirExpr, builder: &mut FrameBuilder<'_>| {
+            match value {
+                HirExpr::Boolean(_) => true,
+                HirExpr::TableAccess(access) => {
+                    let Some(layout) = facts.native_table_read_layout(access) else {
+                        return false;
+                    };
+                    // 所有动态读取在同一结果槽写回，base 保持在声明前缀中；
+                    // 不引入高槽准备，不在下一次 GETTABLE 的回调之前清除旧结果。
+                    facts.table_read_result_home(access) == Some(home)
+                        && layout.key.is_none()
+                        && layout.base.slot() < home.slot()
+                        && facts.table_read_base_home(access) == Some(layout.base)
+                        && builder
+                            .expr(value, 0, home.slot(), None, false, true, None)
+                            .is_some()
+                }
+                _ => false,
+            }
+        };
+        if !decision.nodes.iter().all(|node| {
+            matches!(node.test, HirExpr::TableAccess(_))
+                && valid_value(&node.test, &mut builder)
+                && [&node.truthy, &node.falsy]
+                    .iter()
+                    .all(|target| match target {
+                        HirDecisionTarget::Expr(value) => valid_value(value, &mut builder),
+                        HirDecisionTarget::CurrentValue | HirDecisionTarget::Node(_) => true,
+                    })
+        }) {
+            return;
+        }
+        let Some(value) = super::super::super::decision::collapse_value_decision_expr(
+            &crate::hir::decision::analyze_decision(decision),
+            crate::hir::expr_safety::HirExprSafety::for_dialect(dialect),
+            |_| true,
+        ) else {
+            return;
+        };
+        // 图归约不复制共享求值；原生 initializer 的前缀及后继声明义务仍由整批 preview 验证。
+        plans.push(Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
+            start: index,
+            sink: index,
+            base: home,
+            values: vec![value].into(),
+            result_locals: vec![*local],
+            discarded_result: None,
+            assignment_targets: Vec::new(),
+            luau_compound_global: false,
+            indexed_target: None,
+            continuing_root: None,
+            retained_copies: Vec::new(),
+            replayed_effects: Vec::new(),
+            removed: Vec::new(),
+        });
+    });
+    (plans, count)
+}
 
 pub(super) fn collect(
     context: NativeFrameContext<'_>,
@@ -306,6 +402,7 @@ fn condition_plan(
 
 fn native_value(condition: &HirExpr, truthy: HirExpr, falsy: HirExpr) -> HirExpr {
     HirExpr::Decision(Box::new(HirDecisionExpr {
+        source_result: None,
         entry: HirDecisionNodeRef(0),
         nodes: vec![HirDecisionNode {
             id: HirDecisionNodeRef(0),

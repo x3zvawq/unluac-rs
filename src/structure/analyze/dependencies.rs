@@ -5,6 +5,48 @@ use super::{Cfg, DataflowFacts};
 use crate::structure::BlockRef;
 use crate::structure::cfg::EvaluationDependency;
 
+/// 固定值被表达式实际读取的次数，透明 COPY 沿 Dataflow 的 canonical 身份合并。
+/// phi 转交由各决策的 CurrentValue/operand 协议另行证明，不算成第二次求值。
+pub(super) fn shared_fixed_evaluation_defs(
+    proto: &crate::transformer::LoweredProto,
+    dataflow: &DataflowFacts,
+) -> Vec<bool> {
+    use crate::structure::SsaValue;
+    let mut counts = vec![0u8; dataflow.defs.len()];
+    for (index, uses) in dataflow.use_values.iter().enumerate() {
+        if matches!(proto.instrs[index], crate::transformer::LowInstr::Move(_)) {
+            continue;
+        }
+        let method = dataflow.method_setup_for_call(proto, crate::transformer::InstrRef(index));
+        for (reg, value) in uses.fixed.iter() {
+            // 原 SELF/NAMECALL 的隐式首参与 lookup 共享 receiver 求值；配对由前层证明。
+            // 同槽还被显式参数读取时仍按重复使用处理。
+            if method.as_ref().is_some_and(|setup| setup.first_arg == reg)
+                && !dataflow.instr_effects[index].repeats_fixed_use(reg)
+            {
+                continue;
+            }
+            let Some(SsaValue::Def(root)) = dataflow.canonical_move_value(value) else {
+                continue;
+            };
+            let count = if dataflow.instr_effects[index].repeats_fixed_use(reg) {
+                2
+            } else {
+                1
+            };
+            counts[root.index()] = (counts[root.index()] + count).min(2);
+        }
+    }
+    dataflow
+        .defs
+        .iter()
+        .map(|def| {
+            matches!(dataflow.canonical_move_value(SsaValue::Def(def.id)),
+                Some(SsaValue::Def(root)) if counts[root.index()] > 1)
+        })
+        .collect()
+}
+
 pub(super) struct DependencyMarks<'a> {
     pub(super) instructions: &'a mut [usize],
     pub(super) defs: &'a mut [usize],

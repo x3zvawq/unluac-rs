@@ -8,13 +8,15 @@ mod open;
 mod overwrites;
 mod plain_tables;
 mod root_exits;
+mod scalars;
 mod scratch;
+pub(crate) use scalars::low_instr_def_may_hold_gc_root;
 mod slot_captures;
 mod ssa;
 
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::decompile::{DecompileContext, DecompileError, DecompileState};
+use crate::decompile::{DecompileContext, DecompileDialect, DecompileError, DecompileState};
 use crate::structure::StructureError;
 use crate::transformer::{
     AccessBase, AccessKey, BranchSubject, CaptureSource, CondOperand, InstrRef, LowInstr,
@@ -44,6 +46,7 @@ pub(crate) fn analyze_dataflow(
     let cfg = state.require_cfg()?;
     let graph_facts = state.require_graph_facts()?;
     state.dataflow = Some(compute_dataflow_facts(
+        lowered.header.version,
         &lowered.main,
         &cfg.cfg,
         graph_facts,
@@ -52,8 +55,9 @@ pub(crate) fn analyze_dataflow(
     Ok(())
 }
 
-/// 对 proto 树计算数据流事实。
+/// 对 proto 树计算数据流事实；source 必须是输入 chunk 的实际方言，不能使用输出目标方言。
 pub fn compute_dataflow_facts(
+    source: DecompileDialect,
     proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
@@ -113,6 +117,9 @@ pub fn compute_dataflow_facts(
 
         let frame = stack.pop().expect("dataflow proto frame is non-empty");
         let mut facts = compute_dataflow_proto(frame.proto, frame.cfg, frame.graph_facts)?;
+        if source == DecompileDialect::Luau {
+            facts.gc_inert_values = scalars::collect(frame.proto, frame.cfg, &facts);
+        }
         facts.children = frame.children;
         if let Some(parent) = stack.last_mut() {
             parent.children.push(facts);
@@ -300,6 +307,7 @@ fn compute_dataflow_proto(
         def_overwritten_values,
         canonical_move_values,
         unknown_scratch_overwrites,
+        gc_inert_values: Vec::new(),
         def_phi_uses: ssa.def_phi_uses,
         phi_uses: ssa.phi_uses,
         phi_phi_uses: ssa.phi_phi_uses,

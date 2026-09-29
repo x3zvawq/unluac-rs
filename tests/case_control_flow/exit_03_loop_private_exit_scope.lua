@@ -1,5 +1,9 @@
--- unluac: expect-ast-min [[while]] [[2]]
--- unluac: expect-ast-min [[break]] [[1]]
+-- unluac: expect-ast-count [[while]] [[2]]
+-- unluac: expect-ast-count [[break]] [[2]]
+-- unluac: expect-ast-count [[if]] [[3]]
+-- unluac: expect-ast-count [[close-binding]] [[1]]
+-- unluac: expect-ast-count [[goto]] [[0]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 local events = {}
 local function resource(label)
     return setmetatable({}, {
@@ -41,3 +45,7 @@ external_entry(false)
 assert(table.concat(events, ",") ==
     "body,close:iteration,private,close:iteration,public,shared:0,loop,shared:2")
 print("loop-private-scope", table.concat(events, ","))
+events = {}
+external_entry(nil)
+external_entry(0)
+assert(table.concat(events, ",") == "loop,shared:2,shared:0")

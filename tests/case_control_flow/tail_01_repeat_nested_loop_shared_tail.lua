@@ -9,6 +9,11 @@
 -- unluac: expect-ast-min [[repeat]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-min [[while]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-min [[break]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[repeat]] [[2]]
+-- unluac: expect-ast-count [[while]] [[1]]
+-- unluac: expect-ast-count [[break]] [[1]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-count [[local-binding]] [[2]]
 local function run(a, b, c)
     local x = 0
     repeat
@@ -27,5 +32,7 @@ local function run(a, b, c)
     return x
 end
 
--- 部分布尔组合不会终止；只编译该 proto，避免执行阶段超时。
+-- 固定参数下只有这类真值组合能正常退出；其余路径保留结构断言，不声称运行覆盖。
+assert(run(true, true, true) == 1)
+assert(run(0, "", 0) == 1)
 print("regress_103_repeat_nested_loop_shared_tail#1")

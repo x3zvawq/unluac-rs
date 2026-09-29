@@ -1,4 +1,10 @@
 -- 返回首项 COPY 与后一项算术同属 RETURN 帧，保留原值身份和元方法次数。
+-- unluac: expect-ast-count [[local-binding]] [[7]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[table-constructor]] [[2]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
 -- unluac: expect-contains [[return value, value + 1]] [[@debug=retained]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=luau]]
 local function pair(value)

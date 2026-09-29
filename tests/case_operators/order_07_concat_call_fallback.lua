@@ -1,4 +1,7 @@
 -- CALL 的单值结果与短路备用值共用原 CONCAT 操作数槽。
+-- unluac: expect-ast-count [[function]] [[17]]
+-- unluac: expect-ast-count [[if]] [[0]]
+-- unluac: expect-ast-max [[local-binding]] [[14]]
 -- unluac: expect-not-contains [[= string.match]]
 -- unluac: expect-contains [[.. (string.match(]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=5]] [[@dialect=lua5.4]]
@@ -52,6 +55,16 @@ local co = coroutine.create(function()
 end)
 local ok, value = coroutine.resume(co)
 assert(ok and value == "pause")
+assert(coroutine.status(co) == "suspended")
 ok, value = coroutine.resume(co, false)
 assert(ok and value == "<fallback>")
+assert(coroutine.status(co) == "dead")
 print("regress_639_concat_call_fallback", handler("plain"), fallback_after_call())
+assert(choose_or(function() return false end, "false") == "<false>")
+assert(choose_or(function() return "" end, "unused") == "<>")
+assert(choose_and(function() return 0, "ignored" end, "chosen") == "<chosen>")
+assert(not pcall(choose_and, function() return nil end, "unused"))
+assert(select("#", handler("plain")) == 1)
+assert(select("#", preserve_snapshot("kept")) == 1)
+ok = coroutine.resume(co)
+assert(not ok and coroutine.status(co) == "dead")

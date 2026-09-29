@@ -4,9 +4,82 @@
 //! 向 lowering 发布明确边界，区分源码身份结束与物理根退休。
 
 use super::*;
-use crate::hir::HirLowerError;
 use crate::hir::emission::HirEmissionFacts;
 use crate::hir::promotion::ProtoPromotionFacts;
+use crate::hir::{HirBlock, HirExpr, HirLValue, HirLowerError, HirStmt};
+
+/// 结构化根块内的首次完整赋值已支配后继读取和释放，不需要再提前写入口 nil。
+/// 显式跳转尚无此词法证明，保留原入口 holder；闭包捕获按父 binding 的读取计入。
+pub(in crate::hir::analyze) fn initialized_in_root(
+    body: &HirBlock,
+    roots: &BTreeSet<TempId>,
+) -> BTreeSet<TempId> {
+    use crate::hir::visit::{HirVisitor, visit_stmts};
+
+    if roots.is_empty() {
+        return BTreeSet::new();
+    }
+    struct Mentions<'a> {
+        roots: &'a BTreeSet<TempId>,
+        index: usize,
+        first: BTreeMap<TempId, usize>,
+        reads: BTreeMap<TempId, usize>,
+        has_jump: bool,
+    }
+    impl HirVisitor<'_> for Mentions<'_> {
+        fn visit_stmt(&mut self, stmt: &HirStmt) {
+            self.has_jump |= matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_));
+        }
+        fn visit_expr(&mut self, expr: &HirExpr) {
+            if let HirExpr::TempRef(temp) = expr
+                && self.roots.contains(temp)
+            {
+                self.first.entry(*temp).or_insert(self.index);
+                self.reads.entry(*temp).or_insert(self.index);
+            }
+        }
+        fn visit_lvalue(&mut self, target: &HirLValue) {
+            if let HirLValue::Temp(temp) = target
+                && self.roots.contains(temp)
+            {
+                self.first.entry(*temp).or_insert(self.index);
+            }
+        }
+    }
+    let mut mentions = Mentions {
+        roots,
+        index: 0,
+        first: BTreeMap::new(),
+        reads: BTreeMap::new(),
+        has_jump: false,
+    };
+    let mut declarations = BTreeMap::new();
+    for (index, stmt) in body.stmts.iter().enumerate() {
+        if let HirStmt::Assign(assign) = stmt
+            && let [HirLValue::Temp(temp)] = assign.targets.as_slice()
+            && roots.contains(temp)
+            && !assign.is_phi_transfer
+            && assign.root_release.is_none()
+            && assign.values.fixed.len() == 1
+            && assign.values.tail.is_none()
+        {
+            declarations.entry(*temp).or_insert(index);
+        }
+        mentions.index = index;
+        visit_stmts(std::slice::from_ref(stmt), &mut mentions);
+    }
+    if mentions.has_jump {
+        // 候选拒绝[ProofIncomplete:Scope]：跳转可越过词法首写，不能由语句顺序证明初始化。
+        return BTreeSet::new();
+    }
+    declarations
+        .into_iter()
+        .filter_map(|(temp, index)| {
+            (mentions.first.get(&temp) == Some(&index) && mentions.reads.get(&temp) != Some(&index))
+                .then_some(temp)
+        })
+        .collect()
+}
 
 /// 原 COPY 窗口只含低槽纯写；退出词法窗口不清根，原 NEWTABLE 仍负责实际覆盖。
 pub(in crate::hir::analyze) fn bind_allocation_copy_scopes(

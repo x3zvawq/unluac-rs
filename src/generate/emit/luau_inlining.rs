@@ -9,9 +9,12 @@ use crate::hir::HirLuauInliningBody;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod conditional_methods;
+mod counter_while;
 mod loops;
 mod opaque;
+mod repeat_prefix;
 mod returned_calls;
+mod stateful_generic;
 
 // 只展开词法包装，不穿过控制流或函数边界；binding 身份仍属于同一个 caller。
 fn scope_statements(block: &AstBlock) -> Vec<&AstStmt> {
@@ -179,6 +182,9 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 | HirLuauInliningBody::SnapshotClosureFactory { .. }
                 | HirLuauInliningBody::CapturedCallablePair
                 | HirLuauInliningBody::ConditionalMethod { .. }
+                | HirLuauInliningBody::RepeatPrefix { .. }
+                | HirLuauInliningBody::CounterWhile { .. }
+                | HirLuauInliningBody::StatefulGenericWhile { .. }
         ) && (requirement.result_frame_slots.len() != requirement.occurrences.len()
             || requirement
                 .occurrences
@@ -208,6 +214,7 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
             }
         }
     }
+    let written_locals = crate::ast::written_locals(&module.body);
     let mut declared = BTreeSet::new();
     let mut seen_occurrences = BTreeSet::new();
     let mut seen_result_slots = BTreeSet::new();
@@ -284,6 +291,7 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                     published_globals: &published_globals,
                     bodies: &bodies,
                     opaque_locals: &opaque_locals,
+                    written_locals: &written_locals,
                     scalar_callees: &scalar_callees,
                     captured_callees: &captured_callees,
                     callees: &callees,
@@ -311,6 +319,15 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 let AstCallKind::Call(call) = &stmt.call else {
                     return false;
                 };
+                if let Some(site) = counter_while::comparison_result(call)
+                    && occurrences.get(&site).and_then(|local| bodies.get(local))
+                        .is_some_and(|body| matches!(body, HirLuauInliningBody::CounterWhile { .. }))
+                    && (result_slots.get(&site) != Some(&(active + 2))
+                        || !seen_result_slots.insert(site))
+                {
+                    // assert 的 callee/Boolean 占前两槽，循环返回值必须留在原比较左输入槽。
+                    return false;
+                }
                 if call.required_luau_inlining.is_some()
                     || !(matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name))
                     if name.text == "assert" || name.text == "print")
@@ -321,6 +338,7 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                             published_globals: &published_globals,
                             bodies: &bodies,
                             opaque_locals: &opaque_locals,
+                            written_locals: &written_locals,
                             scalar_callees: &scalar_callees,
                             captured_callees: &captured_callees,
                             callees: &callees,
@@ -370,6 +388,7 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                     published_globals: &published_globals,
                     bodies: &bodies,
                     opaque_locals: &opaque_locals,
+                    written_locals: &written_locals,
                     scalar_callees: &scalar_callees,
                     captured_callees: &captured_callees,
                     callees: &callees,
@@ -420,6 +439,7 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                         published_globals: &published_globals,
                         bodies: &bodies,
                         opaque_locals: &opaque_locals,
+                        written_locals: &written_locals,
                         scalar_callees: &scalar_callees,
                         captured_callees: &captured_callees,
                         callees: &callees,
@@ -440,6 +460,7 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                         published_globals: &published_globals,
                         bodies: &bodies,
                         opaque_locals: &opaque_locals,
+                        written_locals: &written_locals,
                         scalar_callees: &scalar_callees,
                         captured_callees: &captured_callees,
                         callees: &callees,
@@ -470,6 +491,7 @@ struct InvocationExpressions<'a> {
     shared_factories: &'a BTreeSet<crate::hir::LocalId>,
     bodies: &'a BTreeMap<crate::hir::LocalId, HirLuauInliningBody>,
     opaque_locals: &'a BTreeSet<crate::hir::LocalId>,
+    written_locals: &'a BTreeSet<crate::hir::LocalId>,
     scalar_callees: &'a BTreeSet<crate::hir::LocalId>,
     captured_callees: &'a BTreeSet<crate::hir::LocalId>,
     callees: &'a BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
@@ -524,6 +546,17 @@ impl InvocationExpressions<'_> {
                                 | HirLuauInliningBody::PublishedClosureFactory { .. }
                         ) {
                             0
+                        } else if matches!(
+                            self.bodies[callee],
+                            HirLuauInliningBody::RepeatPrefix { .. }
+                        ) {
+                            2
+                        } else if matches!(
+                            self.bodies[callee],
+                            HirLuauInliningBody::CounterWhile { .. }
+                                | HirLuauInliningBody::StatefulGenericWhile { .. }
+                        ) {
+                            4
                         } else {
                             1
                         }
@@ -543,12 +576,37 @@ impl InvocationExpressions<'_> {
                         self.bodies[callee],
                         HirLuauInliningBody::ConditionalMethod { .. }
                     ) || matches!(call.args.as_slice(), [AstExpr::Var(AstNameRef::Local(local))] if !self.opaque_locals.contains(local)))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::RepeatPrefix { .. }
+                    ) || call.args.as_slice()
+                        == [AstExpr::Boolean(true), AstExpr::Boolean(true)])
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::CounterWhile { .. }
+                    ) || counter_while::inlined_arguments(&call.args))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::StatefulGenericWhile { .. }
+                    ) || stateful_generic::inlined_arguments(&call.args, self.written_locals))
                     && (self.bodies[callee] != HirLuauInliningBody::Identity
                         || matches!(call.args.as_slice(), [AstExpr::Number(value)] if value.is_nan())
                         || matches!(call.args.as_slice(), [AstExpr::Integer(value)] if (-32768..=32767).contains(value))
                         || matches!(call.args.as_slice(), [AstExpr::Boolean(_)]))
                     && call.args.iter().all(|arg| plain_expr(arg, self.callees))
                     && self.seen.insert(site)
+            }
+            AstExpr::Call(call)
+                if matches!(&call.callee,
+                AstExpr::Var(AstNameRef::Global(name)) if name.text == "select") =>
+            {
+                // 原固定参数中的展开结果由 AST 保留单值括号；select 的计数
+                // 调用不参与额外内联，内部 occurrence 仍须通过同一编译合同。
+                call.method_key.is_none()
+                    && matches!(call.args.as_slice(), [AstExpr::String(marker), AstExpr::SingleValue(value)]
+                        if marker.as_utf8() == Some("#")
+                            && matches!(value.as_ref(), AstExpr::Call(inner) if inner.required_luau_inlining.is_some()))
+                    && self.check(&call.args[1], top + 3, true)
             }
             AstExpr::Var(AstNameRef::Global(name))
                 if self.published_globals.contains(name.text.as_str()) =>
@@ -597,6 +655,18 @@ impl InvocationExpressions<'_> {
             AstExpr::Call(call) if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local)) if self.shared_factories.contains(&local) && self.declared.contains(&local)) => {
                 fixed_one && top <= 128 && call.method_key.is_none() && call.args.is_empty()
             }
+            AstExpr::Call(call)
+                if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local))
+                if matches!(self.bodies.get(&local), Some(HirLuauInliningBody::CounterWhile { .. })) && self.declared.contains(&local)) =>
+            {
+                call.method_key.is_none() && counter_while::retained_arguments(&call.args)
+            }
+            AstExpr::Call(call)
+                if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local))
+                if matches!(self.bodies.get(&local), Some(HirLuauInliningBody::RepeatPrefix { .. })) && self.declared.contains(&local)) =>
+            {
+                call.method_key.is_none() && repeat_prefix::retained_arguments(&call.args)
+            }
             AstExpr::Call(call) if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local)) if self.opaque_locals.contains(&local)) => {
                 call.method_key.is_none()
                     && call.args.iter().enumerate().all(|(index, arg)| {
@@ -620,6 +690,26 @@ fn callee_body(
     expected_field: &crate::LuaString,
     capture: Option<crate::hir::LocalId>,
 ) -> bool {
+    if let HirLuauInliningBody::StatefulGenericWhile {
+        template,
+        initial,
+        increment,
+    } = body
+    {
+        return stateful_generic::body(func, template, initial, increment, expected_field);
+    }
+    if let HirLuauInliningBody::CounterWhile {
+        template,
+        initial,
+        increment,
+        limit,
+    } = body
+    {
+        return counter_while::body(func, template, initial, increment, limit);
+    }
+    if let HirLuauInliningBody::RepeatPrefix { template } = body {
+        return repeat_prefix::body(func, template);
+    }
     if let HirLuauInliningBody::ConditionalMethod { template } = body {
         return conditional_methods::body(func, template);
     }
@@ -1145,6 +1235,15 @@ fn plain_expr(
         AstExpr::Var(AstNameRef::Local(local)) => !callees.contains_key(local),
         AstExpr::Var(AstNameRef::Param(_) | AstNameRef::Upvalue(_)) => true,
         AstExpr::Call(call) => {
+            // pinned Luau 的 select("#", ...) 单结果路径直接计数当前变参，
+            // 不参与函数解析或参数常量折叠；开放尾部仍由 plain_values 拒绝。
+            if matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if name.text == "select")
+            {
+                return call.required_luau_inlining.is_none()
+                    && call.method_key.is_none()
+                    && matches!(call.args.as_slice(), [AstExpr::String(marker), AstExpr::VarArg]
+                        if marker.as_utf8() == Some("#"));
+            }
             // pcall 不参与 getFunctionExpr；作为其首实参传递的函数值不会额外内联。
             if matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if name.text == "pcall")
             {
@@ -1202,7 +1301,9 @@ fn plain_expr(
                 .enumerate()
                 .all(|(index, field)| match field {
                     AstTableField::Array(value) => {
-                        plain_expr(value, callees)
+                        // getFunctionExpr 不解析表内函数值；后续索引调用仍保留原 CALL。
+                        (matches!(value, AstExpr::Var(AstNameRef::Local(local)) if callees.contains_key(local))
+                            || plain_expr(value, callees))
                             && (index + 1 < table.fields.len() || open_tail_unchanged(value))
                     }
                     AstTableField::Record(record) => {

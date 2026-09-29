@@ -3,6 +3,11 @@
 -- unluac: expect-ast-min [[if]] [[2]]
 -- unluac: expect-ast-min [[break]] [[1]]
 -- unluac: expect-not-line [[local r1_1]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]]
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=4]]
+-- unluac: expect-ast-count [[local-binding]] [[16]]
+-- unluac: expect-ast-count [[while]] [[1]]
+-- unluac: expect-ast-count [[break]] [[1]]
 local function run(flag, limit)
     local result = 0
     while flag do
@@ -56,3 +61,16 @@ assert(changed == false and old == box and additions == 1)
 local unchanged, same = snapshot(false, box)
 assert(unchanged == box and same == box and additions == 1)
 print("return-decision-home", run(true, 2), run(false, 2), comparisons, additions)
+
+assert(run(nil, nil) == 0)
+assert(run(0, 0) == 11 and run("", -2) == 11)
+assert(run(true, 3) == 13)
+left.n, right.n = 4, 4
+assert(after_compare(left, right) == 10 and comparisons == 3)
+assert(after_compare(right, left) == 10 and comparisons == 4)
+changed, old = snapshot(0, 7)
+assert(changed == 17 and old == 7)
+changed, old = snapshot(nil, false)
+assert(changed == false and old == false)
+changed, old = snapshot("", box)
+assert(changed == false and old == box and additions == 2)

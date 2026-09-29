@@ -2,6 +2,8 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-ast-min [[if]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[15]]
 local frame = {}
 
 function guarded_return_chain(kind, key)
@@ -36,6 +38,10 @@ local cases = {
     { false, "RELEASE", "ESCAPE" },
     { true, "PRESS", "ESCAPE" },
     { true, "RELEASE", "RETURN" },
+    { 0, "PRESS", "ESCAPE" },
+    { "", "RELEASE", "RETURN" },
+    { nil, "PRESS", "OTHER" },
+    { false, nil, "ESCAPE" },
 }
 for i, case in ipairs(cases) do
     handled, value, extra = case[1], nil, "extra"
@@ -43,7 +49,7 @@ for i, case in ipairs(cases) do
     local a, b, c = guarded_return_chain(case[2], case[3])
     assert(calls == i and action == case[4])
     if handled then
-        assert(a == true and b == nil and c == "extra")
+        assert(a == handled and b == nil and c == "extra")
     else
         assert(a == "BLOCK" and b == nil and c == case[2])
     end

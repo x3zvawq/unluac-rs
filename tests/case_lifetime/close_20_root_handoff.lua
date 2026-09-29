@@ -1,5 +1,6 @@
 local weak = setmetatable({}, { __mode = "v" })
 -- unluac: expect-ast-count [[close-binding]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[14]]
 local closed = 0
 
 local function allocation_root()
@@ -15,6 +16,7 @@ local function allocation_root()
         second = nil
         collectgarbage("collect")
         assert(a0 == a2 and a1 == a2 and weak[1] ~= nil)
+        assert(weak[2] == nil)
         a0 = nil
         a1 = nil
     end
@@ -34,6 +36,7 @@ local function call_root()
         second = nil
         collectgarbage("collect")
         assert(a0 == a2 and a1 == a2 and weak[1] ~= nil)
+        assert(weak[2] == nil)
         a0 = nil
         a1 = nil
     end

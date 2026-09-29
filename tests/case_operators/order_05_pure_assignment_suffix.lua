@@ -1,5 +1,8 @@
 -- 连续纯依赖移入普通赋值；无关前缀、捕获和求值事件仍保留自己的边界。
 -- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[function]] [[5]]
+-- unluac: expect-ast-count [[if]] [[0]]
+-- unluac: expect-ast-max [[local-binding]] [[16]]
 local function fill(box, value)
     local unrelated = value
     local result = not value
@@ -64,6 +67,7 @@ repeat
 until count == 3
 box.loop = result
 assert(result == true and box.loop == true)
+assert(count == 3)
 
 local function split(value)
     local first = not value
@@ -75,4 +79,8 @@ split(nil)
 assert(box.first == true and box.second == false)
 split(0)
 assert(box.first == false and box.second == true)
+assert(select("#", split(false)) == 0)
+assert(box.first == true and box.second == false)
+assert(select("#", fill(box, true)) == 0)
+assert(box.value == true and events == 2)
 print("regress_548_pure_assignment_suffix", "OK")

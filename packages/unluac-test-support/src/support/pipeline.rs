@@ -254,6 +254,28 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
     let expected_dialect = entry.dialect.decompile_dialect();
 
     let mut chunk = baseline.compiled_chunk;
+    if entry.expectation == LuaCaseExpectation::Lua53Float32 {
+        chunk = lua53_float32_chunk(&chunk).map_err(|detail| {
+            TestFailure::new(
+                FailureKind::CompileSourceFailed,
+                "encode f32 chunk failed",
+                detail,
+            )
+        })?;
+        let path = suite_artifact_path(
+            suite_label,
+            entry,
+            "float32-input",
+            toolchain.chunk_extension,
+        );
+        write_output_file(&path, &chunk).map_err(|detail| {
+            TestFailure::new(
+                FailureKind::CompileSourceFailed,
+                "write f32 chunk failed",
+                detail,
+            )
+        })?;
+    }
     if let LuaCaseExpectation::LuauSelfValueCaptureCarrier {
         closure_pc,
         save_pc,
@@ -510,6 +532,17 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
                 ),
             )
         })?;
+        let prev_chunk_bytes = if entry.expectation == LuaCaseExpectation::Lua53Float32 {
+            lua53_float32_chunk(&prev_chunk_bytes).map_err(|detail| {
+                TestFailure::new(
+                    FailureKind::RecompileDecompileFailed,
+                    "encode f32 roundtrip failed",
+                    detail,
+                )
+            })?
+        } else {
+            prev_chunk_bytes
+        };
         let recompile_result =
             decompile(&prev_chunk_bytes, decompile_options(entry)).map_err(|error| {
                 TestFailure::new(
@@ -690,6 +723,7 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
             ));
         }
         LuaCaseExpectation::Source
+        | LuaCaseExpectation::Lua53Float32
         | LuaCaseExpectation::GlobalDeclResidual
         | LuaCaseExpectation::LuauSelfValueCaptureCarrier { .. }
         | LuaCaseExpectation::UnsupportedIsland { .. } => {}

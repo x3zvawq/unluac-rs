@@ -291,7 +291,8 @@ fn merge_adjacent_single_value_local_decls(
 
         if bindings.len() >= 2
             && bindings.iter().any(|b| {
-                use_index.count_uses_in_suffix(lookahead, b.id) > 1
+                b.rewrite_authority.must_preserve()
+                    || use_index.count_uses_in_suffix(lookahead, b.id) > 1
                     || write_index.has_write_after(index, b.id)
             })
         {
@@ -322,10 +323,15 @@ fn binding_needs_independent_declaration(
     suffix_start: usize,
     binding: &AstLocalBinding,
 ) -> bool {
+    // 调用方已核对相邻声明合并权限；HIR 要求保留的字面量前缀不会被
+    // cleanup/inline-exprs 删除，无显式读取也不需要为这些 pass 保持独立声明。
+    if binding.rewrite_authority.must_preserve() {
+        return false;
+    }
     let uses = use_index.count_uses_in_suffix(suffix_start, binding.id);
     if uses == 0 {
         // 下沉可能刚产生尚未被 cleanup 消费的 dead copy；不能让它因并入另一个
-        // 有用声明而继续持有对象。仍有生命周期职责的 binding 也保持原独立边界。
+        // 有用声明而继续持有对象。
         return true;
     }
     super::inline_exprs::local_attr_belongs_to_inline_pipeline(binding.attr)

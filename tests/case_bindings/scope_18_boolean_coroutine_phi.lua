@@ -2,6 +2,9 @@
 -- LuaJIT 的子函数编号不同；两份函数声明、reader 的一个值和 check 的四个 local 共七个。
 -- unluac: expect-ast-count [[local-binding]] [[7]]
 -- unluac: expect-ast-count [[while]] [[1]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-max-count [[local r]] [[3]]
 -- unluac: expect-not-contains [[ = coroutine.yield]]
 local function reader(flag)
@@ -15,7 +18,8 @@ end
 local function check(flag)
     local co = coroutine.create(reader)
     for round = 1, 3 do
-        local ok, value = coroutine.resume(co, flag)
+        -- 后续恢复传入 false；yield 返回值不能替代首次建立的 Boolean 状态。
+        local ok, value = coroutine.resume(co, round == 1 and flag)
         assert(ok and value == not not flag)
         assert(coroutine.status(co) == "suspended")
     end

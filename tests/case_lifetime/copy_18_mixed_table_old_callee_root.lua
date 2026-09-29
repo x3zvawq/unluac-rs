@@ -1,6 +1,9 @@
 -- 旧 callee 的槽必须在首个字段求值前由 NEWTABLE 覆盖；显式 local 对照须继续持有旧根。
 -- unluac: expect-ast-count [[table-list-field]] [[3]] [[@proto=4]]
 -- unluac: expect-ast-count [[table-list-field]] [[3]] [[@proto=5]]
+-- unluac: expect-ast-count [[local-binding]] [[10]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=5]]
 local weak
 
 local function make_callable()

@@ -3,6 +3,10 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[while ]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[local-binding]] [[11]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[while]] [[1]]
 local function iter_once()
     local done = false
     return function()
@@ -32,3 +36,8 @@ end
 local kept = run()
 assert(kept == false)
 print("regress_347_generic_for_dead_mirror_gc_root", kept)
+
+local next_item = iter_once()
+local index, item = next_item()
+assert(index == 1 and type(item) == "table")
+assert(next_item() == nil)

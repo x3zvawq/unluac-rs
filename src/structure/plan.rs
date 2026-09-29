@@ -22,7 +22,7 @@ pub use loop_protocol::{
 };
 pub use navigation::{EdgeRegionRelation, RegionBoundarySummary, RegionNavigation};
 pub use terminator::{BlockTerminatorKind, BlockTerminatorPlan};
-pub(in crate::structure) use value::loop_carried_input;
+pub(in crate::structure) use value::loop_carried_fact;
 pub use value::{LoopCarriedPhi, PhiIncomingDisposition, PhiIncomingPlan, PhiPlan};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -649,12 +649,46 @@ pub struct ValueDecisionOperandPlan {
     pub continuation: ValueDecisionNodeId,
     pub consumer: ValueDecisionNodeId,
     pub nodes: Vec<ValueDecisionNodeId>,
+    /// 结果 phi 的物理 incoming，保留原终边归属供完整性验证。
     pub leaves: BTreeMap<EdgeRef, SsaValue>,
-    /// 叶值复用对应谓词的本次求值，包含 Luau 结果槽的透明 MOVE。
+    /// 物理 incoming 穿过本弧上的内部 phi 后的逻辑值；以谓词及首边区分共享终边。
+    pub route_values: BTreeMap<(ValueDecisionNodeId, EdgeRef), SsaValue>,
+    /// 叶值复用对应谓词的本次求值；同 route_values 以首边区分真、假弧。
+    /// 包含 Luau 结果槽的透明 MOVE。
     pub current_values: BTreeSet<(ValueDecisionNodeId, EdgeRef)>,
 }
 
 impl ValueDecisionOperandPlan {
+    fn proven_route_values(
+        &self,
+        cfg: &Cfg,
+        dataflow: &DataflowFacts,
+        nodes: &[ValueDecisionNodePlan],
+    ) -> Option<BTreeMap<(ValueDecisionNodeId, EdgeRef), SsaValue>> {
+        let mut values = BTreeMap::new();
+        for id in &self.nodes {
+            let node = nodes.get(id.index())?;
+            for arc in [&node.truthy, &node.falsy] {
+                let Some(&physical) = self.leaves.get(arc.route.last()?) else {
+                    continue;
+                };
+                let mut value = physical;
+                // 同一终边前的不同路径可携带不同 incoming。沿已冻结 route 逆序
+                // 读取索引，不遍历 phi 的其它路径，也不重建嵌套候选。
+                for edge in arc.route.iter().rev() {
+                    let SsaValue::Phi(phi) = value else {
+                        break;
+                    };
+                    if cfg.edges.get(edge.index())?.to == dataflow.phi_candidate(phi)?.block {
+                        value = dataflow.phi_incoming_for_edge(phi, *edge)?.value;
+                    }
+                }
+                values.insert((*id, *arc.route.first()?), value);
+            }
+        }
+        Some(values)
+    }
+
     fn proven_current_values(
         &self,
         proto: &LoweredProto,
@@ -671,8 +705,8 @@ impl ValueDecisionOperandPlan {
                 return None;
             };
             for arc in [&node.truthy, &node.falsy] {
-                let edge = *arc.route.last()?;
-                let Some(&value) = self.leaves.get(&edge) else {
+                let edge = *arc.route.first()?;
+                let Some(&value) = self.route_values.get(&(*id, edge)) else {
                     continue;
                 };
                 let latest = match value {
@@ -710,6 +744,8 @@ pub struct ValueDecisionPlan {
     /// 校验所有 terminal edge 的 copy 完全相同，不能借此合并路径相关的值动作。
     pub shared_exit_action: EdgeRef,
     pub result_phi: crate::structure::PhiId,
+    /// 不属于本次决策叶子的唯一循环入口，由外层 loop 的 RegionInput 消费。
+    pub loop_entry: Option<EdgeRef>,
     /// decision 内部被表达式 DAG 一并消去的中间 phi；按 PhiId 严格递增。
     pub absorbed_phis: Vec<crate::structure::PhiId>,
     /// 按 phi 排序，消费者可直接定位内部操作数而不逐 phi 扫描整个 DAG。

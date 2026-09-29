@@ -1,5 +1,8 @@
 -- nil/Boolean 的多次原写在同一内层绑定中保留；后继索引帧复用原槽时结束声明。
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[assign]] [[5]] [[@proto=1]]
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
 -- unluac: expect-not-contains [[ = table.concat]]
 -- unluac: expect-contains [[return table.concat(]]
@@ -20,4 +23,7 @@ local function trace_path(flag)
 end
 assert(trace_path(true) == "aT")
 assert(trace_path(false) == "aF")
+assert(trace_path(nil) == "aF")
+assert(trace_path(0) == "aT")
+assert(trace_path("") == "aT")
 print("boolean_index_frame", "OK")

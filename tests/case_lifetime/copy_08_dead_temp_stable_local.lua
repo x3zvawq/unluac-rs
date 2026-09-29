@@ -6,6 +6,9 @@
 -- unluac: expect-contains [[local r3_0 = r0_3]]
 -- unluac: expect-not-contains [[local r3_1 = r3_0]]
 -- unluac: expect-ast-max [[local-decl]] [[2]] [[@proto=3]]
+-- unluac: expect-ast-count [[local-binding]] [[32]]
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=14]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 
 local function stable(value, callback)
     local source = value

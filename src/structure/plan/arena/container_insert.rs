@@ -234,16 +234,23 @@ pub(super) fn ordinary_branch_ranges(
         std::slice::from_ref(&header_range),
     );
 
-    if branch.branch.else_entry.is_some() {
-        let Some((then_entry, Some(else_entry))) = branch_arm_entries(branch, input) else {
+    {
+        let Some((then_entry, else_entry)) = branch_arm_entries(branch, input) else {
             return Ok(None);
         };
-        if graph_facts.dominates(then_entry, else_entry)
-            || graph_facts.dominates(else_entry, then_entry)
-        {
+        if else_entry.is_some_and(|else_entry| {
+            graph_facts.dominates(then_entry, else_entry)
+                || graph_facts.dominates(else_entry, then_entry)
+        }) {
             return Ok(None);
         }
-        let allowed = merge_preorder_ranges(vec![subtree(then_entry)?, subtree(else_entry)?]);
+        // 单臂 guard 的最终出口可能同时由正常 continuation 到达；header 支配它，
+        // 退出臂却不支配它。和双臂一样按 arm 的支配域收窄，避免吞入共享出口。
+        let mut allowed = vec![subtree(then_entry)?];
+        if let Some(else_entry) = else_entry {
+            allowed.push(subtree(else_entry)?);
+        }
+        let allowed = merge_preorder_ranges(allowed);
         ranges = intersect_preorder_ranges(&ranges, &allowed);
         ranges.push(position(branch.branch.header)?..position(branch.branch.header)? + 1);
         if let Some(condition) = branch

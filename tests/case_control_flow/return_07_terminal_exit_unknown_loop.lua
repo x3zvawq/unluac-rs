@@ -3,6 +3,15 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[while]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=luajit]]
+-- Luau 已将未修改的捕获常量放进闭包，不为它补回源码声明。
+-- unluac: expect-ast-count [[local-binding]] [[11]] [[@dialect=luau]]
 local saved
 local token = {}
 
@@ -40,6 +49,13 @@ local error_ok = pcall(run, 4, token)
 assert(break_result == nil and break_saved == "value")
 assert(return_result == "return" and return_saved == "value")
 assert(retry_result == "done" and retry_saved == "value" and error_ok == false)
+assert(saved() == "value")
+assert(select("#", run(1, token)) == 0)
+saved = nil
+assert(not pcall(run, 1, {}))
+assert(saved == nil)
+assert(not pcall(run, nil, token))
+assert(saved() == "value")
 
 print(
     "regress_195_terminal_exit_unknown_loop#1",

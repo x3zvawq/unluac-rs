@@ -1,3 +1,6 @@
+-- unluac: expect-ast-count [[function]] [[5]]
+-- unluac: expect-ast-max [[local-binding]] [[6]] [[@proto=0]]
+-- unluac: expect-ast-count [[error]] [[0]]
 -- regress_190_luau_import_open_pack#1: GETIMPORT setup 不阻断末位 open 参数 owner
 -- unluac: expect-contains [[table.unpack]]
 -- unluac: expect-contains [[type]]

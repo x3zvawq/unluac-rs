@@ -1,4 +1,9 @@
 -- 常量选择可越过无 binding 写入的 suffix；短路路径、错误与元方法次数保持不变。
+-- unluac: expect-ast-count [[function]] [[8]]
+-- unluac: expect-ast-count [[if]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[17]]
+-- unluac: expect-count [[and "present" or "missing"]] [[2]]
+-- unluac: expect-count [[and "large" or "small"]] [[1]]
 local function describe(value)
     local prefix = value and "present" or "missing"
     local suffix = value ~= nil and (value > 10 and "large" or "small") or "none"
@@ -68,4 +73,10 @@ local function captured(value)
     return prefix .. ":" .. suffix
 end
 assert(captured(true) == "present:suffix")
+assert(captured(false) == "missing:suffix")
+assert(captured(nil) == "missing:suffix")
+assert(captured(0) == "present:suffix")
+assert(captured("") == "present:suffix")
+assert(select("#", captured(true)) == 1)
+assert(select("#", describe(nil)) == 1)
 print("regress_557_short_circuit_constant_snapshot", "OK")

@@ -4,6 +4,8 @@
 -- unluac: expect-count [[if 1 < 2 then]] [[2]]
 -- unluac: expect-ast-count [[while]] [[1]]
 -- unluac: expect-ast-count [[break]] [[1]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-count [[local-binding]] [[1]]
 local issue17_loop = true
 while issue17_loop do
     if 2 > 1 then
@@ -13,3 +15,4 @@ while issue17_loop do
         end
     end
 end
+assert(issue17_loop == true)

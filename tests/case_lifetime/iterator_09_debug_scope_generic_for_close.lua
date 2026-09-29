@@ -1,8 +1,14 @@
 -- 第四返回值的隐式关闭由原生 for 持有，外层 do 只能恢复自己的根结束点。
 -- unluac: expect-ast-min [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[9]]
+-- unluac: expect-ast-count [[function]] [[4]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[do-block]] [[1]]
+-- unluac: expect-ast-count [[close-binding]] [[0]]
 local function iterator(values, weak, events)
     local guard = setmetatable({}, {
-        __close = function()
+        __close = function(self, err)
+            assert(weak[self] == true and err == nil)
             events.closed = events.closed + 1
         end,
     })

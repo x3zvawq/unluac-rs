@@ -1,5 +1,7 @@
 -- regress_410_lua55_multi_global_tail_call: the reverse probe releases each consumed result slot
 -- unluac: expect-contains [[global first_target, second_target =]]
+-- unluac: expect-ast-count [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
 
 global<const> assert, collectgarbage, print, rawset, setmetatable, table
 

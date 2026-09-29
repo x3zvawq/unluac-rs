@@ -5,6 +5,10 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[generic-for]] [[2]]
+-- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[break]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
 local function run(a, b, xs)
     local x = 0
     for _ in xs do
@@ -23,4 +27,9 @@ end
 
 local result = run(true, true, { true })
 assert(result == 1)
+assert(run(true, true, { [4] = true }) == 4)
+assert(run(true, false, { true, true }) == 0)
+assert(run(false, true, { true, true }) == 0)
+assert(run(false, false, { true, true }) == 0)
+assert(run(true, true, {}) == 0)
 print("regress_84_nested_loop_scope_state#1", result)

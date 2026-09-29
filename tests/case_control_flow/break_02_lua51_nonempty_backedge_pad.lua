@@ -5,6 +5,8 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 local function f(a, b)
     while true do
         print("regress_129_lua51_nonempty_backedge_pad#1 tick")
@@ -21,4 +23,6 @@ end
 
 local result = f(false, false)
 assert(result == 2)
+assert(f(false, true) == 1)
+assert(f(true, true) == 2)
 print("regress_129_lua51_nonempty_backedge_pad#1", result)

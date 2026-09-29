@@ -126,6 +126,7 @@ impl<'a, 'w> GuardBranchExitDagBuilder<'a, 'w> {
             },
             result_reg: None,
             result_phi_id: None,
+            loop_entry: None,
             entry_value: None,
             value_incomings: Vec::new(),
             reducible,

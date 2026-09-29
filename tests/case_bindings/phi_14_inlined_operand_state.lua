@@ -3,18 +3,44 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-contains [[print("inline-state",]]
+-- unluac: expect-ast-count [[function]] [[6]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]]
+-- unluac: expect-ast-count [[call]] [[2]] [[@proto=6]]
+-- unluac: expect-ast-count [[numeric-for]] [[2]] [[@variant=O0]]
+-- unluac: expect-ast-count [[numeric-for]] [[2]] [[@variant=O1]]
+-- unluac: expect-ast-count [[numeric-for]] [[0]] [[@variant=O2]]
+-- unluac: expect-ast-count [[continue]] [[2]] [[@variant=O0]]
+-- unluac: expect-ast-count [[continue]] [[2]] [[@variant=O1]]
+-- unluac: expect-ast-count [[continue]] [[0]] [[@variant=O2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@variant=O0]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@variant=O1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]] [[@variant=O0]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]] [[@variant=O1]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=5]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@variant=O2]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=4]] [[@variant=O2]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@variant=O2]] [[@debug=retained]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=4]] [[@variant=O2]] [[@debug=retained]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local base = getfenv()
 -- unluac-runtime: local events, assertions, calls = {}, 0, 0
+-- unluac-runtime: local observed_weak
 -- unluac-runtime: local function observed_print(tag, ...)
 -- unluac-runtime:     collectgarbage("collect")
 -- unluac-runtime:     calls = calls + 1
 -- unluac-runtime:     events[#events + 1] = "print:" .. tag
 -- unluac-runtime:     print(tag, ...)
 -- unluac-runtime: end
--- unluac-runtime: local environment = {assert = function(value)
+-- unluac-runtime: local environment = {setmetatable = function(value, metadata)
+-- unluac-runtime:     if metadata.__mode == "v" then observed_weak = value end
+-- unluac-runtime:     return setmetatable(value, metadata)
+-- unluac-runtime: end, assert = function(value)
 -- unluac-runtime:     assert(value)
 -- unluac-runtime:     assertions = assertions + 1
+-- unluac-runtime:     if assertions == 8 then
+-- unluac-runtime:         collectgarbage("collect")
+-- unluac-runtime:         assert(observed_weak[3] == nil, "inlined result remains rooted at assert")
+-- unluac-runtime:     end
 -- unluac-runtime:     events[#events + 1] = "assert"
 -- unluac-runtime:     return value
 -- unluac-runtime: end}
@@ -28,7 +54,7 @@
 -- unluac-runtime: end})
 -- unluac-runtime: setfenv(run, environment)
 -- unluac-runtime: run()
--- unluac-runtime: assert(assertions == 13 and calls == 9)
+-- unluac-runtime: assert(assertions == 14 and calls == 9)
 -- unluac-runtime: print("inlined-observation", table.concat(events, ","))
 local function value(a, c)
     local total = 0
@@ -76,22 +102,30 @@ local function object_check(seed, a, c)
 end
 
 local additions = 0
+local lookups = 0
 local weak = setmetatable({}, {__mode = "v"})
 local metadata = {}
 metadata.__add = function(left, right)
     additions = additions + 1
-    local result = setmetatable({total = left.total + right}, metadata)
+    local result = setmetatable({value = left.total + right}, metadata)
     weak[additions] = result
     collectgarbage("collect")
     assert(left.total + right == result.total)
     return result
 end
+-- 字段读取必须执行元方法；COPY 写回及旧 accumulator 退休不能被纯字段读取掩盖。
+metadata.__index = function(value)
+    lookups = lookups + 1
+    collectgarbage("collect")
+    return rawget(value, "value")
+end
 local object_checks = {object_check}
-object_checks[1](setmetatable({total = 0}, metadata), false, false)
-object_checks[1](setmetatable({total = 0}, metadata), false, true)
-object_checks[1](setmetatable({total = 0}, metadata), true, false)
-object_checks[1](setmetatable({total = 0}, metadata), true, true)
+object_checks[1](setmetatable({value = 0}, metadata), false, false)
+object_checks[1](setmetatable({value = 0}, metadata), false, true)
+object_checks[1](setmetatable({value = 0}, metadata), true, false)
+object_checks[1](setmetatable({value = 0}, metadata), true, true)
 assert(additions == 3)
+assert(lookups == 13)
 collectgarbage("collect")
 assert(weak[1] == nil and weak[2] == nil and weak[3] == nil)
-print("object-additions", additions)
+print("object-additions", additions, lookups)

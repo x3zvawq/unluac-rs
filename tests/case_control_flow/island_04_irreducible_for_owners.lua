@@ -91,3 +91,13 @@ do
         jumping
     )
 end
+
+assert(run_numeric(nil, nil) == 3)
+assert(run_numeric(0, nil) == 13)
+assert(run_numeric(nil, 0) == 22)
+assert(run_generic(nil, nil) == 3)
+assert(run_generic(0, nil) == 13)
+assert(run_generic(nil, 0) == 22)
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[while]] [[0]]
+-- unluac: expect-ast-count [[repeat]] [[0]]

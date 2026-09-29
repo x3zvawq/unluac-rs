@@ -5,6 +5,11 @@
 -- unluac: expect-contains [[global<const> setmetatable]]
 -- unluac: expect-contains [[global<const> print]]
 -- unluac: expect-contains [[global<const> string]]
+-- unluac: expect-ast-count [[function]] [[30]]
+-- unluac: expect-ast-count [[repeat]] [[9]]
+-- unluac: expect-ast-count [[close-binding]] [[1]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-max [[while]] [[0]]
 
 local function run()
     local untouched_outer = nil
@@ -43,7 +48,9 @@ end
 
 local function keeps_close_through_condition()
     local closed = false
+    local condition_calls, close_calls = 0, 0
     local function condition()
+        condition_calls = condition_calls + 1
         assert(not closed)
         return true
     end
@@ -54,12 +61,15 @@ local function keeps_close_through_condition()
         global<const> *
         local item <close> = setmetatable({}, {
             __close = function()
+                assert(condition_calls == 1)
+                close_calls = close_calls + 1
                 closed = true
             end,
         })
         close_marker = math.max(close_marker, 1)
     until condition()
     assert(closed)
+    assert(condition_calls == 1 and close_calls == 1)
     return close_marker
 end
 
@@ -265,5 +275,10 @@ assert(keeps_returned_capture_root() == 1)
 assert(keeps_nested_called_closure_escape_root() == 1)
 assert(keeps_sibling_called_closure_escape_root() == 1)
 assert(keeps_outer_handoff_root() == 3)
+assert(reopens_named_const_for_write(false) == nil)
+do
+    global attr_gate
+    attr_gate = nil
+end
 assert(reopens_named_const_for_write(true) == 2)
 print("regress_436_lua55_repeat_collective_scope")

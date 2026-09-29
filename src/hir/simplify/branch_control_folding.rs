@@ -77,6 +77,48 @@ struct BranchControlPass<'a> {
     safety: HirExprSafety,
 }
 
+/// 调用帧和声明恢复稳定后，才把仍需语句前缀的循环尾 guard 接回 until。
+/// 直接条件优先由 Normal 的 leading guard 消费，避免将可内联的 while 条件过早固化为 repeat。
+pub(super) fn fold_tail_loop_conditions_in_proto(proto: &mut HirProto) -> bool {
+    struct TailLoopConditions;
+    impl HirRewritePass for TailLoopConditions {
+        fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
+            if fold_leading_while_break_guard(stmt) {
+                return true;
+            }
+            let HirStmt::While(while_stmt) = stmt else {
+                return false;
+            };
+            if !while_stmt.condition_prefix_only || while_stmt.cond != HirExpr::Boolean(true) {
+                return false;
+            }
+            let Some((HirStmt::If(guard), prefix)) = while_stmt.body.stmts.split_last() else {
+                return false;
+            };
+            if prefix.is_empty()
+                || guard.else_block.is_some()
+                || !matches!(guard.then_block.stmts.as_slice(), [HirStmt::Break])
+                || !repeat_condition_fold_is_safe(prefix, [&guard.cond])
+            {
+                // 候选拒绝[ProofIncomplete]：只接回单次尾条件；continue、资源和残余表达式
+                // 仍由共享的条件移动证明拒绝，不改变其它出口或跳过原前缀。
+                return false;
+            }
+            let Some(HirStmt::If(guard)) = while_stmt.body.stmts.pop() else {
+                unreachable!("validated loop tail must remain an if");
+            };
+            *stmt = HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
+                body: std::mem::take(&mut while_stmt.body),
+                cond: guard.cond,
+                preserves_condition: true,
+                lifetime: Default::default(),
+            }));
+            true
+        }
+    }
+    rewrite_block(&mut proto.body, &mut TailLoopConditions)
+}
+
 impl HirRewritePass for BranchControlPass<'_> {
     fn rewrite_stmt_before_children(&mut self, stmt: &mut HirStmt) -> bool {
         // 循环入口 guard 属于 while 条件；先恢复这个归属，否则子块的常量
@@ -176,9 +218,28 @@ impl HirRewritePass for BranchControlPass<'_> {
 }
 
 fn sink_common_branch_tails(stmts: &mut Vec<HirStmt>) -> bool {
+    let mut changed = false;
+    for index in 0..stmts.len().saturating_sub(1) {
+        let (prefix, suffix) = stmts.split_at_mut(index + 1);
+        let HirStmt::If(branch) = &mut prefix[index] else {
+            continue;
+        };
+        if matches!(suffix[0], HirStmt::Break)
+            && matches!(branch.then_block.stmts.as_slice(), [HirStmt::Break])
+            && branch
+                .else_block
+                .as_ref()
+                .is_none_or(|arm| arm.stmts.is_empty())
+        {
+            // 两条路径都立即退出同一循环，且没有声明或 cleanup。保留原 TEST，
+            // 只合并重复的控制转移；空测试不能再退化为无用 Boolean local。
+            branch.then_block.stmts.clear();
+            branch.preserves_empty_test = true;
+            changed = true;
+        }
+    }
     let original = std::mem::take(stmts);
     let mut rewritten = Vec::with_capacity(original.len());
-    let mut changed = false;
 
     for stmt in original {
         let HirStmt::If(mut if_stmt) = stmt else {
@@ -209,9 +270,8 @@ fn take_common_branch_tail(if_stmt: &mut HirIf) -> Option<HirStmt> {
         // 两臂直接尾部的 break 指向同一外层循环；移到 if 后仍依次退出
         // arm 和循环，不跨越求值或改变 cleanup 顺序。
         if if_stmt.then_block.stmts.len() == 1 && else_block.stmts.len() == 1 {
-            // 候选拒绝[ProofIncomplete]：不能留下会被后续清理删除的空 if，
-            // 原字节码中的显式条件检查仍须保留。
-            return None;
+            // 原 TEST 有独立保留合同，合并相同出口不再需要保留两份 break。
+            if_stmt.preserves_empty_test = true;
         }
     } else {
         let (target, source) = single_binding_copy(then_tail)?;
@@ -318,7 +378,13 @@ fn fold_constant_control(
             changed = true;
             continue;
         }
-        if matches!(&stmt, HirStmt::Block(block) if block.stmts.is_empty()) {
+        if let HirStmt::Block(block) = &stmt
+            && global_initialization_scope_is_empty(block)
+        {
+            let HirStmt::Block(block) = stmt else {
+                unreachable!("validated scope remains a block");
+            };
+            rewritten.extend(block.stmts);
             changed = true;
             continue;
         }
@@ -413,7 +479,18 @@ fn fold_constant_control(
             continue;
         }
 
-        if !discard_condition {
+        if truthiness.is_none() {
+            // 相同 arm 只证明控制结果相同，不授权删除原检查。继续用控制语句
+            // 表达完整短路求值，避免改成无用 local 后令回编译产生不同的值协议。
+            let condition = std::mem::replace(&mut if_stmt.cond, HirExpr::Nil);
+            rewritten.push(HirStmt::If(Box::new(HirIf {
+                cond: condition,
+                preserves_empty_test: true,
+                preserves_arm_order: if_stmt.preserves_arm_order,
+                then_block: HirBlock::default(),
+                else_block: None,
+            })));
+        } else if !discard_condition {
             // 条件结果只为控制转移服务。独立短作用域确保表达式完整求值一次，且其临时
             // GC root 在进入选定 arm 前释放，保持原 branch test 的求值次数、顺序和寿命。
             let local = LocalId(*next_local_index);
@@ -791,6 +868,24 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt, safety: HirExprSafet
     true
 }
 
+/// RHS carrier 已由原 owner 消费后，完整 global 初始化不再持有局部词法根。
+fn global_initialization_scope_is_empty(block: &HirBlock) -> bool {
+    if !block
+        .stmts
+        .iter()
+        .all(|stmt| matches!(stmt, HirStmt::GlobalDecl(_)))
+    {
+        // 候选拒绝[ProofIncomplete]：其余声明、临时写、cleanup 和控制入口的
+        // 作用域仍由各自 owner 证明；不能仅凭“没有源码 local”提前丢掉它们。
+        return false;
+    }
+    let mut boundary = UnmaterializedExprBoundary::default();
+    visit_stmts(&block.stmts, &mut boundary);
+    // 候选拒绝[LayerBoundary]：Decision 仍可能物化声明；残余表达式没有已证明的
+    // 发射合同。稳定 HIR global 只表示 RHS/probe/store，权限作用域由 AST 重建。
+    !boundary.decision && !boundary.unresolved
+}
+
 fn repeat_condition_fold_is_safe<'a>(
     prefix: &[HirStmt],
     exprs: impl IntoIterator<Item = &'a HirExpr>,
@@ -807,7 +902,7 @@ fn repeat_condition_fold_is_safe<'a>(
     // label/goto 与整个 prefix 都保持原位：跳出 prefix 的边同时绕过旧 tail 和新 latch；
     // 任意落入 prefix 后正常落空的边则在两种表示中都依次到达 moved condition 与旧 latch。
     // `continue` 是唯一会绕过旧 tail 却直达新 latch 的当前 owner，已由上面的专用事实拒绝。
-    let mut boundary = RepeatConditionFoldMovedExprBoundary::default();
+    let mut boundary = UnmaterializedExprBoundary::default();
     for expr in exprs {
         visit_expr(expr, &mut boundary);
     }
@@ -935,12 +1030,12 @@ fn collect_repeat_prefix_ownership_stmts(
 }
 
 #[derive(Default)]
-struct RepeatConditionFoldMovedExprBoundary {
+struct UnmaterializedExprBoundary {
     decision: bool,
     unresolved: bool,
 }
 
-impl HirVisitor<'_> for RepeatConditionFoldMovedExprBoundary {
+impl HirVisitor<'_> for UnmaterializedExprBoundary {
     fn visit_expr(&mut self, expr: &HirExpr) {
         self.decision |= matches!(expr, HirExpr::Decision(_));
         self.unresolved |= matches!(expr, HirExpr::Unresolved(_));
@@ -963,6 +1058,7 @@ fn fold_leading_while_break_guard(stmt: &mut HirStmt) -> bool {
     // 合为短路条件不会改变任何输入快照、作用域或 break 的循环归属。
     while_stmt.body.stmts.remove(0);
     while_stmt.cond = normalize_condition_context(condition, true);
+    while_stmt.condition_prefix_only = false;
     true
 }
 
@@ -970,6 +1066,28 @@ fn naturalize_if_polarity(stmt: &mut HirStmt) -> bool {
     let HirStmt::If(if_stmt) = stmt else {
         return false;
     };
+    if if_arms_are_empty(if_stmt) {
+        let mut changed = false;
+        let mut terminal = &mut if_stmt.cond;
+        loop {
+            match terminal {
+                HirExpr::Unary(unary)
+                    if unary.op == HirUnaryOpKind::Not && unary.source_site.is_none() =>
+                {
+                    // 空臂不消费最终极性。只去掉控制反转，原 NOT 和左侧短路
+                    // 路径保持不变，避免编译器交换同后继边后出现极性振荡。
+                    *terminal = std::mem::replace(&mut unary.expr, HirExpr::Nil);
+                    changed = true;
+                }
+                HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical)
+                    if !logical.preserves_boolean_prewrite =>
+                {
+                    terminal = &mut logical.rhs;
+                }
+                _ => return changed,
+            }
+        }
+    }
     let Some(else_block) = if_stmt.else_block.as_mut() else {
         return false;
     };
@@ -1666,11 +1784,27 @@ fn index_top_level_labels(stmts: &[HirStmt]) -> BTreeMap<HirLabelId, usize> {
 
 fn remove_nop_goto_labels(stmts: &mut Vec<HirStmt>) -> bool {
     let label_refs = count_label_references(stmts);
+    let mut label_runs = BTreeMap::new();
+    let mut run_start = 0;
+    for (index, stmt) in stmts.iter().enumerate() {
+        if let HirStmt::Label(label) = stmt {
+            // Label 的 entry_cleanup 只在跳转入边生效，顺序经过 label 不执行关闭。
+            // 因此可跨过连续 label 删除空跳转，但目标自身不能承担尚未消费的 cleanup。
+            if label.entry_cleanup.is_empty() {
+                label_runs.insert(label.id, run_start);
+            }
+        } else {
+            run_start = index + 1;
+        }
+    }
+    let mut source_index = 0;
     let mut old = std::mem::take(stmts).into_iter().peekable();
     let mut rewritten = Vec::with_capacity(old.len());
     let mut changed = false;
 
     while let Some(stmt) = old.next() {
+        let index = source_index;
+        source_index += 1;
         let HirStmt::Goto(goto) = &stmt else {
             rewritten.push(stmt);
             continue;
@@ -1680,11 +1814,16 @@ fn remove_nop_goto_labels(stmts: &mut Vec<HirStmt>) -> bool {
             continue;
         };
         if goto.target != label.id {
+            if label_runs.get(&goto.target) == Some(&(index + 1)) {
+                changed = true;
+                continue;
+            }
             rewritten.push(stmt);
             continue;
         }
 
         let label = old.next().expect("peeked label must remain available");
+        source_index += 1;
         if label_refs.get(&goto.target).copied().unwrap_or_default() > 1 {
             rewritten.push(label);
         }

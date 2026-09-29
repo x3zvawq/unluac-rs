@@ -1,6 +1,8 @@
 -- A boolean shell write must release the call result kept in the same local home.
 -- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=2]]
 -- unluac: expect-contains [[r2_0 = not not p2_0]]
+-- unluac: expect-ast-count [[local-binding]] [[9]]
+-- unluac: expect-ast-count [[function]] [[2]]
 
 local finalized = false
 local mt = {

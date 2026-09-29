@@ -8,6 +8,11 @@
 -- unluac: expect-contains [[local r0_0]]
 -- 循环退出后直接观察原状态，不为合流结果额外复制一个 local。
 -- unluac: expect-contains [[assert(r0_0 == 4)]]
+-- unluac: expect-ast-count [[while]] [[2]] [[@proto=0]]
+-- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=0]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
 local x = 0
 while true do
     if x == 1 then

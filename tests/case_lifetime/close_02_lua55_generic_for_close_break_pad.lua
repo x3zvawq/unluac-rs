@@ -8,6 +8,9 @@
 -- unluac: expect-not-contains [[local r1_3]]
 -- unluac: expect-contains [[r1_0 = r1_0 + r1_2]]
 -- unluac: expect-contains [[r1_0 = r1_0 + 7]]
+-- unluac: expect-ast-count [[local-binding]] [[6]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[break]] [[1]]
 local function run(xs, stop)
     local total = 0
     for i, v in ipairs(xs) do
@@ -26,6 +29,10 @@ end
 local stop_three = run({ 2, 0, -1, 4 }, 3)
 local stop_two = run({ 2, 0, -1, 4 }, 2)
 assert(stop_three == 16 and stop_two == 34)
+assert(run({}, 1) == 0)
+assert(run({ -1, 9 }, 1) == 0)
+assert(run({ -1, -2 }, false) == 14)
+assert(run({ 2, nil, 100 }, 3) == 9)
 print(
     "regress_153_lua55_generic_for_close_break_pad#1",
     stop_three,

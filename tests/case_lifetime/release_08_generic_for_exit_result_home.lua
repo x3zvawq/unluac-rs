@@ -1,14 +1,19 @@
 -- A previous value in a generic-for result home stops being a VM root before every iterator
 -- dispatch, including the zero-iteration exit dispatch.
 -- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[12]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[do-block]] [[1]]
 
 local weak = setmetatable({}, { __mode = "v" })
 local released_during_dispatch = false
+local dispatches = 0
 
 local function iterator()
     collectgarbage("collect")
     collectgarbage("collect")
     released_during_dispatch = weak[1] == nil
+    dispatches = dispatches + 1
     return nil
 end
 
@@ -24,4 +29,5 @@ local function run()
 end
 
 assert(run(), "old result-home root survived the zero-iteration dispatch")
+assert(dispatches == 1)
 print("regress_456_generic_for_exit_result_home", "OK")

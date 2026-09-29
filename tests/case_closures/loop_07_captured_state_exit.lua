@@ -1,4 +1,7 @@
 -- 循环状态共享一个 cell，每轮 captured 则独立关闭；退出值是返回时的快照。
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[table-constructor]] [[1]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-not-contains [[while true do]]
 -- unluac: expect-contains [[while i < limit do]] [[@debug=retained]]
 -- unluac: expect-contains [[return funcs, i]] [[@debug=retained]]
@@ -34,3 +37,6 @@ local e, f = normal[1](0, 1)
 local g, h = normal[2](0)
 assert(e == 5 and f == 3 and g == 10 and h == 3 and normal_i == 2)
 print("captured-state-exit", zero, normal_i, broken_i, a, b, c, d, e, f, g, h)
+
+assert(broken[1] ~= broken[2] and broken[2] ~= broken[3])
+assert(broken[2](0) == 10)

@@ -44,14 +44,15 @@ use rewrites::*;
 
 // 当前块快照保留读写角色，私有性消费二者并集，loop live-out 消费首读/首写位置。
 // 例如 `r = r + 1` 在同一位置读写，不能当作不观察旧 result 的覆盖；成功改写后重建索引。
-pub(super) struct RegionResultIndex {
+pub(super) struct RegionResultIndex<'a> {
     reads: crate::graph::PositionIndex<CarryBinding>,
     writes: crate::graph::PositionIndex<CarryBinding>,
     local_declarations: BTreeMap<LocalId, usize>,
+    inherited_locals: Option<&'a BTreeSet<LocalId>>,
 }
 
-impl RegionResultIndex {
-    pub(super) fn new(stmts: &[HirStmt]) -> RegionResultIndex {
+impl<'a> RegionResultIndex<'a> {
+    pub(super) fn new(stmts: &[HirStmt]) -> Self {
         let mut reads = crate::graph::PositionIndex::default();
         let mut writes = crate::graph::PositionIndex::default();
         let mut local_declarations = BTreeMap::new();
@@ -73,16 +74,26 @@ impl RegionResultIndex {
             reads,
             writes,
             local_declarations,
+            inherited_locals: None,
         }
+    }
+
+    pub(super) fn with_inherited_locals(mut self, locals: &'a BTreeSet<LocalId>) -> Self {
+        self.inherited_locals = Some(locals);
+        self
     }
 
     fn is_available_before(&self, binding: CarryBinding, index: usize) -> bool {
         match binding {
             CarryBinding::Param(_) => true,
-            CarryBinding::Local(local) => self
-                .local_declarations
-                .get(&local)
-                .is_some_and(|declaration| *declaration < index),
+            CarryBinding::Local(local) => {
+                self.inherited_locals
+                    .is_some_and(|locals| locals.contains(&local))
+                    || self
+                        .local_declarations
+                        .get(&local)
+                        .is_some_and(|declaration| *declaration < index)
+            }
             CarryBinding::Temp(_) => false,
         }
     }
@@ -412,7 +423,7 @@ pub(super) fn try_collapse_region_result_handoff(
     index: usize,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
-    result_index: &RegionResultIndex,
+    result_index: &RegionResultIndex<'_>,
     identity_facts: &HandoffIdentityFacts,
     control_facts: &RegionControlFacts,
 ) -> bool {
@@ -448,7 +459,7 @@ fn try_collapse_seeded_if_results(
     index: usize,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
-    result_index: &RegionResultIndex,
+    result_index: &RegionResultIndex<'_>,
     identity_facts: &HandoffIdentityFacts,
     control_facts: &RegionControlFacts,
 ) -> bool {
@@ -535,7 +546,7 @@ fn try_collapse_inferred_if_results(
     index: usize,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
-    result_index: &RegionResultIndex,
+    result_index: &RegionResultIndex<'_>,
     identity_facts: &HandoffIdentityFacts,
     control_facts: &RegionControlFacts,
 ) -> bool {
@@ -616,7 +627,7 @@ fn try_collapse_loop_results(
     index: usize,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
-    result_index: &RegionResultIndex,
+    result_index: &RegionResultIndex<'_>,
     identity_facts: &HandoffIdentityFacts,
     control_facts: &RegionControlFacts,
 ) -> bool {
@@ -641,7 +652,7 @@ fn try_collapse_loop_results(
     // plan；cleanup 别名风险由后面的 proto 身份门按 possible-home 精确处理。
     if condition_forbidden
         || region_has_hard_barrier(&body.stmts, control_facts)
-        || !collect_break_assignments(body, &mut exits, requires_exact_exits)
+        || !collect_loop_exit_assignments(body, &mut exits, requires_exact_exits)
     {
         // 候选拒绝[SemanticBarrier:ControlFlow]：未跟踪 transfer 会漏掉 loop 出口，提交不完整 result->state 映射。
         // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
@@ -704,14 +715,39 @@ fn try_collapse_loop_results(
     }
     let require_home_slot = !requires_exact_exits;
     let results = results.into_iter().collect::<Vec<_>>();
-    let Some(rewrites) = infer_rewrites(
-        &results,
-        &exits,
-        index,
-        result_index,
-        promotion_facts,
-        require_home_slot,
-    ) else {
+    let snapshot_writeback = block.stmts.get(index + 1).and_then(|writeback| {
+        let writebacks = parallel_state_writebacks(writeback)?;
+        results.iter().find_map(|result| {
+            let state = *writebacks.get(result)?;
+            // 精确快照只在紧邻 writeback 被读取；所有 producer 都是同一 state 的独立
+            // copy，因此退休快照不会新增 state 写入。state 可以继续由外层作用域持有。
+            (result_index.is_available_before(state, index)
+                && result_index.reads.span(result) == Some((index + 1, index + 1))
+                && result_index.writes.span(result) == Some((index, index))
+                && exits.iter().all(|exit| {
+                    !exit.contains_key(&state)
+                        && exit.get(result).and_then(ExitValue::exact_binding) == Some(state)
+                })
+                && result_writes_are_seed_copies(
+                    &body.stmts,
+                    *result,
+                    state,
+                    loop_facts.writes.get(result).copied().unwrap_or(0),
+                ))
+            .then_some(BTreeMap::from([(*result, state)]))
+        })
+    });
+    let retains_state = snapshot_writeback.is_some();
+    let Some(rewrites) = snapshot_writeback.or_else(|| {
+        infer_rewrites(
+            &results,
+            &exits,
+            index,
+            result_index,
+            promotion_facts,
+            require_home_slot,
+        )
+    }) else {
         return false;
     };
     if !region_rewrites_preserve_external_transfers(
@@ -735,20 +771,31 @@ fn try_collapse_loop_results(
         // 候选拒绝[SemanticBarrier:ControlFlow]：动态 repeat 某出口不是 state 精确快照或同时写 state 时，改名会改变该出口 live-out。
         return false;
     }
-    if rewrites
-        .iter()
-        .any(|(result, seed)| outer_bindings.contains(result) || outer_bindings.contains(seed))
-        || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
-        || !rewrite_is_private_after(index, &rewrites, result_index)
+    if rewrites.iter().any(|(result, seed)| {
+        outer_bindings.contains(result) || (!retains_state && outer_bindings.contains(seed))
+    }) || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
+        || (!retains_state && !rewrite_is_private_after(index, &rewrites, result_index))
     {
         // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/reference-capture/identity
         // 不满足时，loop 外或 closure 可观察独立 result/state epoch。
         return false;
     }
+    if retains_state {
+        // 候选接受：循环内不读 result，全部写入都是不改变 state 的快照；循环外仅有
+        // 紧邻写回。只退休这段事务，既有 state 声明、更新和后续观察保持原位。
+        apply_rewrites_in_range(
+            block,
+            index..index,
+            index..index + 2,
+            rewrites,
+            promotion_facts,
+        );
+        return true;
+    }
     let can_rewrite_every_occurrence = rewrite_end == block.stmts.len()
         && rewrites.iter().all(|(result, seed)| {
             !loop_facts.writes.contains_key(seed)
-                && result_writes_are_standalone_seed_copies(
+                && result_writes_are_seed_copies(
                     &body.stmts,
                     *result,
                     *seed,
@@ -788,7 +835,7 @@ fn loop_result_rewrite_end(
     block: &HirBlock,
     loop_index: usize,
     result: CarryBinding,
-    result_index: &RegionResultIndex,
+    result_index: &RegionResultIndex<'_>,
 ) -> LoopResultRewriteBoundary {
     let start = loop_index + 1;
     let Some(&read) = result_index.reads.positions_from(&result, start).first() else {

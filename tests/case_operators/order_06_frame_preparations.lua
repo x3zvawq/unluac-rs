@@ -1,5 +1,8 @@
 -- 条件左侧的完整准备帧必须按原顺序复用槽，不能把旧读取结果保留到观察 CALL。
 -- unluac: expect-ast-count [[numeric-for]] [[6]]
+-- unluac: expect-ast-count [[function]] [[29]]
+-- unluac: expect-ast-count [[if]] [[18]]
+-- unluac: expect-ast-max [[local-binding]] [[62]]
 
 -- 动态上值键先准备到 r1，再把上值表准备到 r0；GETTABLE r0,r0,r1 后才调用右侧。
 local function check_dynamic_key()
@@ -31,7 +34,8 @@ local function check_dynamic_key()
         end
         if holder[key] == make() then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
 end
 check_dynamic_key()
@@ -65,7 +69,8 @@ local function check_concat_operand()
         end
         if "9." .. captured == make() then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
 end
 check_concat_operand()
@@ -76,6 +81,7 @@ local function check_method_operand()
     local holder = {value = function(self)
         collectgarbage("collect")
         print("method-observed", weak[1] ~= nil)
+        assert(weak[1] == nil, "method CALL kept old root")
         return "9.125"
     end}
     local calls = 0
@@ -103,7 +109,8 @@ local function check_method_operand()
         end
         if holder:value() == make() then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
 end
 check_method_operand()
@@ -144,7 +151,8 @@ local function check_dynamic_key_metamethod()
         end
         if holder[key] == make() then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
 end
 check_dynamic_key_metamethod()
@@ -184,7 +192,8 @@ local function check_concat_metamethod()
         end
         if "9." .. captured == make() then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
 end
 check_concat_metamethod()
@@ -229,7 +238,8 @@ local function check_method_metamethod()
         end
         if holder:value() == make() then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
 end
 check_method_metamethod()

@@ -2,6 +2,7 @@
 //! 内外表达式共享物理 CFG；后层不再沿 SSA 重新选择短路候选。
 
 use super::*;
+use crate::structure::SsaValue;
 use crate::structure::plan::{ValueDecisionNodeId, ValueDecisionOperandPlan};
 
 pub(super) fn select_operands(
@@ -18,6 +19,19 @@ pub(super) fn select_operands(
         .collect::<BTreeMap<_, _>>();
     let mut operands = Vec::new();
     let mut events = Vec::new();
+    let input_phis = candidate
+        .blocks
+        .iter()
+        .flat_map(|block| dataflow.phi_candidates_in_block(*block))
+        .filter(|phi| {
+            phi.incoming.iter().any(|incoming| {
+                incoming
+                    .pred
+                    .is_none_or(|pred| !candidate.blocks.contains(&pred))
+            })
+        })
+        .map(|phi| phi.id)
+        .collect::<BTreeSet<_>>();
     for block in &candidate.blocks {
         for phi in dataflow.phi_candidates_in_block(*block) {
             if Some(phi.id) == candidate.result_phi_id || dataflow.phi_use_count(phi.id) == 0 {
@@ -32,6 +46,20 @@ pub(super) fn select_operands(
                 continue;
             }
             let inner = *by_phi.get(&phi.id)?;
+            if phi.incoming.iter().any(|incoming| {
+                matches!(incoming.value, SsaValue::Def(def)
+                    if !dataflow.def_overwrites_unknown_scratch(def)
+                        && matches!(dataflow.def_overwritten_value(def), Some(SsaValue::Phi(previous))
+                        if !dataflow.value_is_gc_inert(SsaValue::Phi(previous))
+                            && (input_phis.contains(&previous)
+                                || !candidate.blocks.contains(&dataflow.phi_candidates[previous.index()].block))))
+            }) {
+                // 候选拒绝[ProofIncomplete:Lifetime]：操作数的原写入退休域外传入的
+                // carrier；嵌套表达式没有该写回身份，不能让旧根延续到后续观察。
+                // CALL 已复用的 scratch 不再属于逻辑 SSA 前驱，其覆盖由原帧 owner 管理。
+                // 保留独立值/分支计划，由 HIR 的同槽 carrier owner 恢复真实覆盖。
+                return None;
+            }
             let [use_site] = dataflow.phi_uses.get(phi.id.index())?.as_slice() else {
                 return None;
             };
@@ -62,6 +90,7 @@ pub(super) fn select_operands(
                 consumer: ValueDecisionNodeId(consumer),
                 nodes: Vec::new(),
                 leaves,
+                route_values: BTreeMap::new(),
                 current_values: BTreeSet::new(),
             });
             let depth = graph.dominator_tree.depth[inner.header.index()]?;

@@ -7,6 +7,9 @@
 -- unluac: expect-ast-count [[assign]] [[8]] [[@proto=1]]
 -- unluac: expect-contains [[--!optimize 2]]
 -- unluac: expect-not-contains [[= print]]
+-- unluac: expect-ast-count [[local-binding]] [[2]]
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local check, report = assert, print
 -- unluac-runtime: local collect = collectgarbage

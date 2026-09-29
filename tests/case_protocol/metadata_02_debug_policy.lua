@@ -1,3 +1,10 @@
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-ast-count [[table-constructor]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=0]]
+-- unluac: expect-contains [[ or 0]]
+-- unluac: expect-ast-count [[error]] [[0]]
+-- unluac: expect-contains [[-- proto#1 params=]]
+-- unluac: expect-not-contains [[lines=]]
 -- regress_307_ignore_debug_policy#1: 保留的 debug section 在 ignore 模式下不得进入命名或注释
 -- unluac: expect-not-contains [[debug_secret]]
 -- unluac: expect-not-contains [[debug_helper]]
@@ -16,4 +23,5 @@ end
 
 local result = debug_helper(2)
 assert(result == 4)
+assert(debug_helper(99) == 0)
 print("regress_307_ignore_debug_policy#1", result)

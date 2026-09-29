@@ -25,6 +25,19 @@ impl CopyRootRetirements {
         for_instr: impl Fn(InstrRef) -> bool,
     ) -> Self {
         let mut facts = Self::default();
+        let mut value_captured_defs = vec![false; dataflow.defs.len()];
+        for (index, instr) in proto.instrs.iter().enumerate() {
+            if let LowInstr::Closure(closure) = instr {
+                for capture in &closure.captures {
+                    if let CaptureSource::ByValue(reg) = capture.source
+                        && reg != closure.dst
+                        && let SsaValue::Def(def) = dataflow.use_value(InstrRef(index), reg)
+                    {
+                        value_captured_defs[def.index()] = true;
+                    }
+                }
+            }
+        }
         let mut by_home = BTreeMap::<Reg, Vec<(TempId, InstrRef)>>::new();
         for def in &dataflow.defs {
             let temp = TempId(def.id.index());
@@ -32,6 +45,10 @@ impl CopyRootRetirements {
                 || !emitted(def.instr)
                 || !dataflow.def_phi_uses[def.id.index()].is_empty()
                 || dataflow.reg_is_reference_captured(def.reg)
+                // ByValue 的原 Def 是闭包快照身份，不能复用成跨轮 nil holder；
+                // 否则源码闭包会引用下一轮被清零的 cell。原 COPY 的物理根义务
+                // 仍交给普通 root owner，退休分析不能改写这个捕获身份。
+                || value_captured_defs[def.id.index()]
                 || !matches!(&proto.instrs[def.instr.index()], LowInstr::Move(move_)
                     if move_.src != move_.dst)
             {

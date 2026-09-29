@@ -1,5 +1,8 @@
 -- 旧 CALL 结果保活到原槽覆盖，后继完整调用在该槽重新准备，不延长旧对象生命。
 -- unluac: expect-contains [[observe_frame_roots("after")]]
+-- unluac: expect-ast-count [[do-block]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[7]]
+-- unluac: expect-ast-count [[function]] [[3]]
 local weak = setmetatable({}, {__mode = "v"})
 local events = {}
 
@@ -8,6 +11,7 @@ function make_frame_root(name)
         collectgarbage("collect")
         collectgarbage("collect")
         assert(weak.outer ~= nil, "outer root ended before its overwrite")
+        assert(weak.outer.name == "outer" and #events == 0)
         events[#events + 1] = "alive"
     end
     local object = {name = name}
@@ -16,6 +20,7 @@ function make_frame_root(name)
 end
 
 function observe_frame_roots(stage)
+    assert(stage == "after" and #events == 1)
     collectgarbage("collect")
     collectgarbage("collect")
     assert(weak.outer == nil, "old root survived the new call frame")

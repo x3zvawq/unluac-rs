@@ -1,4 +1,14 @@
 -- 同一函数的原始值调用不能覆盖资源实参；逃逸入口也不能沿用直接调用的参数域。
+-- unluac: expect-ast-count [[local-binding]] [[15]]
+-- unluac: expect-ast-count [[table-constructor]] [[6]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[function]] [[6]] [[@variant=default]]
+-- unluac: expect-ast-count [[function]] [[6]] [[@variant=O0]]
+-- unluac: expect-ast-count [[function]] [[6]] [[@variant=O1]]
+-- unluac: expect-ast-count [[function]] [[6]] [[@variant=O2]] [[@debug=stripped]]
+-- O2 的高槽 value 调试绑定由恒等函数承载；该包装必须在再编译时内联消失。
+-- unluac: expect-ast-count [[function]] [[7]] [[@variant=O2]] [[@debug=retained]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[assert(false == false)]]
 -- unluac: expect-not-contains [[assert(7 == 7)]]

@@ -1,4 +1,4 @@
-//! 为 locals 发布分支与词法块输出的必写 temp。
+//! 为 locals 发布分支、词法块与一次性区域输出的必写 temp。
 //!
 //! 消费共享 HIR 图和语句事件，提供 must-write 与 read-before-def，不分配或改写 binding。
 
@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use super::super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind, LexicalCfgFailure};
 use super::super::root_lifetimes::RootEventBlock;
 use super::super::temp_touch::{TempReadCollector, collect_temp_refs_in_expr};
-use crate::hir::common::{HirBlock, HirLValue, HirStmt, TempId};
+use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt, TempId};
 use crate::hir::expr_safety::HirExprSafety;
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +54,34 @@ pub(super) fn candidate_temps(
             // 子块，嵌套控制流继续由自身 owner 处理，不逐层重扫整棵子树。
             (
                 vec![summarize_block_fallthrough_assignments(block, safety)],
+                BTreeSet::new(),
+            )
+        }
+        HirStmt::Repeat(repeat)
+            if !repeat.preserves_condition && matches!(repeat.cond, HirExpr::Boolean(true)) =>
+        {
+            // ResourceLimit：只为最内层一次性区域建图；遇到任意嵌套循环即短路，
+            // 避免每个外层 repeat 重新扫描整棵子树。其他循环保留自身绑定 owner。
+            if repeat.body.stmts.iter().any(|stmt| {
+                crate::hir::visit::any_stmt_structure(stmt, &mut |stmt| {
+                    matches!(
+                        stmt,
+                        HirStmt::While(_)
+                            | HirStmt::Repeat(_)
+                            | HirStmt::NumericFor(_)
+                            | HirStmt::GenericFor(_)
+                    )
+                })
+            }) {
+                return Vec::new();
+            }
+            // Structure 的一次性壳拥有 break 出口；将完整 repeat 交给共享 CFG，
+            // 才能把提前 break 和尾部路径一起纳入必写证明。单独分析 body 会丢失出口。
+            (
+                vec![
+                    RegionTempFlow::for_stmts(std::slice::from_ref(stmt), safety)
+                        .map(|flow| flow.summarize()),
+                ],
                 BTreeSet::new(),
             )
         }

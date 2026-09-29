@@ -1,5 +1,7 @@
 -- 比较左操作数的完整原准备链必须保持原槽，不能让旧 nil/读取作用域延长到右侧 CALL。
 -- unluac: expect-ast-count [[numeric-for]] [[6]]
+-- unluac: expect-ast-count [[function]] [[28]]
+-- unluac: expect-ast-max [[local-binding]] [[61]]
 
 -- GETUPVAL 后原位取长度，再准备 tonumber 与内层 CALL。
 local function check_length_operand()
@@ -30,8 +32,10 @@ local function check_length_operand()
         end
         if #captured_text < tonumber(make()) then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
+    assert(getmetatable(_G) == old)
 end
 check_length_operand()
 
@@ -64,8 +68,10 @@ local function check_arithmetic_operand()
         end
         if captured_number + 1 < tonumber(make()) then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
+    assert(getmetatable(_G) == old)
 end
 check_arithmetic_operand()
 
@@ -98,8 +104,10 @@ local function check_nested_table_operand()
         end
         if holder.inner.value == make() then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
+    assert(getmetatable(_G) == old)
 end
 check_nested_table_operand()
 
@@ -137,8 +145,10 @@ local function check_length_metamethod()
         end
         if #captured_text < tonumber(make()) then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
+    assert(getmetatable(_G) == old)
 end
 check_length_metamethod()
 
@@ -177,8 +187,10 @@ local function check_arithmetic_metamethod()
         end
         if captured_number + 1 < tonumber(make()) then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
+    assert(getmetatable(_G) == old)
 end
 check_arithmetic_metamethod()
 
@@ -224,7 +236,9 @@ local function check_nested_table_metamethod()
         end
         if holder.inner.value == make() then return 1 else return 2 end
     end
-    followed()
+    assert(followed() == 1)
+    assert(calls == 2)
     setmetatable(_G, old)
+    assert(getmetatable(_G) == old)
 end
 check_nested_table_metamethod()

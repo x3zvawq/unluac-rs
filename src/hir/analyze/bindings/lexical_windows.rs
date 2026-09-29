@@ -9,6 +9,10 @@ use crate::hir::emission::HirEmissionFacts;
 use crate::structure::{CleanupDisposition, DebugBindingFact, GraphFacts, RootObservation};
 use crate::transformer::ResultPack;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "词法窗口消费同一冻结数据流与捕获 epoch 事实"
+)]
 pub(super) fn collect_lexical_scopes(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -17,6 +21,7 @@ pub(super) fn collect_lexical_scopes(
     structure: &ReadyStructureFacts,
     emission: &HirEmissionFacts<'_>,
     captured: &CapturedSlotTargets,
+    epochs: &SlotEpochFacts,
 ) -> Vec<LexicalScope> {
     let mut scopes = captured.lexical_scopes.clone();
     let ends = scopes
@@ -53,6 +58,23 @@ pub(super) fn collect_lexical_scopes(
         )
         .then(|| window.into())
     }));
+    // 已有 cell scope 的末条 CLOSE 就是源码块结束。debug local 在 CLOSE 前
+    // 结束时共用这个边界，不能再为其尾段套一个没有独立关闭事件的 do。
+    let mut closing_scope_starts = BTreeMap::<usize, usize>::new();
+    for scope in &captured.lexical_scopes {
+        let close = scope.end - 1;
+        if matches!(proto.instrs[close], LowInstr::Close(_))
+            && matches!(
+                structure.plan().cleanup_disposition(InstrRef(close)),
+                Some(CleanupDisposition::LexicalScope(_))
+            )
+        {
+            closing_scope_starts
+                .entry(close)
+                .and_modify(|start| *start = (*start).min(scope.start))
+                .or_insert(scope.start);
+        }
+    }
     let debug_bindings = structure.debug_bindings();
     // 同一结束点的 local 共同拥有窗口；producer 可以分属 if 前缀和合流后的基本块。
     let mut cohorts = BTreeMap::<_, Vec<&DebugBindingFact>>::new();
@@ -91,7 +113,20 @@ pub(super) fn collect_lexical_scopes(
             structure,
             emission,
             (end, &facts, last_observation),
+            &|reg, at, window| {
+                captured.reference_capture_fits_window(
+                    reg,
+                    epochs.epoch_at(reg, InstrRef(at)),
+                    at,
+                    window,
+                )
+            },
         )
+        .filter(|window| {
+            closing_scope_starts
+                .get(&window.end)
+                .is_none_or(|&start| start > window.start)
+        })
         .map(Into::into)
     }));
     retain_non_crossing(scopes)
@@ -210,6 +245,10 @@ fn binding_overwrite_floor(value: SsaValue, dataflow: &DataflowFacts) -> Option<
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "候选共享冻结发射域与已关闭捕获窗口查询"
+)]
 fn debug_binding_window(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -218,14 +257,25 @@ fn debug_binding_window(
     structure: &ReadyStructureFacts,
     emission: &HirEmissionFacts<'_>,
     cohort: (usize, &[&DebugBindingFact], Option<usize>),
+    capture_fits_window: &impl Fn(Reg, usize, &Range<usize>) -> bool,
 ) -> Option<Range<usize>> {
     let (end, facts, last_observation) = cohort;
     let debug_bindings = structure.debug_bindings();
     // 空区间证明最后一个声明初始化后立即离域；必须恢复这个词法末端，
     // 否则保留名称会把 local 延长到后继求值，并抬高其 CALL/临时槽。
-    // 非空区间仍需原有调用退休证明，不能单凭 debug end 推断旧根已死亡。
+    // 非空区间须有调用退休或末端原清槽证明，不能单凭 debug end 推断旧根已死亡。
     let immediate_end = facts.iter().any(|fact| fact.start_pc == fact.end_pc);
-    let dispatch = if immediate_end {
+    let cleared_homes = match proto.instrs.get(end - 1) {
+        Some(LowInstr::LoadNil(clear)) => {
+            let homes = clear.dst.start.index()..clear.dst.start.index() + clear.dst.len;
+            facts
+                .iter()
+                .all(|fact| homes.contains(&fact.reg.index()))
+                .then_some(homes)
+        }
+        _ => None,
+    };
+    let dispatch = if immediate_end || cleared_homes.is_some() {
         end - 1
     } else {
         last_observation?
@@ -255,6 +305,7 @@ fn debug_binding_window(
     // 候选拒绝[ProofIncomplete]：非空结果或更宽 caller 前缀仍需额外结果根、外来 binding 证明。
     let final_observation = dataflow.effect_summaries.get(dispatch)?.root_observation;
     if !immediate_end
+        && cleared_homes.is_none()
         && (!matches!(proto.instrs.get(dispatch), Some(LowInstr::Call(call)) if matches!(call.results, ResultPack::Ignore))
             || cfg.instr_to_block[dispatch] != cfg.instr_to_block[end - 1]
             || !matches!(final_observation,
@@ -286,9 +337,12 @@ fn debug_binding_window(
         return None;
     }
     // 空区间末端只关闭原声明及其高槽求值临时量，不清空物理残值；普通窗口
-    // 仍由调用排除上界与必经覆盖写证明退休，不重建 for 的动态值类型。
+    // 由调用排除上界、末端清槽或必经覆盖写证明退休，不重建 for 的动态值类型。
     let home_retires = |reg: Reg, at: usize, block: BlockRef| {
         (immediate_end && reg > ceiling)
+            || cleared_homes
+                .as_ref()
+                .is_some_and(|homes| homes.contains(&reg.index()))
             || final_observation.excludes_home_from_caller(reg)
             || overwrite_floors
                 .get(&reg)
@@ -330,13 +384,16 @@ fn debug_binding_window(
     }
     for &id in &local_phis {
         let phi = dataflow.phi_candidate(id)?;
-        if dataflow.reg_is_reference_captured(phi.reg)
-            || (!owned_phis.contains(&id)
-                && !home_retires(
-                    phi.reg,
-                    cfg.blocks[phi.block.index()].instrs.start.index(),
-                    phi.block,
-                ))
+        if !capture_fits_window(
+            phi.reg,
+            cfg.blocks[phi.block.index()].instrs.start.index(),
+            &window,
+        ) || (!owned_phis.contains(&id)
+            && !home_retires(
+                phi.reg,
+                cfg.blocks[phi.block.index()].instrs.start.index(),
+                phi.block,
+            ))
         {
             return None;
         }
@@ -346,13 +403,14 @@ fn debug_binding_window(
         let instr = &proto.instrs[index];
         let effect = &dataflow.instr_effects[index];
         // for 控制只消费冻结协议的指令身份；其隐式 closing 仍由原生语法在原位置执行。
-        // 额外 Close 只接纳不涉及捕获 cell/显式 TBC 的已归属词法边界。
+        // 额外 Close 只接纳捕获激活完整包含于窗口、且无显式 TBC 的已归属词法边界。
         if (instr.is_control_terminator()
             && !matches!(instr, LowInstr::Branch(_) | LowInstr::Jump(_))
             && !emission.for_instr(InstrRef(index)))
             || matches!(instr, LowInstr::Tbc(_))
             || matches!(instr, LowInstr::Close(close) if close.from < floor
-                || dataflow.reference_captured_regs().any(|reg| reg >= close.from)
+                || dataflow.reference_captured_regs().any(|reg| reg >= close.from
+                    && !capture_fits_window(reg, index, &window))
                 || structure.plan().cleanup_tbc_origins(InstrRef(index)).is_some_and(|origins| !origins.is_empty())
                 || !matches!(structure.plan().cleanup_disposition(InstrRef(index)),
                     Some(CleanupDisposition::LexicalScope(_))))
@@ -396,6 +454,14 @@ fn debug_binding_window(
                 }
                 continue;
             }
+            // 候选拒绝[ProofIncomplete]：末端清槽只覆盖其原范围；更高 scratch 的根
+            // 不能随 debug 窗口一起退休，除非另有完整生命周期证明。
+            if cleared_homes
+                .as_ref()
+                .is_some_and(|homes| !homes.contains(&reg.index()))
+            {
+                return None;
+            }
             // caller 排除只能证明 dispatch 前的 scratch；纯尾部不得再建立窗口内根。
             if index > dispatch {
                 return None;
@@ -414,7 +480,7 @@ fn debug_binding_window(
                     })
             });
             // 候选拒绝[ProofIncomplete]：禁止未归属源码身份的 owner 槽复写、未结束的异期 binding、
-            // 捕获 cell 和逃逸 def/phi；窗口不能吞掉其他生命周期或延续其值身份。
+            // 未完整关闭的捕获 cell 和逃逸 def/phi；窗口不能吞掉其他生命周期或延续其值身份。
             if (owner.is_some_and(|owner| {
                 owner
                     .value
@@ -423,7 +489,7 @@ fn debug_binding_window(
                     .is_none_or(|at| at <= index)
             }) && !is_owner
                 && !source_write)
-                || dataflow.reg_is_reference_captured(reg)
+                || !capture_fits_window(reg, index, &window)
                 || (!is_owner
                     && !source_write
                     && debug_bindings

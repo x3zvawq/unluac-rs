@@ -30,5 +30,26 @@ local function run(a, b, xs)
     return x
 end
 
--- 该 proto 可能不终止；只验证结构恢复，不在测试入口调用。
+-- b 为假走完 numeric-for；xs[0] 为真则 continue 仍执行 until 条件。
+-- b 为真且 xs[0] 为假的 while 不终止，保留结构但不运行该输入。
+assert(run(true, false, {}) == 0)
+assert(run(0, nil, {}) == 0)
+assert(run("", false, {}) == 0)
+assert(run(true, true, {[0] = 0}) == 0)
+assert(run(0, true, {[0] = ""}) == 0)
+local reads = 0
+local xs = setmetatable({}, {__index = function(_, key)
+    assert(key == 0)
+    reads = reads + 1
+    return false
+end})
+assert(run(true, false, xs) == 0 and reads == 1)
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[if]] [[3]] [[@proto=1]]
+-- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
 print("regress_105_luau_same_header_loop_path_owner#1")

@@ -6,25 +6,25 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ShortCircuitCallFrame {
+pub(super) struct ShortCircuitScalarFrame {
     pub(super) input: TempId,
     pub(super) kept: TempId,
     pub(super) alternative: TempId,
     pub(super) result: TempId,
     pub(super) logical_and: bool,
-    pub(super) value: ShortCircuitCallValue,
+    pub(super) value: ShortCircuitScalarValue,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum ShortCircuitCallValue {
+pub(super) enum ShortCircuitScalarValue {
     Scalar(CopyRootScalarValue),
     CopyTemp(TempId),
     CopyParam(ParamId),
 }
 
-/// CALL 的单结果直接保留或经单次 MOVE 写入 phi，另一臂写常量或读取已有低槽 binding。
+/// CALL 或 GETTABLE 的单结果直接保留或经单次 MOVE 写入 phi，另一臂写常量或读取已有低槽 binding。
 /// 原两臂及 merge 必须由同一 predicate 拥有，不从最终表达式外形猜 COPY。
-pub(super) fn collect_calls(
+pub(super) fn collect_scalars(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
@@ -32,7 +32,7 @@ pub(super) fn collect_calls(
     fixed: &[TempId],
     phis: &[TempId],
     predicates: &BTreeMap<PhiId, InstrRef>,
-) -> BTreeMap<InstrRef, Option<ShortCircuitCallFrame>> {
+) -> BTreeMap<InstrRef, Option<ShortCircuitScalarFrame>> {
     let mut frames = BTreeMap::new();
     for phi in plan.phis() {
         let candidate = || {
@@ -52,8 +52,17 @@ pub(super) fn collect_calls(
             let source = dataflow.def_instr(input);
             if source.index() + 1 != predicate.index()
                 || dataflow.defs[input.index()].block != cfg.instr_to_block[predicate.index()]
-                || !matches!(&proto.instrs[source.index()], LowInstr::Call(call)
-                    if call.results == ResultPack::Fixed(crate::transformer::RegRange { start: reg, len: 1 }))
+                || !match &proto.instrs[source.index()] {
+                    LowInstr::Call(call) => {
+                        call.results
+                            == ResultPack::Fixed(crate::transformer::RegRange {
+                                start: reg,
+                                len: 1,
+                            })
+                    }
+                    LowInstr::GetTable(read) => read.dst == reg,
+                    _ => false,
+                }
             {
                 return None;
             }
@@ -101,14 +110,14 @@ pub(super) fn collect_calls(
                         if movement.dst != phi.reg || movement.src.index() >= phi.reg.index() {
                             return None;
                         }
-                        // 记录选中备用臂时读取的原 binding，而不是 CALL 前的值快照。
+                        // 记录选中备用臂时读取的原 binding，而不是求左值前的快照。
                         match dataflow.use_value(site, movement.src) {
                             SsaValue::Entry(reg)
                                 if reg.index() < usize::from(proto.signature.num_params) =>
                             {
-                                ShortCircuitCallValue::CopyParam(ParamId(reg.index()))
+                                ShortCircuitScalarValue::CopyParam(ParamId(reg.index()))
                             }
-                            value => ShortCircuitCallValue::CopyTemp(canonical_value_temp(
+                            value => ShortCircuitScalarValue::CopyTemp(canonical_value_temp(
                                 value,
                                 dataflow.defs.len(),
                                 fixed,
@@ -116,7 +125,7 @@ pub(super) fn collect_calls(
                             )?),
                         }
                     } else {
-                        ShortCircuitCallValue::Scalar(
+                        ShortCircuitScalarValue::Scalar(
                             direct_scalar_overwrite_value(&proto.instrs[site.index()], phi.reg)
                                 .or_else(|| {
                                     let LowInstr::LoadConst(load) = &proto.instrs[site.index()]
@@ -154,7 +163,7 @@ pub(super) fn collect_calls(
             };
             Some((
                 source,
-                ShortCircuitCallFrame {
+                ShortCircuitScalarFrame {
                     input: canonical_value_temp(
                         SsaValue::Def(input),
                         dataflow.defs.len(),

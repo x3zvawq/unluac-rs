@@ -2,10 +2,15 @@
 -- unluac: expect-contains [[<close>]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- 允许内联 expected 字符串，但不增加索引、callee 或返回检查的中转声明。
+-- unluac: expect-ast-max [[local-binding]] [[11]]
+-- unluac: expect-ast-count [[close-binding]] [[3]]
+-- unluac: expect-ast-count [[do-block]] [[2]]
 
 local log = {}
 local close_mt = {
-    __close = function(value)
+    __close = function(value, err)
+        assert(err == nil)
         log[#log + 1] = "close:" .. value.name
     end,
 }

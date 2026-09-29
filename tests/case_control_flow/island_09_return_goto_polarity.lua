@@ -29,3 +29,18 @@ for _, entry in ipairs({false, true}) do
     end
 end
 print("island-return-goto-polarity", "OK")
+
+checks = 0
+assert(run(nil, 0, limit) == 3)
+assert(checks == 3)
+checks = 0
+limit.stop = 1
+assert(run(0, nil, limit) == 1)
+assert(checks == 0)
+limit.stop = nil
+assert(run(false, false, limit) == 3)
+assert(checks == 3)
+-- unluac: expect-ast-count [[goto]] [[2]]
+-- unluac: expect-ast-count [[label]] [[2]]
+-- unluac: expect-ast-count [[while]] [[0]]
+-- unluac: expect-ast-count [[repeat]] [[0]]

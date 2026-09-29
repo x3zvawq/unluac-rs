@@ -1,6 +1,10 @@
 -- 同形工厂不能混同闭包身份；捕获更新须在原 NAMECALL 顺序中求值一次。
 -- unluac: expect-ast-count [[method-call]] [[2]] [[@proto=0]]
 -- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[function]] [[5]]
+-- unluac: expect-ast-count [[table-constructor]] [[2]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[assign]] [[2]] [[@proto=0]]
 
 local sum = 0

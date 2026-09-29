@@ -178,6 +178,7 @@ fn closure_initializers(proto: &HirProto, facts: &ProtoPromotionFacts) -> BTreeM
         rk_literals: None,
         expanded_callees: None,
         retired_roots: None,
+        root_seed_sources: None,
         proto,
         barred: &restrictions.barred,
         closed: &restrictions.closed,

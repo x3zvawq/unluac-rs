@@ -4,6 +4,10 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[r1_0 = r1_1]]
 -- unluac: expect-not-contains [[r2_0 = r2_1]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[while]] [[1]]
 local function repeat_branch(a, c)
     local x = 0
     repeat
@@ -37,5 +41,6 @@ local repeat_break = repeat_branch(false, true)
 local repeat_until = repeat_branch(true, false)
 local repeat_both = repeat_branch(true, true)
 local while_break = while_branch(true, true, true)
+assert(while_branch(false, false, false) == 0)
 assert(repeat_break == 0 and repeat_until == 0 and repeat_both == 0 and while_break == 1)
 print("regress_77_loop_nested_break_continuation#1", repeat_break, repeat_until, repeat_both, while_break)

@@ -1,5 +1,8 @@
 -- regress_448_call_root_immediate_move_overwrite: call 结果经紧邻 MOVE 覆盖旧 root home
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 
 local finalized = 0
 

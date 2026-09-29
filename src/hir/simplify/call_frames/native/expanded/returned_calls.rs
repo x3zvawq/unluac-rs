@@ -150,6 +150,7 @@ pub(super) fn prepare_body(
         rk_literals: None,
         expanded_callees: None,
         retired_roots: None,
+        root_seed_sources: None,
         barred: &restrictions.barred,
         closed: &restrictions.closed,
         callee_aliases: &restrictions.callee_aliases,

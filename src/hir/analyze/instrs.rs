@@ -18,8 +18,8 @@ use super::lower::ProtoLowering;
 use super::shared_closures::CompositeFactoryRef;
 use crate::hir::common::{
     HirCallExpr, HirCallStmt, HirClose, HirExpr, HirGlobalDecl, HirLValue, HirLocalDecl,
-    HirPackTail, HirStmt, HirTableAccess, HirTableConstructor, HirTableField, HirTableSetList,
-    HirToBeClosed, HirUnaryExpr, HirValuePack, LocalId,
+    HirPackTail, HirSourceSite, HirStmt, HirTableAccess, HirTableConstructor, HirTableField,
+    HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack, LocalId,
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
@@ -420,13 +420,32 @@ fn lower_regular_instr_body(
                 lowering.bindings.lvalue_for_temp(*temp) != *target
                     || lowering.promotion_facts.trusted_temp_home_slot(*temp) != Some(*home)
             }))
-            .map(|temp| lowering.bindings.lvalue_for_temp(temp))
+            .map(|temp| (temp, lowering.bindings.lvalue_for_temp(temp)))
             // 原 nil 声明已在同一指令清空这个槽；不能在声明前另写一次未绑定的 local。
-            .filter(|target| !matches!(target, HirLValue::Local(local) if declared_nil_locals.contains(local)))
+            .filter(|(_, target)| !matches!(target, HirLValue::Local(local) if declared_nil_locals.contains(local)))
             .collect::<Vec<_>>();
         if !roots.is_empty() {
             let count = roots.len();
-            stmts.insert(0, assign_stmt(roots, vec![HirExpr::Nil; count]));
+            let (released, targets) = roots.into_iter().unzip();
+            let mut release = assign_stmt(targets, vec![HirExpr::Nil; count]);
+            let HirStmt::Assign(assign) = &mut release else {
+                unreachable!("assign_stmt constructs an assignment");
+            };
+            assign.root_release = Some(crate::hir::common::HirRootRelease::CopyOverwrite {
+                source: HirSourceSite {
+                    proto: lowering.id,
+                    instr: instr_ref,
+                },
+                overwrite: match lowering.dataflow.instr_defs[instr_ref.index()].as_slice() {
+                    [def] => {
+                        let temp = crate::hir::common::TempId(def.index());
+                        (lowering.bindings.fixed_temps[def.index()] == temp).then_some(temp)
+                    }
+                    _ => None,
+                },
+                released,
+            });
+            stmts.insert(0, release);
         }
     }
     let roots = lowering.promotion_facts.copy_root_after_releases(instr_ref);
@@ -671,7 +690,7 @@ pub(super) fn lower_global_decl_owner(
     protocol: &GlobalDeclProtocol,
 ) -> Option<HirStmt> {
     let values = match &protocol.values {
-        GlobalDeclValues::FixedCall(results) => {
+        GlobalDeclValues::FixedCall { prefix, results } => {
             let LowInstr::Call(call) = lowering.proto.instrs.get(instr_ref.index())? else {
                 return None;
             };
@@ -679,10 +698,15 @@ pub(super) fn lower_global_decl_owner(
                 return None;
             }
             let call = HirExpr::Call(Box::new(lower_call_expr(lowering, block, instr_ref, call)));
+            let mut prefix = prefix
+                .iter()
+                .map(|value| expr_for_reg_use(lowering, block, value.instr, value.reg))
+                .collect::<Vec<_>>();
             if results.len == 1 {
-                HirValuePack::fixed(vec![call])
+                prefix.push(call);
+                HirValuePack::fixed(prefix)
             } else {
-                HirValuePack::expanding(Vec::new(), HirPackTail::exact(call, results.len))
+                HirValuePack::expanding(prefix, HirPackTail::exact(call, results.len))
             }
         }
         GlobalDeclValues::ValueUses(values) => HirValuePack::fixed(
@@ -693,6 +717,10 @@ pub(super) fn lower_global_decl_owner(
         ),
     };
     Some(HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
+        probe_source: HirSourceSite {
+            proto: lowering.id,
+            instr: protocol.probe,
+        },
         names: protocol.names.clone(),
         values,
     })))
@@ -770,6 +798,7 @@ pub(in crate::hir::analyze) fn lower_literal_initializer(
         return value;
     }
     HirExpr::TableAccess(Box::new(HirTableAccess {
+        preserve_index_syntax: false,
         sources: Default::default(),
         metamethod_free: true,
         base: HirExpr::TableConstructor(Box::new(HirTableConstructor {
@@ -823,6 +852,7 @@ fn lower_shared_capture_barrier(
         return vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: locals,
             values: vec![HirExpr::TableAccess(Box::new(HirTableAccess {
+                preserve_index_syntax: false,
                 sources: Default::default(),
                 metamethod_free: true,
                 base: table,
@@ -838,6 +868,7 @@ fn lower_shared_capture_barrier(
         .enumerate()
         .map(|(index, _)| {
             HirExpr::TableAccess(Box::new(HirTableAccess {
+                preserve_index_syntax: false,
                 sources: Default::default(),
                 metamethod_free: false,
                 base: HirExpr::LocalRef(box_local),

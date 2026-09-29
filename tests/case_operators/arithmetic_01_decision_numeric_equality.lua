@@ -5,6 +5,9 @@
 -- 非折叠算术仍在原参数槽求值，不留下 callee 快照污染后续声明前缀。
 -- unluac: expect-contains [[assert(r0_0(0 / 0, "nan") == "nan")]]
 -- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=0]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
 
 local function choose(value, fallback)
     local result
@@ -26,6 +29,9 @@ assert(choose(1.0, nil) == false)
 assert(choose(nil, nil) == nil)
 assert(choose(2, false) == false)
 assert(choose(0 / 0, "nan") == "nan")
+assert(choose(1, "fallback") == false)
+assert(choose("1", 0) == 0)
+assert(select("#", choose(nil, nil)) == 1)
 
 local function preserve_numeric_representation(value)
     if value and 1 then
@@ -36,6 +42,11 @@ local function preserve_numeric_representation(value)
 end
 
 assert(math.type(preserve_numeric_representation(1.0)) == "integer")
+assert(preserve_numeric_representation(false) == false)
+assert(preserve_numeric_representation(nil) == nil)
+assert(preserve_numeric_representation(0) == false)
+assert(preserve_numeric_representation(2) == false)
+assert(select("#", preserve_numeric_representation(nil)) == 1)
 print(
     "regress340",
     choose(1.0, "fallback"),

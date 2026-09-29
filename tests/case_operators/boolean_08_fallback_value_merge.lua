@@ -8,14 +8,22 @@
 -- unluac: expect-count [[if r0_0 == "mobile" then]] [[1]]
 -- unluac: expect-order [[local r0_0 = "mobile"]] [[if r0_0 == "mobile" then]]
 -- unluac: expect-order [[if r0_0 == "mobile" then]] [[assert]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[15]]
 
 local hardware_type = "mobile"
-local environment = {
+local reads = {}
+local calls = 0
+local environment = setmetatable({
     screenWidth = nil,
     screenHeight = nil
-}
+}, { __index = function(_, key)
+    reads[#reads + 1] = key
+    return nil
+end })
 local gfx_device = {
     getViewSize = function()
+        calls = calls + 1
         return 1920, 1080
     end
 }
@@ -43,4 +51,5 @@ if hardware_type == "mobile" then
 end
 
 assert(window_width == 1920 and window_height == 1080)
+assert(calls == 1 and table.concat(reads, ",") == "screenWidth,screenHeight")
 print("regress_315_nested_fallback_value_merge", "OK")

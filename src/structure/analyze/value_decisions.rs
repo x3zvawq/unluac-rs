@@ -32,7 +32,8 @@ pub(super) fn selected_value_decisions(
             .debug_locals
             .source_visible_at(reg, &proto.lowering_map.pc_map()[branch_instr])
             && candidate.value_incomings.iter().any(|incoming| {
-                incoming.value == entry_value && incoming.latest_local_def.is_none()
+                incoming.value == entry_value
+                    && (incoming.latest_local_def.is_none() || incoming.pred == candidate.header)
             })
             && !candidate.nodes.iter().any(|node| {
                 let test = cfg.blocks[node.header.index()].instrs.end() - 1;
@@ -41,6 +42,8 @@ pub(super) fn selected_value_decisions(
         {
             // 候选拒绝[SemanticBarrier:BindingIdentity]：活动源码 local 在未赋值臂
             // 只是沿边保留旧值；把它当作短路结果会新增 fallback 读取及一次自赋值。
+            // header 内的初始化早于判定，不是未赋值臂的写；不能因它恰好和首个
+            // 判定同块，就逐轮把连续条件更新中的第一个改成自赋值选择式。
             // 仍由条件/分支 owner 恢复更新，显式测试结果 local 的 and/or 不受影响。
             continue;
         }
@@ -56,7 +59,7 @@ pub(super) fn selected_value_decisions(
     if groups.is_empty() {
         return Vec::new();
     }
-    let safety = ValueDecisionSafetyIndex::new(cfg, dataflow, loops, residual_transfers);
+    let safety = ValueDecisionSafetyIndex::new(proto, cfg, dataflow, loops, residual_transfers);
     let mut scratch = ValueDecisionCandidateScratch::new(proto, cfg, dataflow);
     let mut selected = vec![None::<(usize, &ShortCircuitCandidate)>; dataflow.phi_candidates.len()];
     for mut group in groups {
@@ -79,6 +82,7 @@ pub(super) fn selected_value_decisions(
             proto,
             cfg,
             dataflow,
+            graph_facts,
             &safety,
             &mut scratch,
             representative,
@@ -125,10 +129,24 @@ pub(super) fn selected_value_decisions(
         .map(|(_, candidate)| *candidate)
         .filter_map(|candidate| candidate.result_phi_id.map(|phi| (phi, candidate)))
         .collect::<BTreeMap<_, _>>();
+    let source_values = debug_scope_entries(proto, cfg, graph_facts, dataflow)
+        .into_iter()
+        .map(|(_, _, value)| value)
+        .collect::<BTreeSet<_>>();
+    let repeat_conditions = loops
+        .iter()
+        .filter(|loop_| loop_.kind_hint == super::super::LoopKindHint::RepeatLike)
+        .filter_map(|loop_| required_loop_condition_header(cfg, loop_))
+        .collect::<BTreeSet<_>>();
     selected
         .into_iter()
         .flatten()
-        .filter(|(_, candidate)| !candidate.is_value_operand_only())
+        .filter(|(_, candidate)| {
+            !candidate.is_value_operand_only()
+                || matches!(candidate.exit, ShortCircuitExit::ValueMerge(merge)
+                    if repeat_conditions.contains(&merge))
+                    && anonymous_boolean_materialization(proto, dataflow, candidate, &source_values)
+        })
         .filter_map(|(_, candidate)| {
             Some(ValueDecisionPlanInput {
                 operands: super::value_operands::select_operands(
@@ -142,6 +160,50 @@ pub(super) fn selected_value_decisions(
             })
         })
         .collect()
+}
+
+/// repeat 尾条件的匿名布尔物化独立拥有赋值臂；后继 TEST 仍由循环 owner 消费。
+/// 普通 if 的同类准备继续交给 branch/boolean-shells，避免值上下文阻断原条件内联。
+/// 尾条件若沿用普通分支，跳过另一赋值臂的 JMP 会被 repeat 解释成 continue。
+fn anonymous_boolean_materialization(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    candidate: &ShortCircuitCandidate,
+    source_values: &BTreeSet<super::super::SsaValue>,
+) -> bool {
+    let Some(reg) = candidate.result_reg else {
+        return false;
+    };
+    if candidate
+        .result_phi_id
+        .is_some_and(|phi| source_values.contains(&super::super::SsaValue::Phi(phi)))
+    {
+        // 候选拒绝[PolicyBoundary]：合流本身是源码初始化，不能以写入时尚未活动推断匿名。
+        return false;
+    }
+    let mut values = [false; 2];
+    for incoming in &candidate.value_incomings {
+        let super::super::SsaValue::Def(def) = incoming.value else {
+            return false;
+        };
+        let instr = dataflow.def_instr(def);
+        let LowInstr::LoadBool(load) = &proto.instrs[instr.index()] else {
+            return false;
+        };
+        if load.dst != reg
+            || source_values.contains(&incoming.value)
+            || dataflow.reference_capture_may_be_open(reg, instr)
+            || proto
+                .debug_locals
+                .source_visible_at(reg, &proto.lowering_map.pc_map()[instr.index()])
+        {
+            // 候选拒绝[PolicyBoundary]：源码或开放 cell 的写回仍由普通 branch 保留身份。
+            return false;
+        }
+        values[usize::from(load.value)] = true;
+    }
+    // 两臂相同不能借结果值域抹掉原检查；这里只接管 true/false 物化。
+    values == [true, true]
 }
 
 /// 只描述 ValueDecision 的控制身份；result register、phi 与 leaf SSA 映射不参与分组。
@@ -205,6 +267,7 @@ impl Hash for ValueDecisionDagKey<'_> {
 /// 候选筛选只应遍历候选自身覆盖的 block/edge；loop、residual transfer 与 live phi
 /// 都在这里按稠密 ID 一次投影，避免候选数量放大全图扫描成本。
 pub(super) struct ValueDecisionSafetyIndex {
+    shared_evaluation_defs: Vec<bool>,
     forbidden_blocks: Vec<bool>,
     forbidden_edges: Vec<bool>,
     live_phi_edges: Vec<Vec<super::super::PhiId>>,
@@ -213,6 +276,7 @@ pub(super) struct ValueDecisionSafetyIndex {
 
 impl ValueDecisionSafetyIndex {
     fn new(
+        proto: &LoweredProto,
         cfg: &Cfg,
         dataflow: &DataflowFacts,
         loops: &[LoopCandidate],
@@ -269,6 +333,9 @@ impl ValueDecisionSafetyIndex {
         }
 
         Self {
+            shared_evaluation_defs: super::dependencies::shared_fixed_evaluation_defs(
+                proto, dataflow,
+            ),
             forbidden_blocks,
             forbidden_edges,
             live_phi_edges,
@@ -377,6 +444,7 @@ pub(super) fn value_decision_control_dag_is_closed(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
+    graph: &GraphFacts,
     safety: &ValueDecisionSafetyIndex,
     scratch: &mut ValueDecisionCandidateScratch,
     candidate: &ShortCircuitCandidate,
@@ -451,6 +519,21 @@ pub(super) fn value_decision_control_dag_is_closed(
         else {
             return false;
         };
+        if let Some(phi) = super::super::helpers::equality_right_operand_precedes_left_call(
+            proto, dataflow, graph, predicate,
+        )
+        .and_then(|phi| dataflow.phi_candidate(phi))
+            && scratch.contains_block(phi.block)
+            && phi.incoming.iter().all(|incoming| {
+                incoming
+                    .pred
+                    .is_some_and(|block| scratch.contains_block(block))
+            })
+        {
+            // 候选拒绝[SemanticBarrier:EvaluationOrder]：右值的控制域先于左 CALL。
+            // 在选择最大 DAG 之前保留它的独立边界，后继较小值决策仍可正常胜出。
+            return false;
+        }
         if node.header != entry {
             let Some(uses) = dataflow.use_values.get(predicate.index()) else {
                 return false;
@@ -493,6 +576,26 @@ pub(super) fn value_decision_control_dag_is_closed(
             let terminator = range.last() == Some(instr_ref) && instr.is_control_terminator();
             if *block != entry
                 && scratch.common_needs_instr(instr_ref)
+                && !matches!(
+                    instr,
+                    LowInstr::LoadNil(_)
+                        | LowInstr::LoadBool(_)
+                        | LowInstr::LoadConst(_)
+                        | LowInstr::LoadInteger(_)
+                        | LowInstr::LoadNumber(_)
+                        | LowInstr::Move(_)
+                )
+                && dataflow.instr_defs[index]
+                    .iter()
+                    .any(|def| safety.shared_evaluation_defs[def.index()])
+            {
+                // 候选拒绝[SemanticBarrier:EvaluationCount]：谓词闭包只证明依赖可达，
+                // 不证明 producer 在各次读取中可重复求值。内部节点没有共享值声明，
+                // 因而同时供给条件和后续计算的定义必须由普通分支保留。
+                return false;
+            }
+            if *block != entry
+                && scratch.common_needs_instr(instr_ref)
                 && instr_writes_source_binding(proto, dataflow, instr_ref)
             {
                 // 候选拒绝[SemanticBarrier:NamedRootWrite]：regress_578 的
@@ -507,7 +610,10 @@ pub(super) fn value_decision_control_dag_is_closed(
                 .effect_summaries
                 .get(index)
                 .is_some_and(|summary| !summary.has_effect_tags())
-                && dataflow.instr_defs.get(index).is_some();
+                && dataflow.instr_defs.get(index).is_some()
+                // 源码 binding 的无读写仍可能退休旧对象；只有结果依赖本身重发
+                // 该定义时，才可让值决策拥有它，不能按没有 SSA 读者丢弃清零。
+                && !instr_writes_source_binding(proto, dataflow, instr_ref);
             if !pure_dead {
                 scratch.result_required_instrs.push(instr_ref);
             }

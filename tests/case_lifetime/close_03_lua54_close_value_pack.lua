@@ -1,7 +1,12 @@
 -- regress_175_lua54_close_value_pack#1: 多 binding 声明保留最后一个 <close> 属性
+-- 原声明和循环变量保留，generic-for 准备不能扩散为后续调用的中转变量。
+-- unluac: expect-ast-count [[local-binding]] [[16]]
+-- unluac: expect-ast-count [[close-binding]] [[3]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
 local close_log = {}
 local close_meta = {
-    __close = function(value)
+    __close = function(value, err)
+        assert(err == nil)
         close_log[#close_log + 1] = value.label
     end,
 }
@@ -12,6 +17,8 @@ do
     end
 
     local plain, resource <close> = pair_with_close("declaration")
+    assert(plain == "plain" and resource.label == "declaration")
+    assert(#close_log == 0)
     print("regress_175_lua54_close_value_pack#1", plain, resource.label)
 end
 print("regress_175_lua54_close_value_pack#1-close", table.concat(close_log, ","))
@@ -29,6 +36,7 @@ end
 do
     local closing = setmetatable({ label = "generic-for" }, close_meta)
     for _, value in iterator, { "value" }, nil, closing do
+        assert(value == "value" and #close_log == 1)
         print("regress_175_lua54_close_value_pack#2", value)
     end
 end
@@ -41,6 +49,7 @@ local function assign_before_branch_close(flag)
     local result
     local branch_meta = {
         __close = function()
+            assert(result == "assigned")
             close_log[#close_log + 1] = "branch:" .. tostring(result)
             result = "closed"
         end,

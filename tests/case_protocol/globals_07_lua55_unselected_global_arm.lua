@@ -2,12 +2,17 @@
 -- unluac: expect-not-contains [[if true then]]
 -- unluac: expect-not-contains [[if false then]]
 -- unluac: expect-contains [[global dead_value]]
+-- unluac: expect-ast-count [[if]] [[1]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[error]] [[0]]
 
-global<const> assert, setmetatable, collectgarbage
+global<const> assert, setmetatable, collectgarbage, rawget
 
 local observed = 0
+local root_calls = 0
 local weak_values = setmetatable({}, { __mode = "v" })
 local function make_root()
+    root_calls = root_calls + 1
     return {}
 end
 local literal = 7
@@ -27,3 +32,5 @@ else
 end
 
 assert(observed == 1)
+assert(root_calls == 0 and weak_values.value == nil)
+assert(rawget(_ENV, "dead_value") == nil)

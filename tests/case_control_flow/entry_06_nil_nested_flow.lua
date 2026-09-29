@@ -3,6 +3,11 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 八层原循环加一层输入枚举；原函数保留三个选择检查和两个清零分支。
+-- unluac: expect-ast-count [[numeric-for]] [[9]]
+-- unluac: expect-ast-count [[if]] [[5]]
+-- unluac: expect-ast-count [[while]] [[0]]
+-- unluac: expect-ast-count [[repeat]] [[0]]
 local function choose(outer, a, b, probe)
     local x
     if outer then
@@ -46,6 +51,15 @@ local value = choose(true, true, false, probe)
 assert(value == nil)
 assert(reads == 2)
 
+for mode = 0, 7 do
+    local outer, a, b = mode % 2 == 1, math.floor(mode / 2) % 2 == 1, mode >= 4
+    reads = 0
+    local actual = choose(outer, a, b, probe)
+    local wanted = not outer and 2 or (a and b and 1 or nil)
+    assert(actual == wanted)
+    assert(reads == (outer and (a and 2 or 1) or 0))
+end
+
 -- 同一个 entry-nil result 在路径内已经写成非 nil 后，最终清空不是冗余边 copy。
 local observed
 local ticks = 0
@@ -68,6 +82,10 @@ assert(write_then_clear(true, token) == nil)
 assert(write_then_clear(false, token) == nil)
 assert(observed == token)
 assert(ticks == 1)
+assert(write_then_clear(true, false) == nil)
+assert(observed == false and ticks == 2)
+assert(write_then_clear(true, nil) == nil)
+assert(observed == nil and ticks == 3)
 
 local weak = setmetatable({}, { __mode = "v" })
 local cleared = false
@@ -85,4 +103,7 @@ end
 
 clear_for_gc(true)
 assert(cleared)
+cleared = false
+clear_for_gc(false)
+assert(not cleared)
 print("regress_553_entry_nil_nested_flow", value, reads, observed == token, ticks, cleared)

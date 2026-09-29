@@ -1,6 +1,10 @@
 -- 回编后的退出 pad 不能把已关闭资源的标签插入仍活跃的正常路径。
 -- unluac: expect-ast-count [[close-binding]] [[2]]
--- unluac: expect-ast-min [[goto]] [[1]]
+-- unluac: expect-ast-count [[goto]] [[1]]
+-- unluac: expect-ast-count [[label]] [[1]]
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=5]]
+-- unluac: expect-ast-count [[do-block]] [[2]] [[@proto=5]]
+-- unluac: expect-max-count [[goto ]] [[1]]
 local log, closed
 local function note(s) log[#log + 1] = s end
 local function resource(name)
@@ -42,3 +46,11 @@ check("nested_repeat_normal", function() nested_repeat(false) end,
     "open:outer,open:inner,body:inner,close:inner,condition,after:repeat,close:outer,done")
 check("nested_repeat_exit", function() nested_repeat(true) end,
     "open:outer,open:inner,body:inner,close:inner,close:outer,done")
+
+check("nested_repeat_nil", function() nested_repeat(nil) end,
+    "open:outer,open:inner,body:inner,close:inner,condition,after:repeat,close:outer,done")
+check("nested_repeat_zero", function() nested_repeat(0) end,
+    "open:outer,open:inner,body:inner,close:inner,close:outer,done")
+-- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-ast-count [[while]] [[0]]
+-- unluac: expect-ast-count [[repeat]] [[0]]

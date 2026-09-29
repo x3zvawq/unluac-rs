@@ -2,6 +2,11 @@
 -- unluac: expect-contains [[<close>]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- 资源、数值循环和 x 的原声明足够表达 island，不应分裂为每个入口的状态副本。
+-- unluac: expect-ast-count [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[close-binding]] [[1]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[do-block]] [[1]]
 
 local closed = 0
 local closer = setmetatable({}, {

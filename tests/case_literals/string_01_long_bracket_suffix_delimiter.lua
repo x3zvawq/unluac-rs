@@ -1,11 +1,14 @@
 -- regress_179_long_bracket_suffix_delimiter#1: 内容后缀不能与 closing delimiter 跨边界提前闭合
 -- unluac: expect-contains [[[=[a]]
 -- unluac: expect-contains [[[==[b]]
+-- unluac: expect-ast-max [[local-binding]] [[2]]
 
 local zero_level_suffix = "a\n]"
 local nested_closing_and_suffix = "b\n]]\n]="
 assert(#zero_level_suffix == 3 and zero_level_suffix == "a\n]")
 assert(#nested_closing_and_suffix == 7 and nested_closing_and_suffix == "b\n]]\n]=")
+assert(zero_level_suffix == string.char(97, 10, 93))
+assert(nested_closing_and_suffix == string.char(98, 10, 93, 93, 10, 93, 61))
 
 print(
     "regress_179_long_bracket_suffix_delimiter#1",

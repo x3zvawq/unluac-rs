@@ -137,10 +137,10 @@ impl<'a> Emitter<'a> {
                 }
                 // HIR 已证明 r0/r1 的初始化事务；不能先降成普通表达式树再折叠。
                 if let crate::hir::HirCaptureInitializer::NegatedNumericString(number) = value {
-                    let opposite = format_number(-number.to_f64(), false);
+                    let opposite = format_number(-number.to_f64(), false, false);
                     return Ok(Doc::text(format!("(-\"{opposite}\")")));
                 }
-                let literal = format_number(value.number().to_f64(), false);
+                let literal = format_number(value.number().to_f64(), false, false);
                 (
                     Doc::text(format!("((...) and ({literal}) or ({literal}))")),
                     PREC_LITERAL,
@@ -150,6 +150,7 @@ impl<'a> Emitter<'a> {
             AstExpr::Number(value) => numeric_literal(format_number(
                 *value,
                 target_preserves_float_type(self.target.version),
+                self.number_is_f32,
             )),
             AstExpr::String(value) => (
                 Doc::text(format_string_literal(value, self.options.quote_style)),

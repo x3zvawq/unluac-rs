@@ -137,8 +137,10 @@ fn materialize_tail_scopes(
             // 候选拒绝[ProofIncomplete]：cleanup 还关闭新块之外或身份未发布的资源，不能用局部词法退出代替。
             return false;
         }
-        // 同一尾块内的资源按原声明逆序关闭，共同拥有这条 cleanup。
-        body_end = index;
+        // debug 区间只证明词法容器，不能退休资源终点；否则 close-scopes 会用
+        // 较早的回边 Close 再次缩短同一资源。保留显式事件，由资源 owner 连同
+        // 所有退出路径一起消费，容器本身仍在原 Close 后结束。
+        body_end = index + 1;
     }
 
     let mut stmts = std::mem::take(&mut block.stmts).into_iter();
@@ -147,11 +149,6 @@ fn materialize_tail_scopes(
         // local 的起点由声明自身限定；相同末端无需为后续每个 local 再套一层块。
         stmts: stmts.by_ref().take(body_end - first_start).collect(),
     })));
-    if explicit_cleanup.is_some() {
-        stmts
-            .next()
-            .expect("the validated explicit cleanup follows the moved body");
-    }
     rewritten.extend(stmts);
     block.stmts = rewritten;
     true

@@ -2,6 +2,8 @@
 -- inline-exprs 不能把前置调用移到 call receiver/callee 之后；
 -- method alias 也不能因两个调用参数相同而合并 receiver 求值。
 -- unluac: expect-not-contains [[local r0_6 = r0_4]]
+-- unluac: expect-ast-max [[local-binding]] [[19]]
+-- unluac: expect-ast-count [[function]] [[5]]
 
 local log = {}
 
@@ -52,9 +54,9 @@ local function captured_source_keeps_snapshot()
     return snapshot.tag, source.tag
 end
 
-local written_before, written_after = written_source_keeps_snapshot()
-local captured_before, captured_after = captured_source_keeps_snapshot()
-assert(written_before == "before" and written_after == "after")
-assert(captured_before == "captured" and captured_after == "replaced")
+local written_before, written_after, written_extra = written_source_keeps_snapshot()
+local captured_before, captured_after, captured_extra = captured_source_keeps_snapshot()
+assert(written_before == "before" and written_after == "after" and written_extra == nil)
+assert(captured_before == "captured" and captured_after == "replaced" and captured_extra == nil)
 print("regress_45_inline_stmt_eval_order#2", written_before, written_after)
 print("regress_45_inline_stmt_eval_order#3", captured_before, captured_after)

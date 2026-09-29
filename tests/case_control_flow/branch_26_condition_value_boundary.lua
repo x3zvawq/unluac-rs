@@ -1,6 +1,11 @@
 -- 短路取值与外层条件分别拥有控制区域，字段读取保持次数与顺序。
 -- unluac: expect-ast-count [[goto]] [[0]]
 -- unluac: expect-ast-count [[label]] [[0]]
+-- 两次索引沿原 GETUPVAL 准备帧树化，不为只用一次的 base/key 留下载体。
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=3]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=4]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=0]]
 local calls = 0
 local trace = {}
 local rows = {
@@ -44,3 +49,22 @@ print("matched", x)
 assert(calls == 100 and #trace == 160)
 print("calls", calls, "reads", #trace)
 print(table.concat(trace, ","))
+
+-- 第一层索引可改变第二层键：同名上值的两次 GETUPVAL 不是同一个值版本。
+local selected, catalog = 1, nil
+local function lookup()
+  return catalog[selected][selected]
+end
+local lookup_trace = ""
+catalog = setmetatable({}, { __index = function(_, key)
+  assert(key == 1)
+  lookup_trace = lookup_trace .. "outer"
+  selected, catalog = 2, {}
+  return setmetatable({}, { __index = function(_, inner_key)
+    assert(inner_key == 2)
+    lookup_trace = lookup_trace .. ",inner"
+    return 42
+  end })
+end })
+assert(lookup() == 42 and lookup_trace == "outer,inner")
+print("upvalue lookup order", lookup_trace)

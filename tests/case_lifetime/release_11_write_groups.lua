@@ -1,5 +1,9 @@
 -- 完整 LOADNIL 的写义务不取决于旧根来自哪个控制路径。
 -- 覆盖合并 nil、分支内 nil、limit/step 槽及多个顺序覆盖；GC 残值按各 VM 原运行比较。
+-- unluac: expect-ast-max [[local-binding]] [[47]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
+-- unluac: expect-ast-count [[function]] [[11]]
+-- unluac: expect-ast-count [[numeric-for]] [[9]]
 local snapshots = {}
 local old = getmetatable(_G)
 local baseline = 0
@@ -89,6 +93,7 @@ label = "limit"; limit()
 label = "step"; step()
 label = "sequential"; sequential()
 setmetatable(_G, old)
+assert(#snapshots == 10)
 assert(snapshots[1] == "nonzero:false")
 assert(snapshots[3] == "nested:false")
 assert(snapshots[5] == "branch-true:false")

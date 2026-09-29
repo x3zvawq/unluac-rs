@@ -2,8 +2,11 @@
 -- unluac: expect-not-contains [[end)(]]
 -- unluac: expect-not-contains [[if ]]
 -- unluac: expect-contains [[ and ]]
+-- unluac: expect-ast-count [[function]] [[4]]
+-- unluac: expect-ast-max [[local-binding]] [[6]]
 local builds = 0
 local calls = 0
+local lookups = 0
 local function build_values()
     builds = builds + 1
     local values = {}
@@ -19,6 +22,17 @@ local function build_values()
 end
 
 local values = build_values()
+setmetatable(values, { __index = function(_, key)
+    assert(key == 3)
+    lookups = lookups + 1
+    return nil
+end })
 assert(values[1]() == 10 and values[2]() == 20 and values[3] == nil)
-assert(calls == 2)
+assert(calls == 2 and lookups == 1)
+assert(not (values[1]() == 11 and values[2]() == 20 and values[3] == nil))
+assert(calls == 3 and lookups == 1)
+assert(not (values[1]() == 10 and values[2]() == 21 and values[3] == nil))
+assert(calls == 5 and lookups == 1)
+assert(not (values[1]() == 10 and values[2]() == 20 and values[3] ~= nil))
+assert(calls == 7 and lookups == 2)
 assert(builds == 1)

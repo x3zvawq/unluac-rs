@@ -92,6 +92,8 @@ pub struct DataflowFacts {
     pub(crate) def_overwritten_values: Vec<Option<SsaValue>>,
     pub(crate) canonical_move_values: Vec<Option<SsaValue>>,
     pub(crate) unknown_scratch_overwrites: Vec<bool>,
+    /// Def 后接 Phi；仅无 debug.setlocal 的源 VM 签发跨观察稳定的标量事实。
+    pub(crate) gc_inert_values: Vec<bool>,
     pub(crate) def_phi_uses: Vec<Vec<PhiId>>,
     pub(crate) phi_uses: Vec<Vec<UseSite>>,
     pub(crate) phi_phi_uses: Vec<Vec<PhiId>>,
@@ -110,6 +112,17 @@ pub struct DataflowFacts {
 }
 
 impl DataflowFacts {
+    /// 原 SSA 值已证明不持有 GC 根；不证明物理 scratch 已清空，也不授权删除原写入。
+    /// 仅对构建本事实的原 CFG/SSA 有效，未知入口和开放引用捕获不签发证明。
+    pub(crate) fn value_is_gc_inert(&self, value: SsaValue) -> bool {
+        let index = match value {
+            SsaValue::Def(def) => def.index(),
+            SsaValue::Phi(phi) => self.defs.len() + phi.index(),
+            SsaValue::Entry(_) => return false,
+        };
+        self.gc_inert_values.get(index) == Some(&true)
+    }
+
     /// 原 fixed 写覆盖了入口或 CALL/OPEN 协议可能留下的未知物理残值；与逻辑 SSA 旧值分离。
     pub(crate) fn def_overwrites_unknown_scratch(&self, def: DefId) -> bool {
         self.unknown_scratch_overwrites[def.index()]

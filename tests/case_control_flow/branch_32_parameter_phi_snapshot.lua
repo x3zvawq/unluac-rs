@@ -1,7 +1,23 @@
 -- 同值 incoming 只代表选择时的快照；之后改写被引用捕获的参数不能改变 chosen。
+-- unluac: expect-contains [[assert(r0_46 == not r0_44)]] [[@variant=O2]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-binding]] [[65]] [[@proto=0]] [[@variant=O2]] [[@debug=stripped]]
+-- unluac: expect-not-contains [[assert(r0_]] [[@variant=O2]] [[@debug=retained]]
 -- unluac: expect-contains [[local chosen]] [[@debug=retained]]
 -- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=5]] [[@variant=O0]]
 -- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=5]] [[@variant=O0]]
+-- check 只声明两个调用结果；比较 RHS 的原 NOT 应留在完整参数表达式内。
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=3]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=luau]]
+-- O2 的表输入使根函数也保留 NOT；helper 与内联调用都应直接形成比较 RHS。
+-- unluac: expect-count [[== not value)]] [[2]] [[@variant=O2]] [[@debug=retained]]
+-- 后续候选撤回不应阻断八个独立词法窗口中的比较参数。
+-- unluac: expect-count [[assert(previous]] [[9]] [[@variant=O2]] [[@debug=retained]]
+-- unluac: expect-count [[assert(current]] [[9]] [[@variant=O2]] [[@debug=retained]]
 local function choose(flag, returned)
     local function left()
         return returned
@@ -28,6 +44,10 @@ check(true, true)
 check(true, false)
 check(false, true)
 check(false, false)
+check(true, nil)
+check(false, 0)
+check(true, "")
+check(false, {})
 
 -- 参数本身只读也不够：MOVE 链经过引用捕获的中间 binding 时，回调能改写它。
 local function capture_chain(flag, original)

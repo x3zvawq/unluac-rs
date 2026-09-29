@@ -188,11 +188,11 @@ pub(super) fn freeze_loop_payload(
         crate::structure::LoopKindHint::NumericForLike
             | crate::structure::LoopKindHint::GenericForLike
     ) {
-        candidate
+        partition
             .continue_target
             .filter(|target| partition.control.contains(target))
     } else {
-        candidate.continue_target
+        partition.continue_target
     };
 
     Ok(super::super::LoopPlanData {

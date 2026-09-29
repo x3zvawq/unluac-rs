@@ -1,4 +1,7 @@
 -- CALL 修改捕获值时，算术仍使用调用前的快照；短路备用值只在原分支写回。
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[if]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[7]]
 -- unluac: expect-contains [[value = value + (provider:next() or 1)]] [[@debug=retained]]
 -- unluac: expect-contains [[value = value + (provider:next() and 2)]] [[@debug=retained]]
 -- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=0]]
@@ -37,3 +40,19 @@ result = false
 local ok = pcall(update_and)
 assert(not ok and value == 1000 and calls == 6)
 print("captured-call-selection", value, calls, ok)
+value = 20
+result = 0
+assert(update_and() == 22)
+result = ""
+assert(update_and() == 24)
+result = nil
+ok = pcall(update_and)
+assert(not ok and value == 1000 and calls == 9)
+result = true
+ok = pcall(update)
+assert(not ok and value == 1000 and calls == 10)
+value = 30
+result = 2
+assert(select("#", update()) == 1 and value == 32)
+result = true
+assert(select("#", update_and()) == 1 and value == 34 and calls == 12)

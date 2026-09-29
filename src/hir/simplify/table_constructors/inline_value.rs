@@ -135,6 +135,7 @@ fn inline_constructor_value_inner(
                 base: inline_constructor_value_inner(context, &access.base)?,
                 key: inline_constructor_value_inner(context, &access.key)?,
                 method_setup_protocol: access.method_setup_protocol,
+                preserve_index_syntax: access.preserve_index_syntax,
             }))
         }
         HirExpr::Call(call) => HirExpr::Call(Box::new(inline_constructor_call(context, call)?)),
@@ -248,6 +249,7 @@ fn inline_decision_entry(
     let mut nodes = decision.nodes.clone();
     nodes[entry_index].test = inline_constructor_value_inner(context, &entry.test)?;
     Some(HirDecisionExpr {
+        source_result: decision.source_result,
         emit_as_luau_if: false,
         entry: decision.entry,
         nodes,

@@ -60,6 +60,11 @@ pub(crate) fn generate_chunk(
     context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
     let options = &context.options.generate;
+    let number_is_f32 = state
+        .require_raw_chunk()?
+        .header
+        .puc_lua_layout()
+        .is_some_and(|layout| !layout.integral_number && layout.number_size == 4);
     let hir = state.require_hir()?;
     let module = state.require_readability()?;
     let required_inlining = !hir.required_luau_inlining.is_empty();
@@ -86,6 +91,7 @@ pub(crate) fn generate_chunk(
     let diagnostic = has_errors || !unsupported.is_empty() || unproven_inlining;
     let generated = {
         let emitter = Emitter {
+            number_is_f32,
             names: NameResolver::new(names),
             target: context.requested_target,
             metadata: metadata.as_ref(),
@@ -141,6 +147,8 @@ fn format_ast_features(features: &[AstFeature]) -> String {
 }
 
 struct Emitter<'a> {
+    /// 数字模型来自原 chunk 的 header，与可关闭的展示 metadata 无关。
+    number_is_f32: bool,
     names: NameResolver<'a>,
     target: AstTargetDialect,
     metadata: Option<&'a GenerateCommentMetadata>,

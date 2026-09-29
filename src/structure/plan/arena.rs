@@ -615,6 +615,8 @@ struct LoopPartitions {
     body: BTreeSet<BlockRef>,
     owned: BTreeSet<BlockRef>,
     continuation: Option<BlockRef>,
+    /// repeat 指向完整 until 入口；其他 loop 保留候选的协议入口。
+    continue_target: Option<BlockRef>,
     continues: BTreeSet<EdgeRef>,
     break_routes: BTreeMap<EdgeRef, Vec<EdgeRef>>,
     normal_tail: Option<NormalTailPartition>,

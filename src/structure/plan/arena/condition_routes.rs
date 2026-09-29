@@ -25,7 +25,7 @@ pub(super) fn prune_non_iteration_branch_tail_continues(
                 || caps.continue_stmt
                     && continue_edge_bypasses_body_parts(cfg, body, *edge)
                     && !(candidate.kind_hint == crate::structure::LoopKindHint::RepeatLike
-                        && candidate.continue_target.is_some_and(|target| {
+                        && partition.continue_target.is_some_and(|target| {
                             branch_conditions_share_subject(
                                 proto,
                                 cfg,

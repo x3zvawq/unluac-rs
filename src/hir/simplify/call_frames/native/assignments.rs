@@ -4,6 +4,118 @@
 use super::*;
 
 pub(super) mod literal_globals;
+pub(super) mod prepared_writes;
+
+/// 首项字面量、低槽快照或空表与末项空表按原准备顺序逆序发布到低槽。
+/// PUC 末项 COPY 可仍独立或已吸收，JIT 可直接分配到末项目标。
+pub(super) fn allocation_pair(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    first: FlatStmt<'_>,
+    second: FlatStmt<'_>,
+    third: FlatStmt<'_>,
+    fourth: Option<FlatStmt<'_>>,
+) -> Option<(Plan, usize)> {
+    let (snapshot, left) = scalar_local(first.stmt)?;
+    let (allocation, HirExpr::TableConstructor(right)) = scalar_local(second.stmt)? else {
+        return None;
+    };
+    let frame = facts.allocation_pair_frame(right, left)?;
+    let left_matches = match (&frame.literal_input, frame.copied_input, left) {
+        (Some(original), None, current) => original == current,
+        (None, Some(_), _) => true,
+        (None, None, HirExpr::TableConstructor(table)) => {
+            matches!(table.sources, crate::hir::common::HirOperationSources::Single(source)
+                if source.instr == frame.sites[0] && facts.operation_result_temp(source) == Some(frame.values[0]))
+                && table.fields.is_empty()
+                && table.trailing_multivalue.is_none()
+                && table.matches_allocation_capacity(0)
+        }
+        _ => false,
+    };
+    let left_target = facts.promoted_local_for_temp(frame.writes[0].target)?;
+    let right_target = facts.promoted_local_for_temp(frame.writes[1].target)?;
+    let (right_write, last, consumed) = if allocation == right_target {
+        if !matches!(second.stmt, HirStmt::Assign(_)) {
+            return None;
+        }
+        (second, third, 3)
+    } else {
+        // 第二项仍占独立 scratch 时，必须同批消费它的原 COPY；先单独合并
+        // 分配写回会退休该 Def，使整个并列赋值失去可验证的准备来源。
+        if facts.promoted_local_for_temp(frame.values[1]) != Some(allocation)
+            || facts.trusted_local_home_slot(allocation) != Some(frame.homes[1])
+            || context.closed.contains(&frame.homes[1])
+            || context.proto.local_debug_hints[allocation.index()].is_some()
+            || context.proto.local_debug_scopes[allocation.index()].is_some()
+            || matches!(context.proto.inline_dispositions.local(allocation),
+                crate::hir::common::HirInlineDisposition::Preserve(reasons)
+                    if reasons.iter().any(|reason| *reason != HirInlineRetentionReason::PhysicalFramePrefix))
+            || !matches!(third.stmt, HirStmt::Assign(_))
+            || scalar_local(third.stmt) != Some((right_target, &HirExpr::LocalRef(allocation)))
+        {
+            return None;
+        }
+        (third, fourth?, 4)
+    };
+    let HirStmt::Assign(assign) = last.stmt else {
+        return None;
+    };
+    if ![first, second, right_write, last]
+        .iter()
+        .all(|entry| plain_copy(entry.stmt))
+        || facts.promoted_local_for_temp(frame.values[0]) != Some(snapshot)
+        || facts.trusted_local_home_slot(snapshot) != Some(frame.homes[0])
+        || facts.trusted_local_home_slot(left_target) != Some(frame.writes[0].home)
+        || facts.trusted_local_home_slot(right_target) != Some(frame.writes[1].home)
+        || !matches!(right.sources, crate::hir::common::HirOperationSources::Single(source)
+            if source.instr == frame.sites[1] && facts.operation_result_temp(source) == Some(frame.values[1]))
+        || !left_matches
+        || !right.fields.is_empty()
+        || right.trailing_multivalue.is_some()
+        || !right.matches_allocation_capacity(0)
+        || assign.targets.as_slice() != [HirLValue::Local(left_target)]
+        || assign.values.fixed.as_slice() != [HirExpr::LocalRef(snapshot)]
+        || assign.values.tail.is_some()
+        || context.closed.contains(&frame.homes[0])
+        || context.proto.local_debug_hints[snapshot.index()].is_some()
+        || context.proto.local_debug_scopes[snapshot.index()].is_some()
+        || matches!(context.proto.inline_dispositions.local(snapshot),
+            crate::hir::common::HirInlineDisposition::Preserve(reasons)
+                if reasons.iter().any(|reason| *reason != HirInlineRetentionReason::PhysicalFramePrefix))
+    {
+        // 候选拒绝[ProofIncomplete]：当前语句必须完整承接原分配和写回，
+        // 不能拿同槽的其它版本或含后续字段求值的构造器替代原连续事务。
+        return None;
+    }
+    let mut removed = vec![first.id, second.id];
+    if right_write.id != second.id {
+        removed.push(right_write.id);
+    }
+    Some((
+        Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
+            start: first.id,
+            sink: last.id,
+            base: frame.homes[0],
+            values: vec![left.clone(), HirExpr::TableConstructor(right.clone())].into(),
+            result_locals: Vec::new(),
+            discarded_result: None,
+            assignment_targets: vec![
+                HirLValue::Local(left_target),
+                HirLValue::Local(right_target),
+            ],
+            luau_compound_global: false,
+            indexed_target: None,
+            continuing_root: None,
+            retained_copies: Vec::new(),
+            replayed_effects: vec![right_write.id],
+            removed,
+        },
+        consumed,
+    ))
+}
 
 /// PUC/LuaJIT 的末项 GETTABLE 可直接写入最后一个 local；其余 RHS 先占连续 scratch，
 /// 随后逆序提交。全部原写同批重发，不能把某个捕获 cell 的更新提前到后续读取前。
@@ -287,7 +399,7 @@ pub(super) fn plain_copy(stmt: &HirStmt) -> bool {
             !assign.is_phi_transfer
                 && assign.initializer_merge_transaction.is_none()
                 && assign.generic_for_initializer_producer.is_none()
-                && assign.generic_for_dispatch_release.is_none()
+                && assign.root_release.is_none()
                 && assign.method_rewrite_transaction.is_none()
         }
         HirStmt::LocalDecl(decl) => decl.initializer_merge_transaction.is_none(),

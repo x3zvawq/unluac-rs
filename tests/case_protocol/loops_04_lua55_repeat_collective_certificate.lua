@@ -5,6 +5,9 @@
 -- unluac: expect-order [[string.len("safe")]] [[global<const> print]]
 -- unluac: expect-order [[global<const> print]] [[print("unsafe")]]
 -- unluac: expect-ast-count [[repeat]] [[2]]
+-- unluac: expect-ast-count [[function]] [[4]]
+-- unluac: expect-ast-max [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[error]] [[0]]
 
 local function safe(flag)
     global safe_marker = 0
@@ -21,11 +24,13 @@ end
 
 local function unsafe()
     local weak = setmetatable({}, { __mode = "v" })
-    local rooted = false
+    local rooted = true
+    local observations = 0
     local function observe()
+        observations = observations + 1
         collectgarbage("collect")
-        rooted = weak[1] ~= nil
-        return true
+        rooted = rooted and weak[1] ~= nil
+        return observations == 3
     end
 
     global unsafe_marker = 0
@@ -40,6 +45,7 @@ local function unsafe()
         unsafe_marker = 1
     until observe()
     assert(rooted, "escaped repeat root collected before condition")
+    assert(observations == 3)
     return unsafe_marker
 end
 

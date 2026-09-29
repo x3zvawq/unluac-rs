@@ -1,3 +1,6 @@
+-- unluac: expect-ast-count [[local-binding]] [[11]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[while]] [[1]]
 local function check_a2(expected, level)
 -- unluac: expect-contains [[local a2 = first]] [[@debug=retained]]
 -- unluac: expect-order [[check_a2(false, 3)]] [[local a2 = first]] [[@debug=retained]]
@@ -31,6 +34,7 @@ local function run()
     second = nil
     collectgarbage("collect")
     assert(weak[1] ~= nil)
+    assert(weak[2] == nil)
     a0 = nil
     a1 = nil
     a2 = nil

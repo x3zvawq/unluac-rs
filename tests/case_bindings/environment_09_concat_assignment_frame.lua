@@ -1,6 +1,10 @@
 -- 全局/上值写回完整 CONCAT 帧，先完成读取及拼接，再更新目标。
 -- unluac: expect-contains [[CONCAT_OUT = CONCAT_IN ..]]
 -- unluac: expect-contains [[result = CONCAT_IN .. suffix()]] [[@debug=retained]]
+-- unluac: expect-ast-count [[local-binding]] [[9]]
+-- unluac: expect-ast-count [[assign]] [[4]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]]
 local events = {}
 local result = "before"
 local phase = "global"

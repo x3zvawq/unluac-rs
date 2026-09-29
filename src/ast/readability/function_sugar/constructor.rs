@@ -4,7 +4,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames, binding_mentions_in_stmt};
+use super::super::binding_flow::{
+    BindingUseIndex, BindingWriteIndex, MutableSnapshotNames, binding_mentions_in_stmt,
+};
 use super::super::expr_analysis::is_stable_context_expr;
 use super::super::installer_iife::function_expr_is_substantial;
 use crate::ast::common::{
@@ -113,6 +115,7 @@ pub(super) fn try_inline_terminal_constructor_fields(
 pub(super) fn try_inline_terminal_constructor_call(
     stmts: &[AstStmt],
     use_index: &BindingUseIndex,
+    write_index: &BindingWriteIndex,
     run_facts: &ConstructorRunFacts,
     stmt_base: usize,
     mutable_snapshots: &MutableSnapshotNames,
@@ -211,6 +214,7 @@ pub(super) fn try_inline_terminal_constructor_call(
     if !matches!(sink, AstStmt::Return(_))
         && !removed_constructor_locals_are_dead_after_sink(
             use_index,
+            write_index,
             stmt_base + consumed + 1,
             callee.binding.id,
             &arg_locals,
@@ -635,10 +639,19 @@ fn rewrite_terminal_constructor_call(
 
 fn removed_constructor_locals_are_dead_after_sink(
     use_index: &BindingUseIndex,
+    write_index: &BindingWriteIndex,
     suffix_start: usize,
     callee_binding: AstBindingRef,
     arg_locals: &[ConstructorArg],
 ) -> bool {
+    if std::iter::once(callee_binding)
+        .chain(arg_locals.iter().map(|arg| arg.binding.id))
+        .any(|binding| write_index.has_rebinding_after(suffix_start - 1, binding))
+    {
+        // 候选拒绝[SemanticBarrier:Scope]：没有后续读取不等于声明已失效；保留的
+        // overwrite 仍需要同一词法 binding，否则生成源码会把局部写入变成全局写入。
+        return false;
+    }
     if use_index.count_uses_in_suffix(suffix_start, callee_binding) != 0 {
         // 候选拒绝[SemanticBarrier:Scope]：callee local 在 sink 后仍有 use，不能随 constructor 壳一起删除。
         return false;

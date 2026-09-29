@@ -66,6 +66,7 @@ pub(crate) fn lower_table_access_expr(
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
+        preserve_index_syntax: false,
         sources: crate::hir::common::HirOperationSources::Single(
             crate::hir::common::HirSourceSite {
                 proto: lowering.id,
@@ -147,6 +148,7 @@ pub(crate) fn lower_table_access_target(
     }
 
     HirLValue::TableAccess(Box::new(HirTableAccess {
+        preserve_index_syntax: false,
         sources: crate::hir::common::HirOperationSources::Single(
             crate::hir::common::HirSourceSite {
                 proto: lowering.id,
@@ -172,6 +174,7 @@ pub(crate) fn lower_table_access_expr_inline(
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
+        preserve_index_syntax: false,
         sources: crate::hir::common::HirOperationSources::Single(
             crate::hir::common::HirSourceSite {
                 proto: lowering.id,
@@ -268,6 +271,7 @@ pub(crate) fn lower_table_access_expr_single_eval(
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
+        preserve_index_syntax: false,
         sources: crate::hir::common::HirOperationSources::Single(
             crate::hir::common::HirSourceSite {
                 proto: lowering.id,

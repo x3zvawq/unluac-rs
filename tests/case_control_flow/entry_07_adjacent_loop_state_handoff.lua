@@ -4,6 +4,10 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 模块中只有被测函数含 numeric-for 和 if；观察端的枚举使用 generic-for。
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 local function run(a, b, xs)
     local x = 0
     for _ = 1, 3 do
@@ -24,7 +28,11 @@ end
 
 print("regress_78_adjacent_loop_state_handoff#1", run(true, false, { [3] = true }))
 
-for _, hit in ipairs({ true, false }) do
+-- a=false 时原程序不终止；覆盖所有有限的 Boolean b/hit 组合。
+for _, mode in ipairs({
+    { true, true }, { true, false }, { false, true }, { false, false },
+}) do
+    local b, hit = mode[1], mode[2]
     local reads = {}
     local xs = setmetatable({}, {
         __index = function(_, index)
@@ -32,6 +40,6 @@ for _, hit in ipairs({ true, false }) do
             return hit
         end,
     })
-    assert(run(true, false, xs) == 3)
+    assert(run(true, b, xs) == 3)
     assert(#reads == 1 and reads[1] == 3, "second loop must read the first loop exit state once")
 end

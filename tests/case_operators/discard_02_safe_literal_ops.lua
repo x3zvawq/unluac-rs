@@ -1,3 +1,6 @@
+-- unluac: expect-ast-count [[function]] [[8]]
+-- unluac: expect-ast-count [[if]] [[7]]
+-- unluac: expect-ast-max [[local-binding]] [[16]]
 -- 无观察事件不等于没有原操作；包括永不到达的分支关系也保留。
 -- unluac: expect-contains [[11 + 7]]
 -- unluac: expect-contains [[-(13 * 5)]]
@@ -82,6 +85,15 @@ local function reject_mixed_ordering()
     end
 end
 
+local original_print = print
+local calls = 0
+print = function(label, ...)
+    calls = calls + 1
+    assert(type(label) == "string" and string.sub(label, 1, 8) == "discard-")
+    assert(select("#", ...) == 0)
+    original_print(label)
+end
+
 discard_add()
 discard_nested_negation()
 discard_division()
@@ -89,3 +101,16 @@ discard_power()
 discard_string_length()
 assert(not pcall(reject_number_length))
 assert(not pcall(reject_mixed_ordering))
+
+assert(calls == 5)
+assert(select("#", discard_add()) == 0)
+assert(select("#", discard_nested_negation()) == 0)
+assert(select("#", discard_division()) == 0)
+assert(select("#", discard_power()) == 0)
+assert(select("#", discard_string_length()) == 0)
+assert(calls == 10)
+assert(select("#", pcall(reject_number_length)) == 2)
+assert(select("#", pcall(reject_mixed_ordering)) == 2)
+assert(calls == 10)
+print = original_print
+assert(print == original_print)

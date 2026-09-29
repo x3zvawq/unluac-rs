@@ -73,6 +73,9 @@ fn field_access_from_index(
     access: &AstIndexAccess,
     dialect: DecompileDialect,
 ) -> Option<AstFieldAccess> {
+    if access.preserve_index_syntax {
+        return None;
+    }
     let field = field_name_from_key_expr(&access.index, dialect)?;
     Some(AstFieldAccess {
         base: access.base.clone(),

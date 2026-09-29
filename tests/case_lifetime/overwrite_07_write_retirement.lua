@@ -1,5 +1,10 @@
 -- __call 在 callee 槽留下函数；Ignore CALL 不会用返回值覆写它。后面的 COPY
 -- 即使只改变无逻辑用途的槽，也能决定返回后 caller 的 __index 是否观察到旧函数。
+-- unluac: expect-ast-max [[local-binding]] [[17]]
+-- unluac: expect-ast-count [[function]] [[10]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=5]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=10]] [[@debug=retained]]
+-- unluac: expect-ast-count [[do-block]] [[1]] [[@debug=retained]]
 local function across_return()
     local weak = setmetatable({}, {__mode = "v"})
     local meta = {}
@@ -24,6 +29,7 @@ local function across_return()
     methods.observe()
     debug.setmetatable(1, original)
     collectgarbage("restart")
+    assert(seen == "nil", "old callee survived the copy before return")
     print("across-return", seen)
 end
 
@@ -54,6 +60,7 @@ local function consecutive_copies()
     methods.observe()
     debug.setmetatable(1, original)
     collectgarbage("restart")
+    assert(seen == "nil", "old callee survived both copy epochs")
     print("consecutive-copies", seen)
 end
 

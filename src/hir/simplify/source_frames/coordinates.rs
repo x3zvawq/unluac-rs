@@ -78,8 +78,8 @@ pub(in crate::hir::simplify) fn compact(
         *cursor += 1;
         for_each_nested_block_mut(stmt, &mut |child| compact(child, removed, cursor));
         if matches!(stmt, HirStmt::Repeat(_)) {
-            // condition 点只能替换表达式；不能用删除位删除 loop 或跳过末端条件。
-            assert!(!removed[index] && !removed[*cursor]);
+            // 条件不能独立删除；完整展开帧可一次退休循环及其末端条件。
+            assert_eq!(removed[index], removed[*cursor]);
             *cursor += 1;
         }
         !removed[index]

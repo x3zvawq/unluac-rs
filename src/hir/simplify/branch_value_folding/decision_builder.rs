@@ -269,6 +269,7 @@ impl<'a> BranchValueDecisionBuilder<'a> {
         let value = match root.target {
             HirDecisionTarget::Node(entry) => crate::hir::decision::finalize_value_decision_expr(
                 HirDecisionExpr {
+                    source_result: None,
                     emit_as_luau_if: false,
                     entry,
                     nodes: self.nodes,

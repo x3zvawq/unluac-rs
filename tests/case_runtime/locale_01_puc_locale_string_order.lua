@@ -1,3 +1,7 @@
+-- locale 的三段短路调用属于同一声明初始化，不应留下自赋值。
+-- unluac: expect-ast-count [[assign]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[4]]
+-- unluac: expect-ast-count [[if]] [[2]]
 -- unluac: expect-contains [["ä" < "z"]]
 -- unluac: expect-contains [["ä" <= "z"]]
 

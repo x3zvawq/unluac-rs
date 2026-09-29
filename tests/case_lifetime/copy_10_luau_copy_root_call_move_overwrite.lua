@@ -1,5 +1,8 @@
 -- regress_458_luau_copy_root_call_move_overwrite: unread copy root survives a call until its result MOVE overwrites the old home
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[local-binding]] [[9]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=4]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 
 local weak_values = setmetatable({}, { __mode = "v" })
 

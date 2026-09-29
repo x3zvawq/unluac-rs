@@ -1,4 +1,7 @@
 -- Luau inline capture preparation must retire with the original closure frame.
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[local-binding]] [[4]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-not-contains [[= print]]
 -- unluac: expect-not-contains [[= assert]]
 -- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=0]]

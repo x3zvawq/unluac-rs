@@ -5,6 +5,9 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[ = 4]]
+-- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[if]] [[3]]
+-- unluac: expect-ast-count [[local-binding]] [[6]]
 local function run(a, b, c, d)
     local i = 0
     repeat
@@ -25,6 +28,17 @@ local broken = run(true, true, false, false)
 local returned = run(true, false, true, false)
 local until_four = run(false, false, false, false)
 assert(until_three == 3 and broken == 1 and returned == 1 and until_four == 4)
+assert(run(true, true, true, false) == 1)
+assert(run(true, false, false, true) == 3)
+assert(run(true, false, false, false) == 4)
+assert(run(false, true, true, false) == 4)
+assert(run(false, true, true, true) == 3)
+assert(run(true, false, true, true) == 1)
+assert(run(true, true, false, true) == 1)
+assert(run(0, "", false, false) == 1)
+assert(run("", nil, 0, false) == 1)
+assert(run(nil, true, true, 0) == 3)
+assert(run(true, nil, nil, nil) == 4)
 print("regress_157_repeat_nested_break_return#1", until_three)
 print("regress_157_repeat_nested_break_return#2", broken)
 print("regress_157_repeat_nested_break_return#3", returned)

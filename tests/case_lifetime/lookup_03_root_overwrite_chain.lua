@@ -1,5 +1,7 @@
 -- regress_464_lookup_root_overwrite_chain: 复用 owner 的 lookup 必须保留后继释放端点。
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[local-binding]] [[6]]
+-- unluac: expect-ast-count [[function]] [[3]]
 local weak = setmetatable({}, { __mode = "v" })
 local storage = {}
 local observed = false

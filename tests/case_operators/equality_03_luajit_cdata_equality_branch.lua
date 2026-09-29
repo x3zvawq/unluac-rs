@@ -1,4 +1,7 @@
 -- unluac: expect-contains [[ == nil]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[if]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[8]]
 -- 短路函数的两个参数比较均须保留；Boolean 物化许可不能合并或复制这些 __eq。
 -- unluac: expect-count [[p1_0 == nil]] [[2]]
 
@@ -44,3 +47,20 @@ assert(result == false and hits == 1)
 equality_hits = 0
 result, hits = observe_twice(value_type(1), true)
 assert(result == false and hits == 0)
+
+-- 同值分支的 false 路径仍必须先求比较；数值 0 和空串作为 skip 均为真。
+equality_hits = 0
+assert(observe_equality(value_type(0)) == 1)
+assert(select("#", observe_equality(value_type(1))) == 1)
+assert(equality_hits == 2)
+equality_hits = 0
+result, hits = observe_twice(value_type(1), 0)
+assert(result == false and hits == 0)
+result, hits = observe_twice(value_type(1), "")
+assert(result == false and hits == 0)
+result, hits = observe_twice(nil, false)
+assert(result == true and hits == 0)
+result, hits = observe_twice(false, false)
+assert(result == false and hits == 0)
+assert(select("#", observe_twice(value_type(1), false)) == 2)
+assert(equality_hits == 2)

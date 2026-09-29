@@ -2,6 +2,8 @@
 -- unluac: expect-count [[= setmetatable({}, {]] [[2]]
 -- unluac: expect-not-contains [[and 1 == 1]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-max [[local-binding]] [[20]]
+-- unluac: expect-ast-count [[function]] [[6]]
 do
     local t = {f = function() return "old" end}
     local result = t.f()
@@ -50,7 +52,7 @@ local count = 0
 local value = setmetatable({}, {
     __unm = function()
         count = count + 1
-        return true
+        return count ~= 3
     end,
 })
 local gets = 0
@@ -68,4 +70,6 @@ if outer then
     end
 end
 assert(count == 2 and gets == 1)
+result = -get() and "yes" or "no"
+assert(count == 3 and gets == 2 and result == "no")
 print("scope_11_scalar_call_prefix", count, result)

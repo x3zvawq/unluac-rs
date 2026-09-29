@@ -1,4 +1,6 @@
 -- lookup 的原覆盖端点独立于 callback 是否能被识别为 collectgarbage。
+-- unluac: expect-ast-max [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[function]] [[2]]
 local weak = setmetatable({}, {__mode = "k"})
 local function run(gc)
     local tree = {}
@@ -12,6 +14,7 @@ local function run(gc)
     key = "collect"
     child(key)
     child("collect")
+    assert(next(weak) == nil)
     print("callback-key", next(weak) ~= nil)
 end
 run(collectgarbage)

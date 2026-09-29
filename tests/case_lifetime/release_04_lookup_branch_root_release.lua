@@ -1,4 +1,6 @@
 -- regress_386_lookup_branch_root_release: a branch overwrite releases the lookup root before a later GC fence
+-- unluac: expect-ast-max [[local-binding]] [[12]]
+-- unluac: expect-ast-count [[function]] [[4]]
 
 local weak = setmetatable({}, { __mode = "v" })
 local owner = {}
@@ -18,6 +20,7 @@ local function run(condition)
     end
     collectgarbage("collect")
     collectgarbage("collect")
+    assert(root == (not not condition))
     return weak.key == nil
 end
 
@@ -44,6 +47,7 @@ local function release_before_terminal(condition)
         released = weak.key == nil
         root = false
     end
+    assert(root == (not not condition))
     return released
 end
 
@@ -76,6 +80,7 @@ local function replace_with_successor(condition)
     end
     collectgarbage("collect")
     assert(next(successor_weak) ~= nil)
+    assert(weak.key == nil and successor_weak[root] == true)
     return root
 end
 
@@ -91,3 +96,5 @@ owner = {}
 weak.key = owner
 owner = nil
 assert(replace_with_successor(false) ~= nil)
+collectgarbage("collect")
+assert(next(successor_weak) == nil)

@@ -214,7 +214,8 @@ fn reduce_decision_expr(
     match root {
         ResolvedDecisionTarget::Expr(expr) => Some(ReducedDecision::Expr(expr)),
         ResolvedDecisionTarget::Node(entry) => {
-            let (rebuilt, topology_changed) = rebuild_decision(entry, &nodes);
+            let (mut rebuilt, topology_changed) = rebuild_decision(entry, &nodes);
+            rebuilt.source_result = decision.source_result;
             changed |= topology_changed;
             if let Some(expr) =
                 collapse_value_decision_expr(&analyze_decision(&rebuilt), safety, |_| false)
@@ -310,6 +311,7 @@ fn rebuild_decision(
 
     (
         HirDecisionExpr {
+            source_result: None,
             emit_as_luau_if: false,
             entry: HirDecisionNodeRef(0),
             nodes: rebuilt_nodes,
@@ -416,6 +418,9 @@ fn collapse_value_decision_shape(
         return Some(expr);
     }
     if topology.has_shared_nodes() {
+        if let Some(expr) = short_circuit::collapse_shared_value_continuation(topology, safety) {
+            return Some(expr);
+        }
         synthesize::synthesize_value_decision_expr(decision, safety).or_else(|| {
             let mut memo = BTreeMap::new();
             collapse_value_node(decision, decision.entry, &mut memo, safety)
@@ -479,6 +484,14 @@ fn collapse_linear_value_chain_with(
                 break expr;
             }
             (HirDecisionTarget::CurrentValue, HirDecisionTarget::CurrentValue) => {
+                break node.test;
+            }
+            (
+                HirDecisionTarget::Expr(HirExpr::Boolean(true)),
+                HirDecisionTarget::Expr(HirExpr::Boolean(false)),
+            ) if expr_is_boolean_valued(&node.test) => {
+                // 值链末端的比较已返回 Boolean；直接消费单次测试，不要求可重复，
+                // 也不为元方法比较建立额外 CurrentValue 或表达式副本。
                 break node.test;
             }
             _ => return None,

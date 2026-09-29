@@ -4,6 +4,9 @@
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=17]]
 -- unluac: expect-ast-min [[local-decl]] [[2]] [[@proto=18]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=19]]
+-- unluac: expect-ast-count [[function]] [[20]]
+-- unluac: expect-ast-max [[local-binding]] [[42]]
+-- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=20]]
 local function make_outer()
     return function(value)
         return value
@@ -24,19 +27,23 @@ end
 
 local prefix, value = safe(42)
 assert(prefix == "stable" and value == 42)
+assert(select("#", safe(nil)) == 2)
 
 local weak = setmetatable({}, {__mode = "v"})
+local outer_calls, inner_calls = 0, 0
 local function make_observer()
     return function(result)
         collectgarbage("collect")
         collectgarbage("collect")
         assert(type(weak.inner) == "function")
+        outer_calls = outer_calls + 1
         return result
     end
 end
 local function make_observed_inner()
     local marker = {value = 1}
     local inner = function(result)
+        inner_calls = inner_calls + 1
         return result + marker.value - 1
     end
     weak.inner = inner
@@ -57,6 +64,7 @@ local held_prefix, held_value = held(42)
 assert(held_prefix == "held" and held_value == 42)
 statement(42)
 collectgarbage("restart")
+assert(outer_calls == 2 and inner_calls == 2)
 
 -- 返回后的 caller 逐步覆写低槽，再在 __index 内观察 GC。原高返回准备区仍可能
 -- 保留弱表中的对象，不能仅凭 callee 无 cleanup、末尾只有 COPY 就改为低槽直返。

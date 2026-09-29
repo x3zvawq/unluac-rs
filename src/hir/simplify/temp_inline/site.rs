@@ -1064,6 +1064,9 @@ fn is_safe_conditional_nested_inline_expr(expr: &HirExpr, safety: HirExprSafety)
 
 fn is_small_pure_nested_inline_expr(expr: &HirExpr) -> bool {
     match expr {
+        // Nested 消费的是 scalar producer；纯壳层只读取首个 vararg，
+        // fixed value-pack 的宽度仍由代换及 AST lowering 保留。
+        HirExpr::VarArg => true,
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
@@ -1088,7 +1091,6 @@ fn is_small_pure_nested_inline_expr(expr: &HirExpr) -> bool {
                 && is_small_pure_nested_inline_expr(&logical.rhs)
         }
         HirExpr::CaptureInitializer(_)
-        | HirExpr::VarArg
         | HirExpr::TableAccess(_)
         | HirExpr::Decision(_)
         | HirExpr::Call(_)

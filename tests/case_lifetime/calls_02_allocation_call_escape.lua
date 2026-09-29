@@ -1,5 +1,7 @@
 -- An opaque call may retain only a weak reference to its argument. The original allocation home
 -- must stay live across later observation until the exact nil overwrite ends that transaction.
+-- unluac: expect-ast-count [[local-binding]] [[4]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
 
 local weak = setmetatable({}, { __mode = "v" })
 

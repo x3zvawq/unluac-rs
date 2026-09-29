@@ -1,6 +1,8 @@
 -- regress_07_close_scope_slot_reuse#1: close 后复用寄存器不能写回已关闭 upvalue
 -- unluac: expect-ast-min [[function]] [[2]]
 -- unluac: expect-not-contains [[(function()]]
+-- unluac: expect-ast-count [[local-binding]] [[6]]
+-- unluac: expect-ast-count [[do-block]] [[2]]
 local u
 do
     local count = 0
@@ -17,12 +19,15 @@ print("regress_07_close_scope_slot_reuse#1", first, second)
 
 -- regress_07_close_scope_slot_reuse#2: 当前赋值 RHS 捕获同槽位时应写回原 local
 local outer = 1
+assert(u() == 3)
 do
     local inner = 2
     inner = function()
         return inner
     end
+    u = inner
 end
 
+assert(u() == u)
 print("regress_07_close_scope_slot_reuse#2", outer)
 assert(outer == 1)

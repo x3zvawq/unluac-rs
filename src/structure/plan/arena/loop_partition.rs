@@ -425,6 +425,7 @@ pub(super) fn build_loop_partition(
         control.remove(&preheader);
     }
     let exit_pads = verified_loop_exit_pads(
+        proto,
         cfg,
         candidate,
         loop_.continuation,
@@ -493,7 +494,14 @@ pub(super) fn build_loop_partition(
         && candidate
             .continue_target
             .is_some_and(|target| block_has_non_control_prefix(proto, cfg, target));
-    if let Some(target) = candidate.continue_target
+    // repeat 的 continue 进入整个 until DAG，而非初始形状识别的最终 latch。
+    // 跳入前置短路项同样跳过正文后缀，不能作为普通 branch continuation 吞掉。
+    let continue_target = if candidate.kind_hint == LoopKindHint::RepeatLike {
+        Some(condition_entry)
+    } else {
+        candidate.continue_target
+    };
+    if let Some(target) = continue_target
         && !continue_target_carries_body_tail
     {
         let reaches_target = body_blocks_reaching_target(cfg, &body, target);
@@ -510,9 +518,7 @@ pub(super) fn build_loop_partition(
                 let relaxed_own_continuation = caps.continue_stmt
                     && own_branch_continuation
                     && !(candidate.kind_hint == LoopKindHint::RepeatLike
-                        && candidate.continue_target.is_some_and(|target| {
-                            branch_conditions_share_subject(proto, cfg, *block, target)
-                        }));
+                        && branch_conditions_share_subject(proto, cfg, *block, target));
                 if !matches!(
                     cfg.edges[edge.index()].kind,
                     EdgeKind::Fallthrough | EdgeKind::LoopBody | EdgeKind::LoopExit
@@ -628,6 +634,7 @@ pub(super) fn build_loop_partition(
         body,
         owned,
         continuation,
+        continue_target,
         continues,
         break_routes,
         normal_tail,

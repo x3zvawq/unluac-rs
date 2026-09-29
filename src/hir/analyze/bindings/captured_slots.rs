@@ -3,7 +3,7 @@
 //! 消费 CFG、slot epoch、debug scope 与共享区域/图查询，供 HIR 绑定分配使用。
 
 use super::*;
-use crate::structure::SccId;
+use crate::structure::{DebugBindingFact, SccId};
 
 /// 每个物理 epoch 按原 low 起点索引互不重叠的已关闭 cell 激活。
 type CapturedActivationWindows = BTreeMap<CapturedSlotKey, BTreeMap<usize, usize>>;
@@ -15,6 +15,8 @@ pub(super) struct CapturedSlotTargets {
     /// 只读引用捕获也保留独立激活；不因此提前分配可变 cell。
     pub(super) closed_capture_defs: BTreeSet<DefId>,
     activation_windows: CapturedActivationWindows,
+    /// 至少一次引用捕获缺少完整激活窗口；不能用其它已关闭窗口推断该 home 的空隙。
+    unproven_reference_windows: BTreeSet<HomeSlotKey>,
     pub(super) entry_local_decls: Vec<LocalId>,
     /// Entry nil cell 属于从指令 0 开始的 CLOSE 窗口，声明须留在该窗口内。
     pub(super) closed_entry_local_decls: Vec<LocalId>,
@@ -42,6 +44,26 @@ impl CapturedSlotTargets {
 
     pub(super) fn home_is_uncaptured(&self, home: HomeSlotKey) -> bool {
         !self.captured_homes.contains(&home)
+    }
+
+    /// 候选窗口可以包含完整的已关闭 cell 激活；同槽其它 epoch 的捕获不延长它。
+    pub(super) fn reference_capture_fits_window(
+        &self,
+        reg: Reg,
+        epoch: usize,
+        instr: usize,
+        window: &std::ops::Range<usize>,
+    ) -> bool {
+        let home = HomeSlotKey::new(reg.index(), epoch);
+        if self.unproven_reference_windows.contains(&home) {
+            return false;
+        }
+        let key = CapturedSlotKey::new(reg.index(), epoch);
+        self.activation_windows
+            .get(&key)
+            .and_then(|activations| activations.range(..=instr).next_back())
+            .filter(|(_, end)| instr < **end)
+            .is_none_or(|(&start, &end)| window.start <= start && end <= window.end)
     }
 
     /// ByValue 只冻结被读取的 SSA 版本；同槽的旧快照不阻止新循环状态写回。
@@ -412,6 +434,24 @@ pub(super) fn collect_captured_slot_targets(
         }
     }
     let (lexical_scopes, activation_windows) = collect_lexical_close_scopes(inputs, &captured_uses);
+    // captured_uses 不包含参数等由其他 owner 管理的 cell；完整性必须核对所有原捕获。
+    // 每个捕获只查询一次已有窗口，未闭合或未归属者使整个 home 保持未知。
+    let mut unproven_reference_windows = BTreeSet::new();
+    for (index, instr) in proto.instrs.iter().enumerate() {
+        let LowInstr::Closure(closure) = instr else {
+            continue;
+        };
+        for capture in &closure.captures {
+            let CaptureSource::ByReference(reg) = capture.source else {
+                continue;
+            };
+            let epoch = epochs.epoch_at(reg, InstrRef(index));
+            let key = CapturedSlotKey::new(reg.index(), epoch);
+            if activation_at(&activation_windows, key, index).is_none() {
+                unproven_reference_windows.insert(HomeSlotKey::new(reg.index(), epoch));
+            }
+        }
+    }
     let closed_capture_defs = captured_uses
         .iter()
         .filter_map(|capture| {
@@ -629,6 +669,7 @@ pub(super) fn collect_captured_slot_targets(
         lexical_scopes,
         closed_capture_defs,
         activation_windows,
+        unproven_reference_windows,
         entry_local_decls,
         closed_entry_local_decls: closed_entry_local_decls.into_values().collect(),
         region_local_decls,
@@ -690,7 +731,7 @@ fn dominating_cell_initializers(
         let Some(carried) = phi.loop_carried() else {
             continue;
         };
-        let SsaValue::Def(input) = carried.input else {
+        let Some(SsaValue::Def(input)) = carried.input else {
             continue;
         };
         let header = cfg.blocks[phi.block.index()].instrs.start;
@@ -1070,7 +1111,127 @@ fn collect_lexical_close_scopes(
             });
         }
     }
+    // cell 激活仍从自己的初始化开始；源码词法窗口可包含同一关闭协议的
+    // 低槽 debug 声明。这里统一发布，closed-output 等消费者不再看到两套窗口。
+    extend_closed_debug_initializers(inputs, &mut candidates);
     (candidates, activations)
+}
+
+fn extend_closed_debug_initializers(inputs: CapturedSlotInputs<'_>, scopes: &mut [LexicalScope]) {
+    if scopes.is_empty() {
+        return;
+    }
+    let CapturedSlotInputs {
+        proto,
+        cfg,
+        dataflow,
+        structure,
+        emission,
+        ..
+    } = inputs;
+    let ends = scopes
+        .iter()
+        .enumerate()
+        .map(|(index, scope)| (scope.end, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut cohorts = BTreeMap::<_, Vec<&DebugBindingFact>>::new();
+    for fact in structure.debug_bindings().accepted() {
+        if let Some(end) = fact.end_instr
+            && proto.debug_locals[fact.scope].is_source()
+        {
+            cohorts.entry(end.index()).or_default().push(fact);
+        }
+    }
+    for (end, facts) in cohorts {
+        let mut matching = [end.checked_add(1), Some(end), end.checked_sub(1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|end| ends.get(&end).copied())
+            .filter(|&index| debug_end_shares_close(proto, &scopes[index], end));
+        if let Some(index) = matching.next()
+            && matching.next().is_none()
+            && let Some(start) = closed_debug_initializer_start(
+                proto,
+                cfg,
+                dataflow,
+                emission,
+                &scopes[index],
+                &facts,
+            )
+        {
+            scopes[index].start = start;
+        }
+    }
+}
+
+/// debug 结束点可以在 CLOSE 两侧；PUC 的 CLOSE+JMP 只有同一 raw 来源才是一条协议。
+fn debug_end_shares_close(proto: &LoweredProto, scope: &LexicalScope, end: usize) -> bool {
+    let close = scope.end - 1;
+    if scope.initial_nil_floor.is_some()
+        || !matches!(&proto.instrs[close], LowInstr::Close(close)
+            if close.kind == crate::transformer::CloseKind::Explicit)
+    {
+        return false;
+    }
+    end == close
+        || end == scope.end
+        || (end == scope.end + 1
+            && matches!(proto.instrs.get(scope.end), Some(LowInstr::Jump(jump))
+                if jump.target == InstrRef(end))
+            && proto.lowering_map.low_to_raw[close] == proto.lowering_map.low_to_raw[scope.end])
+}
+
+/// 只把同一可信 debug 结束点的原声明写纳入捕获窗口；不吞并额外计算或外层 binding。
+fn closed_debug_initializer_start(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    emission: &HirEmissionFacts<'_>,
+    scope: &LexicalScope,
+    facts: &[&DebugBindingFact],
+) -> Option<usize> {
+    let mut initializers = BTreeSet::new();
+    let mut start = scope.start;
+    for fact in facts {
+        if let Some(SsaValue::Def(def)) = fact.value.ssa() {
+            if dataflow.def_reg(def) != fact.reg {
+                return None;
+            }
+            start = start.min(dataflow.def_instr(def).index());
+            initializers.insert(def);
+        }
+    }
+    if start == scope.start
+        || cfg.instr_to_block[start] != cfg.instr_to_block[scope.start]
+        || emission
+            .regular_prefix(cfg.instr_to_block[start])
+            .is_none_or(|range| !range.contains(&start))
+    {
+        return None;
+    }
+    for index in start..scope.start {
+        let effect = &dataflow.instr_effects[index];
+        let defs = &dataflow.instr_defs[index];
+        // ProofIncomplete：复杂 initializer 的中间值没有独立源码绑定，不能只靠
+        // 最终 debug 名称延长窗口；其完整求值域应由原 evaluation owner 提供。
+        if defs.is_empty()
+            || effect.open_use.is_some()
+            || effect.open_must_def.is_some()
+            || defs.iter().any(|def| {
+                !initializers.contains(def)
+                    || dataflow.def_uses[def.index()]
+                        .iter()
+                        .any(|site| !(start..scope.end).contains(&site.instr.index()))
+                    || dataflow.def_phi_uses[def.index()]
+                        .iter()
+                        .any(|phi| !dataflow.phi_is_truly_dead(*phi))
+            })
+            || matches!(proto.instrs[index], LowInstr::Close(_) | LowInstr::Tbc(_))
+        {
+            return None;
+        }
+    }
+    Some(start)
 }
 
 fn scope_window_local_def_escapes(

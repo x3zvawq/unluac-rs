@@ -30,3 +30,25 @@ pub(super) fn exact_state_writeback(stmt: &HirStmt, result: CarryBinding) -> Opt
     }
     carry_binding_from_lvalue(target)
 }
+
+/// 纯 binding 并行写回按结果建一次索引；调用方只退休证明为精确快照的对应项。
+pub(super) fn parallel_state_writebacks(
+    stmt: &HirStmt,
+) -> Option<BTreeMap<CarryBinding, CarryBinding>> {
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
+        return None;
+    }
+    let mut targets = BTreeSet::new();
+    let mut writebacks = BTreeMap::new();
+    for (target, value) in assign.targets.iter().zip(&assign.values.fixed) {
+        let target = carry_binding_from_lvalue(target)?;
+        let source = carry_binding_from_expr(value)?;
+        if !targets.insert(target) || writebacks.insert(source, target).is_some() {
+            return None;
+        }
+    }
+    Some(writebacks)
+}

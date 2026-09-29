@@ -4,6 +4,7 @@
 -- unluac: expect-not-contains [[= tostring(]]
 -- unluac: expect-ast-count [[close-binding]] [[2]]
 -- unluac: expect-count [[<close> = setmetatable(]] [[2]]
+-- unluac: expect-ast-count [[local-binding]] [[14]]
 local function make_resource(log)
     local resource <close> = setmetatable({name = "buffer"}, {
         __close = function(value, message)

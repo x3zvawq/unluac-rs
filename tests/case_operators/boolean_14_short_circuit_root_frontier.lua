@@ -2,6 +2,9 @@
 -- 查找本条可能先触发 __index；独立 source local 也不能借调用临时槽的覆盖证明。
 -- unluac: expect-not-contains [[if p1_0 then]]
 -- unluac: expect-not-contains [[if a then]]
+-- unluac: expect-ast-count [[function]] [[10]]
+-- unluac: expect-ast-count [[if]] [[0]]
+-- unluac: expect-ast-max [[local-binding]] [[14]]
 local function direct(a, probe, fallback)
     return a and not probe() or fallback()
 end
@@ -49,3 +52,21 @@ local function falsy() return false end
 local function absent() return nil end
 print("falsy", direct(true, falsy, fallback))
 print("absent", direct(true, absent, fallback))
+assert(table.concat(trace, ",") == "probe,fallback,probe,lookup,probe,fallback,fallback")
+trace = {}
+assert(direct(true, falsy, fallback) == true)
+assert(lookup(0, absent, methods) == true)
+assert(#trace == 0)
+assert(type(direct(false, probe, fallback)) == "boolean")
+assert(table.concat(trace, ",") == "fallback")
+trace = {}
+assert(type(lookup(nil, probe, methods)) == "boolean")
+assert(table.concat(trace, ",") == "lookup")
+trace = {}
+-- saved 的调用无论 enabled 是否为真都必须执行；存活结果仍由每个 VM 的基线观察。
+assert(type(retained(false, probe, fallback)) == "boolean")
+assert(table.concat(trace, ",") == "probe,fallback")
+trace = {}
+assert(select("#", direct(nil, probe, fallback)) == 1)
+assert(select("#", retained("", falsy, fallback)) == 1)
+assert(table.concat(trace, ",") == "fallback")

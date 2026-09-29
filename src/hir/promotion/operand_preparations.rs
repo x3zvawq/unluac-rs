@@ -3,7 +3,7 @@
 //! 消费 Dataflow 的 use/Def、home 与 epoch，为完整帧 owner 发布来源证书；
 //! 证书本身不授权删除 producer 或提前退休物理根。
 
-use crate::hir::common::{HirExpr, TempId, UpvalueId};
+use crate::hir::common::{HirExpr, ParamId, TempId, UpvalueId};
 use crate::parser::RawLiteralConst;
 use crate::structure::{Cfg, DataflowFacts, SsaValue};
 use crate::transformer::{InstrRef, LowInstr, LoweredProto, Reg, UpvalueOperand};
@@ -17,10 +17,14 @@ enum PreparedValue {
     Unary(InstrRef, crate::hir::common::HirUnaryOpKind),
     Binary(InstrRef),
     Upvalue(UpvalueId),
+    ScalarVararg,
+    ParameterCopy(ParamId),
     Nil,
     NilBatch,
     Boolean(bool),
     Integer(i64),
+    Int64(i64),
+    UInt64(u64),
     Number(f64),
     String(crate::LuaString),
 }
@@ -33,7 +37,7 @@ pub(super) struct OperandPreparation {
     value: PreparedValue,
 }
 
-/// 动态索引的 key 准备及可选的 base 准备均绑定到同一 GETTABLE；低槽 base 无须准备。
+/// 动态索引的 key 准备及可选的 base 准备均绑定到同一表操作；低槽 base 无须准备。
 #[derive(Debug, Clone)]
 pub(super) struct TablePreparation {
     pub(super) base: Option<OperandPreparation>,
@@ -69,9 +73,15 @@ impl OperandPreparation {
                 .source_site
                 .is_some_and(|source| source.instr == *read),
             (PreparedValue::Upvalue(original), HirExpr::UpvalueRef(current)) => original == current,
+            (PreparedValue::ScalarVararg, HirExpr::VarArg) => true,
+            (PreparedValue::ParameterCopy(original), HirExpr::ParamRef(current)) => {
+                original == current
+            }
             (PreparedValue::Nil, HirExpr::Nil) => true,
             (PreparedValue::Boolean(original), HirExpr::Boolean(current)) => original == current,
             (PreparedValue::Integer(original), HirExpr::Integer(current)) => original == current,
+            (PreparedValue::Int64(original), HirExpr::Int64(current)) => original == current,
+            (PreparedValue::UInt64(original), HirExpr::UInt64(current)) => original == current,
             (PreparedValue::Number(original), HirExpr::Number(current)) => {
                 original.to_bits() == current.to_bits()
             }
@@ -125,8 +135,17 @@ pub(super) fn collect(
         {
             PreparedValue::Call(read)
         }
+        LowInstr::VarArg(vararg)
+            if vararg.results
+                == crate::transformer::ResultPack::Fixed(crate::transformer::RegRange {
+                    start: reg,
+                    len: 1,
+                }) =>
+        {
+            PreparedValue::ScalarVararg
+        }
         LowInstr::GetTable(_) => PreparedValue::TableRead(read),
-        LowInstr::BinaryOp(_) => PreparedValue::Binary(read),
+        LowInstr::BinaryOp(_) | LowInstr::Concat(_) => PreparedValue::Binary(read),
         LowInstr::UnaryOp(unary) => {
             use crate::hir::common::HirUnaryOpKind;
             use crate::transformer::UnaryOpKind;
@@ -142,6 +161,14 @@ pub(super) fn collect(
             let (UpvalueOperand::Env(upvalue) | UpvalueOperand::Upvalue(upvalue)) = get.src;
             PreparedValue::Upvalue(UpvalueId(upvalue.index()))
         }
+        LowInstr::Move(copy)
+            if copy.src.index() < usize::from(proto.signature.num_params)
+                && dataflow.use_value(read, copy.src) == SsaValue::Entry(copy.src) =>
+        {
+            // 原输入仍为参数入口值；记录 COPY 的结果身份，后层在同一准备槽重发。
+            // 普通 Local COPY 的源版本不能由槽号代替，继续由其自身的转交事实证明。
+            PreparedValue::ParameterCopy(ParamId(copy.src.index()))
+        }
         LowInstr::LoadBool(load) => PreparedValue::Boolean(load.value),
         // 单槽 LOADNIL 可以作为比较准备重发；批量清槽还携带其它写域，不能借此拆开。
         LowInstr::LoadNil(load) if load.dst.start == reg && load.dst.len == 1 => PreparedValue::Nil,
@@ -152,6 +179,8 @@ pub(super) fn collect(
         LowInstr::LoadNumber(load) => PreparedValue::Number(load.value),
         LowInstr::LoadConst(load) => match &proto.constants[load.value.index()] {
             RawLiteralConst::Integer(value) => PreparedValue::Integer(*value),
+            RawLiteralConst::Int64(value) => PreparedValue::Int64(*value),
+            RawLiteralConst::UInt64(value) => PreparedValue::UInt64(*value),
             RawLiteralConst::Number(value) => PreparedValue::Number(*value),
             RawLiteralConst::String(value) => {
                 PreparedValue::String(crate::LuaString::from_raw(value))

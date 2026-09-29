@@ -48,3 +48,22 @@ value, count = without_break(true, 200)
 assert(value == 101 and count == 97)
 value, count = with_break(true, 200)
 assert(value == 101 and count == 97)
+
+-- repeat 至少执行一轮；0 在 Lua 中为真，nil 为假。
+value, count = with_break(false, 0)
+assert(value == 5 and count == 1)
+value, count = without_break(false, -1)
+assert(value == 5 and count == 1)
+value, count = without_break(0, 200)
+assert(value == 101 and count == 97)
+value, count = with_break(nil, 100)
+assert(value == 104 and count == 100)
+-- unluac: expect-ast-count [[repeat]] [[2]]
+-- 尾部 break 可并入 until 的首个短路叶；两个原数值检查都必须保留。
+-- unluac: expect-ast-count [[break]] [[0]]
+-- unluac: expect-ast-count [[while]] [[0]]
+-- unluac: expect-ast-count [[if]] [[0]]
+-- 两个函数的 value/count 都应是原 loop-carried 绑定，不另造状态 local。
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=0]]

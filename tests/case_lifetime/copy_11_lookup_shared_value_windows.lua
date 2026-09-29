@@ -1,5 +1,7 @@
 -- Copies share a value, but each physical home has an independent release endpoint.
 -- unluac: expect-ast-min [[local-decl]] [[32]]
+-- unluac: expect-ast-max [[local-binding]] [[34]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 local weak = setmetatable({}, { __mode = "v" })
 local object = {}
 weak[1] = object

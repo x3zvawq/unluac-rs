@@ -1,6 +1,8 @@
 -- 短路返回中上值键与上值比较各自保留读取位置，条件右臂不能提前执行索引。
 -- unluac: expect-contains [[== true and (]]
 -- unluac: expect-ast-count [[if]] [[0]]
+-- unluac: expect-ast-count [[function]] [[6]]
+-- unluac: expect-ast-max [[local-binding]] [[8]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
@@ -49,3 +51,26 @@ trace = {}
 assert(named_check(names))
 assert(table.concat(trace, ",") == "present,missing")
 print("named-upvalue-key-return", table.concat(trace, ","))
+
+-- 检查严格 Boolean 比较，不能把 == true / ~= true 改成一般真值测试。
+names.present = 0
+observe("present", "missing", false, "")
+trace = {}
+assert(named_check(names) == false and #trace == 0)
+names.present = ""
+observe("present", "missing", false, "")
+names.present = true
+observe("present", "missing", true, "missing")
+names.missing = 0
+observe("present", "missing", true, "")
+names.missing = ""
+observe("present", "missing", true, "")
+names.missing = true
+observe("present", "missing", false, "")
+trace = {}
+assert(named_check(names) == false and #trace == 0)
+names.present, names.missing = nil, nil
+trace = {}
+assert(select("#", named_check(names)) == 1)
+assert(table.concat(trace, ",") == "present,missing")
+assert(select("#", observe("present", nil, true, "present")) == 0)

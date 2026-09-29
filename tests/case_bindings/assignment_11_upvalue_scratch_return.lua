@@ -3,6 +3,9 @@
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=3]]
 -- 调用结果、已有低槽比较与任意值短路末项共同组成原 assert 参数帧。
 -- unluac: expect-count [[assert(]] [[5]]
+-- unluac: expect-ast-count [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[assign]] [[2]] [[@proto=0]]
+-- unluac: expect-ast-count [[if]] [[0]]
 local state = {}
 local function read()
     return state
@@ -24,6 +27,7 @@ local first = state
 selected = replace_record()
 assert(selected == read and state ~= first)
 assert(selected() == state and state.value == 42 and state.ready)
+local second = state
 selected = replace_empty()
-assert(selected() == state and state ~= first and state.value == nil)
+assert(selected() == state and state ~= first and state ~= second and state ~= previous and state.value == nil)
 print("upvalue scratch return", previous ~= first, state ~= first)

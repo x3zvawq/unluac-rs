@@ -2,6 +2,9 @@
 -- 每个场景保留独立弱表及闭包，避免共享 helper 改变被测 frame。
 -- unluac: expect-ast-count [[function]] [[11]]
 -- unluac: expect-ast-count [[function]] [[10]] [[@proto=0]]
+-- unluac: expect-ast-max [[local-binding]] [[23]]
+-- 原字节码中的 padding 初始化不能因为后续未读取而消失。
+-- unluac: expect-count [[= 1]] [[1]]
 
 do
     -- regress_416_copy_local_callback_root: an unread copy local remains a strong root through callback execution

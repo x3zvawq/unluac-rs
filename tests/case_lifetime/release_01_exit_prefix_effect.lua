@@ -4,6 +4,8 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[r1_0 = nil]]
+-- unluac: expect-ast-max [[local-binding]] [[16]]
+-- unluac: expect-ast-count [[function]] [[5]]
 local function choose(outer, a, b, probe)
     local x
     if outer then
@@ -29,6 +31,11 @@ local probe = setmetatable({}, {
 local value = choose(true, true, false, probe)
 assert(value == nil)
 assert(reads == 1)
+assert(choose(true, true, true, probe) == 1)
+assert(reads == 2)
+assert(choose(true, false, true, probe) == nil)
+assert(choose(false, true, true, probe) == 2)
+assert(reads == 2)
 
 -- 同一个 entry-nil result 在路径内已经写成非 nil 后，最终清空不是冗余边 copy。
 local observed
@@ -61,6 +68,7 @@ local function clear_for_gc(flag)
         result = {}
         weak[1] = result
         collectgarbage("collect")
+        assert(weak[1] ~= nil)
         result = nil
         collectgarbage("collect")
         cleared = weak[1] == nil
@@ -70,3 +78,6 @@ end
 clear_for_gc(true)
 assert(cleared)
 print("regress_266_branch_exit_prefix_effect", value, reads, observed == token, ticks, cleared)
+cleared = false
+clear_for_gc(false)
+assert(cleared == false)

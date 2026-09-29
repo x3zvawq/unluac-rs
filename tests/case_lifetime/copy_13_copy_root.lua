@@ -1,5 +1,16 @@
 -- 跨回边的独立副本越过下轮全局查找，在原参数槽覆盖后退休。
 -- unluac: expect-ast-min [[while]] [[1]]
+-- 原 COPY 槽跨回边保活；完整 header 帧应共同消费合成 carrier 与查找暂存。
+-- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=0]]
+-- unluac: expect-ast-max [[local-binding]] [[11]]
+-- unluac: expect-contains [[regress_537_missing_gc("collect")]]
+-- unluac: expect-ast-count [[while]] [[1]]
+-- unluac: expect-ast-count [[do-block]] [[0]]
+-- unluac: expect-ast-count [[break]] [[1]]
+-- unluac: expect-contains [[local owner = make()]] [[@debug=retained]]
+-- unluac: expect-contains [[local copy = owner]] [[@debug=retained]]
+-- unluac: expect-not-contains [[copy = nil]] [[@debug=retained]]
+-- unluac: expect-not-contains [[owner = nil]] [[@debug=retained]]
 local gc = collectgarbage
 local weak = setmetatable({}, { __mode = "v" })
 local iteration = 0

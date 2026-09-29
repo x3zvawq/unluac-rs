@@ -1,3 +1,22 @@
+-- unluac: expect-count [[ = ...]] [[2]]
+-- unluac: expect-ast-count [[function]] [[14]]
+-- unluac: expect-ast-count [[generic-for]] [[4]]
+-- 固定取值保持两次整包操作，重赋值复用同一组三个绑定。
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@dialect=lua5.1]] [[@proto=13]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@dialect=lua5.2]] [[@proto=13]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@dialect=lua5.3]] [[@proto=13]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@dialect=lua5.4]] [[@proto=13]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@dialect=lua5.5]] [[@proto=13]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@dialect=luajit]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@dialect=luau]] [[@proto=13]]
+-- 四个循环直接消费初始化表达式；固定包保留括号截断，不泄漏控制槽准备变量。
+-- unluac: expect-count [[ in next, ]] [[2]] [[@dialect=luau]]
+-- unluac: expect-count [["fixed")) do]] [[2]] [[@dialect=luau]]
+-- unluac: expect-count [[(), nil]] [[1]] [[@dialect=luau]]
+-- 循环结果槽的旧根由下一次原参数写结束，不能生成额外 nil 声明而拆散调用。
+-- unluac: expect-contains [[print("regress_174_explicit_value_pack#5", table.concat(]] [[@dialect=luau]]
+-- unluac: expect-ast-max [[local-binding]] [[32]] [[@proto=0]]
+-- unluac: expect-ast-count [[error]] [[0]]
 -- regress_174_explicit_value_pack#1: open tail 与括号截断在所有 value-list 上保持不同语义
 -- unluac: expect-contains [[return "head", (]]
 -- 两个根作用域表各保留 head 与尾值，后面的循环快照不应抬高它们的声明前缀。
@@ -62,9 +81,15 @@ assert(calls == 1)
 -- regress_174_explicit_value_pack#4: generic-for iterator 列表同样保留 open/fixed 边界
 local function iterator_factory(label)
     local emitted = false
-    return function()
+    return function(state, control)
         if emitted then
             return nil
+        end
+        -- 首次 dispatch 直接观察截断后的控制包，不能仅凭相同的循环输出判定等价。
+        if label == "fixed" then
+            assert(state == nil and control == nil)
+        else
+            assert(state == "state" and control == "control")
         end
         emitted = true
         return label
@@ -117,6 +142,9 @@ local function exact_vararg(...)
 end
 
 print("regress_174_explicit_value_pack#7", exact_vararg("x", "y", "z", "ignored"))
+assert(exact_vararg("x", "y", "z", "ignored") == "3:x,y,z")
+assert(exact_vararg() == "0:")
+assert(exact_vararg("x", "y", nil, "ignored") == "2:x,y")
 
 -- regress_174_explicit_value_pack#8: method receiver 不改变最终参数的 open/fixed 边界
 local receiver = {}

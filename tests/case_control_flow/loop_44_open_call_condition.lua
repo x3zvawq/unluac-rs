@@ -3,6 +3,10 @@
 -- unluac: expect-ast-count [[repeat]] [[0]]
 -- unluac: expect-not-contains [[ = accept]]
 -- unluac: expect-not-contains [[while true do]]
+-- unluac: expect-ast-count [[local-binding]] [[7]]
+-- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-count [[break]] [[1]]
 local events = {}
 local remaining = 0
 local function head()
@@ -40,4 +44,12 @@ events = {}
 remaining = 0
 assert(run(2) == 0 and remaining == -1)
 assert(table.concat(events, ",") == "head,pair,accept")
+events = {}
+remaining = 3
+assert(run(1) == 1 and remaining == 2)
+assert(table.concat(events, ",") == "head,pair,accept")
+events = {}
+remaining = 1
+assert(run(0) == 1 and remaining == -1)
+assert(table.concat(events, ",") == "head,pair,accept,head,pair,accept")
 print("open_call_condition", "OK")

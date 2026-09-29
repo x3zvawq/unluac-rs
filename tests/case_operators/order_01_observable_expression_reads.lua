@@ -1,4 +1,10 @@
 -- unluac: expect-contains [[missing_global]]
+-- unluac: expect-ast-count [[function]] [[6]]
+-- 编译器已删去 and false 的赋值，仍保留三次显式测试；这些检查不能随结果无用而消失。
+-- unluac: expect-ast-count [[if]] [[4]]
+-- unluac: expect-ast-count [[while]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[18]]
+-- unluac: expect-count [[.probe and true]] [[1]]
 -- 可观察读取可保留为条件或独立求值；按实际次数和值验证，不固定生成语法。
 
 local env = _VERSION == "Lua 5.1" and getfenv() or _ENV
@@ -70,3 +76,13 @@ print(
     shared_rhs(true, nil, false) == false,
     reordered_or("first", true, "later")
 )
+local first, last = {}, {}
+assert(shared_rhs(true, nil, false) == false)
+assert(shared_rhs(false, first, true) == first)
+assert(shared_rhs(true, false, nil) == nil)
+assert(shared_rhs(0, "", last) == "")
+assert(reordered_or(first, true, last) == first)
+assert(reordered_or(false, true, last) == last)
+assert(reordered_or(nil, false, last) == false)
+assert(select("#", shared_rhs(true, nil, false)) == 1)
+assert(select("#", reordered_or(first, true, last)) == 1)

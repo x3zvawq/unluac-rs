@@ -1,6 +1,8 @@
 -- lua54_01_close#1: to-be-closed基础
 -- unluac: expect-ast-count [[close-binding]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[close-binding]] [[2]] [[@proto=7]]
+-- unluac: expect-ast-max [[local-binding]] [[131]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=7]]
 local function test_tbc_basic()
     local log = {}
 
@@ -20,6 +22,7 @@ local function test_tbc_basic()
     end
 
     print("lua54_01_close#1", table.concat(log, "|"))
+    assert(table.concat(log, "|") == "body:res|res:true")
 end
 
 -- lua54_01_close#2: to-be-closed多出口
@@ -69,6 +72,11 @@ local function test_tbc_multi_exit()
 
     print("lua54_01_close#2", table.concat(consume("return"), ","))
 
+    assert(table.concat(consume("plain"), ",") ==
+        "first:plain,second:plain,first:plain+second:plain,after:first:plain")
+    assert(table.concat(log, "|") ==
+        "second:break:true|first:break:true|second:return:true|first:return:true|second:plain:true|first:plain:true")
+
     print("lua54_01_close#2", table.concat(log, "|"))
 
 end
@@ -105,6 +113,7 @@ local function test_tbc_goto_reenter()
     end
 
     print("lua54_01_close#3", table.concat(log, "|"))
+    assert(table.concat(log, "|") == "inner:1:true|inner:2:true|outer+inner:3|inner:3:true|outer:true")
 
 end
 
@@ -145,6 +154,9 @@ local function test_close_tailcall()
     print("lua54_01_close#4", finalize("alpha", "tail", "x", "y"))
 
     print("lua54_01_close#4", finalize("beta", "plain", "m"))
+
+    assert(finalize("empty", "plain") == "empty")
+    assert(table.concat(log, "|") == "alpha:true|beta:true|empty:true")
 
     print("lua54_01_close#4", table.concat(log, "|"))
 
@@ -191,6 +203,8 @@ local function test_for_const_close()
     print("lua54_01_close#5", table.concat(out, "|"))
 
     print("lua54_01_close#5", table.concat(log, "|"))
+    assert(table.concat(out, "|") == "aa:1:even|bbb:2:odd|c:3:even")
+    assert(table.concat(log, "|") == "aa:1:true|bbb:2:true|c:3:true")
 
 end
 

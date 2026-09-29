@@ -1,7 +1,9 @@
 -- 合流转移沿用入口状态；循环子块的未物化中转不污染外层 RETURN 声明前缀。
--- unluac: expect-ast-max [[local-binding]] [[12]]
+-- unluac: expect-ast-count [[local-binding]] [[12]]
+-- unluac: expect-ast-count [[assign]] [[4]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
 -- unluac: expect-not-contains [[ = nil]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=0]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
 -- unluac: expect-not-contains [[elseif p1_0 then]] [[@debug=stripped]]
 -- unluac: expect-not-contains [[elseif fullscreen then]] [[@debug=retained]]
@@ -27,7 +29,11 @@ end
 local handler = {
     getCurrentMode = function(self)
         return nil, { w = 800, h = 600, refresh = 60, bpp = 32 }, {
+            { w = 900, h = 100, refresh = 60, bpp = 32 },
+            { w = 100, h = 700, refresh = 60, bpp = 32 },
+            { w = 320, h = 200, refresh = 60, bpp = 32 },
             { w = 640, h = 480, refresh = 60, bpp = 32 },
+            { w = 600, h = 400, refresh = 60, bpp = 32 },
         }
     end,
 }
@@ -44,3 +50,5 @@ check(true, nil, nil, 800, 600)
 check(false, 320, 240, 320, 240)
 check(true, 320, 240, 320, 240)
 check(false, false, 240, 640, 480)
+check(false, 320, false, 640, 480)
+check(true, false, 240, 800, 600)

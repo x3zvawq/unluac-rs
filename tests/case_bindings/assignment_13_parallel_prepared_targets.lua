@@ -67,3 +67,24 @@ local function write_lookup_pack()
 end
 write_lookup_pack()
 print("parallel_lookup_targets", "OK")
+
+-- 两个上值 RHS 都先读取；首个逆序 SETTABLE 的回调改写 cell，不能影响第二次写入。
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=8]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=8]]
+local first_rhs, last_rhs = {}, {}
+local function write_rhs_snapshot(destination)
+    destination[1], destination[2] = first_rhs, last_rhs
+end
+local expected_first, expected_last = first_rhs, last_rhs
+local observed_rhs = {}
+local rhs_target = setmetatable({}, { __newindex = function(destination, key, value)
+    observed_rhs[#observed_rhs + 1] = value
+    assert(key == 3 - #observed_rhs)
+    first_rhs, last_rhs = {}, {}
+    rawset(destination, key, value)
+end })
+write_rhs_snapshot(rhs_target)
+assert(#observed_rhs == 2 and observed_rhs[1] == expected_last and observed_rhs[2] == expected_first)
+assert(rhs_target[1] == expected_first and rhs_target[2] == expected_last)
+assert(first_rhs ~= expected_first and last_rhs ~= expected_last)
+print("parallel_upvalue_rhs_snapshot", "OK")

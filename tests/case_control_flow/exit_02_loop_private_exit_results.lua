@@ -1,13 +1,16 @@
--- unluac: expect-ast-min [[while]] [[1]] [[@dialect=lua5.4]] [[@debug=stripped]] [[@proto=1]]
--- unluac: expect-ast-min [[break]] [[1]] [[@dialect=lua5.4]] [[@debug=stripped]] [[@proto=1]]
--- unluac: expect-contains [[local r1_2, r1_3 = coroutine.resume(r1_0)]] [[@dialect=lua5.4]] [[@debug=stripped]]
--- unluac: expect-not-line [[local r1_2, r1_3]] [[@dialect=lua5.4]] [[@debug=stripped]]
--- unluac: expect-ast-min [[while]] [[3]]
--- unluac: expect-ast-min [[break]] [[2]]
-local function private_exit()
+-- resume 的双结果应直接声明；用成员数约束接收宽度，不绑定自动变量名。
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-decl]] [[4]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=1]]
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[while]] [[3]]
+-- unluac: expect-ast-count [[break]] [[3]]
+local function private_exit(fail)
     local co = coroutine.create(function()
         coroutine.yield(10)
         coroutine.yield(20)
+        if fail then error("private failure", 0) end
         return "done"
     end)
     local out = {}
@@ -57,8 +60,13 @@ local function bypass(early)
 end
 
 assert(private_exit() == "10,20,done")
+assert(private_exit(true) == "10,20,private failure")
+assert(normal_exit(-1) == "public")
+assert(normal_exit(1) == "1,public")
 assert(normal_exit(0) == "public")
 assert(normal_exit(2) == "1,2,public")
 assert(bypass(true) == "early,public")
 assert(bypass(false) == "1,nil,public")
+assert(bypass(nil) == "1,nil,public")
+assert(bypass(0) == "early,public")
 print("loop-private-exit", private_exit(), normal_exit(0), bypass(true), bypass(false))

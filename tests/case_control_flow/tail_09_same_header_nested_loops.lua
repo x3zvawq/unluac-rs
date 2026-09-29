@@ -6,6 +6,9 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[while]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[6]]
 local function run(flag)
     local result = 0
     result = result + 1
@@ -22,3 +25,13 @@ end
 local result = run(true)
 assert(result == 1)
 print("regress_80_same_header_nested_loops#1", result)
+
+local saved_print, calls = print, 0
+print = function(message, value)
+    assert(message == "regress_80_same_header_nested_loops#1 body" and value == 1)
+    calls = calls + 1
+end
+assert(run(0) == 1 and calls == 1)
+assert(run("") == 1 and calls == 2)
+-- flag 为假时内层只有无副作用的无限回边，这里只运行正常退出路径。
+print = saved_print

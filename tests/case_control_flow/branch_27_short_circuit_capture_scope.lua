@@ -5,6 +5,15 @@
 -- unluac: expect-contains [[ or ]]
 -- unluac: expect-contains [[ and ]]
 -- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- 辅助函数的并列上值写回不能把准备槽延长到后面的 CALL 和 generic-for。
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=luajit]]
 local C = {}
 
 C.execSTSTask = function(self, a1, a2)

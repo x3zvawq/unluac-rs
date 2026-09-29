@@ -52,19 +52,12 @@ pub struct PhiPlan {
     pub block: BlockRef,
     pub reg: Reg,
     pub incomings: Vec<PhiIncomingPlan>,
-    pub(in crate::structure) loop_carried_input: Option<usize>,
+    pub(in crate::structure) loop_carried: Option<LoopCarriedPhi>,
 }
 
 impl PhiPlan {
     pub fn loop_carried(&self) -> Option<LoopCarriedPhi> {
-        let input = &self.incomings[self.loop_carried_input?];
-        let PhiIncomingDisposition::RegionInput(owner) = input.disposition else {
-            unreachable!("certified loop input remains a RegionInput");
-        };
-        Some(LoopCarriedPhi {
-            owner,
-            input: input.value,
-        })
+        self.loop_carried
     }
 
     pub fn has_unresolved(&self) -> bool {
@@ -77,26 +70,28 @@ impl PhiPlan {
     }
 }
 
-/// 最终 incoming 共同证明的循环 owner 与唯一入口值，不包含 HIR binding 分配决定。
+/// 最终 incoming 共同证明的循环 owner 与初始化事实，不包含 HIR binding 分配决定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopCarriedPhi {
     pub owner: RegionId,
-    pub input: SsaValue,
+    /// 全部入口边输入同一个值时发布；路径相关初始化不影响循环 owner。
+    pub input: Option<SsaValue>,
 }
 
-pub(in crate::structure) fn loop_carried_input(
+pub(in crate::structure) fn loop_carried_fact(
     plan: &StructurePlan,
     incomings: &[PhiIncomingPlan],
-) -> Option<usize> {
+) -> Option<LoopCarriedPhi> {
     let mut owner = None;
     let mut input = None;
+    let mut uniform_input = true;
     let mut has_carried = false;
-    for (index, incoming) in incomings.iter().enumerate() {
+    for incoming in incomings {
         let region = match incoming.disposition {
             PhiIncomingDisposition::RegionInput(region) => {
-                if input.replace(index).is_some() {
-                    return None;
-                }
+                uniform_input &= input
+                    .replace(incoming.value)
+                    .is_none_or(|value| value == incoming.value);
                 region
             }
             PhiIncomingDisposition::LoopCarried(region) => {
@@ -113,5 +108,11 @@ pub(in crate::structure) fn loop_carried_input(
         }
     }
     let owner = owner?;
-    (has_carried && matches!(plan.region(owner), Some(RegionPlan::Loop { .. }))).then_some(input?)
+    input?;
+    (has_carried && matches!(plan.region(owner), Some(RegionPlan::Loop { .. }))).then_some(
+        LoopCarriedPhi {
+            owner,
+            input: input.filter(|_| uniform_input),
+        },
+    )
 }

@@ -1,5 +1,9 @@
 -- numeric-for 的尾部普通语句仍读取本轮可写 binding，不另建分支出口副本。
--- unluac: expect-ast-max [[local-binding]] [[3]]
+-- unluac: expect-ast-count [[local-binding]] [[3]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[assign]] [[3]] [[@proto=1]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
 -- unluac: expect-not-contains [[ = nil]]
 local function run(flag)
     local total = 0

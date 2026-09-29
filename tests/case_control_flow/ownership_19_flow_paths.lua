@@ -1,7 +1,16 @@
 -- Shared flow events must distinguish loop initialization, backedges and terminal reads.
--- unluac: expect-ast-min [[numeric-for]] [[1]]
--- unluac: expect-ast-min [[generic-for]] [[1]]
--- unluac: expect-ast-min [[repeat]] [[1]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[11]] [[@proto=0]]
+-- parallel_exit 的两个源码绑定已足够承载并行赋值与返回。
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=6]] [[@dialect=luajit]]
 local function branch_exit(flag)
     local state = 10
     local result = state + 3
@@ -97,3 +106,19 @@ assert(generic_first == 26 and generic_second == 26)
 generic_first, generic_second = generic(3, 2)
 assert(generic_first == 18 and generic_second == 11)
 assert(latch(0) == 1 and latch(3) == 3)
+assert(factory_calls == 6)
+assert(branch_exit(nil) == 13 and branch_exit(0) == 13)
+parallel_first, parallel_second = parallel_exit(0)
+assert(parallel_first == 7 and parallel_second == 9)
+parallel_first, parallel_second = parallel_exit(nil)
+assert(parallel_first == 9 and parallel_second == 19)
+assert(loops(-1, 0) == 3 and loops(4, 1) == 4)
+assert(loops(4, 4) == 19 and loops(4, nil) == 21)
+generic_first, generic_second = generic(-1, 0)
+assert(generic_first == 5 and generic_second == 5)
+generic_first, generic_second = generic(3, 1)
+assert(generic_first == 11 and generic_second == 5)
+generic_first, generic_second = generic(3, 3)
+assert(generic_first == 26 and generic_second == 18)
+assert(factory_calls == 9)
+assert(latch(-1) == 1 and latch(1) == 1)

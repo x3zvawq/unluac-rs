@@ -13,6 +13,67 @@ use super::{
     CollapsedValueTarget, combine_value_expr, expr_is_boolean_valued, logical_and, logical_or,
 };
 
+/// 单一共享 continuation 的所有其它出口均为真值时，可作为一个 or 前缀。
+/// 节点身份决定切分边界；不能按最终表达式相等猜测共享尾部。
+pub(super) fn collapse_shared_value_continuation(
+    topology: &DecisionFacts<'_>,
+    safety: HirExprSafety,
+) -> Option<HirExpr> {
+    let mut shared = topology
+        .incoming_counts()
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 1);
+    let (continuation, _) = shared.next()?;
+    if shared.next().is_some() {
+        // 候选拒绝[ProofIncomplete]：多个共享入口需要分别证明区域出口，不能将跨区边复制为树。
+        return None;
+    }
+    let decision = topology.decision();
+    let continuation = crate::hir::HirDecisionNodeRef(continuation);
+    let mut prefix_nodes = decision.nodes.clone();
+    let mut visited = vec![false; prefix_nodes.len()];
+    let mut pending = vec![decision.entry];
+    while let Some(node_ref) = pending.pop() {
+        if std::mem::replace(&mut visited[node_ref.index()], true) {
+            continue;
+        }
+        let node = &mut prefix_nodes[node_ref.index()];
+        for (target, truthy_edge) in [(&mut node.truthy, true), (&mut node.falsy, false)] {
+            match target {
+                HirDecisionTarget::Node(next) if *next == continuation => {
+                    if truthy_edge && !safety.result_is_gc_inert(&node.test) {
+                        // 候选拒绝[ProofIncomplete]：真值 test 可能持有资源根；没有原根结束证书，不能先转成 false 再执行共享尾。
+                        return None;
+                    }
+                    // 假边直接复用本次 test 的 nil/false；真边才需要 false 控制出口。
+                    // 两者只由外层 or 消费，不作为原决策的结果，也不添加重复测试。
+                    *target = if truthy_edge {
+                        HirDecisionTarget::Expr(HirExpr::Boolean(false))
+                    } else {
+                        HirDecisionTarget::CurrentValue
+                    };
+                }
+                HirDecisionTarget::Node(next) => pending.push(*next),
+                HirDecisionTarget::CurrentValue if truthy_edge => {}
+                HirDecisionTarget::Expr(expr)
+                    if super::expr_truthiness(expr, safety) == Some(true) => {}
+                _ => {
+                    // 候选拒绝[SemanticBarrier:ControlFlow]：前缀的独立 falsy 出口原本已结束选值，or 会错误执行 continuation。
+                    return None;
+                }
+            }
+        }
+    }
+    let prefix = super::rebuild_decision(decision.entry, &prefix_nodes).0;
+    let suffix = super::rebuild_decision(continuation, &decision.nodes).0;
+    let prefix =
+        super::collapse_value_decision_expr(&super::analyze_decision(&prefix), safety, |_| false)?;
+    let suffix =
+        super::collapse_value_decision_expr(&super::analyze_decision(&suffix), safety, |_| false)?;
+    Some(logical_or(prefix, suffix))
+}
+
 pub(super) fn collapse_short_circuit_graph(
     topology: &DecisionFacts<'_>,
     safety: HirExprSafety,
@@ -111,39 +172,49 @@ fn reduce_graph(
     for original in topology.topological_nodes().rev() {
         let index = original.id.index();
         loop {
-            let (node, _) = nodes[index].as_ref()?;
-            let merge = [
-                (&node.truthy, &node.falsy, true),
-                (&node.falsy, &node.truthy, false),
-            ]
-            .into_iter()
-            .find_map(|(edge, common, is_and)| {
-                let HirDecisionTarget::Node(child) = edge else {
-                    return None;
-                };
-                if incoming[child.index()] != 1 {
-                    // 候选拒绝[ProofIncomplete]：须先归约 child 的其它入口，不能复制共享 test 的求值。
-                    return None;
-                }
-                let (child_node, root_ends) = nodes[child.index()].as_ref()?;
-                let child_common = if is_and {
-                    &child_node.falsy
-                } else {
-                    &child_node.truthy
-                };
-                if child_common == common {
-                    return Some((child.index(), is_and, false));
-                }
-                let inverse_common = if is_and {
-                    &child_node.truthy
-                } else {
-                    &child_node.falsy
-                };
-                (inverse_common == common
-                    && (condition || can_invert_test(child_node, safety, *root_ends)))
-                .then_some((child.index(), is_and, true))
-            });
-            let Some((child_index, is_and, invert)) = merge else {
+            let (node, parent_root_ends) = nodes[index].as_ref()?;
+            let merge =
+                [
+                    (&node.truthy, &node.falsy, true),
+                    (&node.falsy, &node.truthy, false),
+                ]
+                .into_iter()
+                .find_map(|(edge, common, is_and)| {
+                    let HirDecisionTarget::Node(child) = edge else {
+                        return None;
+                    };
+                    if incoming[child.index()] != 1 {
+                        // 候选拒绝[ProofIncomplete]：须先归约 child 的其它入口，不能复制共享 test 的求值。
+                        return None;
+                    }
+                    let (child_node, root_ends) = nodes[child.index()].as_ref()?;
+                    let child_common = if is_and {
+                        &child_node.falsy
+                    } else {
+                        &child_node.truthy
+                    };
+                    if child_common == common {
+                        return Some((child.index(), is_and, false, false));
+                    }
+                    let inverse_common = if is_and {
+                        &child_node.truthy
+                    } else {
+                        &child_node.falsy
+                    };
+                    if inverse_common != common {
+                        return None;
+                    }
+                    if condition || can_invert_test(child_node, safety, *root_ends) {
+                        return Some((child.index(), is_and, true, false));
+                    }
+                    // child 的 CurrentValue 不能取反；原 parent 只作控制判断时可翻转
+                    // parent 极性并交换 and/or，仍由 child 返回同一次求值的原值。
+                    // 普通规整保留已有控制极性；完整帧 owner 明确许可后才选择翻转 parent，
+                    // 避免抢在原 NOT/调用帧恢复前合成外层 De Morgan 包装。
+                    (*parent_root_ends && can_invert_test(node, safety, *parent_root_ends))
+                        .then_some((child.index(), !is_and, false, true))
+                });
+            let Some((child_index, is_and, invert, invert_parent)) = merge else {
                 break;
             };
             let (mut child, _) = nodes[child_index]
@@ -153,6 +224,9 @@ fn reduce_graph(
                 invert_test(&mut child);
             }
             let (parent, root_ends) = nodes[index].as_mut().expect("decision parent remains live");
+            if invert_parent {
+                invert_test(parent);
+            }
             // 证书只属于输入快照的单个 test epoch；组合后不能沿用 parent 的许可。
             *root_ends = false;
             let common = if is_and {
@@ -186,15 +260,14 @@ pub(super) fn prepare_control_materialization(
     decision: crate::hir::common::HirDecisionExpr,
     safety: HirExprSafety,
 ) -> crate::hir::common::HirDecisionExpr {
-    if decision.nodes.iter().any(|node| {
+    let condition_only = !decision.nodes.iter().any(|node| {
         matches!(node.truthy, HirDecisionTarget::CurrentValue)
             || matches!(node.falsy, HirDecisionTarget::CurrentValue)
-    }) {
-        // 候选拒绝[SemanticBarrier:ValueArity]：CurrentValue 仍消费原测试值，不能按纯控制边翻转。
-        return decision;
-    }
+    });
+    // CurrentValue 必须保留原测试值，但不妨碍其它控制前缀合并唯一入边；
+    // 复用值归约的极性约束，不能因为一个终端取值就展开其所有共享前驱。
     let topology = super::analyze_decision(&decision);
-    let reduced = reduce_graph(&topology, safety, |_| false, true)
+    let reduced = reduce_graph(&topology, safety, |_| false, condition_only)
         .expect("validated decision reduction retains its live parents");
     // 只移动唯一入边 child，保持检查次数和惰性次序；终端仍在选中后提交，不提前写目标。
     // 未归约部分连同已归约节点一起物化，不能因整图值表达式失败而丢弃局部证明。
@@ -203,7 +276,9 @@ pub(super) fn prepare_control_materialization(
         .zip(&decision.nodes)
         .map(|(node, original)| node.map_or_else(|| original.clone(), |(node, _)| node))
         .collect::<Vec<_>>();
-    super::rebuild_decision(decision.entry, &nodes).0
+    let mut rebuilt = super::rebuild_decision(decision.entry, &nodes).0;
+    rebuilt.source_result = decision.source_result;
+    rebuilt
 }
 
 fn normalize_boolean_terminals(node: &mut HirDecisionNode, safety: HirExprSafety, root_ends: bool) {

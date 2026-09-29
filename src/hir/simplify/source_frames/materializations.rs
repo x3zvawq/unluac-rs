@@ -253,11 +253,15 @@ fn close_finished_prefix_scopes(
     };
     let mut scopes = boundaries.closed_prefix_scopes(&proto.body, 0);
     // 直线声明段仍交给完整帧事务，避免先包装词法块而截断并行赋值候选。
-    // 这里只拆除循环子域对外层末端证明的依赖；If 和普通 Block 仍可能参与未折叠的值/调用帧。
+    // 已闭合子域中的声明不占外层后缀槽；跨子域的临时值由下方逃逸检查拒绝，
+    // 新块两端仍须通过完整声明前缀验证，不能仅凭最后一次读取缩短原根生命周期。
     scopes.retain(|start, end| {
-        proto.body.stmts[*start..*end]
-            .iter()
-            .any(|stmt| matches!(stmt, HirStmt::NumericFor(_) | HirStmt::GenericFor(_)))
+        proto.body.stmts[*start..*end].iter().any(|stmt| {
+            matches!(
+                stmt,
+                HirStmt::NumericFor(_) | HirStmt::GenericFor(_) | HirStmt::Block(_)
+            )
+        })
     });
     if scopes.is_empty() {
         return false;
@@ -419,6 +423,7 @@ pub(in crate::hir::simplify) fn restore_materializations(
     );
     let restored_targets =
         restore_lookup_root_declarations(&mut prepared_proto, &mut prepared_facts)
+            | restore_phi_target_declarations(&mut prepared_proto, &mut prepared_facts, dialect)
             | restore_call_target_declarations(&mut prepared_proto, &mut prepared_facts)
             | (dialect == DecompileDialect::Luau
                 && restore_closure_target_declarations(&mut prepared_proto, &mut prepared_facts));
@@ -747,6 +752,134 @@ pub(in crate::hir::simplify) fn restore_materializations(
     changed
 }
 
+/// 分支各臂覆盖同一初始化后，SSA 不再读取 seed，但条件仍可能在其上方准备。
+/// 消费原覆盖关系恢复声明归属；初始化和条件均留在原处，由外层事务验证完整前缀。
+fn restore_phi_target_declarations(
+    proto: &mut HirProto,
+    facts: &mut ProtoPromotionFacts,
+    dialect: DecompileDialect,
+) -> bool {
+    let mut targets = BTreeMap::new();
+    for (initial, local) in facts.phi_overwrite_predecessors() {
+        targets
+            .entry(initial)
+            .and_modify(|target| *target = None)
+            .or_insert(Some(local));
+    }
+    if targets.is_empty() {
+        return false;
+    }
+    let mut reads = BTreeSet::new();
+    let mut writes = BTreeMap::new();
+    visit_stmts(
+        &proto.body.stmts,
+        &mut (
+            BindingReadCollector(|binding| {
+                reads.insert(binding);
+            }),
+            BindingWriteCollector(|binding| {
+                *writes.entry(binding).or_insert(0usize) += 1;
+            }),
+        ),
+    );
+    fn block(
+        body: &mut HirBlock,
+        proto: &mut HirProto,
+        facts: &mut ProtoPromotionFacts,
+        dialect: DecompileDialect,
+        targets: &BTreeMap<TempId, Option<LocalId>>,
+        reads: &BTreeSet<HirBinding>,
+        writes: &BTreeMap<HirBinding, usize>,
+    ) -> bool {
+        let mut changed = false;
+        for index in 0..body.stmts.len().saturating_sub(1) {
+            let Some((
+                initial,
+                HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::Number(_) | HirExpr::String(_),
+            )) = body.stmts[index].scalar_temp_assignment()
+            else {
+                continue;
+            };
+            let Some(&Some(local)) = targets.get(&initial) else {
+                continue;
+            };
+            let Some(home) = facts.trusted_temp_home_slot(initial) else {
+                continue;
+            };
+            let HirStmt::LocalDecl(decl) = &body.stmts[index + 1] else {
+                continue;
+            };
+            if decl.bindings != [local]
+                || decl.initializer_merge_transaction.is_some()
+                || reads.contains(&HirBinding::Temp(initial))
+                || writes.get(&HirBinding::Temp(initial)) != Some(&1)
+                || proto.temp_debug_locals[initial.index()].is_some()
+                || proto.temp_debug_scopes[initial.index()].is_some()
+                || proto.local_debug_hints[local.index()].is_some()
+                || proto.local_debug_scopes[local.index()].is_some()
+                || !facts
+                    .complete_local_definition_write_homes(local)
+                    .iter()
+                    .copied()
+                    .eq([home])
+                || single_value_frame(&decl.values, facts, dialect)
+                    .is_none_or(|entry| entry.slot() != home.slot() + 1)
+            {
+                // 候选拒绝[ProofIncomplete]：仅恢复紧邻、单写的原覆盖关系，不能按槽号
+                // 跨过中间语句或合并独立 debug 身份；条件必须仍拥有原高槽准备入口。
+                continue;
+            }
+            let values = decl.values.clone();
+            let HirStmt::Assign(seed) = &body.stmts[index] else {
+                unreachable!()
+            };
+            if seed.is_phi_transfer
+                || seed.initializer_merge_transaction.is_some()
+                || seed.generic_for_initializer_producer.is_some()
+                || seed.root_release.is_some()
+                || seed.method_rewrite_transaction.is_some()
+                || seed.parallel_nil_frame.is_some()
+            {
+                // 候选拒绝[SemanticBarrier:Protocol]：其它 owner 的写入事务不能转成普通声明。
+                continue;
+            }
+            body.stmts[index] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![local],
+                values: seed.values.clone(),
+                initializer_merge_transaction: None,
+            }));
+            body.stmts[index + 1] = HirStmt::Assign(Box::new(HirAssign {
+                luau_function_declaration: false,
+                targets: vec![HirLValue::Local(local)],
+                values,
+                luau_compound_global: false,
+                upvalue_write_source: None,
+                is_phi_transfer: false,
+                parallel_nil_frame: None,
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
+                root_release: None,
+                method_rewrite_transaction: None,
+            }));
+            facts.record_temp_to_local_merge(initial, local);
+            proto
+                .inline_dispositions
+                .promote_temp_to_local(initial, local);
+            changed = true;
+        }
+        for stmt in &mut body.stmts {
+            for_each_nested_block_mut(stmt, &mut |child| {
+                changed |= block(child, proto, facts, dialect, targets, reads, writes);
+            });
+        }
+        changed
+    }
+    let mut body = std::mem::take(&mut proto.body);
+    let changed = block(&mut body, proto, facts, dialect, &targets, &reads, &writes);
+    proto.body = body;
+    changed
+}
+
 /// 后继读取在结果上方开帧时，保留它下方的原单定义 table 根。
 fn restore_lookup_root_declarations(proto: &mut HirProto, facts: &mut ProtoPromotionFacts) -> bool {
     struct Reads<'a> {
@@ -954,7 +1087,7 @@ fn restore_unused_choices(
                     .into(),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
-                    generic_for_dispatch_release: None,
+                    root_release: None,
                     method_rewrite_transaction: None,
                 }));
                 changed = true;
@@ -1221,8 +1354,8 @@ fn close_inert_carrier_scopes(
     true
 }
 
-/// 帧恢复可能先结束原 nil 的作用域，稍后才把条件准备内联到下一条 if。
-/// 再次相邻时，仍按原 LOADNIL 组与精确 home 交接初始化，不留下机械的 nil 小块。
+/// 帧恢复可能先结束原 nil 的作用域，稍后才把条件准备内联到后继声明。
+/// 再次相邻时，按原 LOADNIL 组与精确 home 交接初始化；有值声明仍保留先 nil 后求值的两次写入。
 fn merge_adjacent_nil_scopes(
     proto: &mut HirProto,
     facts: &mut ProtoPromotionFacts,
@@ -1258,6 +1391,7 @@ fn merge_nil_scope_blocks(
     merges: &mut Vec<(TempId, LocalId)>,
 ) {
     let mut removed = BTreeSet::new();
+    let mut initialized = BTreeMap::new();
     for (index, pair) in block.stmts.windows(2).enumerate() {
         let HirStmt::Block(scope) = &pair[0] else {
             continue;
@@ -1285,15 +1419,78 @@ fn merge_nil_scope_blocks(
         {
             continue;
         }
-        let Some(locals) = crate::hir::simplify::carried_locals::adjacent_nil_initializer_bindings(
-            temps,
-            &block.stmts[index + 1..],
-            facts,
+        if let Some(locals) =
+            crate::hir::simplify::carried_locals::adjacent_nil_initializer_bindings(
+                temps,
+                &block.stmts[index + 1..],
+                facts,
+            )
+        {
+            merges.extend(temps.iter().copied().zip(locals));
+            removed.insert(index);
+            continue;
+        }
+        let ([temp], HirStmt::LocalDecl(next)) = (temps.as_slice(), &pair[1]) else {
+            continue;
+        };
+        let ([local], [value], None) = (
+            next.bindings.as_slice(),
+            next.values.fixed.as_slice(),
+            &next.values.tail,
         ) else {
             continue;
         };
-        merges.extend(temps.iter().copied().zip(locals));
-        removed.insert(index);
+        let Some(home) = facts.trusted_temp_home_slot(*temp) else {
+            continue;
+        };
+        // 候选拒绝[PolicyBoundary]：debug 身份和已有 initializer 事务不随此交接迁移。
+        // 候选拒绝[ProofIncomplete]：须有完整的同槽写事实，不能只按最后一次写猜 home。
+        // 候选拒绝[SemanticBarrier:Scope]：RHS 自读或捕获不能借此提前进入新声明。
+        if next.initializer_merge_transaction.is_some()
+            || proto.local_debug_hints[local.index()].is_some()
+            || proto.local_debug_scopes[local.index()].is_some()
+            || facts.trusted_local_home_slot(*local) != Some(home)
+            || !facts
+                .complete_local_definition_write_homes(*local)
+                .iter()
+                .copied()
+                .eq([home])
+            || crate::hir::simplify::mention::expr_mentions_local(value, *local)
+            || crate::hir::simplify::mention::stmt_captures_local(&pair[1], *local)
+        {
+            continue;
+        }
+        // nil 原写与 RHS 均原位保留，整个后缀仍交外层帧事务校验后才提交。
+        merges.push((*temp, *local));
+        initialized.insert(index, *local);
+    }
+    for (index, local) in initialized {
+        let (prefix, suffix) = block.stmts.split_at_mut(index + 1);
+        let HirStmt::Block(scope) = &prefix[index] else {
+            unreachable!("nil handoff retains its planned scope");
+        };
+        let HirStmt::LocalDecl(seed) = &scope.stmts[0] else {
+            unreachable!("nil handoff retains its planned declaration");
+        };
+        let mut seed = seed.clone();
+        seed.bindings = vec![local];
+        prefix[index] = HirStmt::LocalDecl(seed);
+        let HirStmt::LocalDecl(next) = &mut suffix[0] else {
+            unreachable!("nil handoff retains its adjacent initializer");
+        };
+        suffix[0] = HirStmt::Assign(Box::new(HirAssign {
+            luau_function_declaration: false,
+            luau_compound_global: false,
+            upvalue_write_source: None,
+            is_phi_transfer: false,
+            parallel_nil_frame: None,
+            targets: vec![HirLValue::Local(local)],
+            values: std::mem::take(&mut next.values),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
+            root_release: None,
+            method_rewrite_transaction: None,
+        }));
     }
     let mut index = 0;
     block.stmts.retain(|_| {
@@ -1416,7 +1613,7 @@ fn restore_closure_target_declarations(
                             if !assign.is_phi_transfer
                                 && assign.initializer_merge_transaction.is_none()
                                 && assign.generic_for_initializer_producer.is_none()
-                                && assign.generic_for_dispatch_release.is_none()
+                                && assign.root_release.is_none()
                                 && assign.method_rewrite_transaction.is_none())
                         && !reads.contains(&binding)
                         && writes.get(&binding) == Some(&1)
@@ -1487,7 +1684,7 @@ fn restore_closure_target_declarations(
                 parallel_nil_frame: None,
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
-                generic_for_dispatch_release: None,
+                root_release: None,
                 method_rewrite_transaction: None,
             }));
             facts.record_temp_to_local_merge(temp, local);
@@ -1673,7 +1870,7 @@ fn restore_call_targets_in_block(
                     values: copy.values.clone(),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
-                    generic_for_dispatch_release: None,
+                    root_release: None,
                     method_rewrite_transaction: None,
                 }));
             }
@@ -2383,7 +2580,7 @@ impl ScopeBoundaryFacts<'_> {
             .then_some(frame)
     }
 
-    /// 后继声明、调用或词法块从原首槽重新开始时，结束前面的无捕获声明段；不插入清零或移动求值。
+    /// 后继声明、赋值、调用或词法块从原首槽重新开始时，结束前面的无捕获声明段；不插入清零或移动求值。
     /// 新旧段的全部原帧还须通过事务末尾的 prefix 验证，不能仅凭无后续读取退休 GC 根。
     fn closed_prefix_scopes(&self, block: &HirBlock, mut cursor: usize) -> BTreeMap<usize, usize> {
         let mut scopes = BTreeMap::new();
@@ -2406,6 +2603,7 @@ impl ScopeBoundaryFacts<'_> {
             let next_frame = match stmt {
                 HirStmt::Block(child) => child.stmts.first(),
                 HirStmt::LocalDecl(_)
+                | HirStmt::Assign(_)
                 | HirStmt::CallStmt(_)
                 | HirStmt::If(_)
                 | HirStmt::Return(_) => Some(stmt),
@@ -2472,6 +2670,16 @@ impl ScopeBoundaryFacts<'_> {
                     && matches!((assign.targets.as_slice(), assign.values.fixed.as_slice(), &assign.values.tail),
                         ([HirLValue::Local(local)], [value], None)
                             if locals.contains(local) && (boolean_write_value(value) || self.is_in_place_lookup(*local, value))) => {}
+                // 当前结果写回既有低槽 owner，不新增准备槽；读写顺序保留在窗口内。
+                // 窗口两端和完整帧请求仍须通过同一次 prefix 验证。
+                HirStmt::Assign(assign) if !starts.is_empty()
+                    && matches!((assign.targets.as_slice(), assign.values.fixed.as_slice(), &assign.values.tail),
+                        ([HirLValue::Local(target)], [HirExpr::LocalRef(source)], None)
+                            if locals.contains(source)
+                                && self.facts.trusted_local_home_slot(*source).is_some_and(|source_home|
+                                    source_home.slot() < declaration_top
+                                        && self.facts.trusted_local_home_slot(*target).is_some_and(|target_home|
+                                            target_home.slot() < source_home.slot()))) => {}
                 // CLOSURE 原位覆盖已声明的低槽目标，不增加局部前缀；ByValue 捕获
                 // 的最后一次读取仍由 access_order 计入，ByReference 则继续阻止结束作用域。
                 HirStmt::Assign(assign) if !starts.is_empty()
@@ -3176,7 +3384,7 @@ pub(in crate::hir::simplify) fn restore_split_nil_declarations(
                         parallel_nil_frame: None,
                         initializer_merge_transaction: None,
                         generic_for_initializer_producer: None,
-                        generic_for_dispatch_release: None,
+                        root_release: None,
                         method_rewrite_transaction: None,
                     }));
                 }

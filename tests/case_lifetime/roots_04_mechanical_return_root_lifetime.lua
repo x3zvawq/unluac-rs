@@ -1,4 +1,8 @@
 -- regress_355_mechanical_return_root_lifetime: nested return uses do not take over a recovered root
+-- unluac: expect-ast-count [[function]] [[8]]
+-- unluac: expect-ast-max [[local-binding]] [[27]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[if]] [[0]]
 
 local weak_values = setmetatable({}, { __mode = "v" })
 local methods = setmetatable({}, { __mode = "k" })
@@ -31,10 +35,12 @@ local short_owner = {}
 short_weak_values.key = short_owner
 
 local observer = {}
+local probes = 0
 function observer.probe()
     collectgarbage("restart")
     collectgarbage("collect")
     collectgarbage("collect")
+    probes = probes + 1
     return short_weak_values.key ~= nil
 end
 
@@ -46,6 +52,14 @@ end
 collectgarbage("stop")
 short_owner = nil
 assert(check_short_circuit_root(short_weak_values))
+assert(probes == 1)
+collectgarbage("collect")
+collectgarbage("collect")
+assert(short_weak_values.key == nil)
+assert(check_short_circuit_root(short_weak_values) == nil)
+short_weak_values.key = false
+assert(check_short_circuit_root(short_weak_values) == false)
+assert(probes == 1)
 
 -- The right operand is consumed by the inner concat before the outer concat runs.  Its original
 -- local home still roots it through that second metamethod; folding both lookups into the return
@@ -87,3 +101,5 @@ first_value = nil
 last_value = nil
 assert(concat_name(concat_user) == "")
 assert(concat_live_counts[1] == 2 and concat_live_counts[2] == 2)
+assert(#concat_live_counts == 2)
+assert(count_concat_keys() == 0)

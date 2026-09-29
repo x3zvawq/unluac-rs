@@ -1,5 +1,9 @@
 -- FORPREP 的零次迭代可以保留原 index 字符串。nil 写必须留在原位置、原槽，
 -- 不能因没有表达式读取而消失，也不能在循环前新增保活 holder。
+-- unluac: expect-ast-max [[local-binding]] [[31]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[function]] [[8]]
+-- unluac: expect-ast-count [[numeric-for]] [[8]]
 local snapshots = {}
 local old = getmetatable(_G)
 local baseline = 0
@@ -62,6 +66,7 @@ nested()
 nonzero()
 sequential()
 setmetatable(_G, old)
+assert(#snapshots == 7)
 assert(snapshots[1] == true and snapshots[2] == false)
 assert(snapshots[4] == false and snapshots[5] == false)
 -- prefix/连续循环的其它高槽残值在 5.4/5.5 上不同，由各自原源码运行比较。

@@ -2,6 +2,8 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-ast-count [[local-binding]] [[12]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
 
 local closed = 0
 local mt = {
@@ -60,4 +62,8 @@ assert(left == 13, left)
 assert(right == 4, right)
 assert(empty == 0, empty)
 assert(closed == 3, closed)
+assert(run(false, true, false, true) == 14)
+assert(closed == 4)
+assert(run(true, false, true, true) == 14)
+assert(closed == 5)
 print("regress_184_mixed_irreducible_generic_close#1", left, right, empty, closed)

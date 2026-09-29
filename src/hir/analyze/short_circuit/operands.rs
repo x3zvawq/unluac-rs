@@ -87,12 +87,12 @@ pub(super) fn build_value_operands(
             let mut target = |truthy: bool| {
                 let arc = if truthy { &node.truthy } else { &node.falsy };
                 if let Some(operand) = operand
-                    && let Some(value) = operand.leaves.get(arc.route.last()?)
+                    && let Some(value) = operand.route_values.get(&(node.id, *arc.route.first()?))
                 {
                     // 真值测试同时产生叶值时复用本次求值，不能再次展开 CALL 等 producer。
                     if operand
                         .current_values
-                        .contains(&(node.id, *arc.route.last()?))
+                        .contains(&(node.id, *arc.route.first()?))
                     {
                         return Some(HirDecisionTarget::CurrentValue);
                     }
@@ -132,6 +132,10 @@ pub(super) fn build_value_operands(
             return None;
         }
         values[group] = Some(HirDecisionExpr {
+            source_result: operand.and_then(|operand| {
+                let temp = lowering.bindings.phi_temps[operand.phi.index()];
+                (temp.index() == lowering.dataflow.defs.len() + operand.phi.index()).then_some(temp)
+            }),
             emit_as_luau_if: false,
             entry: HirDecisionNodeRef(dense[entry]),
             nodes,
@@ -151,9 +155,14 @@ fn lower_operand_leaf(
     value: SsaValue,
 ) -> Option<HirExpr> {
     match value {
-        SsaValue::Def(def) if lowering.dataflow.def_block(def) == plan.header()? => Some(
-            super::decision::expr_for_emitted_header_leaf(lowering, plan.header()?, def),
-        ),
+        SsaValue::Def(def) if lowering.dataflow.def_block(def) == plan.header()? => {
+            Some(super::decision::expr_for_emitted_header_leaf(
+                lowering,
+                plan.header()?,
+                node.predicate,
+                def,
+            ))
+        }
         SsaValue::Def(def)
             if lowering
                 .structure

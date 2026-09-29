@@ -87,7 +87,11 @@ impl PlanLoweringIndex {
             }
         }
         let mut repeat_staged_result_by_phi = vec![None; phi_count];
+        let mut loop_transfer_count = vec![0; region_count];
         for (loop_id, payload) in plan.loops() {
+            if let Some(target) = payload.propagated_break {
+                loop_transfer_count[target.index()] += 1;
+            }
             let Some(LoopVmProtocol::Repeat(protocol)) = payload.protocol.as_ref() else {
                 continue;
             };
@@ -257,6 +261,12 @@ impl PlanLoweringIndex {
             let edge = plan
                 .edge_plan(EdgeRef(edge_index))
                 .ok_or_else(|| invalid(root, "final plan has no action entry for one CFG edge"))?;
+            if let EdgeTransfer::Break(target)
+            | EdgeTransfer::Continue(target)
+            | EdgeTransfer::LoopBack(target) = edge.transfer
+            {
+                loop_transfer_count[target.index()] += 1;
+            }
             for copy in &edge.phi_copies {
                 record_edge_action_use(
                     lowering.dataflow,
@@ -321,6 +331,7 @@ impl PlanLoweringIndex {
             scope_starts,
             scope_ends,
             plain_block_count,
+            loop_transfer_count,
             single_plain_block,
             region_inputs,
             unresolved_requirement,

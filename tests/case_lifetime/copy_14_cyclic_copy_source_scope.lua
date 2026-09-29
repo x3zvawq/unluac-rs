@@ -1,5 +1,16 @@
 -- 源码 copy 只在循环体内可见；debug 修改后的当前值才允许跨作用域交接保活。
 -- unluac: expect-ast-min [[while]] [[1]]
+-- 跨轮根仍由原 COPY 槽承接，不引入 scope 外 holder 或 header 查找暂存。
+-- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
+-- unluac: expect-ast-max [[local-binding]] [[18]]
+-- unluac: expect-ast-count [[while]] [[1]]
+-- unluac: expect-ast-count [[do-block]] [[0]]
+-- unluac: expect-ast-count [[numeric-for]] [[2]]
+-- unluac: expect-contains [[local owner = make()]]
+-- unluac: expect-contains [[local copy = owner]]
+-- unluac: expect-contains [[regress_540_missing_gc("collect")]]
+-- unluac: expect-not-contains [[copy = nil]]
+-- unluac: expect-not-contains [[owner = nil]]
 local gc = collectgarbage
 local weak = setmetatable({}, { __mode = "v" })
 local iteration = 0

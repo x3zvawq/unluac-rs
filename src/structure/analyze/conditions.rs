@@ -80,7 +80,8 @@ pub(super) fn selected_conditions(
             value_owned[block.index()] = true;
         }
     }
-    let edge_actions = preliminary_edge_actions(cfg, dataflow, loops, residual_transfers, caps);
+    let edge_actions =
+        preliminary_edge_actions(proto, cfg, dataflow, loops, residual_transfers, caps);
     let mut loops_by_condition_header = vec![Vec::new(); cfg.blocks.len()];
     for (index, loop_) in loops.iter().enumerate() {
         if let Some(header) = required_loop_condition_header(cfg, loop_) {
@@ -685,7 +686,16 @@ pub(super) fn condition_terminal_actions_are_uniform(
                 let Some(expected) = edge_actions.get(expected.index()) else {
                     return false;
                 };
-                if expected != action || action.goto.is_some() || action.has_continue_evidence {
+                // 直达同一 VM-for 控制区且 Phi 写回相同的边可以共享出口，最终
+                // 计划仍逐边验证 owner/transfer/cleanup（continue_10）。
+                // 候选拒绝[ProofIncomplete]：普通 continue evidence 不证明最终
+                // 动作一致；repeat 的条件前缀可能让一边成为普通 arm、另一边仍
+                // 需转发 continue，不能提前合并（tail_03）。
+                if expected != action
+                    || action.goto.is_some()
+                    || action.has_continue_evidence
+                        && !matches!(action.iteration, Some(PreliminaryIteration::ForControl(_)))
+                {
                     return false;
                 }
             }
@@ -707,10 +717,13 @@ pub(super) struct PreliminaryEdgeAction {
 pub(super) enum PreliminaryIteration {
     LoopBack(super::super::BlockRef),
     Continue(super::super::BlockRef),
+    /// 直接进入 VM-for 独立控制区；不经过正文或 repeat 条件的转发前缀。
+    ForControl(super::super::BlockRef),
     Conflicting,
 }
 
 pub(super) fn preliminary_edge_actions(
+    proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     loops: &[LoopCandidate],
@@ -743,13 +756,24 @@ pub(super) fn preliminary_edge_actions(
     }
     if caps.continue_stmt {
         for loop_ in loops {
+            let continue_iteration = |edge: super::super::EdgeRef| {
+                let target = cfg.edges[edge.index()].to;
+                if matches!(
+                    loop_.kind_hint,
+                    super::super::LoopKindHint::NumericForLike
+                        | super::super::LoopKindHint::GenericForLike
+                ) && loop_.continue_target == Some(target)
+                    && !helpers::block_has_non_control_prefix(proto, cfg, target)
+                {
+                    PreliminaryIteration::ForControl(loop_.header)
+                } else {
+                    PreliminaryIteration::Continue(loop_.header)
+                }
+            };
             for edge in &loop_.continue_edges {
                 if let Some(action) = actions.get_mut(edge.index()) {
                     action.has_continue_evidence = true;
-                    record_preliminary_iteration(
-                        action,
-                        PreliminaryIteration::Continue(loop_.header),
-                    );
+                    record_preliminary_iteration(action, continue_iteration(*edge));
                 }
             }
             let Some(target) = loop_.continue_target else {
@@ -773,10 +797,7 @@ pub(super) fn preliminary_edge_actions(
                     && let Some(action) = actions.get_mut(edge.index())
                 {
                     action.has_continue_evidence = true;
-                    record_preliminary_iteration(
-                        action,
-                        PreliminaryIteration::Continue(loop_.header),
-                    );
+                    record_preliminary_iteration(action, continue_iteration(*edge));
                 }
             }
         }
@@ -825,6 +846,7 @@ pub(super) fn simple_condition_input(
         exit: ShortCircuitExit::BranchExit { truthy, falsy },
         result_reg: None,
         result_phi_id: None,
+        loop_entry: None,
         entry_value: None,
         value_incomings: Vec::new(),
         reducible: true,

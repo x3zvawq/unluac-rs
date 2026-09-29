@@ -73,6 +73,7 @@ fn rewrite_block(
                 try_inline_terminal_constructor_call(
                     remaining,
                     &use_index,
+                    &write_index,
                     &constructor_runs,
                     index,
                     mutable_snapshots,

@@ -6,6 +6,7 @@
 mod cfg;
 mod dataflow;
 mod graph;
+mod methods;
 mod phi_graph;
 mod root_frontiers;
 mod root_intervals;

@@ -2,6 +2,42 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_bindings/scope_19_inlined_debug_result_scope.lua",
+        &["scope", "debug", "inline", "capture", "runtime-observer"],
+        "内联结果的首次写回必须处于 debug local 声明域内，不得泄漏为全局写入。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_bindings/assignment_15_upvalue_parallel_values.lua",
+        &["assignment", "upvalue", "eval-order", "error", "recompile"],
+        "并列上值写回保留全部 RHS 的求值、失败原子性及重复目标的方言顺序。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_bindings/assignment_11_upvalue_scratch_return.lua",
         &[
             "assignment",
@@ -708,8 +744,14 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     ),
     LuaCaseDefinition::new(
         "tests/case_bindings/assignment_12_parallel_field_snapshots.lua",
-        &["parallel-assignment", "capture", "metamethod", "snapshot"],
-        "并列字段赋值保持逆序写回和原 RHS 快照，元方法改写源变量不影响尚未提交的第一项。",
+        &[
+            "parallel-assignment",
+            "capture",
+            "metamethod",
+            "snapshot",
+            "gc",
+        ],
+        "并列赋值保留逆序发布、RHS 快照和分配身份，空表发布跨元方法保留原根覆盖。",
         &[
             LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),

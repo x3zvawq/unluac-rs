@@ -8,6 +8,16 @@
 -- unluac: expect-not-contains [[r2_0 = r2_1]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 三个循环只需要原来的分支结果 x，不应增加 loop-exit 状态副本。
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=3]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=luajit]]
 
 local trace = {}
 
@@ -92,4 +102,12 @@ assert(while_elseif_merge(1, false, false, true, false, false, false) == 1)
 assert(while_elseif_merge(1, false, false, false, false, true, false) == 1)
 assert(while_elseif_merge(1, false, false, false, false, false, true) == 3)
 assert(table.concat(trace, ",") == "L11,S11,L12,S12,R21,S21,R22,S22,B1,O1,RR41,RS41,RR42,RS42,RO1,E471,ES71,E472,ES72,EB31,EB51,E681,ES81,E682,ES82")
+trace = {}
+assert(repeat_merge(1, true, false) == 3)
+assert(while_elseif_merge(1, true, false, false, false, false, false) == 3)
+assert(while_elseif_merge(1, false, true, false, false, false, false) == 3)
+assert(while_elseif_merge(1, false, false, false, false, false, false) == 1)
+assert(while_merge(3, true, true, true) == 3)
+assert(while_elseif_merge(3, true, true, true, true, true, true) == 3)
+assert(table.concat(trace, ",") == "RL31,RS31,RL32,RS32,E151,ES51,E152,ES52,E261,ES61,E262,ES62,EE1")
 print("regress_271_loop_break_soft_phi")

@@ -1,3 +1,7 @@
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[if]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=0]]
+-- unluac: expect-ast-count [[error]] [[0]]
 -- 结构计数来自最终 AST：字符串里的关键字不算节点，proto 作用域不包含子函数体。
 -- unluac: expect-count [[@literal-if-while-function]] [[1]]
 -- unluac: expect-instruction-count [[not]] [[0]]

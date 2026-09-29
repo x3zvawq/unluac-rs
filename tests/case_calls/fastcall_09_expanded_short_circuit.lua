@@ -1,4 +1,7 @@
 -- 展开调用的比较与条件 RHS 共同属于外层参数帧；真假路径保留调用次数和临时根。
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[3]]
+-- unluac: expect-ast-count [[table-constructor]] [[6]]
 -- unluac: expect-ast-count [[if]] [[0]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-contains [[assert(select_table({ value = compared }) == compared and table.isfrozen(compared))]] [[@debug=retained]]

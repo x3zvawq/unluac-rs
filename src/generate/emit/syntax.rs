@@ -85,7 +85,11 @@ pub(super) fn format_label_name(label: AstLabelId) -> String {
     label.to_string()
 }
 
-pub(super) fn format_number(value: f64, preserve_integral_float: bool) -> String {
+pub(super) fn format_number(
+    value: f64,
+    preserve_integral_float: bool,
+    single_precision: bool,
+) -> String {
     if value.is_nan() {
         return "(0/0)".to_owned();
     }
@@ -99,10 +103,18 @@ pub(super) fn format_number(value: f64, preserve_integral_float: bool) -> String
     if value == 0.0 && value.is_sign_negative() {
         return "-0.0".to_owned();
     }
-    // 极小/极大的有限数不展开成数百位零；两种格式均使用可 round-trip 的有效数字。
-    // 常用量级保留十进制，指数本身也能保留 Lua 5.3+ 的浮点类型。
+    // f32 在 Parser 中精确扩展为 f64；按 header 声明的精度打印，避免把扩展后的
+    // 二进制尾数暴露为多余小数位。往返目标是原 VM 的数字模型，而非宿主 f64。
     let magnitude = value.abs();
-    let rendered = if magnitude != 0.0 && !(1e-6..1e16).contains(&magnitude) {
+    let scientific = magnitude != 0.0 && !(1e-6..1e16).contains(&magnitude);
+    let rendered = if single_precision {
+        let value = value as f32;
+        if scientific {
+            format!("{value:e}")
+        } else {
+            value.to_string()
+        }
+    } else if scientific {
         format!("{value:e}")
     } else {
         value.to_string()
@@ -162,7 +174,7 @@ pub(super) fn format_complex_literal(real: f64, imag: f64) -> Result<String, Gen
     let coefficient = match (imag.is_infinite(), imag.is_sign_negative()) {
         (true, true) => "-1e999".to_owned(),
         (true, false) => "1e999".to_owned(),
-        (false, _) => format_number(imag, false),
+        (false, _) => format_number(imag, false, false),
     };
     Ok(format!("{coefficient}i"))
 }

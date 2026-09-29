@@ -11,6 +11,16 @@
 -- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]] [[@variant=O1]]
 -- unluac: expect-ast-count [[if]] [[2]] [[@proto=3]] [[@variant=O0]]
 -- unluac: expect-ast-count [[if]] [[2]] [[@proto=3]] [[@variant=O1]]
+-- unluac: expect-ast-count [[repeat]] [[2]] [[@proto=2]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=2]]
+-- unluac: expect-ast-count [[break]] [[1]] [[@proto=3]] [[@variant=O0]]
+-- unluac: expect-ast-count [[break]] [[1]] [[@proto=3]] [[@variant=O1]]
+-- unluac: expect-ast-count [[continue]] [[1]] [[@proto=3]] [[@variant=O0]]
+-- unluac: expect-ast-count [[continue]] [[1]] [[@proto=3]] [[@variant=O1]]
+-- O2 已展开 mixed 的数值循环，原参数检查仍保留在五层条件节点中。
+-- unluac: expect-ast-count [[numeric-for]] [[0]] [[@proto=3]] [[@variant=O2]]
+-- unluac: expect-ast-count [[if]] [[5]] [[@proto=3]] [[@variant=O2]]
 local function mark(trace, name, value)
     trace[#trace + 1] = name
     return value

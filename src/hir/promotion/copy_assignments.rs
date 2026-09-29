@@ -5,6 +5,7 @@ use super::*;
 
 pub(super) mod lookups;
 mod luau;
+pub(super) mod varargs;
 
 /// Luau 参数在整个 proto 中保持原值时，透明 MOVE 链可提供稳定的值身份。
 /// 每一跳都排除引用捕获；仅检查链首参数会漏掉中间 cell 被回调改写的情况。
@@ -82,6 +83,91 @@ pub(in crate::hir) struct ScalarPairFrame {
     pub(in crate::hir) literal_input: Option<HirExpr>,
     pub(in crate::hir) tail: HirExpr,
     pub(super) copied_tail: Option<(TempId, HomeSlotKey)>,
+}
+
+/// 相邻 RHS 准备包含末项分配，完成后才逆序写回低槽；捕获 cell 的发布时点属于整个事务。
+#[derive(Debug, Clone)]
+pub(in crate::hir) struct AllocationPairFrame {
+    pub(in crate::hir) sites: [InstrRef; 2],
+    pub(in crate::hir) values: [TempId; 2],
+    pub(in crate::hir) writes: [ParallelWrite; 2],
+    pub(in crate::hir) homes: [HomeSlotKey; 2],
+    pub(in crate::hir) literal_input: Option<HirExpr>,
+    pub(in crate::hir) copied_input: Option<(TempId, HomeSlotKey)>,
+}
+
+pub(super) fn collect_allocation_pairs(
+    proto: &LoweredProto,
+    dialect: crate::decompile::DecompileDialect,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+    fixed_temps: &[TempId],
+    phi_temps: &[TempId],
+) -> BTreeMap<InstrRef, AllocationPairFrame> {
+    proto.instrs.windows(3).enumerate().filter_map(|(index, window)| {
+        let [first, LowInstr::NewTable(second), third] = window else {
+            return None;
+        };
+        let first_site = InstrRef(index);
+        let (first_reg, literal_input, copied_input) = match first {
+            LowInstr::NewTable(first) => (first.dst, None, None),
+            LowInstr::Move(first) if first.src < first.dst
+                && !epochs.reference_capture_may_be_open(first.src, first_site) => {
+                let input = canonical_value_temp(dataflow.use_value(first_site, first.src),
+                    dataflow.defs.len(), fixed_temps, phi_temps)?;
+                (first.dst, None, Some((input,
+                    HomeSlotKey::new(first.src.index(), epochs.epoch_at(first.src, first_site)))))
+            }
+            _ => {
+                let (reg, value) = scalar_literal(proto, first)?;
+                (reg, Some(value), None)
+            }
+        };
+        let (left, right, end) = match (third, proto.instrs.get(index + 3)) {
+            (LowInstr::Move(left), _) if dialect == crate::decompile::DecompileDialect::Luajit
+                && second.dst.index() < first_reg.index() => (left, None, index + 2),
+            (LowInstr::Move(right), Some(LowInstr::Move(left)))
+                if second.dst.index() == first_reg.index() + 1 && right.src == second.dst =>
+                (left, Some(right), index + 3),
+            _ => return None,
+        };
+        let right_dst = right.map_or(second.dst, |copy| copy.dst);
+        if left.src != first_reg || left.dst.index() >= first_reg.index()
+            || right_dst.index() >= first_reg.index() || left.dst == right_dst
+            || cfg.instr_to_block[index] != cfg.instr_to_block[end]
+        {
+            return None;
+        }
+        let sites = [InstrRef(index), InstrRef(index + 1)];
+        let mut values = [TempId(0); 2];
+        let mut homes = [HomeSlotKey::new(0, 0); 2];
+        let mut writes = Vec::with_capacity(2);
+        for (offset, (reg, copy)) in [(first_reg, Some(left)), (second.dst, right)].into_iter().enumerate() {
+            let site = sites[offset];
+            let def = dataflow.instr_def_for_reg(site, reg)?;
+            values[offset] = TempId(def.index());
+            homes[offset] = HomeSlotKey::new(reg.index(), epochs.epoch_at(reg, site));
+            let (target, home) = if let Some(copy) = copy {
+                let write_site = InstrRef(end - offset);
+                if epochs.reference_capture_may_be_open(reg, site)
+                    || epochs.epoch_at(reg, site) != epochs.epoch_at(reg, write_site)
+                    || dataflow.use_value(write_site, reg) != SsaValue::Def(def)
+                    || !dataflow.def_phi_uses[def.index()].is_empty()
+                    || !matches!(dataflow.def_uses[def.index()].as_slice(), [use_] if use_.instr == write_site)
+                {
+                    return None;
+                }
+                (TempId(dataflow.instr_def_for_reg(write_site, copy.dst)?.index()),
+                    HomeSlotKey::new(copy.dst.index(), epochs.epoch_at(copy.dst, write_site)))
+            } else {
+                // JIT 末项直接分配到已有低槽；没有提前发布任何前项，也没有额外 COPY。
+                (values[offset], homes[offset])
+            };
+            writes.push(ParallelWrite { target, source: values[offset], home });
+        }
+        Some((sites[1], AllocationPairFrame { sites, values, writes: writes.try_into().ok()?, homes, literal_input, copied_input }))
+    }).collect()
 }
 
 pub(super) fn collect_scalar_pairs(

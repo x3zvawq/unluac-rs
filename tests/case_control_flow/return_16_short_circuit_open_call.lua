@@ -1,6 +1,9 @@
 -- 短路共享 fallback 必须保留嵌套调用的开放参数、字段读取次数和单返回值。
 -- unluac: expect-ast-count [[goto]] [[0]]
 -- unluac: expect-ast-count [[label]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[13]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
 function edge(a)
   return GFunc and GFunc.num2 and GFunc.num2(tostring(a)) or tostring(a)
 end
@@ -58,6 +61,9 @@ GFunc = setmetatable({}, {
   end
 })
 check("repeated-lookup", "converted", 1, 1, 2)
+returned = false
+check("repeated-lookup-fallback", "value:2", 2, 1, 2)
+returned = "converted"
 
 -- tostring 是可替换的 global；开放参数必须保留中间 nil 和尾值，
 -- 而整个 and/or 返回表达式仍只产生一个结果。

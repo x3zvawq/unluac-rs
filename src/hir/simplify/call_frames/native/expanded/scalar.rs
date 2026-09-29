@@ -43,7 +43,7 @@ pub(super) fn constant_comparisons(
         { return None; }
         let layout = facts.native_binary_layout(binary)?;
         if layout.lhs != Some(HomeSlotKey::new(frame.home.slot() + 2, 0)) || layout.rhs.is_some()
-            || facts.comparison_operand_preparation(binary, 0, &binary.lhs).map(|(_, home)| home) != layout.lhs {
+            || facts.binary_operand_preparation(binary, 0, &binary.lhs).map(|(_, home)| home) != layout.lhs {
             return None;
         }
         let mut builder = frame_builder(context, &[], facts, DecompileDialect::Luau, frame.home.slot())?;
@@ -251,7 +251,7 @@ fn update_chain(stmts: &[HirStmt]) -> Option<(LocalId, Vec<&HirUnaryExpr>, &HirE
         if assign.is_phi_transfer
             || assign.initializer_merge_transaction.is_some()
             || assign.generic_for_initializer_producer.is_some()
-            || assign.generic_for_dispatch_release.is_some()
+            || assign.root_release.is_some()
             || assign.method_rewrite_transaction.is_some()
         {
             return None;
@@ -628,7 +628,7 @@ pub(super) fn preserve_updates(proto: &mut HirProto, facts: &mut ProtoPromotionF
                 values,
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
-                generic_for_dispatch_release: None,
+                root_release: None,
                 method_rewrite_transaction: None,
             })));
         }
@@ -884,7 +884,7 @@ impl FrameBuilder<'_> {
                 if !assign.is_phi_transfer
                     && assign.initializer_merge_transaction.is_none()
                     && assign.generic_for_initializer_producer.is_none()
-                    && assign.generic_for_dispatch_release.is_none()
+                    && assign.root_release.is_none()
                     && assign.method_rewrite_transaction.is_none() => {}
             _ => return None,
         }

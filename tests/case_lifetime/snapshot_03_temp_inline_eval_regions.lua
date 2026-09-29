@@ -1,4 +1,10 @@
 -- regress_172_temp_inline_eval_regions#1: while 外快照不能内联成每轮重读
+-- unluac: expect-ast-count [[while]] [[1]]
+-- unluac: expect-ast-count [[repeat]] [[3]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[function]] [[11]]
+-- unluac: expect-ast-count [[repeat-condition-local]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[32]]
 local while_state = 1
 local function while_snapshot()
     local snapshot = while_state
@@ -13,6 +19,8 @@ end
 local while_result = while_snapshot()
 assert(while_result == 11)
 print("regress_172_temp_inline_eval_regions#1", while_result)
+while_state = 3
+assert(while_snapshot() == 3)
 
 -- regress_172_temp_inline_eval_regions#2: repeat 外快照不能内联成每轮重读
 local repeat_state = 1
@@ -29,6 +37,8 @@ end
 local repeat_result = repeat_snapshot()
 assert(repeat_result == 11)
 print("regress_172_temp_inline_eval_regions#2", repeat_result)
+repeat_state = 3
+assert(repeat_snapshot() == 4)
 
 -- regress_172_temp_inline_eval_regions#3: numeric-for 头保持 producer 的原始求值顺序
 local numeric_log = {}
@@ -53,8 +63,8 @@ local function return_order()
     local value = return_mark("value")
     return return_mark("other"), value
 end
-local first, second = return_order()
-assert(first == "other" and second == "value" and table.concat(return_log, ",") == "value,other")
+local first, second, extra = return_order()
+assert(first == "other" and second == "value" and extra == nil and table.concat(return_log, ",") == "value,other")
 print(
     "regress_172_temp_inline_eval_regions#4",
     first,
@@ -68,9 +78,10 @@ print(
 -- unluac: expect-not-line [[local r0_17 = r0_15]]
 local method_log = {}
 local method_receiver = setmetatable({}, {
-    __index = function(_, name)
+    __index = function(receiver, name)
         method_log[#method_log + 1] = "lookup:" .. name
-        return function(_, value)
+        return function(self, value)
+            assert(self == receiver and value == "arg")
             method_log[#method_log + 1] = "call:" .. value
         end
     end,
@@ -112,4 +123,7 @@ do
     run()
     assert(ticks == 2)
     print("regress_172_temp_inline_eval_regions#6", ticks)
+    ticks = 0
+    run()
+    assert(ticks == 1)
 end

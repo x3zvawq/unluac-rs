@@ -140,6 +140,7 @@ impl LuaCaseConfiguration {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum LuaCaseExpectation {
     Source,
+    Lua53Float32,
     GlobalDeclResidual,
     InvalidDebugStillRejected,
     LuaJitBuiltinTableRemove,

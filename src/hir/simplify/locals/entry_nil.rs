@@ -628,7 +628,7 @@ pub(in crate::hir::simplify) fn restore_entry_frame(
             || assign.values.fixed.len() != assign.targets.len()
             || assign.initializer_merge_transaction.is_some()
             || assign.generic_for_initializer_producer.is_some()
-            || assign.generic_for_dispatch_release.is_some()
+            || assign.root_release.is_some()
             || assign.method_rewrite_transaction.is_some()
         {
             break;

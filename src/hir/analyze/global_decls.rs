@@ -22,6 +22,7 @@ pub(super) struct GlobalDeclProtocols {
 #[derive(Debug)]
 pub(super) struct GlobalDeclProtocol {
     owner: InstrRef,
+    pub(super) probe: InstrRef,
     pub(super) end: usize,
     pub(super) names: Vec<crate::LuaString>,
     pub(super) values: GlobalDeclValues,
@@ -29,7 +30,10 @@ pub(super) struct GlobalDeclProtocol {
 
 #[derive(Debug)]
 pub(super) enum GlobalDeclValues {
-    FixedCall(RegRange),
+    FixedCall {
+        prefix: Vec<GlobalDeclValueUse>,
+        results: RegRange,
+    },
     ValueUses(Vec<GlobalDeclValueUse>),
 }
 
@@ -46,6 +50,38 @@ struct GlobalDeclItem {
 }
 
 impl GlobalDeclProtocols {
+    pub(super) fn record_preparations(
+        &self,
+        dataflow: &DataflowFacts,
+        fixed_temps: &[crate::hir::TempId],
+        facts: &mut crate::hir::promotion::ProtoPromotionFacts,
+    ) {
+        for protocol in &self.protocols {
+            if let GlobalDeclValues::ValueUses(values) = &protocol.values
+                && let [value] = values.as_slice()
+                && protocol.names.len() == 1
+            {
+                facts.record_global_initializer_write(protocol.probe, value.instr);
+            }
+            let GlobalDeclValues::FixedCall { prefix, .. } = &protocol.values else {
+                continue;
+            };
+            if prefix.is_empty() {
+                continue;
+            }
+            let inputs = prefix
+                .iter()
+                .map(|value| {
+                    let SsaValue::Def(def) = dataflow.use_value(value.instr, value.reg) else {
+                        unreachable!("recognized global call prefix must have a direct definition");
+                    };
+                    fixed_temps[def.index()]
+                })
+                .collect();
+            facts.record_global_call_prefix(protocol.owner, inputs);
+        }
+    }
+
     /// 协议认领后才把原环境定义物化为局部声明，不增加新的读写或槽位。
     pub(super) fn bind_environment(
         &self,
@@ -186,7 +222,7 @@ fn recognize_call_protocol(
     if results.len == 0 {
         return CallProtocolMatch::None;
     }
-    let Some(end) = results
+    let Some(mut end) = results
         .len
         .checked_mul(3)
         .and_then(|item_width| item_width.checked_add(1))
@@ -225,21 +261,42 @@ fn recognize_call_protocol(
         names.push(item.name);
     }
 
-    // 候选拒绝[SemanticBarrier:ValueArity]: a fixed call can provide only the trailing slots of a wider
-    // declaration (`global a, b, c = 11, pair()`). Consuming that suffix would strand the leading
-    // item as a different declaration, so any immediately adjacent complete item rejects the run
-    // (regress_410_lua55_mixed_global_rhs).
-    if end
+    let mut prefix = Vec::new();
+    while end
         .checked_add(3)
         .is_some_and(|item_end| item_end <= block_end)
-        && recognize_item(proto, dataflow, local_environment, InstrRef(end)).is_some()
     {
-        if results.len == 1 {
-            return CallProtocolMatch::None;
-        }
-        return CallProtocolMatch::Blocked {
-            resume_at: contiguous_item_run_end(proto, dataflow, local_environment, end, block_end),
+        let Some(item) = recognize_item(proto, dataflow, local_environment, InstrRef(end)) else {
+            break;
         };
+        let expected = results.start.index().checked_sub(prefix.len() + 1);
+        let value = dataflow.use_value(item.set_ref, item.value_reg);
+        // 候选拒绝[ProofIncomplete]：前缀必须是 CALL 下方连续的独占准备值，且在 CALL 前
+        // 已定义；否则不能把后续独立声明或被闭包修改的现成 local 提前作为 RHS 读取。
+        if expected != Some(item.value_reg.index())
+            || !matches!(value, SsaValue::Def(def)
+                if dataflow.def_instr(def).index() < call_ref.index()
+                    && def_has_only_direct_use(dataflow, def, item.set_ref, item.value_reg))
+        {
+            if results.len == 1 && prefix.is_empty() {
+                return CallProtocolMatch::None;
+            }
+            return CallProtocolMatch::Blocked {
+                resume_at: contiguous_item_run_end(
+                    proto,
+                    dataflow,
+                    local_environment,
+                    end,
+                    block_end,
+                ),
+            };
+        }
+        names.push(item.name);
+        prefix.push(GlobalDeclValueUse {
+            instr: item.set_ref,
+            reg: item.value_reg,
+        });
+        end += 3;
     }
     // 候选拒绝[SemanticBarrier:EvalOrder]: wide target descriptors can be prepared before the tail call, so
     // the leading item is not necessarily adjacent to the direct suffix. A later ERRNNIL/SET
@@ -254,12 +311,14 @@ fn recognize_call_protocol(
         return CallProtocolMatch::Blocked { resume_at };
     }
     names.reverse();
+    prefix.reverse();
 
     CallProtocolMatch::Claimed(GlobalDeclProtocol {
         owner: call_ref,
+        probe: InstrRef(call_ref.index() + 1),
         end,
         names,
-        values: GlobalDeclValues::FixedCall(results),
+        values: GlobalDeclValues::FixedCall { prefix, results },
     })
 }
 
@@ -332,6 +391,7 @@ fn recognize_value_run_protocol(
         .unzip();
     Some(GlobalDeclProtocol {
         owner,
+        probe: owner,
         end: cursor,
         names,
         values: GlobalDeclValues::ValueUses(values),

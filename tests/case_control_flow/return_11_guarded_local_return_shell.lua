@@ -4,6 +4,10 @@
 -- unluac: expect-contains [[if not r3_0 then]]
 -- unluac: expect-contains [[print("dead")]]
 -- unluac: expect-contains [[p4_0 = r0_0.decrypt(p4_0)]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]]
+-- unluac: expect-ast-count [[if]] [[3]] [[@proto=3]]
+-- unluac: expect-ast-count [[if]] [[3]] [[@proto=4]]
 
 local codec = {}
 
@@ -53,3 +57,27 @@ assert(run_block("disabled", false) == "disabled")
 assert(run_if("if", true, false) == "if")
 assert(run_if(false, true, true) == nil)
 assert(run_if(false, true, false) == false)
+
+local events = ""
+codec.decrypt = function(value)
+    events = events .. "decrypt;"
+    return value, "ignored"
+end
+codec.consume = function(value)
+    events = events .. "consume;"
+    return value, nil, "tail"
+end
+local value, hole, tail = run_block(0, "")
+assert(value == 0 and hole == nil and tail == "tail" and events == "decrypt;consume;")
+events = ""
+value, hole, tail = run_if("", 0, nil)
+assert(value == "" and hole == nil and tail == "tail" and events == "decrypt;consume;")
+events = ""
+assert(select("#", run_block(nil, true)) == 1 and events == "decrypt;")
+events = ""
+assert(run_if(nil, true, 0) == nil and events == "decrypt;")
+events = ""
+assert(run_if(nil, true, nil) == false and events == "decrypt;")
+events = ""
+value, hole, tail = run_if(false, nil, true)
+assert(value == false and hole == nil and tail == "tail" and events == "consume;")

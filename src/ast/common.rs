@@ -593,6 +593,8 @@ pub struct AstFieldAccess {
 /// 索引访问。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstIndexAccess {
+    /// HIR 已证明该索引形式承担原准备槽；字段语法整理不得撤销它。
+    pub(crate) preserve_index_syntax: bool,
     pub base: AstExpr,
     pub index: AstExpr,
 }

@@ -76,7 +76,7 @@ use captured_slots::*;
 use captured_temps::*;
 pub(super) use copy_roots::{
     bind_allocation_copy_scopes, bind_copy_root_holders, bind_copy_root_initializers,
-    bind_copy_root_scopes,
+    bind_copy_root_scopes, initialized_in_root as copy_roots_initialized_in_root,
 };
 use debug_entries::*;
 use debug_names::*;
@@ -379,22 +379,14 @@ pub(super) fn build_bindings(
         phi_temps.push(TempId(next_temp_index));
         next_temp_index += 1;
     }
-    let nested_carried_parents =
-        coalesce_nested_loop_carried_temps(structure.plan(), dataflow, &mut phi_temps);
-    let nested_carried_child_owners = nested_carried_parents
-        .iter()
-        .enumerate()
-        .filter_map(|(child, parent)| {
-            Some((
-                (*parent)?,
-                structure
-                    .plan()
-                    .phi_plan(PhiId(child))?
-                    .loop_carried()?
-                    .owner,
-            ))
-        })
-        .collect::<BTreeSet<_>>();
+    let nested_carried_parents = coalesce_nested_loop_carried_temps(
+        structure.plan(),
+        cfg,
+        dataflow,
+        captured_slot_epochs,
+        &phi_debug_hints,
+        &mut phi_temps,
+    );
     coalesce_loop_state_temps(
         cfg,
         dataflow,
@@ -408,6 +400,22 @@ pub(super) fn build_bindings(
         (&mut phi_temps, &mut fixed_temps),
         captured_slot_epochs,
     );
+    // 结果合流可能已并入祖先 carried binding；退出暂存消费最终 binding 身份，
+    // 而非合并前的某个 phi 编号。该索引只在 binding 映射冻结后构建一次。
+    let nested_carried_child_owners = nested_carried_parents
+        .iter()
+        .enumerate()
+        .filter_map(|(child, parent)| {
+            Some((
+                phi_temps[(*parent)?.index()],
+                structure
+                    .plan()
+                    .phi_plan(PhiId(child))?
+                    .loop_carried()?
+                    .owner,
+            ))
+        })
+        .collect::<BTreeSet<_>>();
     preserve_loop_state_overwrites(
         proto,
         cfg,
@@ -444,6 +452,11 @@ pub(super) fn build_bindings(
                 })
         })
         .collect::<Vec<_>>();
+    let carried_temp_owners = structure
+        .plan()
+        .phis()
+        .filter_map(|phi| Some((phi_temps[phi.phi.index()], phi.loop_carried()?.owner)))
+        .collect::<BTreeSet<_>>();
     let repeat_staged_temps = structure
         .plan()
         .loops()
@@ -471,10 +484,11 @@ pub(super) fn build_bindings(
                 if let Some(temp) = repeat_stage_carried_temp(
                     structure.plan(),
                     loop_id,
-                    result.target,
+                    (result.target, result.normal_value),
                     dataflow,
                     &nested_carried_child_owners,
-                    &phi_temps,
+                    &carried_temp_owners,
+                    (&phi_temps, &fixed_temps),
                 ) {
                     temps.push(temp);
                 } else {
@@ -554,6 +568,7 @@ pub(super) fn build_bindings(
         structure,
         emission,
         &captured_slots,
+        captured_slot_epochs,
     );
     let mut scope_starts = lexical_scopes.iter().peekable();
     let mut scope_ends = Vec::new();
@@ -572,7 +587,7 @@ pub(super) fn build_bindings(
         })
         .collect::<Vec<_>>();
 
-    // 显式 nil、根作用域字面量或 MOVE 声明已有原位置与 source scope。后续内层写和外层读共用该身份，
+    // 显式 nil、根作用域或 repeat 本轮入口的标量声明已有原位置与 source scope。各写入共用该身份，
     // 不能等 block-local promotion 把它们分开后，再由 AST 给跨块 temp 补另一份声明。
     // 捕获槽仍由原 cell owner 分配；这里不接管其快照或 CLOSE 协议。
     let plan = structure.plan();
@@ -611,7 +626,7 @@ pub(super) fn build_bindings(
                     .plan()
                     .phi_plan(phi)
                     .and_then(|phi| phi.loop_carried())
-                    .map(|binding| binding.input)
+                    .and_then(|binding| binding.input)
                 else {
                     continue;
                 };
@@ -655,7 +670,8 @@ pub(super) fn build_bindings(
         // goto 区域的共同入口也可位于前置循环之后。所有外部边都经过其首块，且
         // 内部没有回边再进初始化时，原前缀声明先于整个区域，仍由根词法 owner 持有。
         if !matches!(proto.instrs[instr.index()], LowInstr::LoadNil(_))
-            && (emission.scope_owner(block) != Some(structure.plan().root())
+            && ((emission.scope_owner(block) != Some(structure.plan().root())
+                && !emission.repeat_body_entry(block))
                 || (block != cfg.entry_block
                     && !emission.ordinary_block(block)
                     && !(emission.island_entry_prefix(block) && !graph.block_is_cyclic(block)))
@@ -668,9 +684,9 @@ pub(super) fn build_bindings(
                     fact.end_instr.is_none_or(|end| end.index() > window_end)
                 }))
         {
-            // 候选拒绝[ProofIncomplete]：这里只统一函数根作用域声明的多次写；前置分支或
-            // 循环不改变后继声明的 owner，不能用 CFG 入口块替代词法可见性。内层声明的
-            // 词法提升、单写声明帧的槽复用仍由原 owner 决定。CLOSE 窗口早于 debug
+            // 候选拒绝[ProofIncomplete]：只有函数根或 repeat 本轮入口提供共同声明域；
+            // repeat body 和尾条件共享源码 scope，任意内层分支却没有同样的可见性。
+            // 单写声明帧的槽复用仍由原 owner 决定。CLOSE 窗口早于 debug
             // scope 结束时，也不能把本应跨窗口的身份声明固定在窗口内部。
             continue;
         }
@@ -857,7 +873,7 @@ pub(super) fn build_bindings(
     // 这一层默认只消费 reachable 子图，所以 label/temp 也贴着 shared CFG/Dataflow 的约定。
     let _ = cfg;
 
-    ProtoBindings {
+    let mut bindings = ProtoBindings {
         params,
         param_debug_hints,
         local_count,
@@ -875,6 +891,20 @@ pub(super) fn build_bindings(
             .filter_map(|def| {
                 (fixed_temps[def.index()] == TempId(def.index()))
                     .then_some(fixed_temps[def.index()])
+            })
+            .collect(),
+        uncaptured_definition_temps: dataflow
+            .defs
+            .iter()
+            .filter_map(|def| {
+                let temp = TempId(def.id.index());
+                let home = HomeSlotKey::new(
+                    def.reg.index(),
+                    captured_slot_epochs.epoch_at(def.reg, def.instr),
+                );
+                (fixed_temps[def.id.index()] == temp
+                    && captured_slots.version_is_uncaptured(home, SsaValue::Def(def.id)))
+                .then_some(temp)
             })
             .collect(),
         fixed_temps,
@@ -898,5 +928,7 @@ pub(super) fn build_bindings(
         for_binding_phi_locals,
         generic_for_locals,
         block_local_regs,
-    }
+    };
+    reuse_bound_repeat_stages(structure.plan(), &mut bindings);
+    bindings
 }

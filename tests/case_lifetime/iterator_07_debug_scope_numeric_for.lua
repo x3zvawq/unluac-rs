@@ -1,6 +1,10 @@
 -- 完整 for 的控制 phi 留在窗口内部；末尾调用退休高槽，不能延长 scoped 的源码根。
 -- unluac: expect-ast-min [[numeric-for]] [[1]]
 -- unluac: expect-ast-min [[do-block]] [[1]] [[@debug=retained]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[do-block]] [[1]]
 local function run(limit)
     local weak = setmetatable({}, { __mode = "k" })
     do

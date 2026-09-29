@@ -17,6 +17,21 @@
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@dialect=luajit]] [[@proto=5]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[15]]
+-- unluac: expect-ast-count [[local-binding]] [[10]] [[@proto=0]]
+-- pairs 注入器的并列字段写共同消费两个上值快照，不残留独立 RHS local。
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=luajit]]
+-- unluac: expect-contains [[queries, iterator_calls, last_control = {}, 0, 0]] [[@debug=retained]]
+-- 字段更新和 assert 参数共同消费原短路准备，不能留下 base 快照或 Boolean 预写声明。
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]] [[@dialect=luau]]
+-- unluac: expect-contains [=[queries[id] = (queries[id] or 0) + 1]=] [[@debug=retained]] [[@dialect=luau]]
 local A = {}
 
 function A:init()

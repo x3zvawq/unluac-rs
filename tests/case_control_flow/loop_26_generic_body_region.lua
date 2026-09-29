@@ -35,3 +35,18 @@ print(
     entered,
     logged
 )
+
+-- pairs 的首个 key 不影响 x 从 1 开始查找；内层 repeat 多走几步后仍只执行一次外层 body。
+assert(run(nil, {false, false, true}) == 3)
+assert(run(false, {false, 0, true}) == 2)
+assert(run(false, {false, "", true}) == 2)
+-- 输出也由 runner 对照；truthy 的 0/空串各打印一次 body，不能丢掉分支或 break。
+assert(run(0, {false, false, true}) == 3)
+assert(run("", {false, true}) == 2)
+assert(run(true, {}) == 0)
+-- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=0]]

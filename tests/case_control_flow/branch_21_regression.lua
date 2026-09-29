@@ -74,6 +74,24 @@ local function test_impure_or()
     end
 
     print("common_06_boolean_regression#4", tostring(a), tostring(d), table.concat(log, ","))
+
+    -- 单臂选值必须保留 nil 与 false 的区别，首个有副作用谓词只执行一次。
+    local inputs = { false, "truthy" }
+    for index = 0, 2 do
+        local kept = "kept"
+        local fallback = inputs[index]
+        if mark("probe", false) or fallback then
+            kept = kept
+        else
+            kept = fallback
+        end
+        local expected = fallback
+        if index == 2 then
+            expected = "kept"
+        end
+        assert(rawequal(kept, expected))
+    end
+    assert(table.concat(log, ",") == "m2,probe,probe,probe")
 end
 
 -- common_06_boolean_regression#5: 退化guard链

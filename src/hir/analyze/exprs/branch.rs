@@ -101,7 +101,7 @@ pub(in crate::hir::analyze) fn branch_call_result_ending_after_test(
             .is_some_and(|frontier| frontier.home() == reg)
             || lowering
                 .promotion_facts
-                .call_result_root_ends_after_value_use(lowering.bindings.fixed_temps[def.index()])))
+                .result_root_ends_after_value_use(lowering.bindings.fixed_temps[def.index()])))
     .then_some(def)
 }
 

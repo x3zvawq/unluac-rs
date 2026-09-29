@@ -1,6 +1,6 @@
-//! 短路值树的完整调用准备，消费已有 CALL 来源和原逻辑结果 home。
+//! 短路值树的完整准备，消费原操作来源和逻辑结果 home。
 //!
-//! Luau 的值/条件叶使用不同准备槽；单次 CALL 与标量备用值则消费原分支合流事实。
+//! Luau 的值/条件叶使用不同准备槽；单次调用或查表与标量备用值消费原分支合流事实。
 //! 事件、callee/参数 Def 和生命周期由共享 builder 证明，实际源码前缀由 native owner 核对。
 
 use super::*;
@@ -33,7 +33,7 @@ impl FrameBuilder<'_> {
         self.luau_logical_value(&rebuilt, before, home)
     }
 
-    pub(super) fn scalar_call_selection_layout(
+    pub(super) fn scalar_selection_layout(
         &self,
         logical: &crate::hir::common::HirLogicalExpr,
         before: usize,
@@ -43,14 +43,19 @@ impl FrameBuilder<'_> {
             HirExpr::LocalRef(local) => scalar_local(self.run[self.definition(*local, before)?])?.1,
             lhs => lhs,
         };
-        let HirExpr::Call(call) = lhs else {
-            return None;
+        let source = match lhs {
+            HirExpr::Call(call) => call.source_site?,
+            HirExpr::TableAccess(access) => match access.sources {
+                crate::hir::common::HirOperationSources::Single(source) => source,
+                _ => return None,
+            },
+            _ => return None,
         };
         self.facts
-            .short_circuit_call_homes(call, &logical.rhs, logical_and)
+            .short_circuit_scalar_homes(source, &logical.rhs, logical_and)
     }
 
-    pub(super) fn scalar_call_selection(
+    pub(super) fn scalar_selection(
         &mut self,
         logical: &crate::hir::common::HirLogicalExpr,
         before: usize,
@@ -59,7 +64,7 @@ impl FrameBuilder<'_> {
         (input, result): (HomeSlotKey, HomeSlotKey),
     ) -> Option<HirExpr> {
         let context = self.native?;
-        // Luau 可先保留逻辑结果，在高一槽调用后按分支 COPY；O0 与 PUC/JIT 可直接复用结果槽。
+        // Luau 可先保留逻辑结果，在高一槽调用或查表后按分支 COPY；O0 与 PUC/JIT 可直接复用结果槽。
         if result != HomeSlotKey::new(slot, 0)
             || !(input == result
                 || self.dialect == DecompileDialect::Luau && input.slot() == slot + 1)
@@ -91,13 +96,13 @@ impl FrameBuilder<'_> {
         result: HomeSlotKey,
     ) -> Option<HirExpr> {
         if let HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) = expr
-            && let Some(layout) = self.scalar_call_selection_layout(
+            && let Some(layout) = self.scalar_selection_layout(
                 logical,
                 before,
                 matches!(expr, HirExpr::LogicalAnd(_)),
             )
         {
-            return self.scalar_call_selection(
+            return self.scalar_selection(
                 logical,
                 before,
                 result.slot(),
@@ -105,7 +110,7 @@ impl FrameBuilder<'_> {
                 layout,
             );
         }
-        let previous = self.boolean_frame.replace(result.slot());
+        let previous = self.boolean_frame.replace(result);
         let value = self.luau_logical_tree(expr, before, result, LogicalUse::Value);
         self.boolean_frame = previous;
         value
@@ -231,12 +236,13 @@ impl FrameBuilder<'_> {
                     self.facts.native_call_frame(call)?.home
                 };
                 let native = self.native?;
+                // 原 CALL 的未捕获事实绑定 Def；未来同槽创建的 cell 不能回溯阻止
+                // 本次准备。已发生的关闭边界及完整调用/前缀证明仍独立核对。
                 if (if predicate {
                     home.slot() != result.slot() + 1
                 } else {
                     home != result
-                }) || native.barred.contains(&home)
-                    || native.closed.contains(&home)
+                }) || native.closed.contains(&home)
                     || !self
                         .facts
                         .operation_result_reference_unaliased(call.source_site?)
@@ -261,9 +267,13 @@ impl FrameBuilder<'_> {
                 self.expr(expr, before, result.slot(), None, false, true, None)
             }
             HirExpr::Binary(_) if matches!(usage, LogicalUse::Value) => {
-                self.expr(expr, before, result.slot(), None, false, false, None)
+                self.comparison_tree(expr, before, result.slot(), true)
             }
-            HirExpr::Unary(unary) if unary.op == crate::hir::common::HirUnaryOpKind::Neg => {
+            HirExpr::Unary(unary)
+                if unary.op == crate::hir::common::HirUnaryOpKind::Neg
+                    || unary.op == crate::hir::common::HirUnaryOpKind::Not
+                        && unary.source_site.is_some() =>
+            {
                 let predicate = matches!(
                     usage,
                     LogicalUse::Condition {
@@ -273,6 +283,34 @@ impl FrameBuilder<'_> {
                 );
                 let slot = result.slot() + usize::from(predicate);
                 self.expr(expr, before, slot, None, false, false, None)
+            }
+            HirExpr::LocalRef(local)
+                if self.definition(*local, before).is_some_and(|index| {
+                    matches!(scalar_local(self.run[index]), Some((_, HirExpr::Unary(unary)))
+                        if unary.source_site.is_some()
+                            && matches!(unary.op,
+                                crate::hir::common::HirUnaryOpKind::Neg
+                                | crate::hir::common::HirUnaryOpKind::Not))
+                }) =>
+            {
+                // 首叶的一元运算可能因 Boolean 取值身份保留为独立声明。
+                // 按该叶的值/条件位置重放原 NOT/NEG；expr 核对 Def、输入槽与准备事件。
+                let predicate = matches!(
+                    usage,
+                    LogicalUse::Condition {
+                        retain_value: false,
+                        ..
+                    }
+                );
+                self.expr(
+                    expr,
+                    before,
+                    result.slot() + usize::from(predicate),
+                    None,
+                    false,
+                    false,
+                    None,
+                )
             }
             HirExpr::Nil
             | HirExpr::Boolean(_)
@@ -286,7 +324,9 @@ impl FrameBuilder<'_> {
             {
                 Some(expr.clone())
             }
-            _ => None,
+            // 其余叶复用既有比较/读取证明；只有逻辑节点和 CALL 需要本层的值/条件
+            // 路由。不能因共用值树 owner 而丢掉字段、全局和已准备 local 的支持。
+            _ => self.comparison_tree(expr, before, result.slot(), true),
         }
     }
 }

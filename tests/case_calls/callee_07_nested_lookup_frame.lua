@@ -2,6 +2,10 @@
 -- unluac: expect-count [[.nested.field(]] [[1]]
 -- unluac: expect-contains [[()) == 23)]]
 -- unluac: expect-ast-count [[local-function]] [[2]]
+-- unluac: expect-ast-count [[function]] [[6]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[error]] [[0]]
 local function invoke(root, argument)
     assert(root.nested.field(argument()) == 23)
 end

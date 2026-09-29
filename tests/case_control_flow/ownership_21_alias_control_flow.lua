@@ -1,5 +1,10 @@
 -- 参数 alias 消费共享 CFG：深层循环只收集一次事实，break/return 与 repeat latch 保持各自出口。
--- unluac: expect-ast-min [[numeric-for]] [[3]]
+-- unluac: expect-ast-count [[numeric-for]] [[10]]
+-- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[while]] [[1]]
+-- unluac: expect-ast-count [[if]] [[4]]
+-- unluac: expect-ast-count [[break]] [[2]]
+-- unluac: expect-ast-count [[local-binding]] [[14]]
 -- unluac: expect-not-contains [[unluac error]]
 local function nested(value)
     for a = 1, 1 do
@@ -55,4 +60,13 @@ assert(latch(2) == 4)
 assert(latch(5) == 6)
 assert(pretest(0) == 2)
 assert(pretest(10) == 10)
+assert(nested(0) == 1)
+assert(exits(19) == 21)
+assert(exits(21) == 22)
+assert(latch(3) == 4)
+assert(latch(4) == 6)
+assert(latch(6) == 7)
+assert(pretest(2) == 4)
+assert(pretest(3) == 4)
+assert(pretest(4) == 4)
 print("regress_552_param_alias_control_flow", "OK")

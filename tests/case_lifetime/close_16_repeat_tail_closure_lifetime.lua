@@ -1,5 +1,9 @@
 -- A closure in a nested tail scope must release its captured object before the until condition.
 -- unluac: expect-contains [[    do]]
+-- unluac: expect-ast-count [[local-binding]] [[6]]
+-- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[do-block]] [[1]]
+-- unluac: expect-ast-count [[function]] [[3]]
 
 local finalized = false
 local observed
@@ -21,6 +25,9 @@ repeat
         local function hold()
             return value
         end
+        assert(hold() == value)
+        collectgarbage("collect")
+        assert(not finalized)
     end
 until stop()
 

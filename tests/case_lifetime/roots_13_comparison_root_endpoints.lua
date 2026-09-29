@@ -1,8 +1,12 @@
 -- 比较 CALL 的表结果须跨元方法和 callee 查找存活，到原参数/后继写才释放。
 -- unluac: expect-ast-count [[numeric-for]] [[3]]
+-- unluac: expect-ast-count [[local-binding]] [[28]]
+-- unluac: expect-ast-count [[function]] [[9]]
+-- unluac: expect-ast-count [[do-block]] [[2]]
 local weak = setmetatable({}, {__mode = "v"})
 local observations = {}
 local equal = false
+local seeds = 0
 local function observe(label)
     collectgarbage("collect")
     observations[#observations + 1] = label .. ":" .. tostring(weak[1] ~= nil)
@@ -33,6 +37,7 @@ local old_error = error
 error = nil
 setmetatable(_G, {__index = function(_, key)
     if key == "comparison_seed" then
+        seeds = seeds + 1
         return {}
     elseif key == "error" then
         observe("then-lookup")
@@ -65,12 +70,13 @@ local function normal_case()
     for index = comparison_next(), 1 do error("entered") end
     return prefix, 42, comparison_after
 end
-then_case()
+assert(then_case() == 0)
 equal = true
-local prefix, replacement = normal_case()
+local prefix, replacement, after = normal_case()
 setmetatable(_G, old_meta)
 error = old_error
-assert(prefix == 23 and replacement == 42)
+assert(prefix == 23 and replacement == 42 and after == 0)
+assert(seeds == 2 and #observations == 8)
 local result = table.concat(observations, ",")
 print(result)
 assert(result == "eq:true,then-lookup:true,then-call:false,after:false,eq:true,next-lookup:true,next-call:false,after:false")

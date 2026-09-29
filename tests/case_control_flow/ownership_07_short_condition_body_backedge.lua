@@ -17,4 +17,15 @@ local left = run(true, false, true)
 local right = run(false, true, true)
 local blocked = run(true, true, false)
 assert(left == 1 and right == 1 and blocked == 0)
+-- 保留前三次直接调用的 O2 展开，再通过原函数观察完整条件的真值边界。
+local dispatch = {run}
+assert(dispatch[1](nil, false, true) == 0)
+assert(dispatch[1](0, false, "") == 1)
+assert(dispatch[1](false, "", 0) == 1)
+assert(dispatch[1](true, true, nil) == 0)
+assert(dispatch[1](nil, nil, 0) == 0)
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[assign]] [[3]] [[@proto=1]]
 print(left, right, blocked)

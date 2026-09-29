@@ -1,8 +1,8 @@
-//! 把连续 nil 初始化接回同槽的合流声明，保留原写入位置与物理根。
-//! 只合并无读取的匿名 seed；debug/capture 身份和原槽被覆盖的间隔不参与。
+//! 恢复原 nil 批次与合流声明的初始化归属，保留绑定和物理根。
+//! 消费原批次、精确 home 与当前声明边界，不跨求值或回边移动初始化。
 
 use super::*;
-use crate::hir::common::{HirInlineDisposition, HirInlineRetentionReason};
+use crate::hir::common::{HirInlineDisposition, HirInlineRetentionReason, HirValuePack};
 use crate::hir::simplify::mention::stmts_mentioned_locals;
 use crate::hir::simplify::walk::{HirRewritePass, rewrite_proto};
 
@@ -29,6 +29,19 @@ pub(super) fn restore(proto: &mut HirProto, facts: &mut ProtoPromotionFacts) -> 
         facts,
         mentioned,
         debug,
+        nil_groups: facts
+            .nil_write_groups()
+            .filter_map(|temps| {
+                temps
+                    .iter()
+                    .map(|&temp| {
+                        let local = facts.promoted_local_for_temp(temp)?;
+                        let home = facts.trusted_temp_home_slot(temp)?;
+                        (Some(home) == facts.trusted_local_home_slot(local)).then_some(local)
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect(),
         merges: Vec::new(),
     };
     let changed = rewrite_proto(proto, &mut pass);
@@ -56,11 +69,81 @@ struct Restore<'a> {
     facts: &'a ProtoPromotionFacts,
     mentioned: BTreeSet<LocalId>,
     debug: BTreeSet<LocalId>,
+    nil_groups: BTreeSet<Vec<LocalId>>,
     merges: Vec<(LocalId, LocalId)>,
+}
+
+impl Restore<'_> {
+    fn restore_single_pass_initializers(&self, block: &mut HirBlock) -> bool {
+        let mut declarations = Vec::new();
+        let mut bindings = Vec::new();
+        let mut changed = false;
+        for index in 0..block.stmts.len() {
+            match &mut block.stmts[index] {
+                HirStmt::LocalDecl(decl)
+                    if decl.values.is_empty()
+                        && decl.initializer_merge_transaction.is_none()
+                        && decl
+                            .bindings
+                            .iter()
+                            .all(|local| !self.debug.contains(local)) =>
+                {
+                    declarations.push(index);
+                    bindings.extend(decl.bindings.iter().copied());
+                    continue;
+                }
+                HirStmt::Repeat(repeat)
+                    if !repeat.preserves_condition
+                        && matches!(repeat.cond, HirExpr::Boolean(true))
+                        && !bindings.is_empty()
+                        && self.nil_groups.contains(&bindings) =>
+                {
+                    if let Some(HirStmt::Assign(assign)) = repeat.body.stmts.first()
+                        && assign.initializer_merge_transaction.is_none()
+                        && assign.generic_for_initializer_producer.is_none()
+                        && assign.root_release.is_none()
+                        && assign.method_rewrite_transaction.is_none()
+                        && assign.parallel_nil_frame.is_none()
+                        && assign.targets.len() == bindings.len()
+                        && assign
+                            .targets
+                            .iter()
+                            .zip(&bindings)
+                            .all(|(target, local)| *target == HirLValue::Local(*local))
+                        && assign.values.tail.is_none()
+                        && assign.values.fixed.len() == bindings.len()
+                        && assign
+                            .values
+                            .fixed
+                            .iter()
+                            .all(|value| matches!(value, HirExpr::Nil))
+                    {
+                        // 壳入口没有求值，首条原 LOADNIL 恰好初始化紧邻的空声明。
+                        // 同一绑定、槽序及原 nil 批次均已确认；把初始化交回声明，
+                        // 不跨任何原操作，也不把会再次执行的循环体写移到循环外。
+                        repeat.body.stmts.remove(0);
+                        for &declaration in &declarations {
+                            let HirStmt::LocalDecl(decl) = &mut block.stmts[declaration] else {
+                                unreachable!()
+                            };
+                            decl.values =
+                                HirValuePack::fixed(vec![HirExpr::Nil; decl.bindings.len()]);
+                        }
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+            declarations.clear();
+            bindings.clear();
+        }
+        changed
+    }
 }
 
 impl HirRewritePass for Restore<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+        let initializers_changed = self.restore_single_pass_initializers(block);
         let mut seeds = BTreeMap::new();
         let mut replacements = Vec::new();
         let mut removed = BTreeSet::new();
@@ -196,7 +279,7 @@ impl HirRewritePass for Restore<'_> {
                 parallel_nil_frame: None,
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
-                generic_for_dispatch_release: None,
+                root_release: None,
                 method_rewrite_transaction: None,
             }));
         }
@@ -206,6 +289,6 @@ impl HirRewritePass for Restore<'_> {
             index += 1;
             keep
         });
-        !removed.is_empty() || !assigned.is_empty()
+        initializers_changed || !removed.is_empty() || !assigned.is_empty()
     }
 }

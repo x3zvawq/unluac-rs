@@ -13,6 +13,9 @@
 -- unluac: expect-min-count [[ & ]] [[2]]
 -- unluac: expect-min-count [[~]] [[3]]
 -- unluac: expect-not-contains [[ = nil]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[if]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[13]]
 
 local function discard_integer_ops()
     -- PUC 保留比较分支；值域可证明结果为 17，不代表这些操作属于恢复产生的包装。
@@ -40,7 +43,7 @@ local function discard_integer_ops()
     end
 end
 
-discard_integer_ops()
+assert(select("#", discard_integer_ops()) == 0)
 
 local function discard_binary_update()
     local value = 17
@@ -54,5 +57,5 @@ local function discard_unary_update()
     print("discard-unary-update")
 end
 
-discard_binary_update()
-discard_unary_update()
+assert(select("#", discard_binary_update()) == 0)
+assert(select("#", discard_unary_update()) == 0)

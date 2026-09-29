@@ -58,7 +58,7 @@ pub(super) fn analyze_value_merge_candidates(
         if phi.incoming.len() < 2 {
             continue;
         }
-        let Some(root) = value_merge_root(dom_tree, branch_by_header, phi) else {
+        let Some((root, loop_entry)) = value_merge_root(graph_facts, branch_by_header, phi) else {
             continue;
         };
         let operand_entry = operand_entries[root.header.index()];
@@ -66,7 +66,7 @@ pub(super) fn analyze_value_merge_candidates(
             .chain((operand_entry != root.header).then_some(operand_entry))
         {
             if let Some(candidate) =
-                ValueMergeDagBuilder::new(&build_ctx, header, phi, &mut node_refs)
+                ValueMergeDagBuilder::new(&build_ctx, header, phi, loop_entry, &mut node_refs)
                     .and_then(ValueMergeDagBuilder::build)
             {
                 candidates.push(candidate);
@@ -117,16 +117,47 @@ fn operand_entries(
 }
 
 fn value_merge_root<'a>(
-    dom_tree: &DominatorTree,
+    graph: &GraphFacts,
     branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
     phi: &PhiCandidate,
-) -> Option<&'a BranchCandidate> {
+) -> Option<(&'a BranchCandidate, Option<crate::structure::EdgeRef>)> {
     phi.incoming
         .iter()
         .all(|incoming| incoming.pred.is_some())
         .then_some(())?;
-    let root = dom_tree.parent[phi.block.index()]?;
-    branch_by_header.get(&root).copied()
+    let dom = &graph.dominator_tree;
+    if let Some(root) = dom.parent[phi.block.index()].and_then(|root| branch_by_header.get(&root)) {
+        return Some((*root, None));
+    }
+    if graph
+        .natural_loop_forest
+        .loop_for_header(phi.block)
+        .is_some()
+    {
+        let mut loop_entry = None;
+        let mut root = None;
+        for incoming in &phi.incoming {
+            let pred = incoming.pred?;
+            if !dom.dominates(phi.block, pred) {
+                if loop_entry.replace(incoming.edge?).is_some() {
+                    // 候选拒绝[ProofIncomplete]：多个循环入口尚无逐入口初始化归属。
+                    return None;
+                }
+            } else if incoming.value != SsaValue::Phi(phi.id) {
+                root = Some(match root {
+                    Some(previous) => dom.nearest_common_ancestor(previous, pred)?,
+                    None => pred,
+                });
+            }
+        }
+        let root = root?;
+        if root == phi.block {
+            // 候选拒绝[LayerBoundary]：决策跨到循环头，控制仍由 loop owner 发射。
+            return None;
+        }
+        return Some((*branch_by_header.get(&root)?, Some(loop_entry?)));
+    }
+    None
 }
 
 struct ValueMergeBuildCtx<'a> {
@@ -184,6 +215,7 @@ struct ValueMergeDagBuilder<'a, 'w> {
     reference_captured_phis: &'a [bool],
     root: BlockRef,
     phi: &'a PhiCandidate,
+    loop_entry: Option<crate::structure::EdgeRef>,
     nodes: Vec<ShortCircuitNode>,
     branch_targets: Vec<(BlockRef, BlockRef)>,
     node_refs: &'w mut DenseNodeRefs,
@@ -200,9 +232,11 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
         ctx: &'a ValueMergeBuildCtx<'a>,
         root: BlockRef,
         phi: &'a PhiCandidate,
+        loop_entry: Option<crate::structure::EdgeRef>,
         node_refs: &'w mut DenseNodeRefs,
     ) -> Option<Self> {
-        // root 已由 value_merge_root 选为 merge 的严格支配父分支，并排除了 Entry 输入。
+        // 普通合流由支配父分支拥有；循环内结果由全部有效回边的共同入口拥有，
+        // 独立循环入口不属于本次求值。两种情况均只消费已证明的物理 incoming。
         if ctx.dataflow.phi_graph.is_recursive(phi.id)
             && !phi
                 .incoming
@@ -211,10 +245,10 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
         {
             return None;
         }
-        let decision_incomings = phi
-            .incoming
-            .iter()
-            .filter(|incoming| incoming.value != SsaValue::Phi(phi.id));
+        let decision_incomings = phi.incoming.iter().filter(|incoming| {
+            incoming.value != SsaValue::Phi(phi.id)
+                && (loop_entry.is_none() || incoming.edge != loop_entry)
+        });
         if decision_incomings.clone().count() < 2 {
             return None;
         }
@@ -233,6 +267,7 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
             reference_captured_phis: ctx.reference_captured_phis,
             root,
             phi,
+            loop_entry,
             nodes: Vec::new(),
             branch_targets: Vec::new(),
             node_refs,
@@ -303,6 +338,7 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
             exit: ShortCircuitExit::ValueMerge(self.phi.block),
             result_reg: Some(self.phi.reg),
             result_phi_id: Some(self.phi.id),
+            loop_entry: self.loop_entry,
             entry_value: Some(phi_facts.entry_value),
             value_incomings: phi_facts.value_incomings,
             reducible,
@@ -451,12 +487,22 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
             .dataflow
             .last_fixed_def_in_range(self.phi.reg, range.start.index()..range.end())
             .is_none()
+            && !(block_is_passthrough(self.proto, self.cfg, leaf)
+                && self.cfg.unique_reachable_successor(leaf) == Some(self.phi.block))
             || block_has_ignore_call(self.proto, self.cfg, leaf)
         {
             return None;
         }
 
         let leaf_value = self.dataflow.block_exit_value(leaf, self.phi.reg);
+        // 最后一个无写入 pad 与直达 merge 的边同样携带旧 SSA 值；不能要求
+        // 编译器保留无效自 COPY。更早的透明块交给外层 follow 单次前进，
+        // 不从每个 pad 重扫后缀。入口未定义的非参数仍没有可恢复的值身份。
+        if matches!(leaf_value, SsaValue::Entry(reg)
+            if reg.index() >= usize::from(self.proto.signature.num_params))
+        {
+            return None;
+        }
         let mut current = leaf;
         let mut carriers = BTreeSet::new();
         loop {
@@ -524,10 +570,10 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
     }
 
     fn decision_incomings(&self) -> impl Iterator<Item = &crate::structure::PhiIncoming> {
-        self.phi
-            .incoming
-            .iter()
-            .filter(|incoming| incoming.value != SsaValue::Phi(self.phi.id))
+        self.phi.incoming.iter().filter(|incoming| {
+            incoming.value != SsaValue::Phi(self.phi.id)
+                && (self.loop_entry.is_none() || incoming.edge != self.loop_entry)
+        })
     }
 
     fn decision_incoming_from(&self, pred: BlockRef) -> Option<&crate::structure::PhiIncoming> {

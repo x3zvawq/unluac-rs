@@ -37,7 +37,7 @@ pub(crate) struct HirRequiredLuauInlining {
     /// 捕获更新型展开体的父级 cell、发布表工厂的只读容器，或递归闭包工厂的自身绑定。
     pub capture: Option<LocalId>,
     pub occurrences: Vec<HirSourceSite>,
-    /// 固定结果帧须预留原槽；Generate 核对最终声明或赋值的词法前缀。
+    /// 固定结果帧须预留原槽；Generate 核对最终声明、赋值或比较参数的词法前缀。
     pub result_frame_slots: BTreeMap<HirSourceSite, usize>,
 }
 
@@ -64,6 +64,23 @@ pub(crate) enum HirLuauInliningBody {
     /// 单参数快照、条件方法调用及字段返回，完整函数体按模板身份配对。
     ConditionalMethod {
         template: usize,
+    },
+    /// 常量条件选中 repeat 首段，原高槽状态最终写回低槽结果。
+    RepeatPrefix {
+        template: usize,
+    },
+    /// 常量参数选中的计数 while 保留逐次更新、退出比较和原低槽返回。
+    CounterWhile {
+        template: usize,
+        initial: i64,
+        increment: i64,
+        limit: i64,
+    },
+    /// 常量真分支保留状态查找和单次 generic-for，结果从高状态槽写回低槽。
+    StatefulGenericWhile {
+        template: usize,
+        initial: i64,
+        increment: i64,
     },
     TableFactory {
         shared: usize,
@@ -94,6 +111,20 @@ pub(crate) enum HirLuauInliningBody {
         /// 原 builtin 身份及 direct 参数域已在 HIR 核对；Generate 保持对应返回语境。
         fastcall: bool,
     },
+}
+
+/// print/加法组成的 repeat 链：常量真条件只计首段，假条件计全部更新。
+/// 两种成本须分别满足内联与保留 CALL，最终 AST 与 HIR 共用这一编译约束。
+pub(crate) fn luau_repeat_prefix_costs(steps: usize) -> bool {
+    if steps < 2 {
+        return false;
+    }
+    // CostModel 对 repeat 乘 3；普通 print 为 5、加法为 1、条件及 continue 为 3。
+    // 最后一个条件体为空，比中间段少一次 continue；每字节成本饱和于 127。
+    let baseline = steps.saturating_mul(27).saturating_add(12).min(127) + 3;
+    let full = steps.saturating_mul(18).saturating_add(15).min(127);
+    let threshold = |cost: usize| 25 * (100 * baseline / cost).min(300) / 100;
+    36 <= threshold(36) && full > threshold(full)
 }
 
 /// 在循环 binding 不产生常量折扣时，按 pinned Luau 的阈值证明循环不会展开。
@@ -248,6 +279,8 @@ pub enum HirInlineRetentionReason {
     TableInitialization,
     /// 值计算中的 Boolean 覆盖不能转为谓词极性；后者可能不再发射原覆盖操作。
     BooleanValueContext,
+    /// 原 COPY 写承接已消费的合成根退休；删除或内联该覆盖会重新延长旧资源生命周期。
+    RootOverwrite,
     /// 原调用或 scratch 覆盖事务依赖已有声明组成的物理帧前缀，不能删除、移位或提前结束。
     PhysicalFramePrefix,
     /// global 初始化隐式读取的局部环境，不能删除、移位、合并或缩短其词法绑定。
@@ -663,6 +696,8 @@ pub struct HirGlobalRef {
 /// 表访问。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirTableAccess {
+    /// 完整帧证明要求保留方括号；Luau 字符串索引的 base 准备不能被点语法合并到结果槽。
+    pub(crate) preserve_index_syntax: bool,
     /// 互斥合并保留全部原访问；合成访问无来源，物理许可须对每个原操作求交。
     pub(crate) sources: HirOperationSources,
     pub base: HirExpr,
@@ -731,6 +766,8 @@ pub struct HirLogicalExpr {
 /// `local + if + assign`。只有完整源码帧已证明的 Luau 条件选值树可作为原生 if 表达式流到 AST。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirDecisionExpr {
+    /// 内嵌操作数的独立原 phi；仅完整值图保留，子图投影不得继承该结果身份。
+    pub(crate) source_result: Option<TempId>,
     pub entry: HirDecisionNodeRef,
     pub nodes: Vec<HirDecisionNode>,
     /// 完整原帧事务已证明可发射为 Luau 条件表达式；普通 DAG 仍必须由 HIR 消除。
@@ -1130,6 +1167,8 @@ pub struct HirLocalDecl {
 /// 避免把结果物化成会漂移的局部根。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirGlobalDecl {
+    /// 完整协议首个 GET probe 的来源；RHS 改写不改变 probe/store 的原位置和准备边界。
+    pub(crate) probe_source: HirSourceSite,
     pub names: Vec<LuaString>,
     pub values: HirValuePack,
 }
@@ -1157,8 +1196,8 @@ pub struct HirAssign {
     /// 只证明该 assignment occurrence 属于某个 generic-for initializer；删除、移动、
     /// 展开与 capture/lifetime 合法性仍由 consumer 重新验证。
     pub generic_for_initializer_producer: Option<HirGenericForInitializerProducerId>,
-    /// 原 generic-for dispatch 的旧根释放端点；仍是普通 nil 写，不授权独立删除。
-    pub(crate) generic_for_dispatch_release: Option<HirGenericForDispatchRelease>,
+    /// 合成 nil 写的原始根端点；只有重发该端点的完整帧事务可消费它。
+    pub(crate) root_release: Option<HirRootRelease>,
     /// 与紧邻 method call 配对的一次性 HIR 改写事务。
     pub method_rewrite_transaction: Option<HirMethodRewriteTransactionId>,
 }
@@ -1168,6 +1207,23 @@ impl HirAssign {
     pub(crate) fn preserves_parallel_nil(&self) -> bool {
         self.parallel_nil_frame.is_some()
     }
+}
+
+/// 释放身份不随展示 Local 改名；消费者仍须核对当前目标、nil 包及完整物理帧。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HirRootRelease {
+    GenericForDispatch(HirGenericForDispatchRelease),
+    CopyOverwrite {
+        source: HirSourceSite,
+        /// 原指令独立的单结果 Def；与被释放的旧版本分开，供完整覆盖帧配对。
+        overwrite: Option<TempId>,
+        released: Vec<TempId>,
+    },
+    /// 无观察值决策在全部出口覆盖旧 phi；结果已写入后退休独立 debug holder。
+    ValueOverwrite {
+        result: TempId,
+        released: TempId,
+    },
 }
 
 /// 将原 root binding 与同一 generic-for dispatch 的 result endpoint 配对。
@@ -1325,6 +1381,9 @@ pub struct HirIf {
 /// while 语句。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirWhile {
+    /// Plan lowering 为无正文、无回边动作的条件前缀生成的包装；只授权延后选择发射形式。
+    /// 当前控制与资源边界仍须验证，不能据此移动前缀或忽略新增的边动作。
+    pub(crate) condition_prefix_only: bool,
     pub cond: HirExpr,
     pub body: HirBlock,
 }
@@ -1458,7 +1517,7 @@ pub struct HirGoto {
 /// label 语句。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirLabel {
-    /// 跳转到该 label 时跨过的真实 cleanup origins；不等同于 must-active barrier 的补集。
+    /// 跳转到该 label 时尚待词法 owner 消费的 cleanup origins；不等同于 must-active barrier 的补集。
     pub entry_cleanup: Vec<InstrRef>,
     pub id: HirLabelId,
     /// Structure 在目标 block 冻结的活跃 TBC 声明。
@@ -1591,7 +1650,7 @@ impl HirTableConstructor {
     }
 
     /// 完整字段数能否重现索引式构造器的数组预分配（含 VM 最小/饱和容量规则）。
-    /// 这里只检查容量；调用者另证字段均为顺序数组索引且求值/写入顺序不变。
+    /// 这里只检查容量；调用者另证数组索引连续、record 身份及求值/写入顺序不变。
     pub(in crate::hir) fn matches_indexed_array_capacity(&self, count: usize) -> bool {
         let Some(capacity) = self.allocation.indexed_array_capacity() else {
             return false;
@@ -1601,7 +1660,11 @@ impl HirTableConstructor {
                 == Some(capacity);
         }
         let count = count + usize::from(self.trailing_multivalue.is_some());
-        let generated = if count == 0 {
+        // LuaJIT 的显式 [0] 字段也要求最小数组区；它不计入 hash 预分配。
+        let zero_key = self.fields.iter().any(|field| {
+            matches!(field, HirTableField::Record(record) if record.key == HirExpr::Integer(0))
+        });
+        let generated = if count == 0 && !zero_key {
             0
         } else if count >= 2046 {
             2048

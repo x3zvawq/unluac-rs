@@ -1,4 +1,83 @@
-//! 对测试专用 Lua 5.1 chunk 执行受控跳转补丁；依赖格式边界检查，不负责生产解析器。
+//! 对官方编译出的测试 chunk 执行受控协议与数字宽度补丁；不负责生产解析器。
+
+/// 仅改写 Lua 5.3 的浮点宽度及载荷，其余字节保持官方编译器产物。
+/// runtime 仍为 stock f64；Lua 样例必须自行观察 f32 位模式，不能据此验证 f32 算术。
+pub(super) fn lua53_float32_chunk(chunk: &[u8]) -> Result<Vec<u8>, String> {
+    use unluac::decompile::DecompileDialect;
+    use unluac::parser::{Endianness, ParseOptions, RawLiteralConst, parse_chunk_with_dialect};
+
+    let parsed = parse_chunk_with_dialect(DecompileDialect::Lua53, chunk, ParseOptions::default())
+        .map_err(|error| format!("parse f64 baseline: {error}"))?;
+    let layout = parsed.header.puc_lua_layout().ok_or("missing PUC layout")?;
+    if layout.number_size != 8 || layout.instruction_size != 4 {
+        return Err("float32 carrier requires stock f64 Lua 5.3".into());
+    }
+    let little = layout.endianness == Endianness::Little;
+    let encode = |value: f64| {
+        let value = value as f32;
+        if little {
+            value.to_le_bytes()
+        } else {
+            value.to_be_bytes()
+        }
+    };
+    let integer_size = usize::from(layout.lua_integer_size.ok_or("missing integer width")?);
+    let check_offset = 17 + integer_size;
+    let mut edits = vec![(check_offset, encode(370.5))];
+    let mut pending = vec![&parsed.main];
+    while let Some(proto) = pending.pop() {
+        pending.extend(proto.common.children.iter().map(AsRef::as_ref));
+        let last = proto
+            .common
+            .instructions
+            .last()
+            .ok_or("fixture has empty code")?;
+        let mut cursor = last.origin.span.offset + last.origin.span.size;
+        let count = read_lua_uint(chunk, &mut cursor, usize::from(layout.integer_size), little)?;
+        if count != proto.common.constants.common.literals.len() {
+            return Err("fixture constant count disagrees with parser".into());
+        }
+        for literal in proto.common.constants.common.literals.iter() {
+            let tag = *chunk.get(cursor).ok_or("missing constant tag")?;
+            cursor += 1;
+            match (tag, literal) {
+                (0, RawLiteralConst::Nil) => {}
+                (1, RawLiteralConst::Boolean(_)) => cursor += 1,
+                (19, RawLiteralConst::Integer(_)) => cursor += integer_size,
+                (3, RawLiteralConst::Number(value)) => {
+                    edits.push((cursor, encode(*value)));
+                    cursor += 8;
+                }
+                (4 | 20, RawLiteralConst::String(_)) => {
+                    let mut length = read_lua_uint(chunk, &mut cursor, 1, little)?;
+                    if length == 255 {
+                        length = read_lua_uint(
+                            chunk,
+                            &mut cursor,
+                            usize::from(layout.size_t_size),
+                            little,
+                        )?;
+                    }
+                    cursor += length.saturating_sub(1);
+                }
+                _ => return Err(format!("unexpected Lua 5.3 fixture constant tag {tag}")),
+            }
+        }
+    }
+    edits.sort_unstable_by_key(|(offset, _)| *offset);
+    let mut encoded = Vec::with_capacity(chunk.len());
+    let mut cursor = 0;
+    for (offset, bytes) in edits {
+        encoded.extend_from_slice(&chunk[cursor..offset]);
+        encoded.extend_from_slice(&bytes);
+        cursor = offset + 8;
+    }
+    encoded.extend_from_slice(&chunk[cursor..]);
+    encoded[16] = 4;
+    parse_chunk_with_dialect(DecompileDialect::Lua53, &encoded, ParseOptions::default())
+        .map_err(|error| format!("parse f32 carrier: {error}"))?;
+    Ok(encoded)
+}
 
 pub(super) fn patch_lua51_main_jump(
     chunk: &mut [u8],

@@ -1,4 +1,9 @@
 -- 闭包创建与 callee COPY 各自保留原槽，后继构造帧不继承已结束的声明前缀。
+-- unluac: expect-ast-max [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[local-binding]] [[8]] [[@debug=retained]]
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@dialect=luau]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[assign]] [[2]]
+-- unluac: expect-ast-count [[do-block]] [[2]]
 -- unluac: expect-contains [[= setmetatable({}, {]]
 -- unluac: expect-contains [[local result = -get() and "yes" or "no"]] [[@debug=retained]]
 -- Luau 常量传播删掉 marker 比较，但保留比较前的 false 写；and true 重发该协议。

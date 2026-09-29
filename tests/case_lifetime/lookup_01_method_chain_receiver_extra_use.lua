@@ -1,6 +1,9 @@
 -- regress_415_method_chain_receiver_extra_use: receiver reused as an argument must retain its binding
 -- unluac: expect-not-contains [[:first():finish(]]
 -- unluac: expect-contains [[<close>]]
+-- unluac: expect-ast-count [[local-binding]] [[7]]
+-- unluac: expect-ast-count [[function]] [[7]]
+-- unluac: expect-ast-count [[close-binding]] [[1]]
 
 local owner = {}
 
@@ -26,7 +29,8 @@ function close_owner:first()
     return setmetatable({
         finish = function() end,
     }, {
-        __close = function()
+        __close = function(_, err)
+            assert(err == nil)
             close_count = close_count + 1
         end,
     })

@@ -1,6 +1,11 @@
 -- regress_388_cleanup_full_parallel_overwrite: fixed multi-call results retain one physical root
 -- per home through eventful overwrite evaluation, then release each root at its exact overwrite
 -- unluac: expect-not-contains [[local value = 0, mark()]]
+-- unluac: expect-ast-max [[local-binding]] [[42]]
+-- unluac: expect-ast-count [[function]] [[18]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=11]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=13]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=18]]
 
 local calls = 0
 

@@ -6,6 +6,8 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[local r1_2 = r1_0]]
+-- x 应直接承接本轮更新，until 的调用不应经由循环外临时变量。
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
 local function run(a, b, c, xs)
     local x = 0
     for i = 1, 3 do
@@ -36,6 +38,15 @@ local function stop_every_second_call()
 end
 local value = runner(true, true, stop_every_second_call, {})
 assert(value == 6 and condition_calls == 6)
+condition_calls = 0
+value = runner(true, false, stop_every_second_call, { 7, 8 })
+assert(value == 12 and condition_calls == 6, "generic-for break must consume only one item")
+condition_calls = 0
+value = runner(false, false, function()
+    condition_calls = condition_calls + 1
+    return false
+end, { 7, 8 })
+assert(value == 0 and condition_calls == 3, "immediate break must skip the iterator and until call")
 print(
     "regress_121_luau_short_circuit_immediate_repeat_break#1",
     value,

@@ -214,15 +214,13 @@ impl FrameBuilder<'_> {
         Some(HirExpr::Call(Box::new(restored)))
     }
 
-    pub(in crate::hir::simplify::call_frames) fn expanded_captured_comparison(
-        &mut self,
-        binary: &HirBinaryExpr,
+    fn captured_concat_prefix(
+        &self,
         before: usize,
-        slot: usize,
-    ) -> Option<HirExpr> {
+        result: usize,
+    ) -> Option<(usize, LocalId, crate::hir::common::HirSourceSite)> {
         let context = self.native?;
-        let callees = context.expanded_callees?;
-        if binary.op != HirBinaryOpKind::Eq || self.dialect != DecompileDialect::Luau {
+        if self.dialect != DecompileDialect::Luau {
             return None;
         }
         let update = before.checked_sub(1)?;
@@ -238,18 +236,16 @@ impl FrameBuilder<'_> {
         let HirExpr::String(suffix) = &concat.rhs else {
             return None;
         };
-        let callee = callees.get(&(HirLuauInliningBody::CapturedConcatSum, suffix.clone()))?;
+        let callee = context
+            .expanded_callees?
+            .get(&(HirLuauInliningBody::CapturedConcatSum, suffix.clone()))?;
         let source = concat.source_site?;
-        let comparison = binary.source_site?;
-        let result = self.boolean_operand_start(slot);
         let buffer = self.facts.captured_concat_buffer(concat, target)?;
-        let layout = self.facts.native_binary_layout(binary)?;
         if callee.capture != Some(target)
             || source.proto != callee.creation.proto
             || callee.creation.instr.index() >= source.instr.index()
             || buffer.start.index() != result + 1
             || buffer.len != 2
-            || layout.lhs != Some(HomeSlotKey::new(result, 0))
             || (result..result + 3).any(|slot| {
                 let home = HomeSlotKey::new(slot, 0);
                 context.barred.contains(&home) || context.closed.contains(&home)
@@ -257,46 +253,167 @@ impl FrameBuilder<'_> {
         {
             return None;
         }
-        let args = match &binary.lhs {
-            HirExpr::Binary(sum) => {
-                let HirExpr::Binary(first) = &sum.lhs else {
+        Some((update, callee.local, source))
+    }
+
+    fn captured_sum_arguments(
+        &self,
+        sum: &HirBinaryExpr,
+        source: crate::hir::common::HirSourceSite,
+        result: usize,
+    ) -> Option<Vec<HirExpr>> {
+        let context = self.native?;
+        let HirExpr::Binary(first) = &sum.lhs else {
+            return None;
+        };
+        let first_layout = self.facts.native_binary_layout(first)?;
+        let sum_layout = self.facts.native_binary_layout(sum)?;
+        let input = self.direct_home(&first.lhs)?;
+        if first.op != HirBinaryOpKind::Add
+            || sum.op != HirBinaryOpKind::Add
+            || first.source_site?.instr.index() != source.instr.index() + 1
+            || sum.source_site?.instr.index() != source.instr.index() + 2
+            || self.facts.operation_result_home(first.source_site?)
+                != Some(HomeSlotKey::new(result + 1, 0))
+            || self.facts.operation_result_home(sum.source_site?)
+                != Some(HomeSlotKey::new(result, 0))
+            || first_layout.lhs != Some(input)
+            || input.slot() >= self.base
+            || context.barred.contains(&input)
+            || first_layout.rhs.is_some()
+            || sum_layout.rhs.is_some()
+            || sum_layout.lhs != Some(HomeSlotKey::new(result + 1, 0))
+            || !matches!(first.rhs, HirExpr::Integer(_) | HirExpr::Number(_))
+            || !matches!(sum.rhs, HirExpr::Integer(_) | HirExpr::Number(_))
+        {
+            return None;
+        }
+        Some(vec![first.lhs.clone(), first.rhs.clone(), sum.rhs.clone()])
+    }
+
+    pub(in crate::hir::simplify::call_frames) fn expanded_captured_sum_argument(
+        &mut self,
+        call: &HirCallExpr,
+        argument: usize,
+        before: usize,
+        slot: usize,
+    ) -> Option<HirExpr> {
+        let context = self.native?;
+        context.expanded_callees?;
+        let resolve = |value: &HirExpr, before, slot, producer| {
+            let HirExpr::LocalRef(local) = value else {
+                return matches!(value, HirExpr::Binary(_)).then(|| (value.clone(), None));
+            };
+            let index = self.definition(*local, before)?;
+            if index < self.next_event
+                || !self.homes_match(*local, index, slot, None, producer)
+                || context.proto.local_debug_hints[local.index()].is_some()
+                || context.proto.local_debug_scopes[local.index()].is_some()
+                || matches!(context.proto.inline_dispositions.local(*local),
+                    crate::hir::common::HirInlineDisposition::Preserve(reasons)
+                    if reasons.iter().any(|reason| *reason != HirInlineRetentionReason::PhysicalFramePrefix))
+            {
+                return None;
+            }
+            let value = scalar_local(self.run[index])?.1;
+            matches!(value, HirExpr::Binary(_)).then(|| (value.clone(), Some(index)))
+        };
+        let producer = self.facts.call_argument_value(call, argument)?;
+        let (value, sum_definition) =
+            resolve(call.args.fixed.get(argument)?, before, slot, Some(producer))?;
+        let HirExpr::Binary(mut sum) = value else {
+            return None;
+        };
+        let (first, first_definition) =
+            resolve(&sum.lhs, sum_definition.unwrap_or(before), slot + 1, None)?;
+        // 分离的 ADD 声明仍通过原 use→Def 与完整写域连接，不能按临近槽猜测输入。
+        if first_definition.is_some()
+            && self.facts.binary_operand_preparation(&sum, 0, &first)?.0
+                != self.definition_producer(first_definition?)?
+        {
+            return None;
+        }
+        sum.lhs = first;
+        let (update, callee, source) = self
+            .captured_concat_prefix(first_definition.or(sum_definition).unwrap_or(before), slot)?;
+        // 原 CALL 的固定参数必须就是最后一次 ADD 的结果；不能把开放尾或
+        // 同槽的另一个值版本当成这次展开结果。AST 按固定包保留末参数单值括号。
+        if call.source_site?.instr.index() != source.instr.index() + 3
+            || producer != self.facts.operation_result_temp(sum.source_site?)?
+        {
+            return None;
+        }
+        let args = self.captured_sum_arguments(&sum, source, slot)?;
+        let cursor = (self.first_event, self.next_event);
+        for index in [Some(update), first_definition, sum_definition]
+            .into_iter()
+            .flatten()
+        {
+            if self.finish_event(index).is_none() {
+                (self.first_event, self.next_event) = cursor;
+                return None;
+            }
+        }
+        Some(captured_sum_call(callee, source, args))
+    }
+
+    pub(in crate::hir::simplify::call_frames) fn expanded_captured_comparison(
+        &mut self,
+        binary: &HirBinaryExpr,
+        before: usize,
+        slot: usize,
+    ) -> Option<HirExpr> {
+        if binary.op != HirBinaryOpKind::Eq {
+            return None;
+        }
+        let result = self.boolean_operand_start(slot);
+        let definition = match binary.lhs {
+            HirExpr::LocalRef(local) => {
+                let index = self.definition(local, before)?;
+                let value = scalar_local(self.run[index])?.1;
+                let (producer, _) = self.facts.binary_operand_preparation(binary, 0, value)?;
+                let context = self.native?;
+                if index < self.next_event
+                    || !matches!(value, HirExpr::Integer(_))
+                    || !self.homes_match(local, index, result, None, Some(producer))
+                    || context.proto.local_debug_hints[local.index()].is_some()
+                    || context.proto.local_debug_scopes[local.index()].is_some()
+                    || matches!(context.proto.inline_dispositions.local(local),
+                        crate::hir::common::HirInlineDisposition::Preserve(reasons)
+                        if reasons.iter().any(|reason| *reason != HirInlineRetentionReason::PhysicalFramePrefix))
+                {
                     return None;
-                };
-                let first_layout = self.facts.native_binary_layout(first)?;
-                let sum_layout = self.facts.native_binary_layout(sum)?;
-                let input = self.direct_home(&first.lhs)?;
-                if first.op != HirBinaryOpKind::Add
-                    || sum.op != HirBinaryOpKind::Add
-                    || first.source_site?.instr.index() != source.instr.index() + 1
-                    || sum.source_site?.instr.index() != source.instr.index() + 2
-                    || comparison.instr.index() != source.instr.index() + 3
-                    || self.facts.operation_result_home(first.source_site?)
-                        != Some(HomeSlotKey::new(result + 1, 0))
-                    || self.facts.operation_result_home(sum.source_site?)
-                        != Some(HomeSlotKey::new(result, 0))
-                    || first_layout.lhs != Some(input)
-                    || input.slot() >= self.base
-                    || context.barred.contains(&input)
-                    || first_layout.rhs.is_some()
-                    || sum_layout.rhs.is_some()
-                    || sum_layout.lhs != Some(HomeSlotKey::new(result + 1, 0))
-                    || !matches!(first.rhs, HirExpr::Integer(_) | HirExpr::Number(_))
-                    || !matches!(sum.rhs, HirExpr::Integer(_) | HirExpr::Number(_))
+                }
+                Some(index)
+            }
+            _ => None,
+        };
+        let lhs = definition.map_or(&binary.lhs, |index| {
+            scalar_local(self.run[index]).unwrap().1
+        });
+        let (update, callee, source) =
+            self.captured_concat_prefix(definition.unwrap_or(before), result)?;
+        let comparison = binary.source_site?;
+        let layout = self.facts.native_binary_layout(binary)?;
+        if layout.lhs != Some(HomeSlotKey::new(result, 0)) {
+            return None;
+        }
+        let args = match lhs {
+            HirExpr::Binary(sum) => {
+                if comparison.instr.index() != source.instr.index() + 3
                     || self.direct_home(&binary.rhs) != layout.rhs
                     || layout.rhs.is_none_or(|home| home.slot() >= self.base)
                 {
                     return None;
                 }
-                vec![first.lhs.clone(), first.rhs.clone(), sum.rhs.clone()]
+                self.captured_sum_arguments(sum, source, result)?
             }
-            HirExpr::Integer(value) if (0..=32767).contains(value) => {
-                let (_, home) =
-                    self.facts
-                        .comparison_operand_preparation(binary, 0, &binary.lhs)?;
+            HirExpr::Integer(value) if (-32768..=32767).contains(value) => {
+                let (_, home) = self.facts.binary_operand_preparation(binary, 0, lhs)?;
                 if home != HomeSlotKey::new(result, 0)
                     || self
                         .facts
-                        .comparison_preparation_instruction(binary, 0, &binary.lhs)?
+                        .comparison_preparation_instruction(binary, 0, lhs)?
                         .index()
                         != source.instr.index() + 1
                     || comparison.instr.index() != source.instr.index() + 2
@@ -305,7 +422,7 @@ impl FrameBuilder<'_> {
                 {
                     return None;
                 }
-                // 原实参已被常量折叠。非负小整数 n+0+0 精确重发同一个 LOADINT，
+                // 原实参已被常量折叠。有符号小整数 n+0+0 精确重发同一个 LOADINT，
                 // 不宣称恢复原实参；强制内联使两个 ADD 不进入运行时字节码。
                 vec![
                     HirExpr::Integer(*value),
@@ -315,24 +432,37 @@ impl FrameBuilder<'_> {
             }
             _ => return None,
         };
-        let call = HirCallExpr {
-            source_site: None,
-            required_luau_inlining: Some(source),
-            argument_roots: Vec::new(),
-            frame_root_ends: Vec::new(),
-            callee: HirExpr::LocalRef(callee.local),
-            args: args.into(),
-            method: crate::hir::common::HirMethodCall::None,
-            fastcall: None,
-            method_key: None,
-            callee_root_handoff: None,
-            method_rewrite_transaction: None,
-            plain_method_syntax: false,
-            boolean_prewrite_arguments: Vec::new(),
-        };
         let mut rebuilt = binary.clone();
-        rebuilt.lhs = HirExpr::Call(Box::new(call));
-        self.finish_event(update)?;
+        rebuilt.lhs = captured_sum_call(callee, source, args);
+        let cursor = (self.first_event, self.next_event);
+        if self.finish_event(update).is_none()
+            || definition.is_some_and(|index| self.finish_event(index).is_none())
+        {
+            (self.first_event, self.next_event) = cursor;
+            return None;
+        }
         Some(HirExpr::Binary(Box::new(rebuilt)))
     }
+}
+
+fn captured_sum_call(
+    callee: LocalId,
+    source: crate::hir::common::HirSourceSite,
+    args: Vec<HirExpr>,
+) -> HirExpr {
+    HirExpr::Call(Box::new(HirCallExpr {
+        source_site: None,
+        required_luau_inlining: Some(source),
+        argument_roots: Vec::new(),
+        frame_root_ends: Vec::new(),
+        callee: HirExpr::LocalRef(callee),
+        args: args.into(),
+        method: crate::hir::common::HirMethodCall::None,
+        fastcall: None,
+        method_key: None,
+        callee_root_handoff: None,
+        method_rewrite_transaction: None,
+        plain_method_syntax: false,
+        boolean_prewrite_arguments: Vec::new(),
+    }))
 }

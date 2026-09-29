@@ -2,6 +2,9 @@
 -- unluac: expect-contains [[local chosen = "seed"]] [[@debug=retained]]
 -- unluac: expect-contains [[chosen = test() and "one" or "two"]] [[@debug=retained]]
 -- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
 local function choose(flag)
     local chosen = "seed"
     local calls = 0
@@ -16,4 +19,7 @@ local function choose(flag)
 end
 assert(choose(true) == "one")
 assert(choose(false) == "two")
+assert(choose(nil) == "two")
+assert(choose(0) == "one")
+assert(choose("") == "one")
 print("assignment_10_literal_conditional_update", "OK")

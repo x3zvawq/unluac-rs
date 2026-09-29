@@ -1,4 +1,6 @@
 -- 参数COPY跨可观察查找保留独立根，纯nil终点仍须消费原覆盖证书。
+-- unluac: expect-ast-count [[local-binding]] [[7]]
+-- unluac: expect-ast-count [[function]] [[3]]
 local weak = setmetatable({}, {__mode = "v"})
 local seen
 local clear_parameter
@@ -24,3 +26,5 @@ assert(probe({}) == 3)
 setmetatable(_G, old)
 print("parameter-snapshot-pure-end", seen)
 assert(seen)
+collectgarbage("collect")
+assert(weak[1] == nil, "snapshot retained after pure nil endpoint")

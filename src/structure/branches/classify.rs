@@ -2,6 +2,42 @@
 
 use super::*;
 
+pub(super) fn classify_cleanup_exit_guard(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+) -> Option<BranchCandidate> {
+    let merge = graph_facts.nearest_common_postdom(then_entry, else_entry)?;
+    let exits = |escape, normal: BlockRef| {
+        transparent_jump_target(cfg, escape) == Some(merge)
+            && cfg.unique_reachable_predecessor_matching(escape, |_| true) == Some(header)
+            && normal != merge
+            && matches!(
+                proto.instrs[cfg.blocks[normal.index()].instrs.start.index()],
+                crate::transformer::LowInstr::Close(_)
+            )
+    };
+    let (then_entry, continuation, invert_hint) =
+        match (exits(then_entry, else_entry), exits(else_entry, then_entry)) {
+            (true, false) => (then_entry, else_entry, false),
+            (false, true) => (else_entry, then_entry, true),
+            _ => return None,
+        };
+    // 正常路径先结束外部资源作用域，不能连同其后操作一起藏入 if arm。
+    // 退出臂只有独占的原 JMP；保留该边及其 cleanup，正常 CLOSE 留在 if 后。
+    Some(BranchCandidate {
+        header,
+        then_entry,
+        else_entry: None,
+        merge: Some(continuation),
+        kind: BranchKind::Guard,
+        invert_hint,
+    })
+}
+
 pub(super) fn classify_if_else_branch(
     cfg: &Cfg,
     graph_facts: &GraphFacts,

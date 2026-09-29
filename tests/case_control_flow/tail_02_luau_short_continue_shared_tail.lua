@@ -8,6 +8,11 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- O2 已展开三轮 numeric-for，但共享 x 不应随展开产生新的状态绑定。
+-- unluac: expect-ast-count [[numeric-for]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[repeat]] [[3]] [[@proto=1]]
+-- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]]
 local function run(a, b, c, xs)
     local x = 0
     for k, v in xs do
@@ -45,3 +50,13 @@ print("regress_111_result", run(false, true, false, {}), run(false, true, false,
 for _, input in {{false, false, 1}, {false, true, 1}, {true, false, 7}} do
     assert(run(input[1], true, input[2], {1}) == input[3])
 end
+
+local subjects = { run }
+local xs = setmetatable({ 1, 2 }, { __index = function()
+    error("unselected lookup")
+end })
+assert(subjects[1](false, false, false, xs) == 2)
+assert(subjects[1](nil, nil, 0, xs) == 2)
+assert(subjects[1](0, "", false, xs) == 14)
+assert(subjects[1]("", 0, true, xs) == 14)
+assert(subjects[1](true, false, nil, {}) == 0)

@@ -6,6 +6,44 @@ use super::*;
 use crate::hir::common::HirCallArgumentRoot;
 use crate::transformer::ValuePack;
 
+/// 冻结 operand 控制之前已求值、随后在消费谓词读取的 CALL 结果。
+/// 只查询原 Def 与计划节点，不从后层合成的条件声明或语句距离猜测边界。
+pub(super) fn value_operand_prefix_calls(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    fixed_temps: &[TempId],
+) -> BTreeSet<TempId> {
+    let mut results = BTreeSet::new();
+    for (_, decision) in plan.value_decisions() {
+        let Some(header) = decision.header() else {
+            continue;
+        };
+        for operand in &decision.operands {
+            let entry = &decision.nodes[operand.entry.index()];
+            let consumer = &decision.nodes[operand.consumer.index()];
+            for value in dataflow.use_values[consumer.predicate.index()]
+                .fixed
+                .values()
+            {
+                let SsaValue::Def(def) = value else {
+                    continue;
+                };
+                let definition = &dataflow.defs[def.index()];
+                let temp = TempId(def.index());
+                if definition.block == header
+                    && definition.instr < entry.predicate
+                    && fixed_temps[def.index()] == temp
+                    && matches!(proto.instrs[definition.instr.index()], LowInstr::Call(_))
+                {
+                    results.insert(temp);
+                }
+            }
+        }
+    }
+    results
+}
+
 /// 同一原始 CALL 索引下共享参数根与完整调用布局，避免后层按方言重解槽距。
 #[derive(Debug, Clone)]
 pub(super) struct NativeCallFacts {
@@ -319,10 +357,17 @@ pub(super) fn collect(
                         let sources = &dataflow.open_use_sources[index];
                         if !sources.has_entry() && sources.defs().len() == 1 {
                             let def = &dataflow.open_defs[sources.defs().first().unwrap().index()];
-                            // 原开放包必须直接来自同块的最后一条 VARARG，不能把 CALL
-                            // 返回包或跨路径 pack phi 当作源码中的直接省略号。
+                            // 开放包保持同一 VARARG Def；Luau FASTCALL 可在其后复制
+                            // 低槽 callee，目标仍在参数区以下，不覆盖 pack 或引入观察。
+                            let bridge_owned = proto.instrs.get(def.instr.index() + 1..index)
+                                .is_some_and(|bridge| bridge.is_empty()
+                                    || matches!(bridge, [LowInstr::Move(copy)]
+                                        if layout.fastcall.is_some_and(|protocol| protocol.tail_is_direct())
+                                            && copy.dst.index() == layout.home.slot()
+                                            && copy.dst.index() < args_start.index()
+                                            && copy.src.index() < def.start_reg.index()));
                             (def.block == cfg.instr_to_block[index]
-                                && def.instr.index() + 1 == index
+                                && bridge_owned
                                 && matches!(proto.instrs[def.instr.index()], LowInstr::VarArg(_)))
                             .then_some(HomeSlotKey::new(
                                 def.start_reg.index(),
@@ -804,57 +849,59 @@ pub(super) fn boolean_prewrites(
     prewrites
 }
 
-/// 合流后的首条 MOVE 是显式结果写回；其它语句或跨块 COPY 不属于这份事实。
+/// 可达块入口的首条 MOVE 是显式结果写回；源 SSA 值须只有一个确定的目标及完整 home。
 pub(super) fn value_result_copies(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     epochs: &SlotEpochFacts,
-    plan: &StructurePlan,
     fixed_temps: &[TempId],
     phi_temps: &[TempId],
 ) -> BTreeMap<TempId, ImmediateMoveWrite> {
-    plan.phis()
-        .filter_map(|phi| {
-            let result = canonical_value_temp(
-                SsaValue::Phi(phi.phi),
-                fixed_temps.len(),
-                fixed_temps,
-                phi_temps,
-            )?;
-            let instr = cfg.blocks[phi.block.index()].instrs.start;
-            let LowInstr::Move(copy) = proto.instrs[instr.index()] else {
-                return None;
-            };
-            if copy.src != phi.reg || dataflow.use_value(instr, copy.src) != SsaValue::Phi(phi.phi)
-            {
-                return None;
-            }
-            let [def] = dataflow.instr_defs[instr.index()].as_slice() else {
-                return None;
-            };
-            let target = canonical_value_temp(
-                SsaValue::Def(*def),
-                fixed_temps.len(),
-                fixed_temps,
-                phi_temps,
-            )?;
-            Some((
-                result,
-                ImmediateMoveWrite {
-                    source: Some(result),
-                    target,
-                    source_home: HomeSlotKey::new(
-                        copy.src.index(),
-                        epochs.epoch_at(copy.src, instr),
-                    ),
-                    target_home: HomeSlotKey::new(
-                        copy.dst.index(),
-                        epochs.epoch_at(copy.dst, instr),
-                    ),
-                },
-            ))
-        })
+    let mut copies = BTreeMap::<TempId, Option<ImmediateMoveWrite>>::new();
+    for (index, block) in cfg.blocks.iter().enumerate() {
+        if block.instrs.is_empty() || !cfg.reachable_blocks.contains(&BlockRef(index)) {
+            continue;
+        }
+        let instr = block.instrs.start;
+        let Some(LowInstr::Move(copy)) = proto.instrs.get(instr.index()) else {
+            continue;
+        };
+        let value = dataflow.use_value(instr, copy.src);
+        let Some(result) = canonical_value_temp(value, fixed_temps.len(), fixed_temps, phi_temps)
+        else {
+            continue;
+        };
+        let [def] = dataflow.instr_defs[instr.index()].as_slice() else {
+            continue;
+        };
+        let Some(target) = canonical_value_temp(
+            SsaValue::Def(*def),
+            fixed_temps.len(),
+            fixed_temps,
+            phi_temps,
+        ) else {
+            continue;
+        };
+        let write = ImmediateMoveWrite {
+            source: Some(result),
+            target,
+            source_home: HomeSlotKey::new(copy.src.index(), epochs.epoch_at(copy.src, instr)),
+            target_home: HomeSlotKey::new(copy.dst.index(), epochs.epoch_at(copy.dst, instr)),
+        };
+        // 循环出口也可直接读取未更新的 Def；多个入口 COPY 不构成唯一写回证书。
+        copies
+            .entry(result)
+            .and_modify(|old| {
+                if *old != Some(write) {
+                    *old = None;
+                }
+            })
+            .or_insert(Some(write));
+    }
+    copies
+        .into_iter()
+        .filter_map(|(result, copy)| Some((result, copy?)))
         .collect()
 }
 
@@ -912,7 +959,7 @@ pub(super) fn copy_prewrites(
     copies
 }
 
-/// 同一共享 Dataflow 事实给出 call result 的独立 root 后缀终点；HIR 不从后缀文本猜 MOVE。
+/// 共享 Dataflow 给出调用和表分配结果的 root 后缀终点；HIR 不从后缀文本猜覆盖。
 pub(super) fn collect_unobserved_result_ends(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -926,7 +973,10 @@ pub(super) fn collect_unobserved_result_ends(
             let producer = TempId(def.id.index());
             if fixed_temps[def.id.index()] != producer
                 || dataflow.reg_is_reference_captured(def.reg)
-                || !matches!(proto.instrs[def.instr.index()], LowInstr::Call(_))
+                || !matches!(
+                    proto.instrs[def.instr.index()],
+                    LowInstr::Call(_) | LowInstr::NewTable(_)
+                )
             {
                 return None;
             }

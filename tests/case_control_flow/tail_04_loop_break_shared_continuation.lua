@@ -6,7 +6,12 @@
 -- unluac: expect-not-contains [[unresolved(generic-for-loop cond)]]
 -- unluac: expect-not-contains [[goto label_]]
 -- unluac: expect-not-contains [[until true]]
-local values = { "A==B", "BBBB" }
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[while]] [[2]]
+-- unluac: expect-ast-count [[break]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[16]]
+local values = { "A==B", "BBBB", "A=B", "A=", "=B", "", "#AB", "A#B", "AA", "B", 0 }
 
 for _, span in ipairs({ { 1, 2 }, { 1, 2 } }) do
     while span[1] < span[2] do
@@ -54,6 +59,13 @@ for index = 1, #values do
     end
 end
 
+assert(values[1] == "A==B" and values[2] == "BBBB")
+assert(#output == 10 and output[11] == nil)
+assert(output[1] == string.char(1) and output[2] == string.char(4, 4))
+assert(output[3] == string.char(1, 1) and output[4] == string.char(1, 1))
+assert(output[5] == string.char(0, 0) and output[6] == "")
+assert(output[7] == string.char(3) and output[8] == string.char(3))
+assert(output[9] == string.char(2) and output[10] == "")
 print(
     "regress_12_loop_break_shared_continuation#1",
     #output[1],

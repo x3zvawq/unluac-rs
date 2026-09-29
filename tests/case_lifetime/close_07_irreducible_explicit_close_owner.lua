@@ -3,6 +3,11 @@
 -- unluac: expect-contains [[if p3_0 then]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-ast-count [[local-binding]] [[9]]
+-- unluac: expect-ast-count [[close-binding]] [[1]]
+-- unluac: expect-ast-max [[label]] [[3]]
+-- 独占出口 pad 不应使分支退回 island 原始跳转并逐轮增加 goto。
+-- unluac: expect-count [[goto ]] [[3]]
 
 local closed = 0
 local mt = {
@@ -39,8 +44,11 @@ local function run(start_second, jump_second, jump_first)
 end
 
 local direct = run(false, false, false)
+assert(closed == 1)
 local second = run(true, false, false)
+assert(closed == 1)
 local side = run(false, true, false)
+assert(closed == 2)
 local reentry = run(true, false, true)
 assert(direct == 1 and second == 1 and side == 1 and reentry == 1 and closed == 3)
 print(
@@ -51,3 +59,8 @@ print(
     reentry,
     closed
 )
+
+-- 入口极性遵循 Lua 真值规则；重入路径的 close 仍只执行一次。
+assert(run(nil, false, false) == 1 and closed == 4)
+assert(run(0, false, false) == 1 and closed == 4)
+assert(run("", false, true) == 1 and closed == 5)

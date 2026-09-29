@@ -1,6 +1,8 @@
--- 相同读取的内层返回合并后不应留下无声明 block，阻止外层继续消费共同来源。
+-- 相同读取的返回仍保留三个原检查，不引入无声明 block 或布尔中转。
 -- unluac: expect-contains [[return p1_0.value]]
--- unluac: expect-not-contains [[if p1_]]
+-- unluac: expect-ast-count [[if]] [[3]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=1]]
 -- 同槽、无观察的提前返回可整体表达式化；falsy 叶不能套用 and/or 选择。
 -- unluac: expect-ast-count [[if]] [[0]] [[@proto=3]]
 -- unluac: expect-ast-min [[if]] [[1]] [[@proto=4]]

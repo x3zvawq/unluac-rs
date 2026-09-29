@@ -11,3 +11,8 @@ end
 local integer, number, negative_zero = powers(2)
 assert(integer == 4 and number == 6.25 and 1 / negative_zero == math.huge)
 print("regress_134_negative_literal_power#1", integer, number, 1 / negative_zero)
+integer, number, negative_zero = powers(3)
+assert(integer == -8 and number == -15.625 and 1 / negative_zero == -math.huge)
+integer, number, negative_zero = powers(0)
+assert(integer == 1 and number == 1 and negative_zero == 1)
+assert(select("#", powers(2)) == 3)

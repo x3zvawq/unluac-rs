@@ -2,7 +2,9 @@
 -- unluac: expect-count [[ == #]] [[2]]
 -- unluac: expect-count [[ ~= #]] [[1]]
 -- unluac: expect-not-contains [[= assert]]
--- unluac: expect-ast-max [[local-binding]] [[4]]
+-- unluac: expect-ast-max [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[if]] [[0]]
 -- unluac: expect-count [[or false)]] [[1]] [[@dialect=luau]]
 local reads = 0
 local row = setmetatable({ 11, 22 }, {
@@ -25,3 +27,19 @@ assert(not pcall(dispatch[1], 2, row, false))
 assert(not pcall(dispatch[1], 3, row, true))
 -- 各 VM 对表 __len 的支持不同，运行比较保留各自原程序的调用次数。
 print("low-left-length", reads)
+assert(reads == 0 or reads == 5)
+-- 首轮 stdout 已区分 VM 是否调用表 __len；后续按该能力核对每条路径的增量。
+local len_step = reads / 5
+assert(dispatch[1](2, row, 0))
+assert(reads == 8 * len_step)
+assert(dispatch[1](2, row, ""))
+assert(reads == 11 * len_step)
+assert(select("#", dispatch[1](2, row, true)) == 1)
+assert(reads == 14 * len_step)
+assert(not pcall(dispatch[1], 2, row, nil))
+assert(reads == 15 * len_step)
+assert(dispatch[1](0, "", true))
+assert(dispatch[1](2, "\000\255", true))
+assert(not pcall(dispatch[1], 2, 0, true))
+assert(reads == 15 * len_step)
+print("low-left-length-final", reads)

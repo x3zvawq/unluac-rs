@@ -9,6 +9,11 @@
 -- unluac: expect-not-contains [[local r0_2]]
 -- unluac: expect-contains [[r0_0 = r0_0 + 2]]
 -- unluac: expect-contains [[r0_0 = r0_0 + 5]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[continue]] [[1]]
+-- unluac: expect-ast-count [[break]] [[1]]
+-- unluac: expect-ast-count [[if]] [[3]]
+-- unluac: expect-ast-count [[local-binding]] [[2]]
 local x = 0
 for i = 1, 5 do
     if i < 3 then

@@ -1,4 +1,10 @@
 -- Entry nil cell 必须在原 CLOSE 窗口内先声明，后续复用同槽的构造器不能被旧前缀抬高。
+-- unluac: expect-ast-max [[local-binding]] [[9]]
+-- unluac: expect-ast-count [[local-binding]] [[9]] [[@debug=retained]]
+-- unluac: expect-ast-count [[local-binding]] [[8]] [[@debug=stripped]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[assign]] [[2]]
+-- unluac: expect-ast-count [[do-block]] [[3]] [[@debug=retained]]
+-- unluac: expect-ast-count [[do-block]] [[2]] [[@debug=stripped]]
 -- unluac: expect-contains [[= setmetatable({}, {]]
 -- unluac: expect-not-contains [[unresolved]]
 -- 入口 cell 可以没有初始化值；同槽后继多返回声明必须完整恢复，不能再拆空声明。

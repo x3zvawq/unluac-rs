@@ -1,3 +1,20 @@
+-- 重入闭包只需 value 与 step；尾返回不应新增 tostring 的 callee/参数别名。
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=7]]
+-- unluac: expect-ast-count [[function]] [[12]]
+-- unluac: expect-ast-count [[error]] [[0]]
+-- 各子场景只保留源码状态与循环绑定；调用、索引和拼接的准备槽不应成为额外声明。
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=0]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=12]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=4]]
+-- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=5]]
+-- unluac: expect-ast-max [[local-binding]] [[6]] [[@proto=3]]
+-- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=11]]
+-- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=10]]
+-- unluac: expect-ast-max [[local-binding]] [[6]] [[@proto=9]]
+-- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=8]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=6]]
+-- unluac: expect-ast-max [[local-binding]] [[6]] [[@proto=2]]
+-- unluac: expect-ast-max [[local-binding]] [[8]] [[@proto=1]]
 -- luajit_01#1: goto与cdata累加
 local function test_goto_cdata()
     local total = 0LL

@@ -763,13 +763,16 @@ where
     FIndex: FnOnce(AstIndexAccess) -> T,
 {
     let base = lowerer.lower_expr(proto_index, &access.base)?;
-    if let Some(field_name) = field_name_from_key(&access.key, lowerer.target.version) {
+    if !access.preserve_index_syntax
+        && let Some(field_name) = field_name_from_key(&access.key, lowerer.target.version)
+    {
         return Ok(make_field(AstFieldAccess {
             base,
             field: field_name,
         }));
     }
     Ok(make_index(AstIndexAccess {
+        preserve_index_syntax: access.preserve_index_syntax,
         base,
         index: lowerer.lower_expr(proto_index, &access.key)?,
     }))
@@ -853,6 +856,7 @@ fn lower_global_lvalue(
 
 fn environment_index(key: &crate::LuaString) -> AstIndexAccess {
     AstIndexAccess {
+        preserve_index_syntax: false,
         base: AstExpr::Var(AstNameRef::Environment),
         index: AstExpr::String(key.clone()),
     }

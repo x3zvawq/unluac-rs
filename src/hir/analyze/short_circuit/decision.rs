@@ -41,6 +41,7 @@ pub(crate) fn build_condition_decision_expr(
         })
         .collect::<Option<Vec<_>>>()?;
     (!nodes.is_empty()).then_some(HirDecisionExpr {
+        source_result: None,
         entry,
         nodes,
         emit_as_luau_if: false,
@@ -79,6 +80,7 @@ pub(crate) fn build_value_decision_expr(
         })
         .collect::<Option<Vec<_>>>()?;
     (!nodes.is_empty() && entry.index() < nodes.len()).then_some(HirDecisionExpr {
+        source_result: None,
         entry,
         nodes,
         emit_as_luau_if: false,
@@ -166,7 +168,12 @@ pub(super) fn lower_value_target(
                 // 内部操作数可以把入口写入转交到较晚的叶；latest_local_def 只描述
                 // 该叶块，不能因此丢掉已经冻结的入口 SSA 身份。
                 // Header prefix 正常发射，动态 producer 必须读取原值，不能再次求值。
-                expr_for_emitted_header_leaf(lowering, decision.header()?, def)
+                expr_for_emitted_header_leaf(
+                    lowering,
+                    decision.header()?,
+                    decision.nodes[decision.entry.index()].predicate,
+                    def,
+                )
             } else {
                 match leaf.latest_local_def {
                     // ValueDecision 吞掉了 leaf block 的普通指令，必须优先沿完整单次求值
@@ -190,6 +197,7 @@ pub(super) fn lower_value_target(
 pub(super) fn expr_for_emitted_header_leaf(
     lowering: &ProtoLowering<'_>,
     header: BlockRef,
+    predicate: crate::transformer::InstrRef,
     def: crate::structure::DefId,
 ) -> HirExpr {
     let reg = lowering.dataflow.def_reg(def);
@@ -198,12 +206,21 @@ pub(super) fn expr_for_emitted_header_leaf(
             expr_for_ssa_value(lowering, crate::structure::SsaValue::Def(def))
         })
     };
+    // PUC/JIT 的比较在分支出口写 Boolean；入口处已有的同槽常量仍是独立初始化。
+    // 保留它的 SSA 读取，才能在决策消除后将更新接回原绑定。只有 Luau 原二元比较
+    // 使用入口 Boolean 预写协议；普通字段真值测试不能据此抹掉独立初始化的身份。
+    if lowering.target != crate::decompile::DecompileDialect::Luau
+        || !matches!(&lowering.proto.instrs[predicate.index()], LowInstr::Branch(branch)
+            if matches!(branch.cond.subject, crate::transformer::BranchSubject::Compare { .. }))
+    {
+        return fallback();
+    }
     let Some(temp) = lowering.bindings.fixed_temps.get(def.index()).copied() else {
         return fallback();
     };
 
-    // Header prefix 仍按原位置发射。这里只把没有源码/捕获身份的稳定字面量交给
-    // decision leaf；随后 dead-temp 才能在确认无剩余引用后删除那条机械赋值。
+    // Header prefix 仍按原位置发射。这里只把没有源码/捕获身份的 Boolean 交给
+    // decision leaf；原预写仍保留，只有证明完整源码帧会重发它时才能一起消费。
     // 捕获身份由当前 temp/local binding 判断；同槽未来另一版本的 capture 不约束本次字面量。
     if !matches!(
         lowering.bindings.temp_debug_locals.get(temp.index()),

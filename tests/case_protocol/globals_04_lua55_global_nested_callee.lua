@@ -8,6 +8,9 @@
 -- unluac: expect-count [[global left_target, right_target =]] [[3]]
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=10]]
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=11]]
+-- unluac: expect-ast-count [[function]] [[11]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-max [[error]] [[0]]
 
 global<const> print, collectgarbage, getmetatable, setmetatable, rawset, pcall, table, assert
 

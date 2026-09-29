@@ -1,5 +1,6 @@
 -- 原多结果 CALL 的有序写回与 Phi 合流组成一个赋值帧，不引入额外接收变量。
--- unluac: expect-ast-max [[local-binding]] [[11]]
+-- unluac: expect-ast-count [[local-binding]] [[11]]
+-- unluac: expect-ast-count [[local-decl]] [[4]]
 -- unluac: expect-ast-count [[method-call]] [[1]]
 -- unluac: expect-ast-count [[if]] [[1]]
 local function rect(self, x, y, width, height)

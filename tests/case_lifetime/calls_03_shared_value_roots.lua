@@ -1,5 +1,7 @@
 -- Copies share a value, but each physical home has an independent release endpoint.
 -- unluac: expect-ast-min [[local-decl]] [[32]]
+-- 清空前 31 个 home 不应另声明 30 个 nil 中转值；32 份原 root 仍须保留。
+-- unluac: expect-ast-count [[local-binding]] [[35]]
 local weak = setmetatable({}, { __mode = "v" })
 local function make()
     local object = {}

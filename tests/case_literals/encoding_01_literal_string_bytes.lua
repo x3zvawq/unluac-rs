@@ -7,14 +7,16 @@
 -- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=2]]
 -- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=3]]
+-- unluac: expect-ast-max [[local-binding]] [[19]]
 
 local function run_binary()
     local value = "\255\000A"
     return #value, string.byte(value, 1), string.byte(value, 2), string.byte(value, 3)
 end
 
-local binary_length, binary_first, binary_second, binary_third = run_binary()
+local binary_length, binary_first, binary_second, binary_third, binary_extra = run_binary()
 assert(binary_length == 3 and binary_first == 255 and binary_second == 0 and binary_third == 65)
+assert(binary_extra == nil)
 print("regress_58_binary_string_bytes", binary_length, binary_first, binary_second, binary_third)
 
 local function run_leading()
@@ -22,8 +24,9 @@ local function run_leading()
     return #value, string.byte(value, 1), string.sub(value, 2)
 end
 
-local leading_length, leading_first, leading_rest = run_leading()
+local leading_length, leading_first, leading_rest, leading_extra = run_leading()
 assert(leading_length == 6 and leading_first == 10 and leading_rest == "alpha")
+assert(leading_extra == nil)
 print("regress_55_leading_newline_string", leading_length, leading_first, leading_rest)
 
 local function run_control()
@@ -31,6 +34,7 @@ local function run_control()
     return string.byte(value, 1), string.byte(value, 2), #value
 end
 
-local control_first, control_second, control_length = run_control()
+local control_first, control_second, control_length, control_extra = run_control()
 assert(control_first == 194 and control_second == 133 and control_length == 2)
+assert(control_extra == nil)
 print("regress_57_utf8_control_string", control_first, control_second, control_length)

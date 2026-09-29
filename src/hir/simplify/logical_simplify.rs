@@ -692,9 +692,8 @@ fn simplify_condition_logical_or(
     if let Some(replacement) = factor_condition_shared_and_tail(lhs, rhs, safety) {
         return Some(replacement);
     }
-    if let Some(replacement) = absorb_stable_or_guard(lhs, rhs, safety) {
-        return Some(replacement);
-    }
+    // SemanticBarrier:ControlFlow：`x or ((x or y) and z)` 的两次 x 检查均来自原控制流，
+    // 不能仅因 x 可重复读取就吸收第二次检查。
     if matches!(rhs, HirExpr::Boolean(false)) {
         return Some(lhs.clone());
     }
@@ -748,36 +747,5 @@ fn factor_condition_shared_and_tail(
             rhs: rhs_and.lhs.clone(),
         })),
         rhs: shared_tail,
-    })))
-}
-
-/// In a condition, a stable guard repeated on the left side of a nested `or` is
-/// only an implementation detail of a shared short-circuit DAG:
-/// `x or ((x or y) and z)` and `x or (y and z)` have the same truthiness and
-/// preserve the evaluation order of `y` and `z`.  Keep this rule in the
-/// condition-only path; the two expressions do not have the same Lua value.
-fn absorb_stable_or_guard(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> Option<HirExpr> {
-    let HirExpr::LogicalAnd(and_expr) = rhs else {
-        return None;
-    };
-    let HirExpr::LogicalOr(inner_or) = &and_expr.lhs else {
-        return None;
-    };
-    if lhs != &inner_or.lhs {
-        return None;
-    }
-    // 候选拒绝[SemanticBarrier:EvalCount]：重复 guard 为 `f()` 时，吸收会在某些路径把两次调用缩成一次。
-    if !safety.is_repeatable_in_single_value_context(lhs) {
-        return None;
-    }
-
-    Some(HirExpr::LogicalOr(Box::new(HirLogicalExpr {
-        preserves_boolean_prewrite: false,
-        lhs: lhs.clone(),
-        rhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
-            preserves_boolean_prewrite: false,
-            lhs: inner_or.rhs.clone(),
-            rhs: and_expr.rhs.clone(),
-        })),
     })))
 }

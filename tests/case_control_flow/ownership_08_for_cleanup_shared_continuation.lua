@@ -17,7 +17,9 @@ local function run(a, b, c, items, value, fallback)
     return 0
 end
 
+local calls = 0
 local function once(_, control)
+    calls = calls + 1
     if control == nil then
         return 1
     end
@@ -26,4 +28,20 @@ end
 local early = run(true, false, true, once, 7, false)
 local fallback = run(false, false, true, once, 7, 9)
 assert(early == 7 and fallback == 9)
+assert(calls == 1)
+calls = 0
+assert(run(false, 0, false, once, false, 9) == false and calls == 1)
+calls = 0
+assert(run(true, false, true, once, nil, "") == "" and calls == 2)
+calls = 0
+assert(run(true, true, nil, once, 7, 0) == 0 and calls == 0)
+assert(run(false, nil, true, once, 7, false) == 0 and calls == 0)
+local function empty_iterator()
+    calls = calls + 1
+end
+assert(run("", false, false, empty_iterator, 7, nil) == 0 and calls == 1)
+-- unluac: expect-ast-count [[local-binding]] [[7]]
+-- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[while]] [[0]]
 print(early, fallback)

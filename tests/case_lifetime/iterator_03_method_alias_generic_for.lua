@@ -1,6 +1,9 @@
 -- regress_406_method_alias_generic_for: a first iterator may atomically consume its receiver alias
 -- unluac: expect-contains [[:each() do]]
 -- unluac: expect-contains [[:iterator(),]]
+-- unluac: expect-ast-max [[local-binding]] [[34]]
+-- unluac: expect-ast-count [[generic-for]] [[5]]
+-- unluac: expect-ast-count [[function]] [[16]]
 
 local owner = { values = { 10, 20 } }
 
@@ -80,6 +83,8 @@ end
 
 local call_state = { collected = false }
 preserve_call_receiver(make_ephemeral_owner(call_state), call_state)
+collectgarbage("collect")
+assert(call_state.collected)
 
 local function preserve_loop_receiver(source, state)
     local receiver = source
@@ -92,6 +97,8 @@ end
 
 local loop_state = { collected = false }
 preserve_loop_receiver(make_ephemeral_owner(loop_state), loop_state)
+collectgarbage("collect")
+assert(loop_state.collected)
 
 local mixed_loop_weak_values = setmetatable({}, { __mode = "v" })
 local function preserve_mixed_loop_receiver(source, values)
@@ -110,6 +117,9 @@ end
 
 local mixed_loop_state = { collected = false }
 preserve_mixed_loop_receiver(make_ephemeral_owner(mixed_loop_state), { true })
+collectgarbage("collect")
+collectgarbage("collect")
+assert(mixed_loop_state.collected and mixed_loop_weak_values.key == nil)
 
 local tail_method_weak_values = setmetatable({}, { __mode = "v" })
 local function preserve_tail_method_loop_receiver(source)
@@ -128,6 +138,9 @@ local function launch_tail_method_loop(state)
 end
 
 launch_tail_method_loop({ collected = false })
+collectgarbage("collect")
+collectgarbage("collect")
+assert(tail_method_weak_values.key == nil)
 
 print(
     "regress_406_method_alias_generic_for",

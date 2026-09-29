@@ -95,6 +95,8 @@ struct PlanLoweringIndex {
     scope_starts: BTreeMap<usize, Vec<usize>>,
     scope_ends: BTreeMap<usize, Vec<usize>>,
     plain_block_count: Vec<Option<usize>>,
+    /// 冻结边及 propagated-break 对各 loop 的语法转移数；Goto 保持显式，不计入。
+    loop_transfer_count: Vec<usize>,
     single_plain_block: Vec<Option<BlockRef>>,
     region_inputs: Vec<Vec<(PhiId, SsaValue)>>,
     unresolved_requirement: Vec<Option<(BlockRef, Reg)>>,

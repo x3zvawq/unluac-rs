@@ -13,6 +13,13 @@
 -- unluac: expect-not-contains [[__add = nil]] [[@dialect=luajit]]
 -- unluac: expect-not-contains [[__unm = nil]] [[@dialect=luajit]]
 -- unluac: expect-not-contains [[__lt = nil]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[function]] [[12]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=10]] [[@dialect=luajit]]
 local events = 0
 local function mark(value)
     events = events + 1
@@ -48,7 +55,7 @@ assert(selected_value(true, {}, nil) == true)
 
 local object = {}
 local operand = setmetatable({}, {
-    __add = function() events = events + 1; return object end,
+    __add = function(_, right) assert(right == 1); events = events + 1; return object end,
     __unm = function() events = events + 1; return object end,
     __lt = function() events = events + 1; return true end,
 })
@@ -115,3 +122,15 @@ assert(events == 3)
 events = 0
 assert(indexed_left[256] == indexed_right[256])
 assert(events == 2)
+
+object = false
+events = 0
+result = arithmetic(operand)
+assert(result[1] == false and result[2] == false and result[3] == true)
+assert(events == 3)
+assert(selected_number(nil) == 7 and events == 4)
+assert(selected_value(false, {}, nil) == nil)
+assert(selected_value(true, false, {}) == false)
+assert(selected_value(false, nil, 0) == true)
+assert(select("#", falsy(nil)) == 1)
+assert(select("#", arithmetic(operand)) == 1 and events == 7)

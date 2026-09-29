@@ -1,3 +1,8 @@
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[do-block]] [[0]]
+-- unluac: expect-ast-count [[error]] [[0]]
 -- regress_240_lua55_tforprep_swap: TFORPREP交换前的control/closing才是源码迭代器pack
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[, "S", "C", ]]
@@ -10,7 +15,8 @@
 local trace = {}
 
 local closer = setmetatable({ tag = "K" }, {
-    __close = function(self)
+    __close = function(self, failure)
+        assert(failure == nil)
         trace[#trace + 1] = "close:" .. self.tag
     end,
 })

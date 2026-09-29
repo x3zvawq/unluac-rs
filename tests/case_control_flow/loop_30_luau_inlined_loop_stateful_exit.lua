@@ -34,3 +34,12 @@ assert(first == nil, first)
 assert(second == false, second)
 assert(table.concat(calls, ",") == "hit,miss", table.concat(calls, ","))
 print("regress_291_luau_inlined_loop_stateful_exit", table.concat(calls, ","))
+-- O2 内联保留两个输入表、两个结果、两个出口标志和两个循环变量；
+-- calls 与原三个函数仍在，循环控制及调用准备不增加独立绑定。
+-- unluac: expect-ast-count [[local-binding]] [[12]] [[@proto=0]]
+-- unluac: expect-ast-count [[numeric-for]] [[2]] [[@proto=0]]
+-- unluac: expect-ast-count [[break]] [[2]] [[@proto=0]]
+-- unluac: expect-ast-count [[if]] [[4]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]]

@@ -6,6 +6,11 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[generic-for]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[repeat]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=1]]
 local function tested(a, b, c, xs)
     local x = 0
     for i = 1, 3 do
@@ -37,7 +42,7 @@ local function tested(a, b, c, xs)
 end
 
 -- pcall 保留优化编译时的目标 proto；__index 观察 x 的跨轮状态及查表次数、顺序。
--- a=false 的非终止分支没有等价的有限退出，本观察不声称覆盖那些路径或全部 continue owner。
+-- a=false 的分支在下方由迭代器有界中断；b=true 的纯算术无限循环不声称运行覆盖。
 local indexes, take_break = {}, false
 local xs = setmetatable({}, {
     __index = function(_, key)
@@ -51,3 +56,21 @@ for _, mode in ipairs({ false, true }) do
     assert(ok and result == 3 and table.concat(indexes, ",") == "1,2,3")
     print("regress_120#1", mode, result, table.concat(indexes, ","))
 end
+
+indexes, take_break = {}, 0
+local ok, result = pcall(tested, 0, nil, "", xs)
+assert(ok and result == 3 and table.concat(indexes, ",") == "1,2,3")
+
+local calls = 0
+local function iterator(_, control)
+    calls = calls + 1
+    assert(calls <= 6, "observed repeat backedge")
+    if control == nil then
+        return 1
+    end
+end
+assert(not pcall(tested, false, false, true, iterator))
+assert(calls == 7)
+calls = 0
+assert(not pcall(tested, false, false, false, iterator))
+assert(calls == 7)

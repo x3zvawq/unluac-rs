@@ -44,4 +44,18 @@ queue[1] = "third"
 assert(coroutine.resume(worker))
 assert(#queue == 0 and table.concat(log, ",") == "second,first,third")
 assert(coroutine.status(worker) == "suspended")
+credentials = 0
+queue[1] = "fourth"
+assert(coroutine.resume(worker))
+assert(#queue == 0 and table.concat(log, ",") == "second,first,third,fourth")
+credentials = ""
+queue[1] = "fifth"
+assert(coroutine.resume(worker))
+assert(#queue == 0 and table.concat(log, ",") == "second,first,third,fourth,fifth")
+assert(coroutine.status(worker) == "suspended")
 print("regress_69#1", table.concat(log, ","))
+-- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]

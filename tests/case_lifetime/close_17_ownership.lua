@@ -1,6 +1,8 @@
 -- Cleanup ownership must preserve both goto exits and the later sibling's lifetime.
 -- unluac: expect-contains [[<close>]]
 -- unluac: expect-ast-count [[close-binding]] [[3]]
+-- unluac: expect-ast-max [[local-binding]] [[9]]
+-- unluac: expect-ast-count [[repeat]] [[0]]
 
 local function exercise(mode)
     local log = {}

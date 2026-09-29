@@ -1,52 +1,46 @@
-//! 收集 break assignment、推导 carried binding 重写并校验 home slot/capture；依赖 slot ownership，不负责并行赋值拆分。
+//! 收集 loop 出口赋值、推导 carried binding 重写并校验 home slot/capture；依赖 slot ownership，不负责并行赋值拆分。
 
 use super::*;
 
-pub(super) fn collect_break_assignments(
+pub(super) fn collect_loop_exit_assignments(
     block: &HirBlock,
     exits: &mut Vec<ExitValues>,
-    reject_untracked_transfers: bool,
+    include_continues: bool,
 ) -> bool {
     for (index, stmt) in block.stmts.iter().enumerate() {
         match stmt {
-            HirStmt::Break => {
+            HirStmt::Break | HirStmt::Continue
+                if matches!(stmt, HirStmt::Break) || include_continues =>
+            {
                 let Some(previous) = index
                     .checked_sub(1)
                     .and_then(|index| block.stmts.get(index))
                 else {
-                    // 候选拒绝[SemanticBarrier:ControlFlow]：该 break 路径没有定义 result；
-                    // 若只收集其它 break，改名会让这条路径错误地观察 seed 的旧值。
+                    // 候选拒绝[SemanticBarrier:ControlFlow]：该 loop exit 路径没有定义 result；
+                    // 若只收集其它出口，改名会让这条路径错误地观察 seed 的旧值。
                     return false;
                 };
                 let mut assignments = Vec::new();
                 if !collect_terminal_assignments(previous, &mut assignments) {
-                    // 候选拒绝[SemanticBarrier:ControlFlow]：break 前结构尾至少有一条
+                    // 候选拒绝[SemanticBarrier:ControlFlow]：loop exit 前结构尾至少有一条
                     // fallthrough 路径未定义 result；合并后该路径会改为观察 seed 旧值。
                     return false;
                 }
                 exits.extend(assignments.into_iter().map(assignment_values));
             }
             HirStmt::If(if_stmt) => {
-                if !collect_break_assignments(
-                    &if_stmt.then_block,
-                    exits,
-                    reject_untracked_transfers,
-                ) || if_stmt.else_block.as_ref().is_some_and(|block| {
-                    !collect_break_assignments(block, exits, reject_untracked_transfers)
-                }) {
+                if !collect_loop_exit_assignments(&if_stmt.then_block, exits, include_continues)
+                    || if_stmt.else_block.as_ref().is_some_and(|block| {
+                        !collect_loop_exit_assignments(block, exits, include_continues)
+                    })
+                {
                     return false;
                 }
             }
             HirStmt::Block(block) => {
-                if !collect_break_assignments(block, exits, reject_untracked_transfers) {
+                if !collect_loop_exit_assignments(block, exits, include_continues) {
                     return false;
                 }
-            }
-            HirStmt::Continue if reject_untracked_transfers => {
-                // 候选拒绝[SemanticBarrier:ControlFlow]：continue 可绕过已收集的 break
-                // writeback 并从 repeat condition 退出；self-contained goto/label 已由
-                // owner-wide lexical CFG 建边，不再作为整个 body 的 blanket guard。
-                return false;
             }
             HirStmt::While(_)
             | HirStmt::Repeat(_)
@@ -121,7 +115,7 @@ pub(super) fn block_may_fall_through(block: &HirBlock) -> bool {
     }
 }
 
-pub(super) fn result_writes_are_standalone_seed_copies(
+pub(super) fn result_writes_are_seed_copies(
     stmts: &[HirStmt],
     result: CarryBinding,
     seed: CarryBinding,
@@ -155,13 +149,23 @@ pub(super) fn result_writes_are_standalone_seed_copies(
                 return;
             }
             self.writes += result_writes;
-            self.valid &= matches!(
-                (assign.targets.as_slice(), assign.values.fixed.as_slice()),
-                ([target], [value])
-                    if assign.values.tail.is_none()
-                        && carry_binding_from_lvalue(target) == Some(self.result)
-                        && carry_binding_from_expr(value) == Some(self.seed)
-            );
+            // 并行快照的其它 target 不得覆盖 seed；只退休对应的纯 binding COPY，
+            // 其余 RHS 的求值与赋值顺序仍由原 assignment 保留。
+            self.valid &= result_writes == 1
+                && assign.values.tail.is_none()
+                && assign.targets.len() == assign.values.fixed.len()
+                && !assign
+                    .targets
+                    .iter()
+                    .any(|target| carry_binding_from_lvalue(target) == Some(self.seed))
+                && assign
+                    .targets
+                    .iter()
+                    .zip(&assign.values.fixed)
+                    .all(|(target, value)| {
+                        carry_binding_from_lvalue(target) != Some(self.result)
+                            || carry_binding_from_expr(value) == Some(self.seed)
+                    });
         }
     }
 
@@ -179,7 +183,7 @@ pub(super) fn infer_rewrites(
     results: &[CarryBinding],
     exits: &[ExitValues],
     region_index: usize,
-    result_index: &RegionResultIndex,
+    result_index: &RegionResultIndex<'_>,
     promotion_facts: &ProtoPromotionFacts,
     require_home_slot: bool,
 ) -> Option<BTreeMap<CarryBinding, CarryBinding>> {
@@ -359,7 +363,7 @@ pub(super) fn bindings_share_home_slot(
 pub(super) fn rewrite_is_private_after(
     region_index: usize,
     rewrites: &BTreeMap<CarryBinding, CarryBinding>,
-    result_index: &RegionResultIndex,
+    result_index: &RegionResultIndex<'_>,
 ) -> bool {
     rewrites
         .values()
@@ -445,10 +449,14 @@ pub(super) fn apply_loop_result_rewrites(
     };
     let mut rewritten = match &mut block.stmts[loop_index] {
         HirStmt::While(while_stmt) => {
-            rewrite_break_exit_assignments(&mut while_stmt.body, &mut pass)
+            rewrite_loop_exit_assignments(&mut while_stmt.body, &mut pass, false)
         }
         HirStmt::Repeat(repeat_stmt) => {
-            let mut rewritten = rewrite_break_exit_assignments(&mut repeat_stmt.body, &mut pass);
+            let mut rewritten = rewrite_loop_exit_assignments(
+                &mut repeat_stmt.body,
+                &mut pass,
+                repeat_stmt.cond != HirExpr::Boolean(true),
+            );
             if has_fallthrough_exit {
                 rewritten |= rewrite_terminal_assignments_mut(
                     repeat_stmt
@@ -478,18 +486,21 @@ pub(super) fn apply_loop_result_rewrites(
     prune_empty_assign_stmts(block);
 }
 
-fn rewrite_break_exit_assignments(
+fn rewrite_loop_exit_assignments(
     block: &mut HirBlock,
     pass: &mut BindingClassRewritePass<'_>,
+    include_continues: bool,
 ) -> bool {
     let mut rewritten = false;
     for index in 0..block.stmts.len() {
-        if matches!(block.stmts[index], HirStmt::Break) {
+        if matches!(block.stmts[index], HirStmt::Break)
+            || include_continues && matches!(block.stmts[index], HirStmt::Continue)
+        {
             rewritten |= rewrite_terminal_assignments_mut(
                 block
                     .stmts
                     .get_mut(index - 1)
-                    .expect("collected break has a reaching assignment"),
+                    .expect("collected loop exit has a reaching assignment"),
                 pass,
             );
             continue;
@@ -497,12 +508,15 @@ fn rewrite_break_exit_assignments(
         match &mut block.stmts[index] {
             HirStmt::LocalRootRelease(_) => {}
             HirStmt::If(if_stmt) => {
-                rewritten |= rewrite_break_exit_assignments(&mut if_stmt.then_block, pass);
+                rewritten |=
+                    rewrite_loop_exit_assignments(&mut if_stmt.then_block, pass, include_continues);
                 if let Some(else_block) = &mut if_stmt.else_block {
-                    rewritten |= rewrite_break_exit_assignments(else_block, pass);
+                    rewritten |= rewrite_loop_exit_assignments(else_block, pass, include_continues);
                 }
             }
-            HirStmt::Block(block) => rewritten |= rewrite_break_exit_assignments(block, pass),
+            HirStmt::Block(block) => {
+                rewritten |= rewrite_loop_exit_assignments(block, pass, include_continues)
+            }
             HirStmt::While(_)
             | HirStmt::Repeat(_)
             | HirStmt::NumericFor(_)
@@ -591,7 +605,7 @@ fn rewrite_boundary_assignment_reads(
         values: assign.values.clone(),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
-        generic_for_dispatch_release: None,
+        root_release: None,
         method_rewrite_transaction: None,
     }));
     let rewritten = rewrite_stmts(std::slice::from_mut(&mut scratch), pass);
@@ -615,7 +629,7 @@ fn rewrite_boundary_assignment_reads(
         .collect();
     if rewritten {
         assign.generic_for_initializer_producer = None;
-        assign.generic_for_dispatch_release = None;
+        assign.root_release = None;
     }
     rewritten
 }

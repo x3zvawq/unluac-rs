@@ -2,7 +2,7 @@
 //!
 //! 将表达式抽取与值物化委托给专属子模块，输出可进入 AST 的普通 HIR 语句。
 
-use std::mem;
+use std::{collections::BTreeSet, mem};
 
 use crate::hir::common::{
     HirBlock, HirCallStmt, HirErrNil, HirExpr, HirLValue, HirLocalDecl, HirProto, HirReturn,
@@ -11,6 +11,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
+use super::super::mention::{CaptureCollector, ReferenceCapturedBindings};
 use super::super::walk::rewrite_nested_blocks_in_stmt;
 use super::eliminate_materialize::{
     assign_target_supports_direct_materialization, eliminate_condition_expr, empty_local_decl,
@@ -24,9 +25,19 @@ pub(crate) fn eliminate_remaining_decisions_in_proto(
     proto: &mut HirProto,
     promotion_facts: &mut ProtoPromotionFacts,
     safety: HirExprSafety,
+    deferred: &BTreeSet<LocalId>,
 ) -> bool {
     let first_new_local = proto.local_count;
-    let changed = eliminate_block(&mut proto.body, &mut proto.local_count, safety);
+    let mut captures = CaptureCollector::new(crate::hir::common::HirCaptureMode::ByReference);
+    crate::hir::visit::visit_stmts(&proto.body.stmts, &mut captures);
+    let changed = eliminate_block(
+        &mut proto.body,
+        &mut proto.local_count,
+        promotion_facts,
+        &captures.bindings,
+        safety,
+        deferred,
+    );
     for local in (first_new_local..proto.local_count).map(LocalId) {
         promotion_facts.record_home_free_local(local);
     }
@@ -38,15 +49,22 @@ pub(crate) fn eliminate_remaining_decisions_in_proto(
 fn eliminate_block(
     block: &mut HirBlock,
     next_local_index: &mut usize,
+    promotion_facts: &ProtoPromotionFacts,
+    reference_captures: &ReferenceCapturedBindings,
     safety: HirExprSafety,
+    deferred: &BTreeSet<LocalId>,
 ) -> bool {
     let mut changed = false;
     let mut rewritten = Vec::with_capacity(block.stmts.len());
     let original = mem::take(&mut block.stmts);
-    let mut state = EliminationState { next_local_index };
+    let mut state = EliminationState {
+        next_local_index,
+        promotion_facts,
+        reference_captures,
+    };
 
     for stmt in original {
-        let (mut lowered, stmt_changed) = eliminate_stmt(stmt, &mut state, safety);
+        let (mut lowered, stmt_changed) = eliminate_stmt(stmt, &mut state, safety, deferred);
         changed |= stmt_changed;
         rewritten.append(&mut lowered);
     }
@@ -59,8 +77,15 @@ fn eliminate_stmt(
     stmt: HirStmt,
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
+    deferred: &BTreeSet<LocalId>,
 ) -> (Vec<HirStmt>, bool) {
     match stmt {
+        // 完整值帧的操作证明已由 owner 核对；Final 在稳定前缀上重验并消费。
+        HirStmt::LocalDecl(ref decl)
+            if decl.bindings.len() == 1 && deferred.contains(&decl.bindings[0]) =>
+        {
+            (vec![stmt], false)
+        }
         HirStmt::LocalRootRelease(_) => (vec![stmt], false),
         HirStmt::LocalDecl(local_decl)
             if local_decl.bindings.len() == 1
@@ -124,6 +149,7 @@ fn eliminate_stmt(
             let (mut prefix, values, changed) =
                 extract_value_pack(global_decl.values, state, safety);
             prefix.push(HirStmt::GlobalDecl(Box::new(crate::hir::HirGlobalDecl {
+                probe_source: global_decl.probe_source,
                 names: global_decl.names,
                 values,
             })));
@@ -202,11 +228,13 @@ fn eliminate_stmt(
                         HirStmt::If(if_stmt),
                     ],
                 }));
-                let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
+                let nested_changed =
+                    eliminate_nested_blocks_in_stmt(&mut stmt, state, safety, deferred);
                 return (vec![stmt], cond_changed || nested_changed);
             }
             let mut stmt = HirStmt::If(if_stmt);
-            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
+            let nested_changed =
+                eliminate_nested_blocks_in_stmt(&mut stmt, state, safety, deferred);
             (vec![stmt], cond_changed || nested_changed)
         }
         HirStmt::While(mut while_stmt) => {
@@ -232,7 +260,8 @@ fn eliminate_stmt(
                 cond_changed = true;
             }
             let mut stmt = HirStmt::While(while_stmt);
-            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
+            let nested_changed =
+                eliminate_nested_blocks_in_stmt(&mut stmt, state, safety, deferred);
             (vec![stmt], cond_changed || nested_changed)
         }
         HirStmt::Repeat(mut repeat_stmt) => {
@@ -266,7 +295,8 @@ fn eliminate_stmt(
                 }
             }
             let mut stmt = HirStmt::Repeat(repeat_stmt);
-            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
+            let nested_changed =
+                eliminate_nested_blocks_in_stmt(&mut stmt, state, safety, deferred);
             prefix.push(stmt);
             (prefix, nested_changed || cond_changed)
         }
@@ -274,7 +304,8 @@ fn eliminate_stmt(
             let (mut prefix, numeric_for, changed) =
                 extract_numeric_for(numeric_for, state, safety);
             let mut stmt = HirStmt::NumericFor(numeric_for);
-            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
+            let nested_changed =
+                eliminate_nested_blocks_in_stmt(&mut stmt, state, safety, deferred);
             prefix.push(stmt);
             (prefix, changed || nested_changed)
         }
@@ -282,13 +313,14 @@ fn eliminate_stmt(
             let (mut prefix, generic_for, changed) =
                 extract_generic_for(generic_for, state, safety);
             let mut stmt = HirStmt::GenericFor(generic_for);
-            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
+            let nested_changed =
+                eliminate_nested_blocks_in_stmt(&mut stmt, state, safety, deferred);
             prefix.push(stmt);
             (prefix, changed || nested_changed)
         }
         HirStmt::Block(block) => {
             let mut stmt = HirStmt::Block(block);
-            let changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
+            let changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety, deferred);
             (vec![stmt], changed)
         }
         HirStmt::Break
@@ -475,9 +507,17 @@ fn eliminate_nested_blocks_in_stmt(
     stmt: &mut HirStmt,
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
+    deferred: &BTreeSet<LocalId>,
 ) -> bool {
     rewrite_nested_blocks_in_stmt(stmt, &mut |block| {
-        eliminate_block(block, state.next_local_index, safety)
+        eliminate_block(
+            block,
+            state.next_local_index,
+            state.promotion_facts,
+            state.reference_captures,
+            safety,
+            deferred,
+        )
     })
 }
 
@@ -512,7 +552,7 @@ fn materialize_condition_into_flag(
         values: crate::hir::common::HirValuePack::fixed(vec![value.negate().negate()]),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
-        generic_for_dispatch_release: None,
+        root_release: None,
         method_rewrite_transaction: None,
     })));
     HirStmt::Block(Box::new(HirBlock { stmts: prefix }))

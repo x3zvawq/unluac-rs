@@ -225,21 +225,28 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             exit.stmts.extend(self.finish_emission(region, tail)?.stmts);
             exit.stmts.push(HirStmt::Break);
         }
+        let body_edge = self.lower_edge(region, body_edge)?;
+        let condition_prefix_only = normal_tail.is_none()
+            && body.is_empty()
+            && body_edge.stmts.is_empty()
+            && cross_loop_transfer.is_none()
+            && matches!(exit.stmts.as_slice(), [HirStmt::Break]);
         if normal_tail.is_none()
             && loop_body.is_empty()
             && cross_loop_transfer.is_none()
             && matches!(exit.stmts.as_slice(), [HirStmt::Break])
         {
-            loop_body.extend_plain(self.lower_edge(region, body_edge)?.stmts);
+            loop_body.extend_plain(body_edge.stmts);
             loop_body.append(body);
             stmts.push(HirStmt::While(Box::new(HirWhile {
+                condition_prefix_only: false,
                 cond,
                 body: self.finish_emission(region, loop_body)?,
             })));
             return Ok(stmts);
         }
         loop_body.push(branch_stmt(cond.negate(), exit, None));
-        loop_body.extend_plain(self.lower_edge(region, body_edge)?.stmts);
+        loop_body.extend_plain(body_edge.stmts);
         loop_body.append(body);
         if normal_tail.is_some()
             && exit_transfer == EdgeTransfer::BranchArm(crate::structure::BranchArm::LoopExit)
@@ -254,6 +261,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             })));
         } else {
             stmts.push(HirStmt::While(Box::new(HirWhile {
+                condition_prefix_only,
                 cond: HirExpr::Boolean(true),
                 body: self.finish_emission(region, loop_body)?,
             })));
@@ -347,7 +355,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     })?;
                 Ok((
                     self.lowering.bindings.lvalue_for_temp(target),
-                    HirExpr::TempRef(*temp),
+                    self.lowering.bindings.expr_for_temp(*temp),
                 ))
             })
             .collect::<Result<Vec<_>, HirLowerError>>()?;
@@ -363,7 +371,9 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         if !normal_stage.is_empty() {
             let (targets, values): (Vec<_>, Vec<_>) = normal_stage
                 .into_iter()
-                .map(|(temp, value)| (HirLValue::Temp(temp), value))
+                // 参数与 debug/capture 投影可能晚于 stage 身份分配；正常出口和
+                // 提前 break 必须消费同一最终 binding，不能重新制造裸 Temp。
+                .map(|(temp, value)| (self.lowering.bindings.lvalue_for_temp(temp), value))
                 .unzip();
             body_stmts.push(assign_stmt(targets, values));
         }
@@ -450,10 +460,20 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
     ) -> Result<PlannedBlock, HirLowerError> {
         let mut stmts = self.lower_syntax_region_prefix(region, control, None)?;
         stmts.append(body);
+        let mut body = self.finish_emission(region, stmts)?;
+        if matches!(body.stmts.last(), Some(HirStmt::Break))
+            && self.index.loop_transfer_count[region.index()] == 1
+        {
+            // WhileTrue 协议没有原条件操作；所有回跳已按冻结边计划显式发射。
+            // 唯一本层 break 只是正常完成包装，保留词法块即可维持声明和 Close 边界。
+            body.stmts.pop();
+            return Ok(PlannedBlock::from(vec![HirStmt::Block(Box::new(body))]));
+        }
         Ok(PlannedBlock::from(vec![HirStmt::While(Box::new(
             HirWhile {
+                condition_prefix_only: false,
                 cond: HirExpr::Boolean(true),
-                body: self.finish_emission(region, stmts)?,
+                body,
             },
         ))]))
     }

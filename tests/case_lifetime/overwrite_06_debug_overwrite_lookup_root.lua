@@ -1,4 +1,7 @@
 -- 新 debug 声明保持独立身份；旧调用结果根跨过 lookup 求值，写入完成后必须退休。
+-- unluac: expect-ast-count [[local-binding]] [[4]]
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-contains [[local env = regress_534_missing_env]] [[@debug=retained]]
 local gc = collectgarbage
 local weak = setmetatable({}, { __mode = "v" })
 local object

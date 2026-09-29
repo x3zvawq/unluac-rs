@@ -10,6 +10,7 @@ mod nil_initializers;
 mod param_alias;
 mod rewrite;
 mod root_scopes;
+mod varargs;
 
 use mapping::LocalMapping;
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,7 +38,10 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     facts: &mut ProtoPromotionFacts,
     safety: HirExprSafety,
     dialect: crate::decompile::DecompileDialect,
+    is_chunk_entry: bool,
 ) -> bool {
+    let inert_releases_changed =
+        super::root_lifetimes::remove_inert_value_releases(proto, safety, dialect);
     let seed_split_changed = super::walk::rewrite_proto(proto, &mut MixedCarrierSeeds { facts });
     // 定义数和根块实际绑定压力须同时超限；单纯 SSA 版本多不证明源码局部槽不足。
     // 无 debug 身份时才允许同 home/epoch 复用，避免把源码声明压成同一绑定。
@@ -70,6 +74,13 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     identity_sensitive_temps.extend(to_be_closed_temps.iter().copied());
     let mut cell_sensitive_temps = reference_captured_temps;
     cell_sensitive_temps.extend(to_be_closed_temps.iter().copied());
+    let vararg_packs_changed = varargs::restore(
+        proto,
+        facts,
+        dialect,
+        is_chunk_entry,
+        &identity_sensitive_temps,
+    );
     let parameter_phis_changed = param_alias::remove_readonly_parameter_phis(
         proto,
         facts,
@@ -80,10 +91,31 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let root_scopes_changed = root_scopes::restore(proto, facts, safety, &identity_sensitive_temps);
     let event_index = RootEventIndex::new(&proto.body.stmts, facts, safety);
     let constants_fit_rk = super::call_frames::constants_fit_rk(proto);
+    let first_new_local = proto.local_count;
+    let mut vararg_prefix_temps = BTreeSet::new();
+    let mut literal_temps = BTreeSet::new();
+    for stmt in &proto.body.stmts {
+        crate::hir::visit::visit_stmt_structure(stmt, &mut |stmt| {
+            if let Some((
+                temp,
+                HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::Number(_) | HirExpr::String(_),
+            )) = stmt.scalar_temp_assignment()
+            {
+                literal_temps.insert(temp);
+            }
+            if let Some((result, HirExpr::VarArg)) = stmt.scalar_temp_assignment()
+                && let Some(previous) = facts.fixed_vararg_predecessor(result)
+            {
+                vararg_prefix_temps.insert(previous);
+            }
+        });
+    }
+    vararg_prefix_temps.retain(|temp| literal_temps.contains(temp));
     let result = {
         let mut ctx = PromotionCtx {
             dialect,
             constants_fit_rk,
+            vararg_prefix_temps: &vararg_prefix_temps,
             proto_id: proto.id,
             facts,
             safety,
@@ -115,6 +147,22 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             &|_| false,
         )
     };
+    // 新身份尚无旧 local 来源。只有全部提升输入都明确 home-free，才能沿用
+    // 合成 temp 的事实；已有 local 或含未知/物理输入的合并仍保留原边界。
+    let mut home_free_promotions = vec![None; proto.local_count - first_new_local];
+    for &(temp, local) in &promoted_bindings {
+        if let Some(index) = local.index().checked_sub(first_new_local) {
+            let known = home_free_promotions[index].get_or_insert(true);
+            *known &= facts
+                .possible_temp_home_slots(temp)
+                .is_some_and(|homes| homes.is_empty());
+        }
+    }
+    for (offset, home_free) in home_free_promotions.into_iter().enumerate() {
+        if home_free == Some(true) {
+            facts.record_home_free_local(LocalId(first_new_local + offset));
+        }
+    }
     for (temp, local) in promoted_bindings.iter().copied() {
         if let Some(home_slot) = facts.home_slot(temp) {
             facts.record_local_home_slot(local, home_slot);
@@ -127,6 +175,13 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         // temp-inline 的负向语义结论属于 binding，而不是 TempId 的展示形式。promotion
         // 可能把多个 canonical temp 合并进同一个 local，因此按映射逐项取并集。
         proto.inline_dispositions.promote_temp_to_local(temp, local);
+        if vararg_prefix_temps.contains(&temp) {
+            // 原低槽声明仍被 VARARG 原位覆盖；AST 不得删除初始化或把后写合入声明。
+            proto.inline_dispositions.preserve_local(
+                local,
+                crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix,
+            );
+        }
     }
     for (temp, local) in direct_seed_promotions {
         facts.record_direct_table_seed_promotion(temp, local);
@@ -147,12 +202,17 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         facts.record_temp_to_local_merge(temp, local);
     }
     proto.physical_root_locals.extend(physical_root_locals);
+    let coalesced_releases_changed =
+        super::root_lifetimes::remove_coalesced_root_releases(proto, facts);
     let nil_initializers_changed =
         super::source_frames::restore_split_nil_declarations(proto, facts)
             | nil_initializers::restore(proto, facts);
     let entry_nil_changed = entry_nil::prune_redundant_entry_nil_writes(proto, facts, safety);
     let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts, safety);
     result.changed
+        || inert_releases_changed
+        || coalesced_releases_changed
+        || vararg_packs_changed
         || entry_nil_changed
         || alias_changed
         || seed_split_changed
@@ -182,7 +242,7 @@ impl super::walk::HirRewritePass for MixedCarrierSeeds<'_> {
                 && assign.values.tail.is_none()
                 && assign.initializer_merge_transaction.is_none()
                 && assign.generic_for_initializer_producer.is_none()
-                && assign.generic_for_dispatch_release.is_none()
+                && assign.root_release.is_none()
                 && assign.method_rewrite_transaction.is_none()
                 && self.facts.is_loop_carrier_temp(*temp)
             {
@@ -246,7 +306,7 @@ enum PromotionInit {
 enum BatchDeclaration {
     /// 原 CALL/nil 批次的准备写继续留给原协议 owner 消费。
     Empty,
-    /// 新绑定直接接收原固定常量组或 VARARG 包，不引入 nil 预写。
+    /// 新绑定直接接收原固定值初始化组或 VARARG 包，不引入 nil 预写。
     Direct,
 }
 
@@ -344,6 +404,7 @@ struct PromotionCtx<'a> {
     label_refs: &'a BTreeMap<crate::hir::common::HirLabelId, usize>,
     debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
     compact_home_slots: bool,
+    vararg_prefix_temps: &'a BTreeSet<TempId>,
 }
 
 struct PlanAllocator<'a> {
@@ -733,16 +794,18 @@ fn fixed_vararg_initializer(assign: &HirAssign) -> bool {
 fn direct_fixed_initializer(assign: &HirAssign) -> bool {
     assign.initializer_merge_transaction.is_none()
         && assign.generic_for_initializer_producer.is_none()
-        && assign.generic_for_dispatch_release.is_none()
+        && assign.root_release.is_none()
         && assign.method_rewrite_transaction.is_none()
         && (fixed_vararg_initializer(assign)
             || (assign.values.tail.is_none()
                 && assign.values.fixed.len() == assign.targets.len()
-                // 直接值生产可整体成为声明；binding COPY 的旧根交接和 CALL 结果
+                // 直接值生产和上值读取可整体成为声明；当前帧 binding COPY 的旧根交接和 CALL 结果
                 // 则由各自的 owner 合并，不能在此提前创建另一组 Local 身份。
                 && assign.values.fixed.iter().all(|value| {
                     matches!(value, HirExpr::Nil | HirExpr::Boolean(_) | HirExpr::Integer(_)
-                        | HirExpr::Number(_) | HirExpr::TableConstructor(_))
+                        | HirExpr::Number(_) | HirExpr::Int64(_) | HirExpr::UInt64(_)
+                        | HirExpr::UpvalueRef(_)
+                        | HirExpr::TableConstructor(_) | HirExpr::Closure(_))
                 })))
 }
 
@@ -785,7 +848,10 @@ fn collect_plans(
     let label_flow_boundary = block.stmts.iter().position(stmt_has_label_or_goto);
     let linear_prefix_end = label_flow_boundary.unwrap_or(block.stmts.len());
     let lifetime_stmts = &block.stmts[..linear_prefix_end];
-    let has_label_flow = label_flow_boundary.is_some();
+    // 唯一位于块尾的 goto 只离开当前词法域；块内没有可重入标签，不能把
+    // 其前缀声明当成跨 label 的长寿根。生命周期扫描仍止于这条退出边之前。
+    let has_label_flow = label_flow_boundary
+        .is_some_and(|index| !matches!(&block.stmts[index..], [HirStmt::Goto(_)]));
     let suffix_dominance = if has_label_flow {
         LexicalCfg::analyze(&block.stmts, ctx.label_refs, ctx.safety)
             .ok()
@@ -895,12 +961,14 @@ fn collect_plans(
     let mut materialized_owner_locals = BTreeMap::<(usize, HomeSlotKey), LocalId>::new();
     let mut copy_reuse_last_touch = BTreeMap::<LocalId, usize>::new();
     let mut planned_temp_locals = BTreeMap::<TempId, LocalId>::new();
+    let mut planned_temp_homes = BTreeMap::<TempId, Option<HomeSlotKey>>::new();
     let mut accounted_plans = 0;
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         // 每份 plan 只登记一次。一个 local 的所有已映射 SSA 版本共用最后需求位置；
         // 后续新增 capture/debug 身份会撤销资格，不能因最后一个 temp 已死就复用旧 cell。
         for plan in &plans[accounted_plans..] {
             planned_temp_locals.extend(plan.temps.iter().map(|&temp| (temp, plan.local)));
+            planned_temp_homes.extend(plan.temps.iter().map(|&temp| (temp, plan.home_slot)));
             let anonymous = ctx
                 .local_debug_hints
                 .get(plan.local.index())
@@ -1020,7 +1088,7 @@ fn collect_plans(
             && matches!(stmt, HirStmt::Assign(assign)
                 if assign.initializer_merge_transaction.is_none()
                     && assign.generic_for_initializer_producer.is_none()
-                    && assign.generic_for_dispatch_release.is_none()
+                    && assign.root_release.is_none()
                     && assign.method_rewrite_transaction.is_none())
             && facts.nil_write_temps(temp) == Some(std::slice::from_ref(&temp))
             && !reserved_temps.contains(&temp)
@@ -1548,7 +1616,23 @@ fn collect_plans(
             continue;
         };
         if inherited.contains_key(&root_temp) || reserved_temps.contains(&root_temp) {
-            // 已被祖先映射或当前 plan 认领的 temp 不再形成新候选。
+            // 同一 carried temp 的后续写入继续使用已声明身份，但仍是新的物理根
+            // producer。登记原写入点，才能让后续覆盖找到 owner；跨 home 的 CALL/MOVE
+            // 交接不能借 temp 的旧 home 登记，必须与该 temp 实际采用的 plan home 一致。
+            if let Some(home) = facts.trusted_temp_home_slot(root_temp)
+                && planned_temp_homes.get(&root_temp) == Some(&Some(home))
+                && let Some(&local) = planned_temp_locals.get(&root_temp)
+            {
+                materialized_owner_locals.insert((decl_index, home), local);
+                current_slot_locals.insert(home, local);
+                if call_root_lifetimes.is_root(decl_index)
+                    || scalar_gc_root_lifetimes.is_root(decl_index)
+                {
+                    ctx.physical_root_locals.insert(local);
+                    unavailable_for_compaction.insert(local);
+                }
+            }
+            // 已被祖先映射或当前 plan 认领的 temp 不再形成新声明候选。
             continue;
         }
         if event_block.has_touch_before(root_temp, decl_index) {
@@ -1582,6 +1666,11 @@ fn collect_plans(
                 Err(LabelFlowGroupFailure::ControlFlow) => {
                     // 候选拒绝[SemanticBarrier:Scope]：若入口 goto 绕过 temp 定义抵达后缀
                     // label，新声明会令该入口跳入 local scope，且后续读取观察未初始化值。
+                    continue;
+                }
+                Err(LabelFlowGroupFailure::SuffixPreparation) => {
+                    // 候选拒绝[LayerBoundary]：frame-end 只证明原根保活，不能把跳转后缀
+                    // 中的匿名准备写认成源码声明；保留 Temp 供完整表达式帧消费。
                     continue;
                 }
                 Err(LabelFlowGroupFailure::Lifetime) => {
@@ -1711,6 +1800,57 @@ fn collect_plans(
             sticky_local
                 .or(debug_local)
                 .or(preceding_physical_root_local)
+                .or_else(|| {
+                    if touching_stmt_indices.len() == 1
+                        && let Some(index) = touching_stmt_indices.first()
+                        && matches!(block.stmts[*index], HirStmt::NumericFor(_))
+                        && event_block
+                            .stmt(*index)
+                            .consumes_only_control_head(&block.stmts[*index], &group)
+                    {
+                        // 候选拒绝[LayerBoundary]：仅供数值 for 头使用的常量仍由完整循环头帧消费；
+                        // 接到已退休参数声明会保留旧准备变量，阻止 header alias 恢复。
+                        return None;
+                    }
+                    let home = home_slot?;
+                    let previous = facts
+                        .scalar_load_predecessor(root_temp, stmt.scalar_temp_assignment()?.1)?;
+                    let local = *planned_temp_locals.get(&previous)?;
+                    // 原常量写仍在原位覆盖同一 home/epoch；旧匿名版本已无后续需求。
+                    // 不把新的 debug/capture 身份合并，也不从相同槽号猜测覆盖前驱。
+                    (!has_label_flow
+                        && current_slot_locals.get(&home) == Some(&local)
+                        && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
+                        && debug_scope_for_temp_group(temp_debug_scopes, &group).is_none()
+                        && group
+                            .iter()
+                            .all(|temp| !ctx.identity_sensitive_temps.contains(temp))
+                        && copy_reuse_last_touch
+                            .get(&local)
+                            .is_some_and(|last| *last < decl_index))
+                    .then_some(local)
+                })
+                .or_else(|| {
+                    if has_label_flow
+                        || !matches!(stmt.scalar_temp_assignment()?.1, HirExpr::VarArg)
+                        || debug_scope_for_temp_group(temp_debug_scopes, &group).is_some()
+                        || debug_hint_for_temp_group(temp_debug_locals, &group).is_some()
+                        || group
+                            .iter()
+                            .any(|temp| ctx.identity_sensitive_temps.contains(temp))
+                    {
+                        // 候选拒绝[SemanticBarrier:Scope]：标签入口、debug 新身份及捕获
+                        // 需要各自的声明证明，物理覆盖前驱不能替代这些边界。
+                        return None;
+                    }
+                    let previous = facts.fixed_vararg_predecessor(root_temp)?;
+                    let home = home_slot?;
+                    let local = *planned_temp_locals.get(&previous)?;
+                    // 只接回原覆盖前驱的现存声明；同槽但不同 Def 不构成身份连续性。
+                    (planned_temp_homes.get(&previous) == Some(&Some(home))
+                        && current_slot_locals.get(&home) == Some(&local))
+                    .then_some(local)
+                })
                 .or_else(|| {
                     let home = home_slot?;
                     let predecessor = facts.copy_predecessor(root_temp)?;
@@ -1919,8 +2059,18 @@ fn collect_plans(
                 })
         };
 
-        // 并行赋值需要先物化被覆盖的低槽声明，后续 COPY 才能沿用原 binding。
-        let source_assignment_target = facts.is_parallel_target_seed(root_temp);
+        // 原并行写回或 VARARG 覆盖需要先物化低槽声明，后续原位写才能沿用 binding。
+        let source_assignment_target = facts.is_parallel_target_seed(root_temp)
+            || (ctx.vararg_prefix_temps.contains(&root_temp)
+                && matches!(
+                    single_temp_assign_value(stmt, root_temp),
+                    Some(
+                        HirExpr::Boolean(_)
+                            | HirExpr::Integer(_)
+                            | HirExpr::Number(_)
+                            | HirExpr::String(_)
+                    )
+                ));
         // 原 CLOSURE 即使没有显式读取仍会在源码中物化；提前建立同一 home 的
         // binding，完整帧才能看见其前缀。分配与捕获保持原位，不借此延长根生命周期。
         let source_closure = home_slot.is_some()
@@ -2124,6 +2274,15 @@ fn collect_plans(
             .iter()
             .flat_map(|plan| plan.temps.iter().map(|&temp| (temp, plan.local))),
     );
+    // 标量计划先收集完毕；其中的 debug 身份可能尚未在当前合流点声明。
+    // 用计划索引定位声明所有者，避免每个合流值重新扫描全部计划。
+    let mut declaration_plans = plans
+        .iter()
+        .enumerate()
+        .filter_map(|(index, plan)| {
+            matches!(plan.action, PromotionAction::AllocateLocal).then_some((plan.local, index))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts[..linear_prefix_end].iter().enumerate() {
         let is_reserved = |temp| inherited.contains_key(&temp) || reserved_temps.contains(&temp);
@@ -2199,6 +2358,38 @@ fn collect_plans(
             let debug_local = home_slot
                 .zip(debug_scope)
                 .and_then(|key| allocator.debug_scope_locals.get(&key).copied());
+            if let Some(local) = debug_local
+                && let Some(&owner) = declaration_plans.get(&local)
+                && allocator.plans[owner].decl_index > decl_index
+            {
+                let initializer = debug_scope.and_then(|scope| ctx.debug_scopes[scope]);
+                if initializer.is_some_and(|scope| {
+                    scope.initializer_temp == Some(temp) || scope.initializer_phi == Some(temp)
+                }) && allocator.plans[owner].batch_declaration.is_none()
+                {
+                    // 原 debug 初始化发生在当前完整合流内；较晚标量写属于同一 local。
+                    // 声明移交到合流入口，后一次 RHS 留在原位置作为赋值，不能提前求值。
+                    allocator.plans[owner].action = PromotionAction::ReuseExistingLocal;
+                    allocator.reuse_existing_local(
+                        decl_index,
+                        local,
+                        home_slot,
+                        BTreeSet::from([temp]),
+                        BTreeSet::new(),
+                        PromotionInit::Empty,
+                    );
+                    let anchor = allocator.plans.len() - 1;
+                    allocator.plans[anchor].action = PromotionAction::AllocateLocal;
+                    declaration_plans.insert(local, anchor);
+                    if let Some(home) = home_slot {
+                        current_slot_locals.insert(home, local);
+                    }
+                    continue;
+                }
+                // 候选拒绝[ProofIncomplete]：未来声明尚不可见，且当前值不是已确认的
+                // 初始化身份；不能把写入改成对该 Local 的越域引用。
+                continue;
+            }
             let reusable = debug_local.or_else(|| {
                 preceding_physical_root_local
                     .or_else(|| {
@@ -2356,6 +2547,7 @@ fn move_home_relation(
 enum LabelFlowGroupFailure {
     ControlFlow,
     Lifetime,
+    SuffixPreparation,
 }
 
 struct LabelFlowGroupProof<'a> {
@@ -2384,6 +2576,22 @@ impl LabelFlowGroupProof<'_> {
             return Err(LabelFlowGroupFailure::ControlFlow);
         };
         let exact_home = trusted_home_slot_for_group(&group.temps, self.facts);
+        if group.temps.len() == 1
+            && let Some(HirStmt::ToBeClosed(tbc)) = self.block.stmts.get(decl_index + 1)
+            && matches!(tbc.declaration(&self.block.stmts[decl_index]),
+                Some(crate::hir::common::HirTbcDeclaration::Temps { close_temp, .. })
+                    if close_temp == root_temp)
+            && exact_home == Some(self.facts.tbc_home(tbc.origin))
+            && group
+                .touching_stmt_indices
+                .iter()
+                .all(|&index| !stmt_writes_temp(&self.block.stmts[index], root_temp))
+        {
+            // 候选接受：相邻 TBC 已拥有此单一身份的资源区间；纯身份提升不移动
+            // 初始化、activation 或 cleanup。标签入口仍经过上面的支配证明，
+            // 且没有后继写借用该身份，不再要求普通 scratch 的覆盖/退休证书。
+            return Ok(());
+        }
         if !self.safety.result_is_gc_inert(value) {
             let Some(home) = exact_home else {
                 return Err(LabelFlowGroupFailure::Lifetime);
@@ -2391,7 +2599,14 @@ impl LabelFlowGroupProof<'_> {
             if !self.closed_root_homes.contains(&(decl_index, home))
                 && !self.facts.has_retargeted_scalar_root(root_temp)
             {
-                return Err(LabelFlowGroupFailure::Lifetime);
+                // 入口前缀中的原根可由完整 frame-end 事实补齐保活证明；含提前
+                // overwrite 的事务仍须逐端点重放，不能借纯 scope-end 延长生命周期。
+                if !self.facts.is_pure_scope_end_copy_root_temp(root_temp) {
+                    return Err(LabelFlowGroupFailure::Lifetime);
+                }
+                if decl_index >= self.linear_prefix_end {
+                    return Err(LabelFlowGroupFailure::SuffixPreparation);
+                }
             }
         }
         for &index in &group.touching_stmt_indices {
@@ -2856,18 +3071,20 @@ fn rewrite_plan_anchor_stmt(
             initializer_merge_transaction: None,
         }))),
         (PromotionAction::ReuseExistingLocal, PromotionInit::FromAssign(_)) => {
-            let generic_for_dispatch_release = match original {
+            let original_assignment = match original {
                 HirStmt::Assign(assign)
-                    if assign.values == values
-                        && assign.targets.len() == 1
+                    if assign.targets.len() == 1
                         && match assign.targets[0] {
                             HirLValue::Temp(temp) => plan.temps.contains(&temp),
                             HirLValue::Local(local) => local == plan.local,
                             _ => false,
                         } =>
                 {
-                    // 同一 nil 写只应用已经证明的 Temp→Local 映射，保留其原 dispatch 身份。
-                    assign.generic_for_dispatch_release
+                    let mut original_values = assign.values.clone();
+                    rewrite::value_pack(&mut original_values, mapping);
+                    // 同一写只应用已证明的身份映射；producer 与 iterator 同步提升，
+                    // 不因重建 Assign 丢掉循环初始化或 dispatch 的 occurrence。
+                    (original_values == values).then_some(assign)
                 }
                 _ => None,
             };
@@ -2880,8 +3097,9 @@ fn rewrite_plan_anchor_stmt(
                 targets: vec![HirLValue::Local(plan.local)],
                 values,
                 initializer_merge_transaction: None,
-                generic_for_initializer_producer: None,
-                generic_for_dispatch_release,
+                generic_for_initializer_producer: original_assignment
+                    .and_then(|assign| assign.generic_for_initializer_producer),
+                root_release: original_assignment.and_then(|assign| assign.root_release.clone()),
                 method_rewrite_transaction: None,
             })))
         }

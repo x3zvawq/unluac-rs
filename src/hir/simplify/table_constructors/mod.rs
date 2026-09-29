@@ -422,7 +422,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                         self.returned_indexed_region_is_safe(block, index, binding, region, &roots);
                     let source_initializer =
                         self.source_debug_initializer_is_safe(block, index, binding, region);
-                    let private_owner = !self.has_cleanup
+                    let unobserved_inert_owner = !self.has_cleanup
                         && roots.removed_roots_are_inert_tables
                         && (!self
                             .observed_before_exit
@@ -434,28 +434,34 @@ impl HirRewritePass for TableConstructorPass<'_> {
                                     binding,
                                     source_gc_inert: false,
                                     source,
+                                    value,
                                     ..
                                 } if preserved_stmt_indices
                                     .binary_search(&source.stmt_index())
                                     .is_err() =>
                                 {
-                                    self.private_allocations
-                                        .contains(binding_identity(*binding))
+                                    self.allocation_root_ends_after_value_use(*binding, value)
+                                        || self.private_allocations
+                                            .contains(binding_identity(*binding))
                                 }
                                 _ => true,
                             }))
                         && (!binding_occurrences.has_source_identity(binding_id)
-                            || source_initializer);
+                            || source_initializer
+                            // seed 本身仍保留原身份；未来 capture 不应阻止其更早的
+                            // 完整 initializer。已有 debug 身份或分配时开放的 cell 仍受保护。
+                            || !self.debug_identity_bindings.get(binding).copied().unwrap_or_default()
+                                && self.promotion_facts.allocation_result_reference_unaliased(seed_ctor));
                     let open_owner = rebuilt_constructor.trailing_multivalue.is_some()
                         && self
                             .open_constructor_region_is_safe(block, index, binding, region, &roots);
                     if !indexed_owner
-                        && !private_owner
+                        && !unobserved_inert_owner
                         && roots.temp_producers.iter().any(|temp| {
                             !open_owner
                                 || !self
                                     .promotion_facts
-                                    .call_result_root_ends_after_value_use(*temp)
+                                    .result_root_ends_after_value_use(*temp)
                         })
                     {
                         // 原始标量结果须由完整 indexed/open-owner 事务消费；不能先提交字段前缀，
@@ -501,7 +507,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // 候选拒绝[SemanticBarrier:Lifetime]：反例见
                     // tests/case_lifetime/close_23_close.lua#lua54_01_close#13/#14/#16。
                     let producer_root_is_observable = !indexed_owner
-                        && !private_owner
+                        && !unobserved_inert_owner
                         && !open_owner
                         && !returned_batch
                         && roots.has_removed_object_producer
@@ -509,7 +515,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // 候选拒绝[SemanticBarrier:Lifetime]：对象 producer 后再覆盖 table field
                     // 时，删除 producer 会提前释放最后一个强引用；反例同上。
                     let has_followup_object_write = !indexed_owner
-                        && !private_owner
+                        && !unobserved_inert_owner
                         && !(open_owner
                             && rebuilt_constructor
                                 .allocation
@@ -647,7 +653,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
 }
 
 /// 只处理本次提交移走 initializer 后留下的匿名占位，不删除源码原有的 nil 初始化。
-/// 连续占位后的同序原写承接声明；nil 以及原位 NEWTABLE 不需要额外 RHS 准备槽。
+/// 连续占位后的同序原写承接声明；直接常量及原位 NEWTABLE 不需要额外 RHS 准备槽。
 fn reuse_following_initializers(
     block: &mut crate::hir::common::HirBlock,
     emptied: &BTreeSet<LocalId>,
@@ -678,7 +684,11 @@ fn reuse_following_initializers(
             matches!(block.stmts.get(cursor + offset), Some(HirStmt::Assign(assign))
                 if assign.targets.as_slice() == [HirLValue::Local(*local)]
                     && matches!(assign.values.fixed.as_slice(), [value] if match value {
-                        HirExpr::Nil => true,
+                        HirExpr::Nil | HirExpr::Boolean(_) => true,
+                        // 非负有限数直接加载到目标槽；负号和非有限数的生成表达式
+                        // 可能另需操作数准备，不能仅凭 HIR 常量外形合并声明。
+                        HirExpr::Integer(value) => *value >= 0,
+                        HirExpr::Number(value) => value.is_finite() && !value.is_sign_negative(),
                         HirExpr::TableConstructor(table) => {
                             matches!(table.sources, crate::hir::common::HirOperationSources::Single(source)
                                 if facts.operation_result_home(source).is_some_and(|home|
@@ -693,7 +703,7 @@ fn reuse_following_initializers(
                     && assign.parallel_nil_frame.is_none()
                     && assign.initializer_merge_transaction.is_none()
                     && assign.generic_for_initializer_producer.is_none()
-                    && assign.generic_for_dispatch_release.is_none()
+                    && assign.root_release.is_none()
                     && assign.method_rewrite_transaction.is_none())
         });
         if matches_initializers {
@@ -1008,6 +1018,7 @@ impl TableConstructorPass<'_> {
                             is_phi_transfer: false,
                             parallel_nil_frame: None,
                             targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
+                                preserve_index_syntax: false,
                                 sources: Default::default(),
                                 metamethod_free: false,
                                 base: base.clone(),
@@ -1017,7 +1028,7 @@ impl TableConstructorPass<'_> {
                             values: HirValuePack::fixed(vec![value.clone()]),
                             initializer_merge_transaction: None,
                             generic_for_initializer_producer: None,
-                            generic_for_dispatch_release: None,
+                            root_release: None,
                             method_rewrite_transaction: None,
                         }))
                     })
@@ -2275,10 +2286,7 @@ impl TableConstructorPass<'_> {
                     ..
                 } => match producer {
                     TableBinding::Temp(temp) => {
-                        if !self
-                            .promotion_facts
-                            .call_result_root_ends_after_value_use(*temp)
-                        {
+                        if !self.promotion_facts.result_root_ends_after_value_use(*temp) {
                             return false;
                         }
                     }
@@ -2355,6 +2363,29 @@ impl TableConstructorPass<'_> {
         ) else {
             return false;
         };
+        if matches!(
+            seed.allocation,
+            crate::hir::HirTableAllocation::Luau(_) | crate::hir::HirTableAllocation::PucBatched(_)
+        ) && !self
+            .debug_identity_bindings
+            .get(TableBinding::Local(*root))
+            .copied()
+            .unwrap_or_default()
+            && self
+                .promotion_facts
+                .native_table_batch_layout(batch)
+                .is_some_and(|layout| {
+                    layout.fixed_width == Some(1)
+                        && self.promotion_facts.allocation_result_home(seed) == Some(layout.base)
+                        && self.promotion_facts.trusted_local_home_slot(*root)
+                            == Some(layout.buffer)
+                })
+        {
+            // 候选拒绝[LayerBoundary]：匿名 COPY 属于原 SETLIST buffer。仅折叠表而
+            // 留下 COPY 会额外物化源码 local，冻结后继复用该槽的调用帧；完整构造帧
+            // 必须一起核对 buffer 的退休和后缀声明，不能按紧邻语句猜测生命周期。
+            return false;
+        }
         if let Some(HirStmt::Assign(assign)) = block.stmts.get(index + 1)
             && assign.targets.as_slice() == [HirLValue::Local(*root)]
             && let ([HirExpr::Closure(closure)], None) =

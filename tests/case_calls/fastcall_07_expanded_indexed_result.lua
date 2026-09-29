@@ -1,6 +1,9 @@
 -- 内联参数在高槽求值，pack 的单结果经 GETTABLEN 写回低槽；不能增加真实 CALL。
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[table-constructor]] [[5]]
 -- unluac: expect-contains [[local result = select_table({ value = false })]] [[@debug=retained]]
 -- unluac: expect-contains [[local selected = select_table({ value = chosen })]] [[@debug=retained]]
 -- unluac: expect-contains [[local empty = select_table({})]] [[@debug=retained]]

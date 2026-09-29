@@ -19,7 +19,6 @@ impl LoopQueryIndex {
     pub(super) fn build(
         cfg: &Cfg,
         arena: &RegionArena,
-        input: &FinalPlanInput,
         partitions: &[LoopPartitions],
         layout_edges: &[LayoutEdgeFact],
     ) -> Result<Self, StructureError> {
@@ -34,16 +33,12 @@ impl LoopQueryIndex {
                 continue;
             };
             let region = arena.slots[spec_index].region();
-            let loop_ = input
-                .loops
-                .get(id.index())
-                .ok_or_else(|| StructureError::invalid("loop query references missing evidence"))?;
             let partition = partitions.get(id.index()).ok_or_else(|| {
                 StructureError::invalid("loop query references missing partition")
             })?;
             spec_by_region[region.index()] = Some(spec_index);
             continuation[region.index()] = partition.continuation;
-            continue_target[region.index()] = loop_.candidate.continue_target;
+            continue_target[region.index()] = partition.continue_target;
             normal_tail_entry[region.index()] = partition
                 .normal_tail
                 .as_ref()

@@ -1,4 +1,7 @@
 -- 比较结果的 Boolean 槽低于完整调用准备；恢复调用时保留比较和原根后缀。
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[4]]
+-- unluac: expect-ast-count [[table-constructor]] [[4]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[local-decl]] [[3]] [[@proto=0]]

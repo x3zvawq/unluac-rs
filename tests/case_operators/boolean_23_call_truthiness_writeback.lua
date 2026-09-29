@@ -2,6 +2,8 @@
 -- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[call]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[3]]
 local calls = 0
 local function evaluate(input)
     local result
@@ -25,3 +27,7 @@ assert(evaluate("") == true)
 assert(evaluate({}) == true)
 assert(calls == 6)
 print("call-truthiness-writeback", calls)
+assert(evaluate(false) == false)
+assert(select("#", evaluate(nil)) == 1)
+assert(select("#", evaluate("again")) == 1)
+assert(calls == 9)

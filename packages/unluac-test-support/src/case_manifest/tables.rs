@@ -320,9 +320,20 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/order_03_table_constructor_pending_alias.lua",
-        &["alias", "numeric-key", "overwrite", "table-constructor"],
-        "证明构造器待折叠的整数字段不能跨越可能别名的后续写，并保留最后写胜出。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[
+            "alias",
+            "numeric-key",
+            "overwrite",
+            "table-constructor",
+            "evaluation-order",
+        ],
+        "保留整数字段别名下的最后写胜出，以及数组批次与字段交错时的键值求值顺序。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/setlist_01_table_constructor_open_overlap.lua",
@@ -754,7 +765,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_tables/indexing_07_indexed_arithmetic_order.lua",
         &["gc", "indexed-assignment", "metamethod", "target-snapshot"],
-        "索引赋值中目标表应在算术元方法前快照，而动态key在元方法改写后读取；另验证两级lookup算术中间根。",
+        "索引赋值中目标表在算术元方法前快照，动态 key 在元方法改写后读取；覆盖比较 Boolean 写回、求值顺序及两级 lookup 算术中间根。",
         &[
             LuaCaseConfiguration::new(PUC_LUA_ALL),
             LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {

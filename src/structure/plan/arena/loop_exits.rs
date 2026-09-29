@@ -223,7 +223,12 @@ pub(super) fn closed_while_lexical_arm(
             // 短路条件可从多个本轮 block 进入同一退出臂。单入口是 block 身份，
             // 不等于只能有一条入边；entry 支配整个闭合域，全部外部入边仍须来自
             // 当前 loop 已认领的正文，不能接纳公共后缀或其它循环的入口。
-            if block != entry || !workspace.contains(edge.from, WHILE_ARM_OWNED)? {
+            // control 同时跳入的共享出口仍在循环外；仅检查 owned 会把 while
+            // 条件的退出端误收为 body，使条件两端都变成进入循环的边。
+            if block != entry
+                || !workspace.contains(edge.from, WHILE_ARM_OWNED)?
+                || workspace.contains(edge.from, WHILE_ARM_EXCLUDED)?
+            {
                 return Ok(false);
             }
         }
@@ -603,6 +608,7 @@ impl LoopExitPadWorkspace {
 }
 
 pub(super) fn verified_loop_exit_pads(
+    proto: &LoweredProto,
     cfg: &Cfg,
     candidate: &crate::structure::LoopCandidate,
     continuation: Option<BlockRef>,
@@ -661,12 +667,20 @@ pub(super) fn verified_loop_exit_pads(
             .iter()
             .filter(|edge| cfg.reachable_blocks.contains(&cfg.edges[edge.index()].from))
             .count();
-        if reachable_predecessors == 1
-            && matches!(
-                cfg.edges[edge.index()].kind,
-                EdgeKind::Return | EdgeKind::TailCall
-            )
-        {
+        let terminal = matches!(
+            cfg.edges[edge.index()].kind,
+            EdgeKind::Return | EdgeKind::TailCall
+        );
+        let target = cfg.edges[edge.index()].to;
+        // 独占的纯跳转出口仍属于循环臂，实际外部目标留在原 owner。
+        // island_03 的 rewind pad 若排在 loop 之后，会把正文 goto 和正常退出
+        // 都拆成中转标签。这里只签发无正文的末端块，原边及 phi 动作保持原位；
+        // 前驱块继续由下面的完整出口域分析核对独占入口，不跳过其中的 MOVE/CLOSE。
+        let jump_exit = cfg.edges[edge.index()].kind == EdgeKind::Jump
+            && cfg.non_control_instr_range(&proto.instrs, block).is_empty()
+            && !owned.contains(&target)
+            && !candidates.contains(&target);
+        if reachable_predecessors == 1 && (terminal || jump_exit) {
             workspace.select_pad(block)?;
             if workspace.insert(block, LOOP_EXIT_PAD_REACHES_EXIT)? {
                 workspace.pending.push_back(block);

@@ -9,6 +9,9 @@
 -- unluac: expect-contains [[return left and not first() or right and not methods.second() or methods.fallback()]] [[@dialect=lua5.4]] [[@debug=retained]]
 -- unluac: expect-contains [[trace[#trace + 1] = label .. ":" .. tostring(weak.value ~= nil)]] [[@dialect=lua5.4]] [[@debug=retained]]
 -- unluac: expect-contains [[observe("lookup-" .. key)]] [[@dialect=lua5.4]] [[@debug=retained]]
+-- unluac: expect-ast-count [[function]] [[9]]
+-- unluac: expect-ast-count [[if]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[12]]
 local function direct(a,b,first,second,fallback)
     return a and not first() or b and not second() or fallback()
 end
@@ -61,3 +64,17 @@ print("lookup-nil-first", lookup(true,true,absent,methods))
 print("lookup-false-second", lookup(true,true,first,{second=falsy,fallback=fallback}))
 print("lookup-nil-second", lookup(true,true,first,{second=absent,fallback=fallback}))
 print("trace", table.concat(trace, ","))
+-- 只统一事件标签；弱根 true/false 已由上面的原 VM 输出独立观察。
+assert((table.concat(trace, ","):gsub(":true", ""):gsub(":false", "")) ==
+    "first,second,fallback,first,fallback,second,fallback,first,lookup-second,second,lookup-fallback,fallback,first,lookup-fallback,fallback,first,first,first,first")
+trace = {}
+assert(direct(false, false, first, second, fallback) == "done")
+assert(lookup(nil, false, first, methods) == "done")
+assert((table.concat(trace, ","):gsub(":true", ""):gsub(":false", "")) == "fallback,lookup-fallback,fallback")
+trace = {}
+assert(direct(0, "", falsy, second, fallback) == true)
+assert(direct(false, true, first, absent, fallback) == true)
+assert(lookup(nil, true, first, { second = absent }) == true)
+assert(#trace == 0)
+assert(select("#", direct(false, false, first, second, fallback)) == 1)
+assert((table.concat(trace, ","):gsub(":true", ""):gsub(":false", "")) == "fallback")

@@ -1,4 +1,7 @@
 -- regress_356_physical_root_copy_lifetime: a shorter copy home cannot replace the source root
+-- unluac: expect-ast-count [[local-binding]] [[6]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[function]] [[1]]
 
 local weak_values = setmetatable({}, { __mode = "v" })
 local owner = {}
@@ -17,3 +20,7 @@ alias = nil
 collectgarbage("collect")
 collectgarbage("collect")
 assert(weak_values.key ~= nil)
+
+first = nil
+collectgarbage("collect")
+assert(weak_values.key == nil)

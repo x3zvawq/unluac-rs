@@ -7,6 +7,11 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-count [[break]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
 local function run(a)
     local out = 0
     for i = 1, 1 do
@@ -27,4 +32,9 @@ end
 
 local result = run(1)
 assert(result == 3, result)
+assert(run(2) == 5)
+assert(run(0) == 5)
+assert(run(nil) == 5)
+assert(run(false) == 5)
+assert(run("1") == 5)
 print("regress_293_puc_nested_repeat_break_live_out", result)

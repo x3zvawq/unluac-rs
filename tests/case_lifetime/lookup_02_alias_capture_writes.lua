@@ -7,6 +7,9 @@
 -- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=8]] [[@debug=stripped]]
 -- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=8]] [[@debug=retained]]
 -- unluac: expect-contains [[local function forwarded(]] [[@debug=retained]]
+-- unluac: expect-ast-max [[local-binding]] [[38]]
+-- unluac: expect-ast-count [[function]] [[16]]
+-- unluac: expect-ast-count [[generic-for]] [[2]]
 
 local methods = {}
 
@@ -67,6 +70,8 @@ local readonly = collect_readonly(new_receiver())
 local writable = collect_writable(new_receiver())
 assert(readonly == "10,20", readonly)
 assert(writable == "10,20", writable)
+collectgarbage("collect")
+assert(weak_receivers[1] == nil and weak_receivers[2] == nil)
 
 local forwarded_replacement = {}
 local function install_forwarded(target)
@@ -138,4 +143,5 @@ do
     assert(effectful_colon() == receiver)
     print("retained-effectful-scratch", seen[1], seen[2])
     assert(seen[1] == true and seen[2] == false)
+    assert(#seen == 2)
 end

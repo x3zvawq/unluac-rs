@@ -1,5 +1,8 @@
 -- regress_419_dead_temp_physical_root: HIR 保留的 dead physical-home copy 必须阻止 AST cleanup 再删除
 -- unluac: expect-contains [[no_event_callable()]]
+-- unluac: expect-ast-max [[local-binding]] [[17]]
+-- unluac: expect-ast-count [[function]] [[9]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=8]]
 
 local function run()
     collectgarbage("stop")
@@ -13,6 +16,7 @@ local function run()
         collectgarbage("collect")
         collectgarbage("collect")
         assert(weak.value ~= nil, "copy root lost")
+        assert(weak.value.marker == 42)
     end
 
     local root_copy = original
@@ -56,6 +60,7 @@ local function global_callee_keeps_independent_root()
 
     local callee = global_callable
     callee()
+    assert(global_callable == nil)
     collectgarbage("restart")
     collectgarbage("collect")
     collectgarbage("collect")
@@ -74,4 +79,5 @@ run()
 expires_at_overwrite()
 global_callee_keeps_independent_root()
 global_callee_without_later_observation_stays_inlineable()
+assert(no_event_callable == nil)
 print("regress_419_dead_temp_physical_root", "OK")

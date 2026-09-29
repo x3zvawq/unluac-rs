@@ -5,6 +5,8 @@
 -- unluac: expect-count [[ and true or false]] [[1]]
 -- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]]
 -- unluac: expect-not-contains [[goto ]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[function]] [[2]]
 
 local weak = setmetatable({}, { __mode = "v" })
 
@@ -18,6 +20,7 @@ local function run(condition)
     end
     collectgarbage("collect")
     collectgarbage("collect")
+    assert(value == (not not condition))
     return weak.key == nil
 end
 
@@ -28,11 +31,15 @@ local function run_testset(condition)
     value = condition and true or false
     collectgarbage("collect")
     collectgarbage("collect")
+    assert(value == (not not condition))
     return weak.key == nil
 end
 
 assert(run(true))
 assert(run(false))
+assert(run(nil))
+assert(run(0))
+assert(run(""))
 assert(run_testset(true))
 assert(run_testset(false))
 assert(run_testset(nil))

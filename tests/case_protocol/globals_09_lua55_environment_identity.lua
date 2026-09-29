@@ -6,6 +6,9 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-count [[_ENV["end"] = 7]] [[1]]
 -- unluac: expect-count [[_ENV._ENV = 9]] [[1]]
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-ast-count [[assign]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=1]]
 
 local function probe()
     global none, assert, print

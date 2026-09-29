@@ -1,4 +1,8 @@
 -- 自引用闭包在独立词法域中建立；后继 for 控制区复用其槽，兼顾引用与按值捕获。
+-- unluac: expect-ast-count [[local-binding]] [[3]]
+-- unluac: expect-ast-count [[assign]] [[2]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[if]] [[1]]
 -- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=0]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=0]]

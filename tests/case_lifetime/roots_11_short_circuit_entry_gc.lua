@@ -13,6 +13,8 @@
 -- unluac: expect-ast-min [[local-decl]] [[1]] [[@proto=2]] [[@dialect=lua5.4]]
 -- unluac: expect-ast-min [[local-decl]] [[1]] [[@proto=2]] [[@dialect=lua5.5]]
 -- unluac: expect-ast-min [[local-decl]] [[1]] [[@proto=3]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[local-binding]] [[10]]
+-- unluac: expect-ast-count [[function]] [[4]]
 local function choose(step)
     return (step("a") and (step("b") or step("c")) and step("d")) or step("e")
 end
@@ -23,26 +25,40 @@ local function keep_entry(step)
     return (saved and (step("b") or step("c")) and step("d")) or step("e")
 end
 
-local function check(run, keep)
+local function check(run, keep, false_steps, expected, expected_type)
     local weak = setmetatable({}, {__mode = "v"})
     local log = {}
     local function step(name)
         collectgarbage("collect")
         collectgarbage("collect")
-        assert((weak.a ~= nil) == (keep and name ~= "a"))
+        assert((weak.a ~= nil) == (keep and name ~= "a" and not false_steps.a))
         assert(weak.b == nil and weak.c == nil and weak.d == nil)
         log[#log + 1] = name
-        local value = {}
+        local value = {name = name}
         weak[name] = value
-        if name == "d" then return false end
+        if false_steps[name] then return false end
         return value, "ignored second result"
     end
     collectgarbage("stop")
-    assert(run(step))
-    assert(table.concat(log) == "abde")
+    local result, extra = run(step)
+    assert(type(result) == expected_type and extra == nil)
+    assert(result == false or result.name == expected:sub(-1))
+    assert(table.concat(log) == expected)
     collectgarbage("restart")
 end
 
-check(choose, false)
-check(keep_entry, true)
+check(choose, false, {d=true}, "abde", "table")
+check(keep_entry, true, {d=true}, "abde", "table")
+check(choose, false, {a=true}, "ae", "table")
+check(keep_entry, true, {a=true}, "ae", "table")
+check(choose, false, {b=true}, "abcd", "table")
+check(keep_entry, true, {b=true}, "abcd", "table")
+check(choose, false, {b=true,c=true}, "abce", "table")
+check(keep_entry, true, {b=true,c=true}, "abce", "table")
+check(choose, false, {}, "abd", "table")
+check(keep_entry, true, {}, "abd", "table")
+check(choose, false, {b=true,d=true}, "abcde", "table")
+check(keep_entry, true, {b=true,d=true}, "abcde", "table")
+check(choose, false, {d=true,e=true}, "abde", "boolean")
+check(keep_entry, true, {d=true,e=true}, "abde", "boolean")
 print("regress_562_short_circuit_entry_gc", "OK")

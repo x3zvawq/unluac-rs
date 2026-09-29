@@ -3,6 +3,10 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-max [[if]] [[3]] [[@proto=1]]
+-- unluac: expect-ast-count [[goto]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[label]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[while]] [[0]] [[@proto=1]]
 local subject = function(a, b, c)
     local x
     if a then
@@ -21,6 +25,10 @@ end
 
 -- 经表调用保留被测 proto，不让优化编译器直接内联并消去输入分支。
 local dispatch = { subject }
+assert(dispatch[1](nil, 0, nil) == 2)
+assert(dispatch[1](0, nil, false) == 1)
+assert(dispatch[1](nil, false, 0) == 2)
+assert(dispatch[1](0, 0, nil) == 1)
 for _, a in ipairs({ false, true }) do
     for _, b in ipairs({ false, true }) do
         for _, c in ipairs({ false, true }) do

@@ -61,7 +61,7 @@ pub(super) fn install_phi_plans(
             phi: phi.id,
             block: phi.block,
             reg: phi.reg,
-            loop_carried_input: crate::structure::plan::loop_carried_input(plan, &incomings),
+            loop_carried: crate::structure::plan::loop_carried_fact(plan, &incomings),
             incomings,
         });
     }
@@ -219,7 +219,16 @@ pub(super) fn claim_selected_region_values(
                     .chain(decision.absorbed_phis.iter().copied())
                 {
                     let phi = require_phi(dataflow, phi_id)?;
-                    for slot in &mut dispositions[phi.id.index()] {
+                    for (incoming, slot) in
+                        phi.incoming.iter().zip(&mut dispositions[phi.id.index()])
+                    {
+                        if phi_id == decision.result_phi
+                            && (incoming.value == SsaValue::Phi(phi_id)
+                                || (decision.loop_entry.is_some()
+                                    && incoming.edge == decision.loop_entry))
+                        {
+                            continue;
+                        }
                         claim_owner(
                             owner_index,
                             slot,

@@ -2,7 +2,9 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-min [[repeat]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[if]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
 local function run(stop, left, right)
     local x = 0
     repeat
@@ -18,4 +20,13 @@ local exhausted = run(false, false, false)
 local condition = run(false, true, true)
 local stopped = run(true, false, false)
 assert(exhausted == 4 and condition == 1 and stopped == 1)
+assert(run(false, false, true) == 4)
+assert(run(false, true, false) == 4)
+assert(run(true, false, true) == 1)
+assert(run(true, true, false) == 1)
+assert(run(true, true, true) == 1)
+assert(run(nil, 0, "") == 1)
+assert(run(false, nil, true) == 4)
+assert(run(0, false, false) == 1)
+assert(run(false, "", nil) == 4)
 print(exhausted, condition, stopped)

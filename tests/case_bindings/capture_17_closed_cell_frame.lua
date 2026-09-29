@@ -1,4 +1,6 @@
 -- 新 CLOSE 窗口的只读捕获不继承旧 CALL 结果；旧声明段与新构造器参数须一起恢复原帧。
+-- unluac: expect-ast-count [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[assign]] [[5]]
 -- unluac: expect-contains [[= setmetatable({}, {]]
 -- unluac: expect-ast-count [[do-block]] [[2]]
 -- unluac: expect-not-contains [[read = 0]]

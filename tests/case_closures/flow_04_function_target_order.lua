@@ -1,4 +1,8 @@
 -- Luau 的具名声明先创建闭包，普通赋值先求目标；语法恢复须保留各自的求值顺序。
+-- unluac: expect-ast-count [[function]] [[5]]
+-- unluac: expect-ast-count [[local-binding]] [[7]]
+-- unluac: expect-ast-count [[table-constructor]] [[3]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-contains [[.nested.declared()]]
 -- unluac: expect-ast-count [[local-function]] [[2]] [[@proto=0]]
 -- 普通赋值不能改成 Luau 的闭包优先声明，否则会把分配移到 __index 之前。
@@ -29,3 +33,11 @@ assign(target, 23)
 assert(reads == 2 and leaf.assigned() == 23)
 assert(leaf.declared() == 17)
 print("flow_04_function_target_order", reads)
+
+local first_declared, first_assigned = leaf.declared, leaf.assigned
+declare(target, 31)
+assign(target, 37)
+assert(reads == 4)
+assert(first_declared ~= leaf.declared and first_assigned ~= leaf.assigned)
+assert(first_declared() == 17 and first_assigned() == 23)
+assert(leaf.declared() == 31 and leaf.assigned() == 37)

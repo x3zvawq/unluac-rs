@@ -108,6 +108,32 @@ fn inert_table_contents(value: &HirExpr) -> bool {
 }
 
 impl TableConstructorPass<'_> {
+    /// 原分配的末次读取后、任何观察前已覆盖其独立槽；后续表逃逸不再需要这个临时根。
+    /// 当前 producer 仍须对应原 Def，字段求值次序与内容惰性由完整 region 验证。
+    pub(super) fn allocation_root_ends_after_value_use(
+        &self,
+        binding: TableBinding,
+        value: &HirExpr,
+    ) -> bool {
+        let HirExpr::TableConstructor(table) = value else {
+            return false;
+        };
+        let crate::hir::common::HirOperationSources::Single(source) = table.sources else {
+            return false;
+        };
+        let Some(result) = self.promotion_facts.operation_result_temp(source) else {
+            return false;
+        };
+        (match binding {
+            TableBinding::Temp(temp) => temp == result,
+            TableBinding::Local(local) => {
+                self.promotion_facts.promoted_local_for_temp(result) == Some(local)
+            }
+        }) && self
+            .promotion_facts
+            .result_root_ends_after_value_use(result)
+    }
+
     pub(super) fn returned_indexed_region_is_safe(
         &self,
         block: &crate::hir::common::HirBlock,

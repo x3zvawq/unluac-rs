@@ -5,7 +5,9 @@
 
 mod analyze;
 mod common;
-pub(crate) use common::{HirLuauInliningBody, HirSourceSite, luau_loop_unroll_blocked};
+pub(crate) use common::{
+    HirLuauInliningBody, HirSourceSite, luau_loop_unroll_blocked, luau_repeat_prefix_costs,
+};
 #[cfg(feature = "decompile-debug")]
 mod debug;
 pub(crate) mod decision;

@@ -1,4 +1,10 @@
 -- 固定结果先写回旧绑定，随后较窄 CALL 和新声明复用同一 scratch 区。
+-- unluac: expect-ast-count [[local-binding]] [[12]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[assign]] [[2]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[local-binding]] [[12]] [[@proto=0]]
 -- unluac: expect-contains [[first, second, count, value = results(3)]] [[@debug=retained]]

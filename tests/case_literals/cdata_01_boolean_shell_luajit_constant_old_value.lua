@@ -2,6 +2,8 @@
 -- unluac: expect-contains [[not not]]
 -- unluac: expect-ast-count [[assign]] [[6]]
 -- unluac: expect-not-contains [[if ]]
+-- unluac: expect-ast-count [[generic-for]] [[3]]
+-- unluac: expect-ast-max [[local-binding]] [[9]]
 
 for _, value in ipairs({ 1 }) do
     value = 1LL
@@ -11,6 +13,7 @@ for _, value in ipairs({ 1 }) do
     else
         value = false
     end
+    assert(value == true)
     print("regress342-luajit-int64-old-value", marker)
 end
 
@@ -22,6 +25,7 @@ for _, value in ipairs({ 1 }) do
     else
         value = false
     end
+    assert(value == true)
     print("regress342-luajit-uint64-old-value", marker)
 end
 
@@ -33,5 +37,6 @@ for _, value in ipairs({ 1 }) do
     else
         value = false
     end
+    assert(value == true)
     print("regress342-luajit-complex-old-value", marker)
 end

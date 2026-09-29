@@ -706,7 +706,7 @@ fn assignments_match_iterator(
     }
 }
 
-fn producer_matches_iterator_span(
+pub(super) fn producer_matches_iterator_span(
     assign: &crate::hir::common::HirAssign,
     generic_for: &HirGenericFor,
     span: &crate::hir::common::HirGenericForInitializerSpan,

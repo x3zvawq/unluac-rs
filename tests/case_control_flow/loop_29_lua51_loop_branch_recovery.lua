@@ -99,3 +99,38 @@ print("regress_28_lua51_loop_branch_recovery#1", target_score("target"), target_
 print("regress_28_lua51_loop_branch_recovery#2", count_remaining(1, false), count_remaining(1, true))
 print("regress_28_lua51_loop_branch_recovery#3", previous_level_name("target"), previous_level_name("first"))
 print("regress_28_lua51_loop_branch_recovery#4", entry_local_scope_name())
+assert(target_score("first") == 10)
+assert(target_score("last") == 30)
+assert(target_score("missing") == false)
+assert(target_score(nil) == false)
+assert(count_remaining(1, false) == 4)
+assert(count_remaining(1, true) == 1)
+assert(count_remaining(2, nil) == 4)
+assert(count_remaining(2, 0) == 2)
+assert(count_remaining(3, "") == 3)
+assert(count_remaining(0, false) == 0)
+assert(count_remaining(4, false) == 4)
+assert(count_remaining(-1, false) == -1)
+assert(previous_level_name("first") == "none")
+assert(previous_level_name("target") == "first")
+assert(previous_level_name("last") == "target")
+assert(previous_level_name("missing") == "missing")
+-- iterator setup 中主动读取调用方；不能将 previous 的 debug 声明推迟到 setup 之后。
+assert(entry_local_scope_name() == "previous")
+-- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]]
+-- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=3]]
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=3]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=4]]
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=4]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=5]]
+-- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=5]]
+-- unluac: expect-ast-count [[if]] [[2]] [[@proto=5]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=7]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=8]]
+-- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=8]]

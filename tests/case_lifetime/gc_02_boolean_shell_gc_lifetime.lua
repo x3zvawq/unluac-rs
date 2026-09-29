@@ -1,4 +1,7 @@
 -- A dead boolean value write can still release the previous parameter value for collection.
+-- unluac: expect-ast-count [[local-binding]] [[6]]
+-- unluac: expect-ast-count [[function]] [[4]]
+-- unluac: expect-contains [[not not]]
 
 local finalized = false
 local mt = {

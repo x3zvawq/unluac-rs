@@ -1,3 +1,7 @@
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[6]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[error]] [[0]]
 -- regress_131_lua55_anonymous_vararg#1: PF_VAHID 不能伪装成命名变参
 -- unluac: expect-contains [[(...)]]
 -- unluac: expect-not-contains [[(...r]]

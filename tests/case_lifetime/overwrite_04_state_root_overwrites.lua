@@ -2,6 +2,9 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[12]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-count [[ 9]] [[1]]
 local weak = setmetatable({}, { __mode = "v" })
 
 local function run(swap, clear_with_nil)
@@ -29,8 +32,10 @@ local function run(swap, clear_with_nil)
     assert(right.marker == (swap and 11 or 22))
     if clear_with_nil then
         right = nil
+        assert(right == nil)
     else
         right = false
+        assert(right == false)
     end
     collectgarbage("collect")
     collectgarbage("collect")
@@ -46,11 +51,14 @@ run(false, false)
 local x, y = 5, 6
 x, x, y = x, 9, y
 local before = x
+assert(before == 5)
+local mutations = 0
 local function mutate()
+    mutations = mutations + 1
     x = 20
     return 30
 end
 x, y = x, mutate()
-assert(x == before and y == 30)
+assert(x == before and y == 30 and mutations == 1)
 print("parallel snapshot", x, y)
 print("regress_474_loop_state_root_overwrites", "OK")

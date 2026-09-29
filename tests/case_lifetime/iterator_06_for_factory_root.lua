@@ -1,6 +1,9 @@
 -- regress_463_generic_for_factory_root: iterator 工厂与 dispatch 函数有不同的根生命周期。
 -- 工厂只用于初始化，但显式 local 的 VM 槽在循环体执行期间仍保活该工厂。
 -- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 local builtin_ipairs = ipairs
 local weak = setmetatable({}, { __mode = "v" })
 ipairs = function(values)

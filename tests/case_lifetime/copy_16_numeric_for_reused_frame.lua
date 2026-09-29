@@ -2,6 +2,9 @@
 -- unluac: expect-ast-min [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[numeric-for]] [[9]]
 -- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=35]] [[@debug=retained]]
+-- unluac: expect-ast-max [[local-binding]] [[119]]
+-- unluac: expect-ast-count [[function]] [[36]]
+-- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=35]]
 -- integer_skip
 do
 local weak = setmetatable({}, {__mode="v"})

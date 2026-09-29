@@ -1,6 +1,6 @@
 //! StructureFacts 共用的只读图查询。
 //!
-//! 消费 CFG 与 GraphFacts，提供区域出入边和可规约性等基础事实，具体候选由各 owner 判断。
+//! 消费 CFG 与 GraphFacts，提供区域出入边、可规约性及原操作数顺序等基础事实，具体候选由各 owner 判断。
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -236,4 +236,46 @@ pub(super) fn compute_irreducible_regions(
 
     irreducible_regions.sort_by_key(|region| region.entry);
     irreducible_regions
+}
+
+/// 相等比较不能交换元方法接收方；右值已合流后才执行的左侧 CALL
+/// 不能移到该右值的内嵌表达式之前。返回必须保留独立求值边界的 phi。
+pub(super) fn equality_right_operand_precedes_left_call(
+    proto: &LoweredProto,
+    dataflow: &crate::structure::DataflowFacts,
+    graph: &crate::structure::GraphFacts,
+    predicate: crate::transformer::InstrRef,
+) -> Option<crate::structure::PhiId> {
+    let LowInstr::Branch(branch) = &proto.instrs[predicate.index()] else {
+        return None;
+    };
+    let crate::transformer::BranchSubject::Compare {
+        predicate: crate::transformer::BranchPredicate::Eq,
+        lhs: crate::transformer::CondOperand::Reg(lhs),
+        rhs: crate::transformer::CondOperand::Reg(rhs),
+    } = branch.cond.subject
+    else {
+        return None;
+    };
+    let (crate::structure::SsaValue::Def(left), crate::structure::SsaValue::Phi(right)) = (
+        dataflow.use_value(predicate, lhs),
+        dataflow.use_value(predicate, rhs),
+    ) else {
+        return None;
+    };
+    // 内嵌操作数只允许一个谓词读取；每个 phi 的入边也只由一个节点检查。
+    let [site] = dataflow.phi_uses[right.index()].as_slice() else {
+        return None;
+    };
+    (site.instr == predicate
+        && site.reg == rhs
+        && matches!(
+            proto.instrs[dataflow.def_instr(left).index()],
+            LowInstr::Call(_)
+        )
+        && graph.dominates(
+            dataflow.phi_candidate(right)?.block,
+            dataflow.def_block(left),
+        ))
+    .then_some(right)
 }

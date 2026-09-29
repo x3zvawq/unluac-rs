@@ -182,6 +182,35 @@ impl<'a> HirEmissionFacts<'a> {
         Some(self.regions[owner.index()].scope_owner)
     }
 
+    /// repeat 的本轮入口在 body 中原位发射，声明同时对尾条件可见。
+    /// 前缀是否已被协议外提、具体初始化是否独立发射仍由调用方核对。
+    pub(super) fn repeat_body_entry(&self, block: BlockRef) -> bool {
+        let Some(body) = self.scope_owner(block) else {
+            return false;
+        };
+        let Some(RegionPlan::Loop {
+            plan: loop_id,
+            body: owner,
+            ..
+        }) = self
+            .plan
+            .region(body)
+            .and_then(RegionPlan::parent)
+            .and_then(|parent| self.plan.region(parent))
+        else {
+            return false;
+        };
+        *owner == body
+            && self
+                .plan
+                .loop_(*loop_id)
+                .is_some_and(|payload| payload.header == block)
+            && matches!(
+                self.plan.loop_protocol(*loop_id),
+                Some(LoopVmProtocol::Repeat(_))
+            )
+    }
+
     /// 声明可以供其词法子域写入，但 CFG 支配本身不授权逃出源码作用域。
     pub(super) fn scope_contains(&self, declaration: BlockRef, write: BlockRef) -> bool {
         self.scope_owner(declaration)
@@ -229,6 +258,15 @@ impl<'a> HirEmissionFacts<'a> {
         for run in cfg.instr_to_block[window.clone()].chunk_by(|a, b| a == b) {
             let block = run[0];
             if self.ordinary_block(block) {
+                continue;
+            }
+            // 值决策 header 的 regular prefix 独立发射；窗口若在 predicate 之前
+            // 结束，不会切开该表达式，不能要求把后面的整个决策也包进来。
+            let range = cfg.blocks[block.index()].instrs;
+            if self.regular_prefix(block).is_some_and(|prefix| {
+                prefix.start <= window.start.max(range.start.index())
+                    && window.end.min(range.end()) <= prefix.end
+            }) {
                 continue;
             }
             let Some(owner) = self.plan.region_for_block(block) else {

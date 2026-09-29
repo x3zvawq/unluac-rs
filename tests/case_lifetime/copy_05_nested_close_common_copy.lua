@@ -3,13 +3,16 @@
 -- unluac: expect-order [[label = "else"]] [[r2_1 = r2_0]]
 -- unluac: expect-count [[r2_1 = r2_0]] [[1]]
 -- unluac: expect-contains [[return r2_1]]
--- unluac: expect-ast-count [[local-decl]] [[4]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-decl]] [[3]] [[@proto=2]]
 -- unluac: expect-ast-count [[close-binding]] [[2]] [[@proto=2]]
 -- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[7]]
 
 local close_log = {}
 local close_meta = {
-    __close = function(value)
+    __close = function(value, err)
+        assert(err == nil)
         close_log[#close_log + 1] = value.label
     end,
 }
@@ -32,5 +35,6 @@ local function run(flag)
 end
 
 assert(run(true) == "assigned")
+assert(table.concat(close_log, ",") == "then")
 assert(run(false) == "assigned")
 assert(table.concat(close_log, ",") == "then,else")

@@ -1,6 +1,8 @@
 -- aggregate 持有关系不得随着中间 binding 的覆盖丢失；外层逃逸必须传播到后加入的 child。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-ast-count [[local-binding]] [[30]]
+-- unluac: expect-ast-count [[repeat]] [[2]]
 -- 完整左值/读取/常量写帧不保留中转声明；外层调用恢复后也不产生 print 别名。
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
 -- 外层仅保留 weak、child/inner/outer 和 repeat 的三份对象声明；末尾调用不另立 callee。

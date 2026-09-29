@@ -1,7 +1,9 @@
 -- 后继调用复用临时对象槽；恢复词法末端后，弱引用观察必须与原 VM 保持一致。
 -- unluac: expect-not-contains [[= assert]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[do-block]] [[1]]
 -- unluac: expect-count [[() == ]] [[1]]
 -- unluac: expect-contains [[assert(read() == value)]] [[@debug=retained]]
 local weak = setmetatable({}, {__mode = "v"})

@@ -1,6 +1,8 @@
 -- regress_279_repeat_short_body_scope_break#1: repeat 的短路 body 臂可先进入内层 loop，再 break 外层
--- unluac: expect-ast-min [[repeat]] [[2]] [[@proto=1]]
--- unluac: expect-ast-min [[break]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[repeat]] [[2]]
+-- unluac: expect-ast-count [[break]] [[1]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-count [[local-binding]] [[7]]
 local function run(a, b, c, xs)
     local x = 0
     repeat
@@ -20,6 +22,22 @@ local nested = run(true, false, false, { [3] = true })
 local skipped = run(true, true, false, {})
 local alternate = run(false, false, true, { [2] = true })
 assert(nested == 3 and skipped == 0 and alternate == 2)
+local reads = 0
+local xs = setmetatable({}, {
+    __index = function(_, key)
+        reads = reads + 1
+        assert(key == reads and reads <= 3)
+        return key == 3 and 0
+    end,
+})
+assert(run(0, nil, false, xs) == 3)
+assert(reads == 3)
+reads = 0
+assert(run(nil, false, "", xs) == 3)
+assert(reads == 3)
+reads = 0
+assert(run(nil, 0, "", xs) == 0 and reads == 0)
+assert(run("", false, nil, {true}) == 1)
 print(
     "regress_279_repeat_short_body_scope_break#1",
     nested,

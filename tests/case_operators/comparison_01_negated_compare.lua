@@ -1,6 +1,9 @@
 -- regress_248_luajit_negated_compare: ISGE/ISGT 是原关系的逻辑取反
 -- unluac: expect-contains [[not]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[function]] [[8]]
+-- unluac: expect-ast-count [[if]] [[0]]
+-- unluac: expect-ast-max [[local-binding]] [[13]]
 -- unluac: expect-contains [[assert(r0_6(2 <= r0_3 % 4, r0_3 % 2 == 1) == r0_5[r0_3 + 1])]] [[@dialect=luajit]]
 -- 独立参数帧要把可能调用元方法的取模、调用和动态键保持在一条 assert 内。
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=7]] [[@dialect=luau]]
@@ -16,15 +19,15 @@ local calls = {}
 local mt = {
     __lt = function(a, b)
         calls[#calls + 1] = "lt:" .. a.tag .. ":" .. b.tag
-        return false
+        return a.result
     end,
     __le = function(a, b)
         calls[#calls + 1] = "le:" .. a.tag .. ":" .. b.tag
-        return false
+        return a.result
     end,
 }
-local a = setmetatable({ tag = "a" }, mt)
-local b = setmetatable({ tag = "b" }, mt)
+local a = setmetatable({ tag = "a", result = false }, mt)
+local b = setmetatable({ tag = "b", result = false }, mt)
 
 assert((a >= b) == false)
 assert(not (a < b))
@@ -65,3 +68,35 @@ parameter_frame(a, expected, consume)
 assert(table.concat(calls, ",") == "mod:4,mod:2,call,add:1,index:6")
 
 print("regress_248_luajit_negated_compare")
+
+-- 参数比较不能被编译期常量折叠，四个返回位置分别观察原关系与逻辑补集。
+local function nan_comparisons(value)
+    return value >= 1, not (value < 1), value > 1, not (value <= 1)
+end
+local ge, not_lt, gt, not_le = nan_comparisons(nan)
+assert(ge == false and not_lt == true and gt == false and not_le == true)
+ge, not_lt, gt, not_le = nan_comparisons(1)
+assert(ge == true and not_lt == true and gt == false and not_le == false)
+ge, not_lt, gt, not_le = nan_comparisons(2)
+assert(ge == true and not_lt == true and gt == true and not_le == true)
+ge, not_lt, gt, not_le = nan_comparisons(-math.huge)
+assert(ge == false and not_lt == false and gt == false and not_le == false)
+assert(select("#", nan_comparisons(nan)) == 4)
+
+calls = {}
+a.result, b.result = true, false
+assert((a >= b) == false)
+assert((not (a < b)) == false)
+assert((a > b) == false)
+assert((not (a <= b)) == false)
+assert(table.concat(calls, ",") == "le:b:a,lt:a:b,lt:b:a,le:a:b")
+calls = {}
+a.result, b.result = nil, 0
+assert((a >= b) == true)
+assert((not (a < b)) == true)
+assert((a > b) == true)
+assert((not (a <= b)) == true)
+assert(table.concat(calls, ",") == "le:b:a,lt:a:b,lt:b:a,le:a:b")
+calls = {}
+assert(select("#", parameter_frame(a, expected, consume)) == 0)
+assert(table.concat(calls, ",") == "mod:4,mod:2,call,add:1,index:6")

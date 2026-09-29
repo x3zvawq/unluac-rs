@@ -1,4 +1,7 @@
 -- 旧闭包关闭后，新的参数帧可复用其物理槽，不能沿用旧 cell 或假定 epoch 为零。
+-- unluac: expect-ast-count [[do-block]] [[1]]
+-- unluac: expect-ast-count [[assign]] [[4]]
+-- unluac: expect-ast-count [[local-binding]] [[7]]
 -- unluac: expect-contains [[= setmetatable({}, {]]
 do
     local first, second, captured = 0, 1, 2

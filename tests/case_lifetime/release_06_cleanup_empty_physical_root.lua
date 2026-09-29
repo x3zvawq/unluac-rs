@@ -1,4 +1,6 @@
 -- regress_435_cleanup_empty_physical_root: an empty local clears the reused VM home before GC
+-- unluac: expect-ast-max [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[function]] [[4]]
 
 local weak = setmetatable({}, { __mode = "k" })
 

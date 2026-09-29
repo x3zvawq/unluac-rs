@@ -92,7 +92,7 @@ impl HirRewritePass for BranchValuePass<'_> {
                 || [truthy, falsy].iter().any(|assign| {
                     assign.initializer_merge_transaction.is_some()
                         || assign.generic_for_initializer_producer.is_some()
-                        || assign.generic_for_dispatch_release.is_some()
+                        || assign.root_release.is_some()
                         || assign.method_rewrite_transaction.is_some()
                         || assign.parallel_nil_frame.is_some()
                 })
@@ -255,7 +255,7 @@ fn fold_nil_fallback_decision_locals_in_block(
                         values: HirValuePack::fixed(vec![rewrite.fallback]),
                         initializer_merge_transaction: None,
                         generic_for_initializer_producer: None,
-                        generic_for_dispatch_release: None,
+                        root_release: None,
                         method_rewrite_transaction: None,
                     }))],
                 },
@@ -393,7 +393,7 @@ fn collapsible_bound_assignment(
         )
         && truthy.initializer_merge_transaction.is_none()
         && truthy.generic_for_initializer_producer.is_none()
-        && truthy.generic_for_dispatch_release.is_none()
+        && truthy.root_release.is_none()
         && truthy.method_rewrite_transaction.is_none()
     {
         let (subject, is_or) = match &if_.cond {
@@ -431,7 +431,7 @@ fn collapsible_bound_assignment(
     let plain_copy = |assign: &HirAssign| {
         assign.initializer_merge_transaction.is_none()
             && assign.generic_for_initializer_producer.is_none()
-            && assign.generic_for_dispatch_release.is_none()
+            && assign.root_release.is_none()
             && assign.method_rewrite_transaction.is_none()
     };
     let direct_value = |expr: &HirExpr| {
@@ -503,7 +503,7 @@ fn collapsible_bound_assignment(
         let value = single_assign_value(assign, binding)?;
         if assign.initializer_merge_transaction.is_some()
             || assign.generic_for_initializer_producer.is_some()
-            || assign.generic_for_dispatch_release.is_some()
+            || assign.root_release.is_some()
             || assign.method_rewrite_transaction.is_some()
             || !matches!(
                 value,
@@ -958,6 +958,7 @@ fn finalize_branch_value_targets(
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
     let decision = HirDecisionExpr {
+        source_result: None,
         emit_as_luau_if: false,
         entry: HirDecisionNodeRef(0),
         nodes: vec![HirDecisionNode {
@@ -1350,7 +1351,7 @@ fn assign_binding_value(binding: BranchValueBinding, value: HirExpr) -> HirStmt 
         values: HirValuePack::fixed(vec![value]),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
-        generic_for_dispatch_release: None,
+        root_release: None,
         method_rewrite_transaction: None,
     }))
 }

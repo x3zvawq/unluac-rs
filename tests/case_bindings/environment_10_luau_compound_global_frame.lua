@@ -8,6 +8,7 @@
 -- unluac: expect-contains [[COMPOUND_VALUE ^= 2]]
 -- unluac: expect-contains [[PLAIN_VALUE = PLAIN_VALUE + 1]]
 -- unluac: expect-ast-count [[local-binding]] [[0]]
+-- unluac: expect-ast-count [[assign]] [[9]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local check, report, collect = assert, print, collectgarbage
 -- unluac-runtime: local weak = setmetatable({}, {__mode = "v"})

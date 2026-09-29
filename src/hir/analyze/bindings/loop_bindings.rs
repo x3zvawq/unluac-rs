@@ -5,7 +5,7 @@
 
 use super::*;
 
-/// 无值读取的 scalar 写入仍可能结束循环状态的强根。只接回已证明的 carried 身份，
+/// scalar 写入仍可能结束循环状态的强根。只接回已证明的 carried 身份，
 /// 不按槽号合并不同 value epoch，也不把新分配对象的根延长到旧 local 的作用域末尾。
 pub(super) fn preserve_loop_state_overwrites(
     proto: &LoweredProto,
@@ -18,20 +18,34 @@ pub(super) fn preserve_loop_state_overwrites(
 ) {
     let (numeric_phis, debug_hints) = barriers;
     let (phi_temps, fixed_temps) = temps;
-    let mut carried_temps = BTreeSet::new();
+    let mut carried_temps = BTreeMap::<TempId, Option<RegionId>>::new();
     let mut blocked_temps = BTreeSet::new();
+    // 已合并的 loop/result Phi 共享最终 temp；按最外层循环 owner 判断退出，
+    // 不能要求覆盖关系指向的中间 result Phi 自身也是 loop-carried。
     for phi in plan.phis() {
         let temp = phi_temps[phi.phi.index()];
         if numeric_phis[phi.phi.index()] || debug_hints[phi.phi.index()].is_some() {
             blocked_temps.insert(temp);
-        } else if phi.loop_carried().is_some() {
-            carried_temps.insert(temp);
+        } else if let Some(carried) = phi.loop_carried() {
+            carried_temps
+                .entry(temp)
+                .and_modify(|owner| {
+                    *owner = match *owner {
+                        Some(current) if plan.region_contains(current, carried.owner) => {
+                            Some(current)
+                        }
+                        Some(current) if plan.region_contains(carried.owner, current) => {
+                            Some(carried.owner)
+                        }
+                        _ => None,
+                    };
+                })
+                .or_insert(Some(carried.owner));
         }
     }
     for def in &dataflow.defs {
         if fixed_temps[def.id.index()] != TempId(def.id.index())
             || dataflow.reg_is_captured(def.reg)
-            || !dataflow.def_uses[def.id.index()].is_empty()
             || !dataflow.def_phi_uses[def.id.index()].is_empty()
             || debug_local_hint_for_reg_at_instr(proto, def.reg, def.instr).is_some()
         {
@@ -56,12 +70,28 @@ pub(super) fn preserve_loop_state_overwrites(
             continue;
         };
         let target = phi_temps[source.index()];
+        if !dataflow.def_uses[def.id.index()].is_empty()
+            && carried_temps
+                .get(&target)
+                .copied()
+                .flatten()
+                .is_none_or(|carried| {
+                    plan.region_for_block(def.block)
+                        .is_none_or(|owner| plan.region_contains(carried, owner))
+                })
+        {
+            // 候选拒绝[ProofIncomplete]：循环内仍有读取的版本属于循环值/帧协议，
+            // 需由 coalesce_loop_state_temps 连同回边证明；这里只补齐循环外的退休端点。
+            continue;
+        }
         if phi.reg == def.reg
-            && carried_temps.contains(&target)
+            && carried_temps.contains_key(&target)
             && !blocked_temps.contains(&target)
             && epochs.epoch_at(def.reg, def.instr)
                 == epochs.epoch_at(phi.reg, cfg.blocks[phi.block.index()].instrs.start)
         {
+            // 后续直接读取只观察这次原位写入的值，不会取消它对旧根的覆盖。
+            // Phi 消费者的独立快照仍在上方拒绝，不能据同槽关系合并其它合流身份。
             fixed_temps[def.id.index()] = target;
         }
     }
@@ -74,7 +104,10 @@ pub(super) fn preserve_loop_state_overwrites(
 /// 提前写回变得可观察，因此保守保留独立 temp。
 pub(super) fn coalesce_nested_loop_carried_temps(
     plan: &StructurePlan,
+    cfg: &Cfg,
     dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+    debug_hints: &[Option<DebugBindingHint<'_>>],
     phi_temps: &mut [TempId],
 ) -> Vec<Option<PhiId>> {
     let mut parents = vec![None; plan.phis().len()];
@@ -86,8 +119,36 @@ pub(super) fn coalesce_nested_loop_carried_temps(
         let Some(binding) = phi.loop_carried() else {
             continue;
         };
-        let SsaValue::Phi(source) = binding.input else {
-            continue;
+        let source = match binding.input {
+            Some(SsaValue::Phi(source)) => source,
+            Some(SsaValue::Def(def)) => {
+                // 内层入口也可能是祖先状态在原槽中的一次更新。只消费 Dataflow
+                // 的直接覆盖事实；COPY 的 canonical 源和跨 epoch/debug 身份不能
+                // 据此共址，原更新仍在原定义点求值。
+                let definition = &dataflow.defs[def.index()];
+                let Some(SsaValue::Phi(source)) = dataflow.def_overwritten_value(def) else {
+                    continue;
+                };
+                let Some(source_plan) = plan.phi_plan(source) else {
+                    continue;
+                };
+                let epoch = epochs.epoch_at(phi.reg, cfg.blocks[phi.block.index()].instrs.start);
+                if definition.reg != phi.reg
+                    || dataflow.canonical_move_value(SsaValue::Def(def)) != Some(SsaValue::Def(def))
+                    || epochs.epoch_at(phi.reg, definition.instr) != epoch
+                    || epochs.epoch_at(
+                        source_plan.reg,
+                        cfg.blocks[source_plan.block.index()].instrs.start,
+                    ) != epoch
+                    || debug_hints[phi.phi.index()].is_some()
+                    || debug_hints[source.index()].is_some()
+                {
+                    // ProofIncomplete：同槽覆盖尚不能证明跨身份的可观察绑定一致。
+                    continue;
+                }
+                source
+            }
+            _ => continue,
         };
         let Some(source_plan) = plan.phi_plan(source) else {
             continue;
@@ -169,8 +230,8 @@ impl<T: Copy + Eq> BindingCandidate<T> {
 
 /// 同一未捕获 VM 槽的 loop state 在原定义点直接写回 carried temp；这里只合并 identity，
 /// 不移动表达式。无真实读取的同 loop phi stage 也只有在全部消费者仍属于该 carried/result
-/// 协议时才共址；nested carried target 仅额外接纳直接正常出口上唯一的独立 snapshot，
-/// 避免其它 edge copy 延后读取已被覆盖的状态。候选从 carried target 出发一次构建，
+/// 协议时才共址；nested carried target 的结果消费者必须已证明共址，独立 snapshot
+/// 仅接纳直接正常出口的唯一读取，避免其它 edge copy 延后读取已覆盖状态。候选从 carried target 出发一次构建，
 /// 避免 result × owner 的重复扫描。
 pub(super) fn coalesce_loop_state_temps(
     cfg: &Cfg,
@@ -196,7 +257,18 @@ pub(super) fn coalesce_loop_state_temps(
                 .iter()
                 .all(|incoming| match incoming.disposition {
                     PhiIncomingDisposition::RegionResult(region) => {
-                        owner.replace(region).is_none_or(|owner| owner == region)
+                        // 内层提前退出可以直接汇入外层 continuation。结果仍属于
+                        // 已冻结的外层 region；保留嵌套 owner 链，不要求每条边都
+                        // 恰好在同一层产生，也不合并互不包含的 region。
+                        match owner {
+                            None => owner = Some(region),
+                            Some(current) if plan.region_contains(region, current) => {
+                                owner = Some(region);
+                            }
+                            Some(current) if plan.region_contains(current, region) => {}
+                            Some(_) => return false,
+                        }
+                        true
                     }
                     PhiIncomingDisposition::Dead => true,
                     _ => false,
@@ -231,6 +303,20 @@ pub(super) fn coalesce_loop_state_temps(
         })
         .collect::<Vec<_>>();
     let mut direct_exit_stages = vec![BindingCandidate::default(); phi_temps.len()];
+    // 同一 stage 可以被多个 carried 候选引用，逐 phi 冻结输入 owner，避免反复扫描输入。
+    let carried_stage_owners = plan
+        .phis()
+        .map(|phi| {
+            let PhiIncomingDisposition::LoopCarried(owner) = phi.incomings.first()?.disposition
+            else {
+                return None;
+            };
+            phi.incomings
+                .iter()
+                .all(|incoming| incoming.disposition == PhiIncomingDisposition::LoopCarried(owner))
+                .then_some(owner)
+        })
+        .collect::<Vec<_>>();
     for consumer in plan.phis() {
         for incoming in &consumer.incomings {
             let Some((source, owner, edge)) =
@@ -319,6 +405,8 @@ pub(super) fn coalesce_loop_state_temps(
                 continue;
             }
             match incoming.value {
+                // 内层重试边可直接保留同一 SSA 状态；它没有交接，也不否定其它回边的写回证明。
+                SsaValue::Phi(source) if source == phi.phi => {}
                 SsaValue::Def(def)
                     if def_is_same_reg_in_region(dataflow, plan, def, phi.reg, direct_region)
                         || while_control_def == Some(def)
@@ -331,12 +419,18 @@ pub(super) fn coalesce_loop_state_temps(
                 SsaValue::Phi(source) => {
                     direct_compatible = false;
                     let source_plan = plan.phi_plan(source);
+                    let repeat_state_stage = matches!(
+                        plan.loop_protocol(*loop_id),
+                        Some(LoopVmProtocol::Repeat(_))
+                    ) && carried_stage_owners[source.index()]
+                        == Some(carried.owner);
                     let loop_stage = source != phi.phi
                         && (!has_nested_parent
                             || (!nested_stage_barrier_temps[target.index()]
-                                && direct_exit_stages[source.index()]
-                                    .resolved()
-                                    .is_some_and(|(owner, _)| owner == carried.owner)))
+                                && (repeat_state_stage
+                                    || direct_exit_stages[source.index()]
+                                        .resolved()
+                                        .is_some_and(|(owner, _)| owner == carried.owner))))
                         && phi_debug_hints[phi.phi.index()].is_none()
                         && stage_source_eligible[source.index()]
                         && source_plan.is_some_and(|source| {
@@ -419,7 +513,16 @@ pub(super) fn coalesce_loop_state_temps(
                 PhiIncomingDisposition::LoopCarried(region) => {
                     consumer.phi == target && region == owner
                 }
-                PhiIncomingDisposition::RegionResult(region) => !nested_target && region == owner,
+                PhiIncomingDisposition::RegionResult(region) => {
+                    region == owner
+                        && (!nested_target
+                            // 结果合流已独立证明写回同一 binding，条件入口的 stage
+                            // 无需保存第二份状态；独立出口快照仍不能借此合并。
+                            || phi_targets[consumer.phi.index()]
+                                .is_some_and(|(temp, _, stage)| {
+                                    temp == target_temp && stage.is_none()
+                                }))
+                }
                 PhiIncomingDisposition::EdgeCopy => {
                     nested_target
                         && incoming.edge.is_some_and(|edge| {
@@ -580,24 +683,98 @@ pub(super) fn def_is_same_reg_in_region(
 pub(super) fn repeat_stage_carried_temp(
     plan: &StructurePlan,
     loop_id: LoopPlanId,
-    target: PhiId,
+    (target, normal_value): (PhiId, SsaValue),
     dataflow: &DataflowFacts,
-    nested_carried_child_owners: &BTreeSet<(PhiId, RegionId)>,
-    phi_temps: &[TempId],
+    nested_carried_child_owners: &BTreeSet<(TempId, RegionId)>,
+    carried_temp_owners: &BTreeSet<(TempId, RegionId)>,
+    (phi_temps, fixed_temps): (&[TempId], &[TempId]),
 ) -> Option<TempId> {
     let owner = plan.loop_region(loop_id)?;
     let result = plan.phi_plan(target)?;
     if dataflow.reg_is_captured(result.reg) {
         return None;
     }
-    let carried = result.loop_carried()?;
-    if carried.owner == owner
-        || !plan.region_contains(carried.owner, owner)
-        || !nested_carried_child_owners.contains(&(target, owner))
-    {
-        return None;
+    // binding 分配已证明出口合流和正常输入共用 carried 身份时，额外 stage
+    // 只会复制该身份。正常输入既可能是条件入口 Phi，也可能是本轮最后的 Def；
+    // 读取已分配的 temp 身份，不按寄存器重新猜测两份状态等价。
+    let normal_temp = match normal_value {
+        SsaValue::Phi(source) if plan.phi_plan(source)?.reg == result.reg => {
+            phi_temps.get(source.index())
+        }
+        SsaValue::Def(source) if dataflow.def_reg(source) == result.reg => {
+            fixed_temps.get(source.index())
+        }
+        _ => None,
+    };
+    if normal_temp.is_some() && normal_temp == phi_temps.get(target.index()) {
+        return normal_temp.copied();
     }
-    phi_temps.get(target.index()).copied()
+    if matches!(normal_value, SsaValue::Def(_))
+        && let Some(&temp) = normal_temp
+        && carried_temp_owners.contains(&(temp, owner))
+    {
+        // 本轮计算已由 carried 绑定在原定义点接管。复用它承接出口暂存，
+        // 独立结果 phi 仍按原协议在循环后提交；不省略尚未共址的合流 COPY。
+        return Some(temp);
+    }
+    // 完整条件入口的 phi 已属于本轮 carried 状态时，出口快照仍是同一个 VM 槽。
+    // 正常路径不改值，break 按原边写入该槽；独立出口 phi 只在循环后读取最终状态。
+    if let SsaValue::Phi(source) = normal_value
+        && let Some(source_plan) = plan.phi_plan(source)
+        && source_plan.reg == result.reg
+        && !source_plan.incomings.is_empty()
+        && source_plan
+            .incomings
+            .iter()
+            .all(|incoming| incoming.disposition == PhiIncomingDisposition::LoopCarried(owner))
+    {
+        return phi_temps.get(source.index()).copied();
+    }
+    let target = *phi_temps.get(target.index())?;
+    // nested-carried 索引已经证明本 loop 沿用祖先 binding；出口 phi 也可能
+    // 经结果合流取得该身份，不要求它自己仍是祖先 loop header 的 phi。
+    nested_carried_child_owners
+        .contains(&(target, owner))
+        .then_some(target)
+}
+
+/// 绑定分配完成后，repeat 的全部出口输入若已归于同一 Local，直接复用该 owner。
+/// 捕获 cell、debug 声明与独立快照沿用 lowering 的统一身份查询，不按寄存器是否捕获猜测。
+pub(super) fn reuse_bound_repeat_stages(plan: &StructurePlan, bindings: &mut ProtoBindings) {
+    for (loop_id, payload) in plan.loops() {
+        let Some(LoopVmProtocol::Repeat(protocol)) = &payload.protocol else {
+            continue;
+        };
+        for (index, result) in protocol.value_plan.staged_results.iter().enumerate() {
+            let target_for = |value| {
+                let temp = match value {
+                    SsaValue::Def(def) => *bindings.fixed_temps.get(def.index())?,
+                    SsaValue::Phi(phi) => *bindings.phi_temps.get(phi.index())?,
+                    SsaValue::Entry(_) => return None,
+                };
+                bindings.temp_target(temp)
+            };
+            let Some(phi) = plan.phi_plan(result.target) else {
+                continue;
+            };
+            let Some(owner @ BoundSlotTarget::Local(_)) = target_for(SsaValue::Phi(result.target))
+            else {
+                continue;
+            };
+            if target_for(result.normal_value) != Some(owner)
+                || !phi.incomings.iter().all(|incoming| {
+                    incoming.disposition == PhiIncomingDisposition::Dead
+                        || target_for(incoming.value) == Some(owner)
+                })
+            {
+                continue;
+            }
+            // 原写入和各出口都已属于同一词法身份，stage 只重复合流；捕获 cell 的
+            // 更新仍由该 Local 承接。独立快照没有这个投影，不能凭相同槽位合并。
+            bindings.repeat_staged_temps[loop_id.index()][index] =
+                bindings.phi_temps[result.target.index()];
+        }
+    }
 }
 
 /// NumericFor 的 control 前缀在本轮 body 尾部发射，仍处于同一 binding 作用域。

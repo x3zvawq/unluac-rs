@@ -1,6 +1,7 @@
 -- regress_449_call_root_multi_home_overwrite: 一个 call result 覆盖多个旧 root home
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]]
+-- unluac: expect-ast-count [[function]] [[2]]
 
 local finalized = 0
 
@@ -24,3 +25,7 @@ collectgarbage("collect")
 assert(finalized == 2, "old roots retained")
 assert(first == second and first == replacement)
 print("regress_449_call_root_multi_home_overwrite", finalized)
+first, second, replacement = nil, nil, nil
+collectgarbage("collect")
+collectgarbage("collect")
+assert(finalized == 3, "replacement root survived its last owners")

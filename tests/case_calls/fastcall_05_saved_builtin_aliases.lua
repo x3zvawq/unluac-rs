@@ -1,6 +1,11 @@
 -- 参数回调替换全局 builtin 后，保存的别名仍调用旧值；固定参数和开放包共用此边界。
 -- unluac: expect-not-contains [[ = print]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[local-binding]] [[10]] [[@variant=O0]]
+-- unluac: expect-ast-count [[local-binding]] [[9]] [[@variant=O1]]
+-- unluac: expect-ast-count [[local-binding]] [[9]] [[@variant=O2]]
+-- unluac: expect-ast-count [[error]] [[0]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 -- unluac: expect-contains [[environment.math = {]] [[@debug=retained]]
 -- unluac: expect-contains [[local maximum = math.max]] [[@debug=retained]]

@@ -1,4 +1,8 @@
 -- debug start 位于回边 phi 时，前置块的初始化与循环写回仍共用源码绑定。
+-- unluac: expect-ast-count [[local-binding]] [[3]]
+-- unluac: expect-ast-count [[assign]] [[1]]
+-- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[if]] [[1]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
 -- unluac: expect-contains [[until (function(]]

@@ -132,9 +132,6 @@ impl FrameBuilder<'_> {
         if tail.exact_width().is_some() {
             return None;
         }
-        let HirExpr::Call(argument) = tail.as_expr() else {
-            return None;
-        };
         let frame = facts.native_fastcall_frame(call)?;
         let ValuePack::Open(argument_home) = frame.args else {
             return None;
@@ -190,12 +187,11 @@ impl FrameBuilder<'_> {
             }
             fixed.push(value);
         }
-        let argument = self.call(
-            argument,
+        let tail = self.open_tail(
+            tail,
+            facts.call_vararg_tail_home(call),
             before,
             argument_home.index() + fixed.len(),
-            false,
-            CallWidth::Open,
         )?;
         let callee = self.expr(
             &call.callee,
@@ -214,7 +210,7 @@ impl FrameBuilder<'_> {
             callee,
             args: HirValuePack {
                 fixed,
-                tail: Some(HirPackTail::open(HirExpr::Call(Box::new(argument)))),
+                tail: Some(tail),
             },
             required_luau_inlining: call.required_luau_inlining,
             source_site: call.source_site,
@@ -300,6 +296,16 @@ impl FrameBuilder<'_> {
         } else {
             // locals 可以复用旧 callee 的身份；只消费当前 Boolean 写，不退休旧声明。
             let local = facts.promoted_local_for_temp(initial)?;
+            // 入口预写和结果 phi 可以提升为同一 Local；预写在结果定义之前，
+            // 不能把调用前最后一次结果赋值误认为原 Boolean 初始化。
+            // 配对身份来自原值决策，结果表达式仍由后续完整帧逐事件消费。
+            let before = if argument == &HirExpr::LocalRef(local)
+                && facts.promoted_local_for_temp(result) == Some(local)
+            {
+                self.definition(local, before)?
+            } else {
+                before
+            };
             let index = self.definition(local, before)?;
             // ProofIncomplete/BindingIdentity：预写的值、完整写域和公开身份须保持原合同。
             if !matches!(scalar_local(self.run[index]), Some((target, HirExpr::Boolean(value))) if target == local && *value == initial_value)
@@ -433,7 +439,9 @@ impl FrameBuilder<'_> {
                     }
                     let previous_boolean_frame = self.boolean_frame;
                     if boolean_tree || boolean_prewrite {
-                        self.boolean_frame = Some(slot);
+                        self.boolean_frame = facts
+                            .call_argument_value(call, index)
+                            .and_then(|temp| facts.trusted_temp_home_slot(temp));
                     }
                     let value = self.expr(
                         argument,

@@ -3,6 +3,12 @@
 -- unluac: expect-contains [[if r1_0 and r1_0.b then]] [[@debug=stripped]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[if]] [[4]]
+-- 嵌套表实参后复用准备槽，不应留下空声明或拆散后续直接调用。
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=0]]
+-- 只保留源码中的 a 和 reads，空 TEST 的调用仍直接位于条件中。
+-- unluac: expect-ast-count [[local-decl]] [[2]]
+-- unluac: expect-contains [[if read() then]] [[@debug=retained]]
 function fn(cfg, h, id)
     local a = cfg[id]
     if not (h and a) then

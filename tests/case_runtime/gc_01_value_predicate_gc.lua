@@ -1,3 +1,9 @@
+-- 双 not 是原 Boolean 写回，既不能删成纯谓词，也不应新增中转声明。
+-- unluac: expect-count [[not not]] [[5]]
+-- unluac: expect-ast-count [[function]] [[13]]
+-- unluac: expect-ast-count [[if]] [[6]]
+-- unluac: expect-ast-count [[goto]] [[0]]
+-- unluac: expect-ast-count [[error]] [[0]]
 -- Boolean 值的原槽覆盖不能退化成谓词极性；不同 VM 的存活结果由各自源码基线决定。
 -- 后续 callee 的 __index 在赋入目标槽之前观察 GC，调用前插入的临时槽也会影响结果。
 local weak = setmetatable({}, {__mode="v"})
@@ -86,3 +92,10 @@ print("logical_value", logical_value(false))
 print("copied_value", copied_value(false))
 print("compared_value", compared_value(false))
 print("predicate_writeback", predicate_writeback())
+
+-- 覆盖原先未执行的短路入口与直接返回分支；GC 结果仍按各方言源码基线比较。
+print("double_value_skip", double_value(false, true))
+print("predicate_skip", predicate(false, true))
+assert(double_value(true, true) == true)
+assert(predicate(true, true) == true)
+assert(logical_value(true) == true)

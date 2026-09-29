@@ -1,5 +1,7 @@
--- Ordinary returns have no pending cleanup identity to distinguish equal arms.
--- unluac: expect-not-contains [[if ]]
+-- 相等返回可共享出口，但参数和调用结果的原 TEST 均须保留。
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-count [[local-decl]] [[1]]
+-- unluac: expect-ast-count [[do-block]] [[0]]
 -- unluac: expect-count [[return 42]] [[2]]
 local function plain(flag)
     if flag then return 42 else return 42 end

@@ -1,8 +1,19 @@
 -- lua53_01#1: 位运算与整除
+-- unluac: expect-ast-count [[function]] [[18]]
+-- unluac: expect-ast-count [[numeric-for]] [[4]]
+-- unluac: expect-ast-count [[while]] [[1]]
+-- 索引写入和多结果返回的准备不能成为额外的源码绑定。
+-- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=4]]
+-- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=6]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=8]]
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=11]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=14]]
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=18]]
 local function test_bitwise_idiv()
     local a = (15 // 2) + (5 << 1)
     local b = (0x3F & 0x0F) ~ 0x02
     local c = 20 >> 2
+    assert(a == 17 and b == 13 and c == 5 and math.type(a) == "integer")
 
     print("lua53_01#1", a, b, c)
 end
@@ -38,6 +49,10 @@ local function test_closure_mesh()
 
     print("lua53_01#2", run_a({ 3, 9, 12, 17 }))
     print("lua53_01#2", run_b({ 8, 1, 14 }))
+    -- 空输入不追加 history，仍返回上一次调用留下的两个尾项。
+    assert(run_a({}) == 182 and select(2, run_a({})) == 39 and select(3, run_a({})) == 4)
+    assert(run_b({}) == 112 and select(2, run_b({})) == 27 and select(3, run_b({})) == 10)
+    assert(select("#", run_a({})) == 3)
 end
 
 -- lua53_01#3: 整除浮点分支
@@ -61,11 +76,17 @@ local function test_idiv_float()
             end
         end
 
+        assert(math.type(score) == "integer" and math.type(frac) == "float")
         return score, frac, score // 3, frac / #values
     end
 
     local a, b, c, d = analyze({ 5, 8, 13, 21, 34 })
+    assert(a == 86 and c == 28)
+    assert(math.abs(b - 2717 / 140) < 1e-12 and math.abs(d - 2717 / 700) < 1e-12)
     print("lua53_01#3", a, b, c, d)
+    a, b, c, d = analyze({})
+    assert(a == 0 and b == 0 and c == 0 and d ~= d)
+    assert(select("#", analyze({})) == 4)
 end
 
 -- lua53_01#4: 方法表位运算
@@ -99,6 +120,9 @@ local function test_method_bitwise()
 
     local x1, y1 = obj:fold(1, 2)
     local x2, y2 = obj:fold(2, 1)
+    assert(x1 == 50 and y1 == 54 and x2 == 65 and y2 == 66)
+    assert(#obj.rows[1] == 4 and #obj.rows[2] == 4)
+    assert(obj.rows[1][4] == x1 and obj.rows[2][4] == x2)
 
     print("lua53_01#4", x1, y1, x2, y2, obj.rows[1][4], obj.rows[2][4])
 end
@@ -122,18 +146,28 @@ local function test_int_float_capture()
                 base_float = wave * 1.75
             end
 
+            assert(math.type(base_int) == "integer" and math.type(base_float) == "float")
             return base_int, base_float, right // 3, wave
         end
     end
 
     local f = factory(11)
-    print("lua53_01#5", f(3))
-    print("lua53_01#5", f(8))
-    print("lua53_01#5", f(5))
+    local a, b, c, d, extra = f(3)
+    assert(a == 91 and c == 29 and extra == nil)
+    assert(math.abs(b - 28 / 15) < 1e-12 and math.abs(d - 14 / 3) < 1e-12)
+    print("lua53_01#5", a, b, c, d)
+    a, b, c, d, extra = f(8)
+    assert(a == 95 and c == 20 and extra == nil)
+    assert(math.abs(b - 301 / 60) < 1e-12 and math.abs(d - 43 / 15) < 1e-12)
+    print("lua53_01#5", a, b, c, d)
+    a, b, c, d, extra = f(5)
+    assert(a == 130 and c == 19 and extra == nil)
+    assert(math.abs(b - 677 / 300) < 1e-12 and math.abs(d - 677 / 120) < 1e-12)
+    print("lua53_01#5", a, b, c, d)
 end
 
 -- lua53_01#6: 循环位运算分发
-local function test_loop_dispatch()
+local function test_loop_dispatch(values)
     local handlers = {
         [0] = function(state, value)
             return ((state << 1) ~ value) & 0xFF
@@ -148,7 +182,6 @@ local function test_loop_dispatch()
 
     local state = 0x41
     local log = {}
-    local values = { 6, 11, 4, 15, 9, 2 }
     local i = 1
 
     while i <= #values do
@@ -171,6 +204,12 @@ local function test_loop_dispatch()
         i = i + 1
     end
 
+    assert(i == #values + 1 and #log == #values)
+    if values[1] == 60 then
+        assert(#values > 6)
+    else
+        assert(state == 36 and #values == 6 and log[1] == 40 and log[3] == 10 and log[#log] == 2.5)
+    end
     print("lua53_01#6", state, log[1], log[3], log[#log], #values)
 end
 
@@ -199,8 +238,12 @@ local function test_bnot_mask()
     end
 
     local f = make_filter(0x2D)
-    print("lua53_01#7", f({ 3, 8, 12, 19 }))
-    print("lua53_01#7", f({ 5, 7, 11 }))
+    local a, b, c, extra = f({ 3, 8, 12, 19 })
+    assert(a == 20 and b == 195 and c == 235 and extra == nil)
+    print("lua53_01#7", a, b, c)
+    a, b, c, extra = f({ 5, 7, 11 })
+    assert(a == 232 and b == 187 and c == 23 and extra == nil)
+    print("lua53_01#7", a, b, c)
 end
 
 test_bitwise_idiv()
@@ -208,5 +251,6 @@ test_closure_mesh()
 test_idiv_float()
 test_method_bitwise()
 test_int_float_capture()
-test_loop_dispatch()
+test_loop_dispatch({ 6, 11, 4, 15, 9, 2 })
+test_loop_dispatch({ 60, 11, 4, 15, 9, 2 })
 test_bnot_mask()

@@ -2,6 +2,8 @@
 -- unluac: expect-ast-count [[close-binding]] [[5]]
 -- unluac: expect-ast-min [[goto]] [[3]]
 -- unluac: expect-ast-min [[label]] [[3]]
+-- unluac: expect-ast-max [[local-binding]] [[32]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 local function linear_tail()
     local log = {}
     local function resource(name)

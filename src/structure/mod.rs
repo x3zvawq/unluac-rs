@@ -30,7 +30,7 @@ pub use cfg::{
     ReachableSuccessorShape, RootObservation, RootOverwriteFrontier, RootOverwriteFrontiers,
     SideEffectSummary, SsaRegMap, SsaValue, UseSite, build_cfg_graph, compute_dataflow_facts,
 };
-pub(crate) use cfg::{PhiIncomingSlot, SccId};
+pub(crate) use cfg::{PhiIncomingSlot, SccId, low_instr_def_may_hold_gc_root};
 pub(crate) use common::{
     BranchCandidate, BranchRegionFact, BranchValueMergeCandidate, LoopCandidate, LoopExitAlias,
     LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings, LoopValueMerge, RegionFact,

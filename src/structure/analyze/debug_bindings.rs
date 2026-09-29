@@ -247,9 +247,10 @@ fn enclosing_initializer_scope(
     let DebugBindingValue::Ssa(SsaValue::Def(def)) = value else {
         return None;
     };
-    let scope = *scopes
-        .iter()
-        .min_by_key(|&&scope| proto.debug_locals[scope].start_pc)?;
+    let scope = *scopes.iter().min_by_key(|&&scope| {
+        let local = &proto.debug_locals[scope];
+        (local.start_pc, std::cmp::Reverse(local.end_pc))
+    })?;
     let outer = &proto.debug_locals[scope];
     let producer = dataflow.def_instr(def);
     if proto.lowering_map.pc_map()[producer.index()]
@@ -260,15 +261,41 @@ fn enclosing_initializer_scope(
         return None;
     }
     // Luau 内联实参可以直接借用 caller local 的寄存器，并另记一段参数 debug 区间。
+    // 同起点的内联形参也可能借用刚初始化的 caller local；只有整段只读且无引用
+    // 捕获时，较短区间才是同一值的视图，不能借长度把可写的两个身份合并。
+    let shared_start = scopes
+        .iter()
+        .any(|&other| other != scope && proto.debug_locals[other].start_pc == outer.start_pc);
+    if shared_start {
+        let start = proto
+            .lowering_map
+            .low_instr_at_or_after_pc(outer.start_pc)?
+            .index();
+        let end = proto
+            .lowering_map
+            .low_instr_at_or_after_pc(outer.end_pc)
+            .map_or(proto.instrs.len(), |instr| instr.index());
+        if dataflow.reg_is_reference_captured(outer.reg)
+            || dataflow
+                .first_must_write_in_range(outer.reg, start..end)
+                .is_some()
+        {
+            // 候选拒绝[SemanticBarrier:Identity]：区间长短不能证明后续写或捕获归属。
+            return None;
+        }
+    }
     // 同槽、同 SSA、严格内含且没有独立初始化的名称是该值的局部视图；initializer
-    // 仍属于紧邻原写入的外层声明。交叉区间或同起点不能据此裁决。
+    // 仍属于紧邻原写入的外层声明。交叉区间、重合外层及同起点零长度身份继续拒绝。
     scopes
         .iter()
         .all(|&other| {
             let inner = &proto.debug_locals[other];
             other == scope
                 || (inner.reg == outer.reg
-                    && outer.start_pc < inner.start_pc
+                    && (outer.start_pc < inner.start_pc
+                        || outer.start_pc == inner.start_pc
+                            && inner.start_pc < inner.end_pc
+                            && inner.end_pc < outer.end_pc)
                     && inner.end_pc <= outer.end_pc)
         })
         .then_some(scope)

@@ -1,4 +1,7 @@
 -- CALL 在并列 local 的共同 scratch 求值，单值结果按原顺序写回各声明槽。
+-- unluac: expect-ast-count [[local-binding]] [[14]]
+-- unluac: expect-ast-count [[function]] [[4]]
+-- unluac: expect-ast-count [[table-constructor]] [[8]]
 -- unluac: expect-ast-max [[empty-local]] [[0]]
 -- unluac: expect-contains [[local first, second, third = result("a"), result("b"), result("c")]] [[@debug=retained]]
 -- unluac: expect-contains [[local r0_2, r0_3, r0_4 = r0_1("a"), r0_1("b"), r0_1("c")]] [[@debug=stripped]] [[@dialect=luau]]

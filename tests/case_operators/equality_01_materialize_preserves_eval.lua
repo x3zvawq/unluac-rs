@@ -1,4 +1,7 @@
 -- regress_252_materialize_preserves_eval: 等值/常量短路不能删除可观察求值
+-- unluac: expect-ast-count [[function]] [[4]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[15]]
 -- unluac: expect-not-contains [["logic") then]]
 -- 原 CALL 的显式 TEST 应随完整短路 initializer 保留，不能只留下裸调用和常量。
 -- unluac: expect-contains [[("logic") and false or 9]] [[@dialect=lua5.1]]
@@ -26,6 +29,13 @@
 -- unluac: expect-contains [[local r2_4 = r2_2() + 1]] [[@dialect=lua5.4]]
 -- unluac: expect-contains [[local r2_4 = r2_2() + 1]] [[@dialect=lua5.5]]
 -- unluac: expect-contains [[local r1_4 = r1_2() + 1]] [[@dialect=luajit]]
+-- 取负也应恢复为完整 initializer，不能留下保存 callee、CALL、NEG 三步包装。
+-- unluac: expect-contains [[local r2_6 = -r2_2()]] [[@dialect=lua5.1]]
+-- unluac: expect-contains [[local r2_6 = -r2_2()]] [[@dialect=lua5.2]]
+-- unluac: expect-contains [[local r2_6 = -r2_2()]] [[@dialect=lua5.3]]
+-- unluac: expect-contains [[local r2_6 = -r2_2()]] [[@dialect=lua5.4]]
+-- unluac: expect-contains [[local r2_6 = -r2_2()]] [[@dialect=lua5.5]]
+-- unluac: expect-contains [[local r1_6 = -r1_2()]] [[@dialect=luajit]]
 
 local trace = ""
 
@@ -66,3 +76,7 @@ local function root_suffix()
     return ignored, seen, ignored_again, negative
 end
 print("conditional_root_suffix", root_suffix())
+-- 弱根的具体观察由各方言原程序决定；完整返回包不能被截为单值。
+assert(select("#", root_suffix()) == 4)
+assert(select("#", mark("tail")) == 1)
+assert(trace == "tablelogicequaltail", trace)

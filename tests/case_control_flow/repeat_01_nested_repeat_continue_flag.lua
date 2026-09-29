@@ -1,6 +1,8 @@
 -- unluac: expect-ast-min [[repeat]] [[2]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
+-- 源码只有 d/e/f/g 和循环内的 continue_inner，不能为各写入拆出不同 debug 身份。
+-- unluac: expect-ast-count [[local-binding]] [[5]]
 local d, e, f = 117
 local g = 1
 
@@ -36,3 +38,4 @@ repeat
 until false
 -- 观察放在循环外，避免额外短路分支改变被测 continue 状态机。
 assert(g == 6 and e == 3 and f == 2)
+assert(d == 2)

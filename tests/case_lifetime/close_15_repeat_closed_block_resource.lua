@@ -1,5 +1,10 @@
 -- regress_371_repeat_closed_block_resource: a completed lexical block closes before the repeat tail
 -- unluac: expect-contains [[until mark("stop", true) or mark("again", false)]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[close-binding]] [[3]]
+-- unluac: expect-ast-count [[repeat]] [[3]]
+-- unluac: expect-ast-count [[do-block]] [[3]]
+-- unluac: expect-ast-count [[break]] [[0]]
 
 local events = {}
 
@@ -38,3 +43,15 @@ repeat
     end
 until mark("again", true)
 assert(table.concat(events, ",") == "body,close,stop,again")
+
+events = {}
+repeat
+    do
+        local resource <close> = setmetatable({}, close_meta)
+        events[#events + 1] = "body"
+    end
+    if mark("stop", false) then
+        break
+    end
+until mark("again", #events >= 7)
+assert(table.concat(events, ",") == "body,close,stop,again,body,close,stop,again")

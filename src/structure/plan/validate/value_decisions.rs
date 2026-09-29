@@ -687,6 +687,18 @@ pub(super) fn validate_value_decision_values(
                 decision_id.index()
             )));
         }
+        if let Some(entry) = decision.loop_entry
+            && result_phi
+                .incoming
+                .iter()
+                .filter(|incoming| incoming.edge == Some(entry))
+                .count()
+                != 1
+        {
+            return Err(StructureError::invalid(
+                "value decision loop entry is not a unique result incoming",
+            ));
+        }
         let phi_plan = plan.phi_plan(decision.result_phi).ok_or_else(|| {
             StructureError::invalid("value decision result phi has no final value plan")
         })?;
@@ -700,6 +712,16 @@ pub(super) fn validate_value_decision_values(
         }
         for (incoming, incoming_plan) in result_phi.incoming.iter().zip(&phi_plan.incomings) {
             let valid = match incoming_plan.disposition {
+                PhiIncomingDisposition::RegionInput(owner)
+                    if decision.loop_entry.is_some() && incoming.edge == decision.loop_entry =>
+                {
+                    matches!(plan.region(owner), Some(RegionPlan::Loop { plan: loop_id, .. })
+                        if plan.loop_(*loop_id).is_some_and(|loop_| loop_.header == decision.merge))
+                        && plan.region_contains(owner, region)
+                        && incoming
+                            .pred
+                            .is_some_and(|pred| !graph.dominates(decision.merge, pred))
+                }
                 PhiIncomingDisposition::RegionResult(owner) => owner == region,
                 PhiIncomingDisposition::LoopCarried(owner)
                     if incoming.value == SsaValue::Phi(result_phi.id) =>
@@ -896,6 +918,13 @@ fn validate_value_operands(
     let mut owners = vec![root; decision.nodes.len()];
     for (index, operand) in decision.operands.iter().enumerate() {
         if operand
+            .proven_route_values(cfg, dataflow, &decision.nodes)
+            .as_ref()
+            != Some(&operand.route_values)
+        {
+            return Err(invalid());
+        }
+        if operand
             .proven_current_values(proto, dataflow, &decision.nodes)
             .as_ref()
             != Some(&operand.current_values)
@@ -915,6 +944,12 @@ fn validate_value_operands(
             .get(operand.continuation.index())
             .is_none_or(|node| node.block != phi.block)
             || site.instr != consumer.predicate
+            || crate::structure::helpers::equality_right_operand_precedes_left_call(
+                proto,
+                dataflow,
+                graph,
+                consumer.predicate,
+            ) == Some(phi.id)
             || !graph.post_dominates(consumer.block, phi.block)
             || dataflow.instr_effects[site.instr.index()].repeats_fixed_use(site.reg)
             || !dataflow.phi_consumer_ids(phi.id).is_empty()

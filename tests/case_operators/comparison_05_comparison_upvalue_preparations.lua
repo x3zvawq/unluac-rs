@@ -2,6 +2,12 @@
 -- unluac: expect-ast-min [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[numeric-for]] [[2]]
 -- unluac: expect-ast-min [[if]] [[1]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[if]] [[4]]
+-- unluac: expect-ast-max [[local-binding]] [[16]]
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=3]]
+-- unluac: expect-count [[ = for_skip_observe]] [[2]]
+-- unluac: expect-count [[ = nil]] [[2]]
 local captured = 1
 local weak = setmetatable({}, {__mode = "v"})
 local observed = {}
@@ -41,8 +47,17 @@ local function followed()
     return prefix
 end
 assert(followed() == 23)
-setmetatable(_G, old)
 local result = table.concat(observed, ",")
 print("repeated-upvalue-snapshot", result, captured, calls)
 assert(result == "false,false", "old scope result remains rooted")
 assert(captured == 3 and calls == 4, "read or call identity changed")
+-- 复用同一原函数，验证每次比较都读取本轮上值，而不是复用上次准备的快照。
+captured = -2.5
+assert(followed() == 23)
+assert(captured == -0.5 and calls == 8)
+assert(table.concat(observed, ",") == "false,false,false,false")
+assert(select("#", followed()) == 1)
+assert(captured == 1.5 and calls == 12)
+assert(table.concat(observed, ",") == "false,false,false,false,false,false")
+setmetatable(_G, old)
+assert(getmetatable(_G) == old)

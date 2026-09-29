@@ -556,14 +556,16 @@ pub struct ShortCircuitCandidate {
     pub exit: ShortCircuitExit,
     pub result_reg: Option<Reg>,
     pub result_phi_id: Option<PhiId>,
+    /// 循环内决策只产生回边值；唯一循环入口仍由 loop owner 初始化。
+    pub loop_entry: Option<EdgeRef>,
     pub entry_value: Option<SsaValue>,
     pub value_incomings: Vec<ShortCircuitValueIncoming>,
     pub reducible: bool,
 }
 
 impl ShortCircuitCandidate {
-    /// 单分支的两条独立赋值臂只为嵌套谓词提供操作数证据；没有外层消费者
-    /// 认领时保留普通 branch，让 Boolean 物化与循环尾条件继续使用原协议。
+    /// 单分支的两条独立赋值臂通常只为嵌套谓词提供操作数证据；独立消费须由
+    /// selector 额外证明 repeat 尾部的匿名 Boolean 物化，否则保留普通 branch 的绑定写回。
     pub(crate) fn is_value_operand_only(&self) -> bool {
         matches!(self.exit, ShortCircuitExit::ValueMerge(_))
             && self.nodes.len() == 1

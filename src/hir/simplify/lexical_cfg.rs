@@ -58,6 +58,61 @@ pub(super) struct LexicalCfg {
     has_external_exit: bool,
 }
 
+/// 当前树中只退出到同块或祖先块尾部的 label。尾 label 不进入本块新声明的作用域；
+/// 此证书仅解释控制位置，不授权移动求值、声明或资源边界，改写后必须重建。
+pub(super) fn trailing_label_exits(block: &HirBlock) -> BTreeSet<HirLabelId> {
+    struct Scan {
+        cursor: usize,
+        labels: BTreeMap<HirLabelId, Option<std::ops::Range<usize>>>,
+        gotos: Vec<(HirLabelId, usize)>,
+    }
+    impl Scan {
+        fn block(&mut self, block: &HirBlock) {
+            let start = self.cursor;
+            let trailing = block
+                .stmts
+                .iter()
+                .rposition(|stmt| !matches!(stmt, HirStmt::Label(_)))
+                .map_or(0, |index| index + 1);
+            for (index, stmt) in block.stmts.iter().enumerate() {
+                let position = self.cursor;
+                self.cursor += 1;
+                match stmt {
+                    HirStmt::Goto(goto) => self.gotos.push((goto.target, position)),
+                    HirStmt::Label(label) => {
+                        // 尾部只剩 labels，当前 cursor 已包含本块全部可能的 goto。
+                        let range = (index >= trailing).then_some(start..self.cursor);
+                        self.labels
+                            .entry(label.id)
+                            .and_modify(|value| *value = None)
+                            .or_insert(range);
+                    }
+                    _ => crate::hir::visit::for_each_nested_block(stmt, &mut |child| {
+                        self.block(child)
+                    }),
+                }
+            }
+        }
+    }
+    let mut scan = Scan {
+        cursor: 0,
+        labels: BTreeMap::new(),
+        gotos: Vec::new(),
+    };
+    scan.block(block);
+    for (target, source) in scan.gotos {
+        if let Some(range) = scan.labels.get_mut(&target)
+            && !range.as_ref().is_some_and(|range| range.contains(&source))
+        {
+            *range = None;
+        }
+    }
+    scan.labels
+        .into_iter()
+        .filter_map(|(label, range)| range.map(|_| label))
+        .collect()
+}
+
 /// 仅在一次 HIR topology 快照中有效的节点身份。
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct HirFlowNodeId(usize);
@@ -248,6 +303,31 @@ impl<'a> HirFlowGraph<'a> {
 
     pub(super) fn nodes(&self) -> &[HirFlowNode<'a>] {
         &self.nodes
+    }
+
+    /// 当前函数/区域快照的支配树，节点编号对应 `nodes()`。
+    pub(super) fn dominance(&self) -> crate::graph::DominatorTree<usize> {
+        let count = self.nodes.len();
+        let mut predecessors = vec![Vec::new(); count];
+        for (source, node) in self.nodes.iter().enumerate() {
+            for target in node.successors().keys() {
+                predecessors[target.index()].push(source);
+            }
+        }
+        let traversal = crate::graph::depth_first(
+            count,
+            self.entry.index(),
+            |node| node,
+            |node| node < count,
+            |node| self.nodes[node].successors().keys().map(|id| id.index()),
+        );
+        crate::graph::dominator_tree(
+            &traversal,
+            |node| node,
+            |node| node,
+            |node| predecessors[node].iter().copied(),
+        )
+        .expect("HIR flow graph traversal must define a valid dominance tree")
     }
 
     /// 当前图的直接 binding 活跃性，按共享 visitor 读取 RHS、条件、参数与 capture。

@@ -3,6 +3,9 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
 -- unluac: expect-ast-count [[continue]] [[1]]
+-- 嵌套闭包的作用域须在非稳定尾条件之前结束，原 iterations 检查仍应保留。
+-- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=0]]
+-- unluac: expect-ast-count [[if]] [[2]] [[@proto=0]]
 
 local weak_values = setmetatable({}, { __mode = "v" })
 local guard = true
@@ -38,6 +41,7 @@ repeat
 until if guard then selected() else wrong_fallback()
 
 assert(iterations == 1, iterations)
+assert(guard == false, "selected must publish its guard update")
 assert(weak_values[1] == nil, "nested closure root must be released before until")
 assert(table.concat(events, ",") == "selected", table.concat(events, ","))
 print("regress_457_luau_repeat_continue_scope_latch", iterations, events[1])

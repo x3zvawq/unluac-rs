@@ -1,6 +1,7 @@
 -- regress_356_lookup_copy_only_root: only the copied home crosses the collection fence
 -- 原 COPY 是跨 GC 的独立 root；限制额外声明和重复 lookup，不按自动变量编号禁止它。
 -- unluac: expect-ast-count [[local-decl]] [[5]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[call]] [[5]]
 -- unluac: expect-count [[.weak.key]] [[1]]

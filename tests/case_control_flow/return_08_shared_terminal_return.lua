@@ -4,15 +4,23 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 比较操作数的先后读取需要一个快照，其余分支不应引入布尔控制变量。
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]]
+-- unluac: expect-ast-count [[if]] [[10]] [[@proto=4]]
+-- unluac: expect-ast-count [[local-binding]] [[14]]
+local star_calls, feather_calls = 0, 0
+
 local function showRequiredItemsPopup(level, reason)
     print("locked", level.name, reason)
 end
 
 local function calculateEpisodeStars(_episode)
+    star_calls = star_calls + 1
     return 4
 end
 
 local function calculateFeatherScore(_episode)
+    feather_calls = feather_calls + 1
     return 8
 end
 
@@ -76,3 +84,72 @@ print(
     "regress_21_shared_terminal_return#1",
     allowed
 )
+
+local saved_print, messages = print, {}
+print = function(first, second, third)
+    messages[#messages + 1] = { first, second, third }
+end
+local level = { name = "probe" }
+local episode = { last_open_level = 2 }
+local function check(expected, message, second, third, stars, feathers)
+    star_calls, feather_calls, messages = 0, 0, {}
+    assert(level_access_allowed(level, episode) == expected)
+    assert(star_calls == (stars or 0) and feather_calls == (feathers or 0))
+    if message then
+        assert(#messages == 1 and messages[1][1] == message)
+        assert(messages[1][2] == second and messages[1][3] == third)
+    else
+        assert(#messages == 0)
+    end
+end
+
+check(true)
+level.stars_required = 5
+check(false, "locked", "probe", "stars", 1)
+level.unlocked = 0
+check(true, nil, nil, nil, 1)
+level.unlocked, level.stars_required = false, 4
+check(true, nil, nil, nil, 1)
+level.stars_required = 0
+check(true, nil, nil, nil, 1)
+level.feathers_required = 9
+check(false, "locked", "probe", "feathers", 0, 1)
+level.unlocked = ""
+check(true, nil, nil, nil, 0, 1)
+level.unlocked, level.feathers_required = nil, 8
+check(true, nil, nil, nil, 0, 1)
+
+level.calendar, level.index = true, 2
+check(true)
+level.index, level.days, level.seconds_to_open = 3, {}, 10
+check(true)
+level.days[3] = 0
+check(false, "calendar locked", 10)
+level.seconds_to_open = 0
+check(true)
+level.seconds_to_open = -1
+check(true)
+level.calendar, level.useDateLock, level.layout_open = false, true, ""
+check(true)
+level.layout_open, level.seconds_to_open = false, 10
+check(false, "timer", 10)
+level.seconds_to_open = 0
+check(false)
+level.seconds_to_open = -1
+check(false)
+
+-- >= 的两个索引读取可触发元方法，不能为了少一个局部变量交换其顺序。
+local reads = ""
+episode = setmetatable({}, { __index = function(_, key)
+    assert(key == "last_open_level")
+    reads = reads .. "episode;"
+    return 2
+end })
+level = setmetatable({ calendar = true, useDateLock = false }, { __index = function(_, key)
+    assert(key == "index")
+    reads = reads .. "level;"
+    return 1
+end })
+check(true)
+assert(reads == "episode;level;")
+print = saved_print

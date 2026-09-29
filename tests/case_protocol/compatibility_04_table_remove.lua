@@ -1,3 +1,7 @@
+-- unluac: expect-ast-count [[function]] [[4]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[22]]
 local dump_command, dump_path = ...
 if dump_command == "--dump-table-remove" then
     local dump = string.dump(table.remove, true)

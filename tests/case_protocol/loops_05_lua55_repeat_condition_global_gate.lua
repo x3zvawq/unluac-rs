@@ -5,6 +5,9 @@
 -- unluac: expect-order [[global<const> *]] [[print("body")]]
 -- unluac: expect-count [[global<const> type]] [[1]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[1]]
+-- unluac: expect-ast-count [[while]] [[0]]
 
 local function run(flag)
     global marker = 0
@@ -18,3 +21,5 @@ local function run(flag)
 end
 
 assert(run(true) == 1)
+_ENV.marker = nil
+assert(run(false) == 1)

@@ -1,4 +1,7 @@
 -- 函数根块和显式内层块共享尾部 RETURN 时，debug 区间与捕获关闭仍须分别恢复。
+-- unluac: expect-ast-count [[local-binding]] [[19]]
+-- unluac: expect-ast-count [[assign]] [[4]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- LuaJIT 的子 proto 编号逆序，分别定位同一个函数，避免把 hook 内层块计入。
 -- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=1]] [[@dialect=lua5.2]]

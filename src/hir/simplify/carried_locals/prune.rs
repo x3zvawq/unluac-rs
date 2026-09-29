@@ -277,7 +277,7 @@ pub(super) fn restore_phi_copy_writes(
                         if !copy.is_phi_transfer
                             && copy.initializer_merge_transaction.is_none()
                             && copy.generic_for_initializer_producer.is_none()
-                            && copy.generic_for_dispatch_release.is_none()
+                            && copy.root_release.is_none()
                             && copy.method_rewrite_transaction.is_none())
                 {
                     replacements.push((index, component, temp, target));

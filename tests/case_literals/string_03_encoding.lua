@@ -2,12 +2,18 @@
 -- unluac: expect-contains [["\214\208\206\196"]]
 -- unluac: expect-count [["中文"]] [[1]]
 -- unluac: expect-contains [[\214\208\n\206\196]]
+-- unluac: expect-ast-count [[function]] [[1]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=0]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
 local function test_gbk_string_literal()
     local value = "\214\208\206\196"
     return value
 end
 
-local value = test_gbk_string_literal()
+local value, extra = test_gbk_string_literal()
+assert(extra == nil)
 assert(#value == 4)
 assert(string.byte(value, 1) == 214 and string.byte(value, 2) == 208)
 assert(string.byte(value, 3) == 206 and string.byte(value, 4) == 196)
@@ -26,7 +32,9 @@ local expected = {
     { 214, 208, 34, 39, 55 },
     { 0, 255, 57 },
 }
+local visits = 0
 for i, text in ipairs(strings) do
+    visits = visits + 1
     assert(#text == #expected[i])
     local bytes = {}
     for j = 1, #text do
@@ -36,3 +44,4 @@ for i, text in ipairs(strings) do
     end
     print("common_12_string_encoding#2", i, table.concat(bytes, ","))
 end
+assert(visits == 4)

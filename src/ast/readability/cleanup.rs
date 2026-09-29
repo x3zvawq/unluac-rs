@@ -44,6 +44,7 @@ impl AstRewritePass for CleanupPass {
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
         match stmt {
             AstStmt::NumericFor(for_stmt) => flatten_closed_tail_scope(&mut for_stmt.body),
+            AstStmt::While(while_stmt) => flatten_closed_tail_scope(&mut while_stmt.body),
             AstStmt::If(branch) => {
                 let mut changed = flatten_closed_tail_scope(&mut branch.then_block);
                 if let Some(block) = &mut branch.else_block {
@@ -69,8 +70,8 @@ impl AstRewritePass for CleanupPass {
     }
 }
 
-// 仅由 if 分支和 numeric-for 正文调用：两个词法域在同一出口结束，后面没有
-// 仍属于父域的 Return hook 或 repeat condition，debug local 的可见区间也不延长。
+// if 分支及 while/numeric-for 正文的尾块与父域在同一出口结束；while 条件属于正文之外，
+// 不像 repeat 条件继续读取正文 local。没有父域 Return hook，debug 可见区间也不延长。
 fn flatten_closed_tail_scope(block: &mut AstBlock) -> bool {
     let mut changed = false;
     while let Some(AstStmt::DoBlock(nested)) = block.stmts.last() {

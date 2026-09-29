@@ -8,6 +8,11 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[local r1_2]]
 -- unluac: expect-contains [[r1_0 = r1_0 + r1_1]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[if]] [[3]]
+-- unluac: expect-ast-count [[continue]] [[1]]
+-- unluac: expect-ast-count [[break]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[8]]
 
 local function run(a, b, c, n)
     local count = 0
@@ -31,4 +36,23 @@ local third = run(true, false, true, 2)
 assert(first == 3, first)
 assert(second == 0, second)
 assert(third == 1, third)
+local saved_print = print
+local trace = {}
+print = function(value)
+    trace[#trace + 1] = value
+end
+assert(run(false, true, false, 3) == 6)
+assert(table.concat(trace, ",") == "1,2,3")
+trace = {}
+assert(run(nil, true, true, 3) == 1)
+assert(table.concat(trace, ",") == "1")
+trace = {}
+assert(run(true, true, true, 3) == 0)
+assert(run(0, "", true, 3) == 0)
+assert(run("", false, false, 3) == 6)
+assert(run(true, nil, 0, 3) == 1)
+assert(run(false, false, false, 0) == 0)
+assert(run(false, false, false, -1) == 0)
+assert(#trace == 0)
+print = saved_print
 print("regress_290_luau_numeric_for_early_continue_tail", first, second, third)

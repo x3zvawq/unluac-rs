@@ -260,6 +260,11 @@ do
     end
 end
 -- unluac: expect-contains [[old.year < new.year]] [[@debug=retained]]
+-- CONCAT 比较参数与后继调用各自恢复完整帧，不能遗留 callee/COPY 中转。
+-- unluac: expect-not-contains [[= assert]]
+-- unluac: expect-contains [[print("loop shared decision",]]
+-- 条件分支内的字段更新不属于分支前的表构造器。
+-- unluac: expect-contains [[new.day = new.day + direction]] [[@debug=retained]]
 
 -- 值合流完成后仍有独立的循环 guard；取值 owner 不能吞掉后继条件。
 -- unluac: expect-contains [[if levels[index].feathers_required and levels[index].feathers_required > 0 then]] [[@debug=retained]]
@@ -307,6 +312,14 @@ end
 
 -- 取值区域切断前一分支的条件图，但两侧仍能汇入后继的复合 guard。
 -- 多入口弱连通分量必须按各自出口分段，不能整组放弃并留下 goto。
+-- unluac: expect-contains [[local inner = option or 0]] [[@debug=retained]]
+-- 比较的 Boolean 写回沿原结果身份直接进入固定字段或既有低槽 key。
+-- unluac: expect-contains [[flags[key] = bits % 2 == 1]] [[@debug=retained]]
+-- unluac: expect-contains [[flags.release = tail % 2 == 0]] [[@debug=retained]]
+-- unluac: expect-contains [[flags.cheats = tail == 2]] [[@debug=retained]]
+-- unluac: expect-contains [[flags.pressed = tail ~= 3]] [[@debug=retained]]
+-- 原 false 初始化与条件更新保留共同绑定；只有后继 if 的字符串合流需要空声明。
+-- unluac: expect-ast-max [[empty-local]] [[1]] [[@proto=25]] [[@debug=stripped]]
 local function check_shared_guard_after_value_region()
     local function route(outer, option, flags, emit)
         if outer then

@@ -1,4 +1,11 @@
 -- unluac: expect-not-contains [[p5_0 or p5_3 and p5_1 and p5_2) and p5_1 and p5_2]]
+-- unluac: expect-ast-count [[function]] [[13]]
+-- unluac: expect-ast-count [[numeric-for]] [[3]]
+-- unluac: expect-ast-count [[generic-for]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[57]]
+-- 数值 for 的常量控制输入不能延用已退休的 print 参数声明。
+-- unluac: expect-ast-max [[local-binding]] [[24]] [[@proto=7]] [[@dialect=luajit]]
+-- unluac: expect-max-count [[= "common_05_boolean_expr#4"]] [[1]] [[@dialect=luajit]]
 -- unluac: expect-not-contains [[p10_0 or p10_3 and p10_1 and p10_2) and p10_1 and p10_2]]
 -- 两个循环内尚未恢复的 assert 帧不能阻断循环外的独立帧；此上限也检查再生成。
 -- unluac: expect-max-count [[ = assert]] [[2]] [[@dialect=lua5.4]]
@@ -64,6 +71,7 @@ local function test_precedence()
     end
     assert(judge(0, false, nil) == "F")
     assert(judge("", "value", false) == "T")
+    assert(select("#", judge(nil, nil, nil)) == 1)
 end
 
 -- common_05_boolean_expr#3: 深层嵌套短路表达式
@@ -96,6 +104,7 @@ local function test_boolean_hell()
     assert(boolean_hell(0, true, true, true) == "yes")
     assert(boolean_hell(true, true, 0, true) == "maybe")
     assert(boolean_hell(nil, true, true, nil) == "maybe")
+    assert(select("#", boolean_hell(nil, nil, nil, nil)) == 1)
 end
 
 -- common_05_boolean_expr#4: 控制流+闭包+表综合压力测试
@@ -137,6 +146,10 @@ local function test_ultimate_mess()
     end
     local label, value = ultimate_mess(input, 0, "", nil)
     assert(label == "T" and value == 11)
+    input.branches.t.items[1].value = nil
+    label, value = ultimate_mess(input, true, true, false)
+    assert(label == "T" and value == nil)
+    assert(select("#", ultimate_mess(input, true, true, false)) == 2)
 end
 
 -- common_05_boolean_expr#5: 短路求值的副作用保留
@@ -174,6 +187,7 @@ local function test_sc_side_effects()
         local result, log = run_case(row[1], row[2])
         assert(result == row[3] and log == row[4])
     end
+    assert(select("#", run_case(nil, nil)) == 2)
 end
 
 -- common_05_boolean_expr#6: 嵌套短路调用与多返回值
@@ -211,6 +225,7 @@ local function test_nested_sc()
         local result, log = run_case(row[1])
         assert(result == row[2] and log == row[3])
     end
+    assert(select("#", run_case(nil)) == 2)
 end
 
 test_arith_logic()

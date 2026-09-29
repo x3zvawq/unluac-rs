@@ -252,7 +252,8 @@ fn collapse_block_handoffs(
             let temp_touches = collect_temp_touch_positions(&block.stmts);
             let label_jumps = LabelJumpIndex::new(&block.stmts);
             captured_bindings = collect_captured_bindings(&block.stmts);
-            let region_results = RegionResultIndex::new(&block.stmts);
+            let region_results =
+                RegionResultIndex::new(&block.stmts).with_inherited_locals(inherited_locals);
             let mut action = None;
             while index < block.stmts.len() {
                 if try_collapse_region_result_handoff(

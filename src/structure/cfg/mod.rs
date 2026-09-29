@@ -25,6 +25,7 @@ pub use common::{
 pub(crate) use common::{EvaluationDependency, PhiIncomingSlot, SccId};
 pub(crate) use dataflow::analyze_dataflow;
 pub use dataflow::compute_dataflow_facts;
+pub(crate) use dataflow::low_instr_def_may_hold_gc_root;
 #[cfg(feature = "decompile-debug")]
 pub(super) use debug::{dump_cfg_graph, dump_dataflow_facts, dump_graph_facts_tree};
 pub(crate) use graph::analyze_graph_facts;

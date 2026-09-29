@@ -4,6 +4,8 @@
 -- unluac: expect-contains [[_ENV = replacement]] [[@debug=retained]]
 -- unluac: expect-ast-count [[local-decl]] [[6]] [[@proto=0]]
 -- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[assign]] [[8]]
 -- unluac: expect-not-contains [[unluac error]]
 local original = _ENV
 local events = {}

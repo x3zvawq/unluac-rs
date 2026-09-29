@@ -221,7 +221,7 @@ pub(super) fn parallel_literals(
             || facts.native_table_write_layout(access)?.base.slot() >= base.slot()
             || assign.initializer_merge_transaction.is_some()
             || assign.generic_for_initializer_producer.is_some()
-            || assign.generic_for_dispatch_release.is_some()
+            || assign.root_release.is_some()
             || assign.method_rewrite_transaction.is_some()
         {
             return None;
@@ -265,9 +265,9 @@ pub(super) fn parallel_literals(
     })
 }
 
-/// 两项字段赋值的首个 RHS 在高槽快照，末项直接读低槽；PUC/JIT 逆序写回两个字段。
+/// 两项字段赋值的首个 RHS 在高槽准备，末项直接读低槽或 RK；PUC/JIT 逆序写回两个字段。
 /// 把快照连同两次写一起重发，避免独立 local 延长到后继复用该槽的调用。
-pub(super) fn parallel_copies(
+pub(super) fn parallel_values(
     context: NativeFrameContext<'_>,
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
@@ -279,24 +279,18 @@ pub(super) fn parallel_copies(
     if dialect == DecompileDialect::Luau || !context.constants_fit_rk {
         return None;
     }
-    let HirStmt::LocalDecl(decl) = first.stmt else {
+    if !assignments::plain_copy(first.stmt) {
         return None;
-    };
-    let ([snapshot], [source], None) = (
-        decl.bindings.as_slice(),
-        decl.values.fixed.as_slice(),
-        &decl.values.tail,
-    ) else {
-        return None;
-    };
+    }
+    let (snapshot, source) = scalar_local(first.stmt)?;
     let direct_home = |value: &HirExpr| match value {
         HirExpr::LocalRef(local) => facts.trusted_local_home_slot(*local),
         HirExpr::ParamRef(param) => facts.trusted_param_home_slot(*param),
         _ => None,
     };
-    let home = facts.trusted_local_home_slot(*snapshot)?;
-    if direct_home(source)?.slot() >= home.slot()
-        || decl.initializer_merge_transaction.is_some()
+    let home = facts.trusted_local_home_slot(snapshot)?;
+    if !(tables::literal_rk(source)
+        || direct_home(source).is_some_and(|source| source.slot() < home.slot()))
         || context.barred.contains(&home)
         || context.closed.contains(&home)
         || context.proto.local_debug_hints[snapshot.index()].is_some()
@@ -304,7 +298,7 @@ pub(super) fn parallel_copies(
         || context
             .proto
             .inline_dispositions
-            .local(*snapshot)
+            .local(snapshot)
             .must_preserve()
     {
         return None;
@@ -316,7 +310,7 @@ pub(super) fn parallel_copies(
     if [write_first, write_second].iter().any(|assign| {
         assign.initializer_merge_transaction.is_some()
             || assign.generic_for_initializer_producer.is_some()
-            || assign.generic_for_dispatch_release.is_some()
+            || assign.root_release.is_some()
             || assign.method_rewrite_transaction.is_some()
     }) {
         return None;
@@ -335,11 +329,24 @@ pub(super) fn parallel_copies(
     ) else {
         return None;
     };
-    let second_home = direct_home(second_value)?;
-    if *read != *snapshot || second_home.slot() >= home.slot() {
+    let second_home = if tables::literal_rk(second_value) {
+        None
+    } else {
+        Some(direct_home(second_value)?)
+    };
+    if *read != snapshot || second_home.is_some_and(|second| second.slot() >= home.slot()) {
         return None;
     }
-    for (target, value) in [(first_target, home), (second_target, second_home)] {
+    if tables::literal_rk(source) || !matches!(first.stmt, HirStmt::LocalDecl(_)) {
+        // 新的常量准备或复用写必须消费本次 SETTABLE 的原 use→Def，不能把
+        // 同槽较早的字面量或后继 callee 版本当作并列 RHS。旧根退休仍由整批验证。
+        let (producer, original_home) =
+            facts.table_write_value_preparation(first_target, source)?;
+        if original_home != home || facts.promoted_local_for_temp(producer) != Some(snapshot) {
+            return None;
+        }
+    }
+    for (target, value) in [(first_target, Some(home)), (second_target, second_home)] {
         let (key, original_value) = if let Some(layout) = facts.native_table_write_layout(target) {
             if layout.base != direct_home(&target.base)? || layout.base.slot() >= home.slot() {
                 return None;
@@ -362,7 +369,7 @@ pub(super) fn parallel_copies(
                 target.key,
                 HirExpr::String(_) | HirExpr::Integer(_) | HirExpr::Number(_)
             )
-            || original_value != Some(value)
+            || original_value != value
         {
             return None;
         }
@@ -459,11 +466,11 @@ fn prepared_parallel_targets(
 // 5.2/5.3 直接写上值表使用 SETTABUP；5.4+ 动态 key 在 key 之后快照目标，
 // 整数 SETI 则在 RHS 之前快照，字符串 SETTABUP 仍在 RHS 之后读取 cell。
 // 显式提前保存的上值表必须继续作为独立 local，不能套用其它方言的左值准备顺序。
-fn snapshot_matches_target(
+pub(super) fn snapshot_matches_target(
     source: &HirExpr,
     home: HomeSlotKey,
-    key: Option<HomeSlotKey>,
-    key_expr: &HirExpr,
+    access: &HirTableAccess,
+    facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
 ) -> bool {
     if !matches!(source, HirExpr::UpvalueRef(_)) {
@@ -472,8 +479,17 @@ fn snapshot_matches_target(
     match dialect {
         DecompileDialect::Lua52 | DecompileDialect::Lua53 => false,
         DecompileDialect::Lua54 | DecompileDialect::Lua55 => {
-            key.is_some_and(|key| home.slot().abs_diff(key.slot()) == 1)
-                || (key.is_none() && matches!(key_expr, HirExpr::Integer(_)))
+            let key = facts
+                .native_table_write_layout(access)
+                .and_then(|layout| layout.key);
+            key.is_some_and(|key| {
+                home.slot().abs_diff(key.slot()) == 1
+                    // 已有低槽 key 不产生准备事件；GETUPVAL 使用当前空闲槽，
+                    // 两者之间可有其它声明或隐式 vararg 表。直接输入身份由原
+                    // SETTABLE 核对，快照与 RHS 的完整顺序仍由 builder 验证。
+                    || (key.slot() < home.slot()
+                        && facts.direct_table_write_input_home(access, 1) == Some(key))
+            }) || (key.is_none() && matches!(access.key, HirExpr::Integer(_)))
         }
         _ => true,
     }
@@ -511,6 +527,23 @@ pub(super) fn is_candidate(assign: &HirAssign) -> bool {
             ),
             ([HirLValue::TableAccess(_)], [_], None)
         )
+}
+
+/// 合成反相仍消费同一个比较的 Boolean 写回；原 NOT 不属于该结果身份。
+fn comparison_result(value: &HirExpr, facts: &ProtoPromotionFacts) -> Option<TempId> {
+    match value {
+        HirExpr::Binary(binary) => facts.comparison_result_temp(binary),
+        HirExpr::Unary(unary)
+            if unary.source_site.is_none()
+                && unary.op == crate::hir::common::HirUnaryOpKind::Not =>
+        {
+            match &unary.expr {
+                HirExpr::Binary(binary) => facts.comparison_result_temp(binary),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn plan(
@@ -601,7 +634,23 @@ pub(super) fn plan(
         && tables::literal_rk(rhs))
     .then(|| facts.table_write_value_preparation(access, rhs))
     .flatten();
+    let comparison = comparison_result(rhs, facts);
+    if matches!(rhs, HirExpr::UpvalueRef(_)) {
+        // GETUPVAL 的原准备 Def 与字段写布局由同一 owner 核对；所有方言都
+        // 需要重发原读取槽，不能把它误送到仅接受字面量的 Luau 分支。
+        return scalar_rhs(
+            context,
+            run,
+            facts,
+            dialect,
+            access,
+            value,
+            rhs,
+            result_local,
+        );
+    }
     if dialect == DecompileDialect::Luau
+        && comparison.is_none()
         && prepared_literal.is_none()
         && direct_rhs_home.is_none()
         && !matches!(rhs, HirExpr::Call(_))
@@ -652,19 +701,6 @@ pub(super) fn plan(
         }
         (layout.key, layout.value)
     };
-    let comparison = match rhs {
-        HirExpr::Binary(binary) => facts.comparison_result_temp(binary),
-        HirExpr::Unary(unary)
-            if unary.source_site.is_none()
-                && unary.op == crate::hir::common::HirUnaryOpKind::Not =>
-        {
-            match &unary.expr {
-                HirExpr::Binary(binary) => facts.comparison_result_temp(binary),
-                _ => None,
-            }
-        }
-        _ => None,
-    };
     let literal_rhs = value_home.is_none()
         && result_local.is_none()
         && matches!(
@@ -698,149 +734,199 @@ pub(super) fn plan(
             result_local,
         );
     }
-    let result = if literal_rhs || direct_rhs_home.is_some() {
-        None
-    } else if let Some((temp, _)) = prepared_literal {
-        Some(temp)
-    } else if let Some(result) = comparison {
-        // 比较指令本身不写结果；使用原双分支 Boolean 写回，不能借谓词操作数猜 RHS 槽。
-        Some(result)
-    } else {
-        let source = match rhs {
-            HirExpr::Binary(binary) => binary.source_site?,
-            HirExpr::Call(call) => call.source_site?,
-            HirExpr::TableAccess(access) => {
-                let crate::hir::common::HirOperationSources::Single(source) = access.sources else {
-                    return None;
-                };
-                source
-            }
-            HirExpr::GlobalRef(global) => {
-                let crate::hir::common::HirOperationSources::Single(source) = global.sources else {
-                    return None;
-                };
-                source
-            }
-            HirExpr::TableConstructor(table) => {
-                let crate::hir::common::HirOperationSources::Single(source) = table.sources else {
-                    return None;
-                };
-                source
-            }
-            _ => return None,
-        };
-        Some(facts.operation_result_temp(source)?)
-    };
-    let key_home = key_home?;
-    let direct_base = match &access.base {
-        HirExpr::LocalRef(local) => facts.trusted_local_home_slot(*local),
-        HirExpr::ParamRef(param) => facts.trusted_param_home_slot(*param),
-        _ => None,
-    }
-    .filter(|home| {
-        register_layout.is_some_and(|layout| *home == layout.base) && home.slot() < key_home.slot()
-    });
-    // 动态 key 前的全局/上值目标快照同样由原 SETTABLE use-to-Def 识别。
-    // Temp 与 Local 只是当前物化状态，不能因此漏掉同一段左值准备。
-    let snapshot = match &access.base {
-        HirExpr::TempRef(_) | HirExpr::LocalRef(_) => run
-            .iter()
-            .rev()
-            .find_map(|stmt| {
-                let (binding, source) = scalar_binding(stmt)?;
-                let matches = match (&access.base, binding) {
-                    (HirExpr::TempRef(read), HirBinding::Temp(write)) => *read == write,
-                    (HirExpr::LocalRef(read), HirBinding::Local(write)) => *read == write,
-                    _ => false,
-                };
-                matches.then_some((binding, source))
-            })
-            .and_then(|(binding, source)| {
-                if !matches!(
-                    source,
-                    HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_) | HirExpr::TableAccess(_)
-                ) {
-                    return None;
-                }
-                let (producer, home) = facts.table_write_base_preparation(access, source)?;
-                let same_definition = match binding {
-                    HirBinding::Temp(temp) => temp == producer,
-                    HirBinding::Local(local) => {
-                        facts.promoted_local_for_temp(producer) == Some(local)
-                    }
-                    _ => false,
-                };
-                (same_definition
-                    && register_layout.is_some_and(|layout| home == layout.base)
-                    && snapshot_matches_target(source, home, Some(key_home), &access.key, dialect))
-                .then_some((producer, home, matches!(source, HirExpr::UpvalueRef(_))))
-            }),
-        HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_) | HirExpr::TableAccess(_)
-            if register_layout.is_some() =>
-        {
-            facts
-                .table_write_base_preparation(access, &access.base)
-                .filter(|(_, home)| {
-                    snapshot_matches_target(
-                        &access.base,
-                        *home,
-                        Some(key_home),
-                        &access.key,
-                        dialect,
-                    )
-                })
-                .map(|(producer, home)| {
-                    (
-                        producer,
-                        home,
-                        matches!(access.base, HirExpr::UpvalueRef(_)),
-                    )
-                })
-        }
-        _ => None,
-    };
-
-    let rhs_slot = snapshot.map_or(key_home.slot(), |(_, home, _)| {
-        home.slot().max(key_home.slot())
-    }) + 1;
-    if let Some(result) = result
-        && (facts.trusted_temp_home_slot(result) != value_home
-            || value_home != Some(HomeSlotKey::new(rhs_slot, 0)))
-    {
-        return None;
-    }
-    let base = if let Some((_, home, _)) = snapshot {
-        if key_home == HomeSlotKey::new(home.slot() + 1, 0) {
-            home
-        } else if matches!(dialect, DecompileDialect::Lua54 | DecompileDialect::Lua55)
-            && home == HomeSlotKey::new(key_home.slot() + 1, 0)
-        {
-            // key 的 CALL 先占 free slot，随后 GETUPVAL 在其上一槽准备目标；
-            // RHS 从目标上一槽开始，整个事务仍从 key 槽按原顺序验证。
-            key_home
+    // 先证明包含 key 准备的完整帧；若先把较低的 key 当成已有变量，
+    // 会把 #out + 1 等原准备永久冻结为声明。
+    let prepared_key = (|| {
+        let result = if literal_rhs || direct_rhs_home.is_some() {
+            None
+        } else if let Some((temp, _)) = prepared_literal {
+            Some(temp)
+        } else if let Some(result) = comparison {
+            // 比较指令本身不写结果；使用原双分支 Boolean 写回，不能借谓词操作数猜 RHS 槽。
+            Some(result)
         } else {
+            let source = match rhs {
+                HirExpr::Binary(binary) => binary.source_site?,
+                HirExpr::Call(call) => call.source_site?,
+                HirExpr::TableAccess(access) => {
+                    let crate::hir::common::HirOperationSources::Single(source) = access.sources
+                    else {
+                        return None;
+                    };
+                    source
+                }
+                HirExpr::GlobalRef(global) => {
+                    let crate::hir::common::HirOperationSources::Single(source) = global.sources
+                    else {
+                        return None;
+                    };
+                    source
+                }
+                HirExpr::TableConstructor(table) => {
+                    let crate::hir::common::HirOperationSources::Single(source) = table.sources
+                    else {
+                        return None;
+                    };
+                    source
+                }
+                _ => return None,
+            };
+            Some(facts.operation_result_temp(source)?)
+        };
+        let key_home = key_home?;
+        let direct_base = match &access.base {
+            HirExpr::LocalRef(local) => facts.trusted_local_home_slot(*local),
+            HirExpr::ParamRef(param) => facts.trusted_param_home_slot(*param),
+            _ => None,
+        }
+        .filter(|home| {
+            register_layout.is_some_and(|layout| *home == layout.base)
+                && home.slot() < key_home.slot()
+        });
+        // 动态 key 前的全局/上值目标快照同样由原 SETTABLE use-to-Def 识别。
+        // Temp 与 Local 只是当前物化状态，不能因此漏掉同一段左值准备。
+        let snapshot = match &access.base {
+            HirExpr::TempRef(_) | HirExpr::LocalRef(_) => run
+                .iter()
+                .rev()
+                .find_map(|stmt| {
+                    let (binding, source) = scalar_binding(stmt)?;
+                    let matches = match (&access.base, binding) {
+                        (HirExpr::TempRef(read), HirBinding::Temp(write)) => *read == write,
+                        (HirExpr::LocalRef(read), HirBinding::Local(write)) => *read == write,
+                        _ => false,
+                    };
+                    matches.then_some((binding, source))
+                })
+                .and_then(|(binding, source)| {
+                    if !matches!(
+                        source,
+                        HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_) | HirExpr::TableAccess(_)
+                    ) {
+                        return None;
+                    }
+                    let (producer, home) = facts.table_write_base_preparation(access, source)?;
+                    let same_definition = match binding {
+                        HirBinding::Temp(temp) => temp == producer,
+                        HirBinding::Local(local) => {
+                            facts.promoted_local_for_temp(producer) == Some(local)
+                        }
+                        _ => false,
+                    };
+                    (same_definition
+                        && register_layout.is_some_and(|layout| home == layout.base)
+                        && snapshot_matches_target(source, home, access, facts, dialect))
+                    .then_some((producer, home, matches!(source, HirExpr::UpvalueRef(_))))
+                }),
+            HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_) | HirExpr::TableAccess(_)
+                if register_layout.is_some() =>
+            {
+                facts
+                    .table_write_base_preparation(access, &access.base)
+                    .filter(|(_, home)| {
+                        snapshot_matches_target(&access.base, *home, access, facts, dialect)
+                    })
+                    .map(|(producer, home)| {
+                        (
+                            producer,
+                            home,
+                            matches!(access.base, HirExpr::UpvalueRef(_)),
+                        )
+                    })
+            }
+            _ => None,
+        };
+
+        let rhs_slot = snapshot.map_or(key_home.slot(), |(_, home, _)| {
+            home.slot().max(key_home.slot())
+        }) + 1;
+        if let Some(result) = result
+            && (facts.trusted_temp_home_slot(result) != value_home
+                || value_home != Some(HomeSlotKey::new(rhs_slot, 0)))
+        {
             return None;
         }
-    } else {
-        if upvalue_layout.is_none() {
-            direct_base?;
+        let base = if let Some((_, home, _)) = snapshot {
+            if key_home == HomeSlotKey::new(home.slot() + 1, 0) {
+                home
+            } else if matches!(dialect, DecompileDialect::Lua54 | DecompileDialect::Lua55)
+                && home == HomeSlotKey::new(key_home.slot() + 1, 0)
+            {
+                // key 的 CALL 先占 free slot，随后 GETUPVAL 在其上一槽准备目标；
+                // RHS 从目标上一槽开始，整个事务仍从 key 槽按原顺序验证。
+                key_home
+            } else {
+                return None;
+            }
+        } else {
+            if upvalue_layout.is_none() {
+                direct_base?;
+            }
+            key_home
+        };
+        if direct_rhs_home.is_some_and(|home| home.slot() >= base.slot()) {
+            // 只保留左值准备区之下的原寄存器读取，不把准备区中的 RHS 快照当成已有值。
+            return None;
         }
-        key_home
-    };
-    if direct_rhs_home.is_some_and(|home| home.slot() >= base.slot()) {
-        // 只保留左值准备区之下的原寄存器读取，不把准备区中的 RHS 快照当成已有值。
-        return None;
-    }
-    let mut builder = frame_builder(context, run, facts, dialect, base.slot())?;
-    // Lua 5.1/JIT/Luau 在 key 之前保存上值目标；5.4+ 的动态索引先计算 key，随后
-    // GETUPVAL 保存目标。SETTABUP 则始终在 RHS 后读取 cell，不生成快照。
-    // 因而 log[#log+1]=f() 中 __len 与 f 改写同名 log cell 时，不能只凭名字合并读取。
-    let early_base = if snapshot.is_some_and(|(_, home, upvalue)| {
-        home.slot() < key_home.slot()
-            && !(upvalue && matches!(dialect, DecompileDialect::Lua54 | DecompileDialect::Lua55))
-    }) {
-        if let Some((producer, home, _)) = snapshot {
-            Some(builder.expr(
+        let mut builder = frame_builder(context, run, facts, dialect, base.slot())?;
+        // Lua 5.1/JIT/Luau 在 key 之前保存上值目标；5.4+ 的动态索引先计算 key，随后
+        // GETUPVAL 保存目标。SETTABUP 则始终在 RHS 后读取 cell，不生成快照。
+        // 因而 log[#log+1]=f() 中 __len 与 f 改写同名 log cell 时，不能只凭名字合并读取。
+        let early_base = if snapshot.is_some_and(|(_, home, upvalue)| {
+            home.slot() < key_home.slot()
+                && !(upvalue
+                    && matches!(dialect, DecompileDialect::Lua54 | DecompileDialect::Lua55))
+        }) {
+            if let Some((producer, home, _)) = snapshot {
+                Some(builder.expr(
+                    &access.base,
+                    run.len(),
+                    home.slot(),
+                    None,
+                    false,
+                    true,
+                    Some(producer),
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Luau 的 key 结果槽独立于更低的表快照槽；复合 key 的 scratch 从 key 上一槽开始。
+        builder.indexed_key_base = Some(if dialect == DecompileDialect::Luau {
+            key_home.slot()
+        } else {
+            base.slot()
+        });
+        let previous_register_operand = builder.register_operand;
+        let key_producer = if matches!(access.key, HirExpr::UpvalueRef(_)) {
+            let (producer, home) = facts.table_key_value_preparation(access)?;
+            if home != key_home {
+                return None;
+            }
+            // key 已树化为 cell 读取，原 SETTABLE use→Def 仍证明其准备槽；
+            // 只在完整左值帧中重发该读取，不给任意同名上值开放寄存器操作数许可。
+            Some(producer)
+        } else {
+            None
+        };
+        builder.register_operand = key_producer.is_none();
+        let key = builder.expr(
+            &access.key,
+            run.len(),
+            key_home.slot(),
+            None,
+            false,
+            true,
+            key_producer,
+        )?;
+        builder.register_operand = previous_register_operand;
+        builder.indexed_key_base = None;
+        let target_base = if let Some(base) = early_base {
+            base
+        } else if let Some((producer, home, _)) = snapshot {
+            builder.expr(
                 &access.base,
                 run.len(),
                 home.slot(),
@@ -848,68 +934,20 @@ pub(super) fn plan(
                 false,
                 true,
                 Some(producer),
-            )?)
+            )?
         } else {
-            None
-        }
-    } else {
-        None
-    };
-    // Luau 的 key 结果槽独立于更低的表快照槽；复合 key 的 scratch 从 key 上一槽开始。
-    builder.indexed_key_base = Some(if dialect == DecompileDialect::Luau {
-        key_home.slot()
-    } else {
-        base.slot()
-    });
-    let previous_register_operand = builder.register_operand;
-    builder.register_operand = true;
-    let key = builder.expr(
-        &access.key,
-        run.len(),
-        key_home.slot(),
-        None,
-        false,
-        true,
-        None,
-    )?;
-    builder.register_operand = previous_register_operand;
-    builder.indexed_key_base = None;
-    let target_base = if let Some(base) = early_base {
-        base
-    } else if let Some((producer, home, _)) = snapshot {
-        builder.expr(
-            &access.base,
-            run.len(),
-            home.slot(),
-            None,
-            false,
-            true,
-            Some(producer),
-        )?
-    } else {
-        access.base.clone()
-    };
-    // 字段 RHS 的低槽 base 与计算 key 必须按原 GETTABLE 布局核对，
-    // 不能只凭字面字段名走一般 CALL 参数的语法重建入口。
-    builder.register_operand = matches!(rhs, HirExpr::TableAccess(_));
-    let value = if literal_rhs || direct_rhs_home.is_some() {
-        // RK 常量和既有低槽都不需新 RHS 准备；低槽读取仍留在 key 求值后的写入点。
-        rhs.clone()
-    } else if prepared_literal.is_some() || result_local.is_some() {
-        // JIT/Luau 字面量仍在 key 后的原槽加载；连同现存准备声明一起消费，
-        // 不能把这个写入当成 PUC 的 RK 直接省掉。
-        builder.expr(
-            value,
-            run.len(),
-            value_home?.slot(),
-            None,
-            false,
-            true,
-            result,
-        )?
-    } else {
-        match rhs {
-            value if comparison.is_some() => builder.expr(
+            access.base.clone()
+        };
+        // 字段 RHS 的低槽 base 与计算 key 必须按原 GETTABLE 布局核对，
+        // 不能只凭字面字段名走一般 CALL 参数的语法重建入口。
+        builder.register_operand = matches!(rhs, HirExpr::TableAccess(_));
+        let value = if literal_rhs || direct_rhs_home.is_some() {
+            // RK 常量和既有低槽都不需新 RHS 准备；低槽读取仍留在 key 求值后的写入点。
+            rhs.clone()
+        } else if prepared_literal.is_some() || result_local.is_some() {
+            // JIT/Luau 字面量仍在 key 后的原槽加载；连同现存准备声明一起消费，
+            // 不能把这个写入当成 PUC 的 RK 直接省掉。
+            builder.expr(
                 value,
                 run.len(),
                 value_home?.slot(),
@@ -917,30 +955,22 @@ pub(super) fn plan(
                 false,
                 true,
                 result,
-            )?,
-            HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Concat => {
-                builder.concat(binary, run.len(), value_home?.slot())?
-            }
-            HirExpr::Binary(_) => builder.expr(
-                rhs,
-                run.len(),
-                value_home?.slot(),
-                None,
-                false,
-                true,
-                result,
-            )?,
-            HirExpr::Call(call) => HirExpr::Call(Box::new(builder.call(
-                call,
-                run.len(),
-                value_home?.slot(),
-                true,
-                CallWidth::Single,
-            )?)),
-            // 字段 RHS 同样在 key 后的相邻槽读取；完整 lookup 由共享 builder 验证，
-            // 不先冻结 key 声明再把其后续同槽值连成一个 Local 身份。
-            HirExpr::TableConstructor(_) | HirExpr::TableAccess(_) | HirExpr::GlobalRef(_) => {
-                builder.expr(
+            )?
+        } else {
+            match rhs {
+                value if comparison.is_some() => builder.expr(
+                    value,
+                    run.len(),
+                    value_home?.slot(),
+                    None,
+                    false,
+                    true,
+                    result,
+                )?,
+                HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Concat => {
+                    builder.concat(binary, run.len(), value_home?.slot())?
+                }
+                HirExpr::Binary(_) => builder.expr(
                     rhs,
                     run.len(),
                     value_home?.slot(),
@@ -948,36 +978,78 @@ pub(super) fn plan(
                     false,
                     true,
                     result,
-                )?
+                )?,
+                HirExpr::Call(call) => HirExpr::Call(Box::new(builder.call(
+                    call,
+                    run.len(),
+                    value_home?.slot(),
+                    true,
+                    CallWidth::Single,
+                )?)),
+                // 字段 RHS 同样在 key 后的相邻槽读取；完整 lookup 由共享 builder 验证，
+                // 不先冻结 key 声明再把其后续同槽值连成一个 Local 身份。
+                HirExpr::TableConstructor(_) | HirExpr::TableAccess(_) | HirExpr::GlobalRef(_) => {
+                    builder.expr(
+                        rhs,
+                        run.len(),
+                        value_home?.slot(),
+                        None,
+                        false,
+                        true,
+                        result,
+                    )?
+                }
+                _ => return None,
             }
-            _ => return None,
+        };
+        let start = builder.first_event?;
+        // 候选拒绝[ProofIncomplete]：只能收回一次完整连续准备区，遗漏的事件或独立快照不能跨越。
+        if builder.next_event != run.len() {
+            return None;
         }
-    };
-    let start = builder.first_event?;
-    // 候选拒绝[ProofIncomplete]：只能收回一次完整连续准备区，遗漏的事件或独立快照不能跨越。
-    if builder.next_event != run.len() {
-        return None;
-    }
-    Some(Plan {
-        prefix_at_sink: false,
-        luau_function_declaration: false,
-        start,
-        sink: run.len(),
-        base,
-        values: vec![value].into(),
-        result_locals: Vec::new(),
-        discarded_result: None,
-        assignment_targets: Vec::new(),
-        luau_compound_global: false,
-        indexed_target: Some(HirTableAccess {
-            base: target_base,
-            key,
-            ..access.as_ref().clone()
-        }),
-        continuing_root: None,
-        retained_copies: Vec::new(),
-        replayed_effects: Vec::new(),
-        removed: Vec::new(),
+        Some(Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
+            start,
+            sink: run.len(),
+            base,
+            values: vec![value].into(),
+            result_locals: Vec::new(),
+            discarded_result: None,
+            assignment_targets: Vec::new(),
+            luau_compound_global: false,
+            indexed_target: Some(HirTableAccess {
+                base: target_base,
+                key,
+                ..access.as_ref().clone()
+            }),
+            continuing_root: None,
+            retained_copies: Vec::new(),
+            replayed_effects: Vec::new(),
+            removed: Vec::new(),
+        })
+    })();
+    prepared_key.or_else(|| {
+        // key 也可以是循环变量等已有低槽输入，此时只准备 RHS。
+        // 仍由原 SETTABLE 输入身份及 scalar_rhs 的完整事件/前缀证明约束。
+        key_home
+            .is_some_and(|key| {
+                facts.direct_table_write_input_home(access, 1) == Some(key)
+                    && value_home.is_some_and(|value| key.slot() < value.slot())
+            })
+            .then(|| {
+                scalar_rhs(
+                    context,
+                    run,
+                    facts,
+                    dialect,
+                    access,
+                    value,
+                    rhs,
+                    result_local,
+                )
+            })
+            .flatten()
     })
 }
 
@@ -1182,8 +1254,15 @@ fn scalar_rhs(
         }
         (layout.key, layout.value)
     };
-    let prepared_value = if (matches!(rhs, HirExpr::UpvalueRef(_))
-        && !matches!(dialect, DecompileDialect::Luau | DecompileDialect::Luajit))
+    let comparison = comparison_result(rhs, facts);
+    let prepared_value = if let Some(result) = comparison {
+        // 比较指令不直接定义结果；沿冻结的 Boolean 写回核对 SETTABLE 的原 RHS 槽。
+        // 候选拒绝[ProofIncomplete]：比较的结果身份不属于本次字段写的准备槽。
+        if facts.trusted_temp_home_slot(result) != value_home {
+            return None;
+        }
+        Some(result)
+    } else if matches!(rhs, HirExpr::UpvalueRef(_))
         || ((matches!(dialect, DecompileDialect::Luau | DecompileDialect::Luajit)
             || !context.constants_fit_rk)
             && tables::literal_rk(rhs)
@@ -1198,6 +1277,7 @@ fn scalar_rhs(
         None
     };
     let source = match rhs {
+        _ if comparison.is_some() => None,
         HirExpr::UpvalueRef(_) if prepared_value.is_some() => None,
         HirExpr::Closure(closure) => Some(closure.source_site?),
         HirExpr::TableConstructor(table) => match table.sources {
@@ -1271,7 +1351,7 @@ fn scalar_rhs(
             // 源码声明，否则该 scratch 会阻断后继复用同槽的构造器。
             (definition == *temp
                 && producer == *temp
-                && snapshot_matches_target(source, home, key_home, &access.key, dialect))
+                && snapshot_matches_target(source, home, access, facts, dialect))
             .then_some((producer, home))
         }),
         HirExpr::LocalRef(local) => builder.definition(*local, run.len()).and_then(|index| {
@@ -1284,13 +1364,13 @@ fn scalar_rhs(
             };
             let (producer, home) = facts.table_write_base_preparation(access, source)?;
             (facts.promoted_local_for_temp(producer) == Some(*local)
-                && snapshot_matches_target(source, home, key_home, &access.key, dialect))
+                && snapshot_matches_target(source, home, access, facts, dialect))
             .then_some((producer, home))
         }),
         HirExpr::TableAccess(_) | HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_) => facts
             .table_write_base_preparation(access, &access.base)
             .filter(|(_, home)| {
-                snapshot_matches_target(&access.base, *home, key_home, &access.key, dialect)
+                snapshot_matches_target(&access.base, *home, access, facts, dialect)
             }),
         _ => None,
     };
@@ -1369,6 +1449,15 @@ fn scalar_rhs(
         rebuilt?
     } else {
         match rhs {
+            _ if comparison.is_some() => builder.expr(
+                rhs,
+                run.len(),
+                value_home?.slot(),
+                None,
+                false,
+                true,
+                prepared_value,
+            )?,
             HirExpr::UpvalueRef(_) => {
                 // 同一 SETTABLE 的 use→Def 保证 RHS 是原 GETUPVAL，目标表的
                 // GETUPVAL 已在前面按原槽消费；不借上值名把读取移过 RHS 或元方法。

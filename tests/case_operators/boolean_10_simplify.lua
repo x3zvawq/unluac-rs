@@ -7,6 +7,25 @@
 -- unluac: expect-contains [[if not ((p11_0 or]]
 -- unluac: expect-contains [[return p12_0 and p12_1 or {}]]
 -- unluac: expect-contains [[return p16_0 and p16_1 and p16_2 or {}]]
+-- unluac: expect-ast-count [[function]] [[16]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=6]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=9]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=12]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=14]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=15]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=16]]
+-- 原 CALL 参数 phi 已提供结果槽；嵌入短路树不能退回 callee/result 准备别名。
+-- unluac: expect-contains [[assert(r0_11(true) and #r0_0 == 0)]]
+-- unluac: expect-contains [[assert(r0_11(false) and table.concat(r0_0, ",") == "condition-b")]]
+-- 预写与结果复用同一绑定时，仍恢复直接比较、原 do 末端和整包低槽写回。
+-- unluac: expect-ast-max [[local-binding]] [[31]] [[@proto=0]]
+-- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=0]]
+-- unluac: expect-max-count [[ = assert]] [[0]]
+-- unluac: expect-contains [[r0_18, r0_19 = r0_15(r0_16(nil, "second"))]]
+-- unluac: expect-contains [[r0_18, r0_19 = r0_15(r0_16(false, "second"))]]
+-- unluac: expect-contains [[r0_18, r0_19 = r0_15(r0_16())]]
 
 local trace = {}
 
@@ -153,3 +172,29 @@ do
     assert(type(first) == "table" and type(second) == "table" and type(third) == "table")
     assert(first ~= second and second ~= third and first ~= third)
 end
+
+-- 缺失或为假的首个 vararg 仍是一个标量结果，不能展开或丢失 nil。
+return_count, return_value = count_values(scalar_return(nil, "second"))
+assert(return_count == 1 and return_value == nil)
+return_count, return_value = count_values(scalar_return(false, "second"))
+assert(return_count == 1 and return_value == false)
+return_count, return_value = count_values(scalar_return())
+assert(return_count == 1 and return_value == nil)
+argument_count, argument_value = scalar_argument(nil, "second")
+assert(argument_count == 1 and argument_value == nil)
+argument_count, argument_value = scalar_argument(false, "second")
+assert(argument_count == 1 and argument_value == false)
+argument_count, argument_value = scalar_argument()
+assert(argument_count == 1 and argument_value == nil)
+trace = {}
+assert(shared_vararg_with_calls(condition_mark, condition_mark, false) == false)
+assert(shared_vararg_with_calls(condition_mark, condition_mark, nil) == nil)
+assert(#trace == 0)
+assert(shared_vararg_with_calls(condition_mark, condition_mark, true) == true)
+assert(table.concat(trace, ",") == "condition-b")
+guarded_value, guarded_trace = mutable_param_guard(false)
+assert(guarded_value == false and guarded_trace == "")
+guarded_value, guarded_trace = mutable_param_guard(nil)
+assert(guarded_value == nil and guarded_trace == "")
+assert(truthy_effectful_shared_or_tail(true, allocated) == allocated)
+assert(select("#", truthy_effectful_shared_or_tail(false, nil)) == 1)

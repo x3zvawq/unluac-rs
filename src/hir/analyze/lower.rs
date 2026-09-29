@@ -81,6 +81,7 @@ pub(super) struct ProtoBindings {
     pub(super) capture_region_local_decls: BTreeMap<crate::structure::RegionId, Vec<LocalId>>,
     pub(super) closure_capture_targets: BTreeMap<(usize, usize), LocalId>,
     pub(super) closed_capture_temps: BTreeSet<TempId>,
+    pub(super) uncaptured_definition_temps: BTreeSet<TempId>,
     pub(super) lexical_scopes: Vec<LexicalScope>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
     pub(super) numeric_for_locals: BTreeMap<BlockRef, LocalId>,
@@ -113,7 +114,7 @@ impl BoundSlotTarget {
 }
 
 impl ProtoBindings {
-    fn temp_target(&self, temp: TempId) -> Option<BoundSlotTarget> {
+    pub(super) fn temp_target(&self, temp: TempId) -> Option<BoundSlotTarget> {
         self.bound_temp_targets
             .get(&temp)
             .or_else(|| self.captured_temp_targets.get(&temp))
@@ -531,6 +532,7 @@ fn lower_proto_one(
         &bindings.phi_temps,
     );
     super::bindings::bind_parameter_slots(&mut bindings, &promotion_facts, dataflow, &emission);
+    global_decls.record_preparations(dataflow, &bindings.fixed_temps, &mut promotion_facts);
     let lexical_environment_local =
         global_decls.bind_environment(&mut bindings, &mut promotion_facts)?;
     let captured_shared_closures = CapturedSharedClosureLowering::new(
@@ -629,6 +631,7 @@ fn lower_proto_one(
         promotion_facts.record_home_free_temp(temp);
     }
     promotion_facts.record_closed_capture_temps(&bindings.closed_capture_temps);
+    promotion_facts.record_uncaptured_definition_temps(&bindings.uncaptured_definition_temps);
     // `entry_local_regs` 是 Entry(reg) 的可见 binding；它与 SSA entry leaf 一样属于
     // `(reg, epoch 0)`。把这份已知身份带入 lowering/simplify，避免异槽 reference capture
     // 被误判为可能观察任意 local 写入。后续异槽合并仍会通过 invalidation 使其失效。
@@ -749,11 +752,16 @@ fn lower_proto_one(
         .map(|upvalue| lowering.bindings.upvalues[upvalue.index()])
         .collect();
     let mut body = build_proto_body(id, &mut lowering)?;
+    let initialized_copy_roots =
+        super::bindings::copy_roots_initialized_in_root(&body, promotion_facts.copy_root_temps());
     let copy_roots = promotion_facts
         .copy_root_temps()
         .iter()
         .copied()
-        .filter(|temp| matches!(lowering.bindings.lvalue_for_temp(*temp), HirLValue::Temp(_)))
+        .filter(|temp| {
+            !initialized_copy_roots.contains(temp)
+                && matches!(lowering.bindings.lvalue_for_temp(*temp), HirLValue::Temp(_))
+        })
         .collect::<Vec<_>>();
     if !copy_roots.is_empty() {
         body.stmts.insert(
@@ -913,6 +921,7 @@ fn lower_proto_one(
         super::capture_initializers::preserve(&lowering, &mut body, &mut inline_dispositions);
     }
     let bindings = lowering.bindings;
+    promotion_facts.record_copy_root_seeds(&copy_roots);
 
     let physical_root_locals = promotion_facts
         .copy_scoped_temps()

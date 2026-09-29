@@ -1,5 +1,6 @@
 -- 全局谓词读取和低槽选择写回之间不保留机械 local，后继 CALL/CONCAT 共用原准备区。
 -- unluac: expect-count [[FRAME_MARKER == "hit"]] [[2]]
+-- unluac: expect-count [["seed"]] [[1]]
 -- unluac: expect-count [[echo(chosen) == "value:" .. chosen]] [[2]] [[@debug=retained]]
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]]
 -- unluac: expect-contains [[local chosen = "seed"]] [[@debug=retained]]
@@ -30,7 +31,8 @@ setmetatable(_G, {
     __index = function(_, key)
         assert(key == "FRAME_MARKER")
         reads = reads + 1
-        events[#events + 1] = "read:" .. reads
+        -- 按调用者槽位观察旧值，不依赖 stripped chunk 中不存在的 debug 名称。
+        events[#events + 1] = "read:" .. reads .. ":" .. select(2, debug.getlocal(2, 1))
         if reads == 1 then
             return "hit"
         end
@@ -40,5 +42,5 @@ setmetatable(_G, {
 local result = run()
 setmetatable(_G, previous)
 assert(result == "four" and reads == 2)
-assert(table.concat(events, ",") == "read:1,echo:one,read:2,echo:four")
+assert(table.concat(events, ",") == "read:1:seed,echo:one,read:2:one,echo:four")
 print("environment_08_global_predicate_frames", table.concat(events, ","))

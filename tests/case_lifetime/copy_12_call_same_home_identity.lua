@@ -1,3 +1,7 @@
+-- 两个独立 home 保留各自清空时点，不引入 callee 或比较临时量。
+-- unluac: expect-ast-count [[local-binding]] [[5]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 local weak = setmetatable({}, { __mode = 'v' })
 local function hold(make)
     local a = make()

@@ -16,9 +16,14 @@ use super::eliminate_state::EliminationState;
 use crate::hir::visit::any_expr;
 
 pub(super) fn assign_target_supports_direct_materialization(target: &HirLValue) -> bool {
+    // 参数已有前层确定的写回身份，和 local 一样在决策终端提交；不再增加结果中转槽。
     matches!(
         target,
-        HirLValue::Temp(_) | HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_)
+        HirLValue::Param(_)
+            | HirLValue::Temp(_)
+            | HirLValue::Local(_)
+            | HirLValue::Upvalue(_)
+            | HirLValue::Global(_)
     )
 }
 
@@ -199,7 +204,11 @@ impl OrderedExprExtraction {
         state: &mut EliminationState<'_>,
     ) {
         self.append_prefix(prefix, state);
-        if snapshot_allowed && !stable && expr_requires_ordered_snapshot(&expr) {
+        if snapshot_allowed
+            && !stable
+            && !state.binding_read_is_stable(&expr)
+            && expr_requires_ordered_snapshot(&expr)
+        {
             self.pending_snapshots.push(self.exprs.len());
         }
         self.exprs.push(expr);
@@ -246,7 +255,7 @@ pub(super) fn extract_assign(
     let parallel_nil_frame = assign.parallel_nil_frame;
     let initializer_merge_transaction = assign.initializer_merge_transaction;
     let generic_for_initializer_producer = assign.generic_for_initializer_producer;
-    let generic_for_dispatch_release = assign.generic_for_dispatch_release;
+    let root_release = assign.root_release;
     let mut leading = Vec::new();
     let mut target_shapes = Vec::with_capacity(assign.targets.len());
     for target in assign.targets {
@@ -268,6 +277,7 @@ pub(super) fn extract_assign(
         .map(|target| {
             target.unwrap_or_else(|sources| {
                 HirLValue::TableAccess(Box::new(HirTableAccess {
+                    preserve_index_syntax: false,
                     sources,
                     metamethod_free: false,
                     base: leading
@@ -302,9 +312,7 @@ pub(super) fn extract_assign(
             generic_for_initializer_producer: (!changed)
                 .then_some(generic_for_initializer_producer)
                 .flatten(),
-            generic_for_dispatch_release: (!changed)
-                .then_some(generic_for_dispatch_release)
-                .flatten(),
+            root_release: (!changed).then_some(root_release).flatten(),
             method_rewrite_transaction: None,
         },
         changed,
@@ -323,6 +331,28 @@ pub(super) fn extract_value_expr(
         return (Vec::new(), collapsed, true);
     }
 
+    let (prefix, value) = materialize_value(expr, state, safety);
+    (prefix, value, true)
+}
+
+fn materialize_value(
+    expr: HirExpr,
+    state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
+) -> (Vec<HirStmt>, HirExpr) {
+    if let HirExpr::Decision(decision) = &expr
+        && let Some(temp) = decision.source_result
+        && state.promotion_facts.trusted_temp_home_slot(temp).is_some()
+        && state
+            .promotion_facts
+            .promoted_local_for_temp(temp)
+            .is_none()
+    {
+        // 原操作数只有一个消费点，独立 phi 尚未并入可见 binding。
+        // 恢复其分支写入，让 Locals 依据原 home/初始化归属确定声明位置。
+        let prefix = materialize_expr_into_target(expr, HirLValue::Temp(temp), state, safety);
+        return (prefix, HirExpr::TempRef(temp));
+    }
     let local = state.alloc_local();
     let mut prefix = vec![empty_local_decl(local)];
     prefix.extend(materialize_expr_into_target(
@@ -331,7 +361,7 @@ pub(super) fn extract_value_expr(
         state,
         safety,
     ));
-    (prefix, HirExpr::LocalRef(local), true)
+    (prefix, HirExpr::LocalRef(local))
 }
 
 pub(super) fn materialize_expr_into_target(
@@ -376,6 +406,12 @@ pub(super) fn materialize_expr_for_assignment(
         // 再使用其逐步物化通道；后者可能在后续 RHS 事件前覆盖旧 local/upvalue。
         let decision = super::short_circuit::prepare_control_materialization(*decision, safety);
         return materialize_decision_node(&decision, decision.entry.index(), target, state, safety);
+    }
+
+    if !matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
+        // 普通表达式先抽取内嵌决策，完整求值后才写目标；只有逻辑值物化会逐步写目标。
+        // 保留原赋值时点即可，不需要为二元计算等再合成一层结果声明。
+        return materialize_expr_into_target(expr, target, state, safety);
     }
 
     let result = state.alloc_local();
@@ -464,6 +500,14 @@ fn materialize_decision_node(
     let captures_current = matches!(node.truthy, HirDecisionTarget::CurrentValue)
         || matches!(node.falsy, HirDecisionTarget::CurrentValue);
     let (mut prefix, prepared_test) = prepare_pure_expr(node.test.clone(), state, safety);
+    if matches!(node.truthy, HirDecisionTarget::CurrentValue)
+        && matches!(node.falsy, HirDecisionTarget::CurrentValue)
+    {
+        // 两条终端边都提交这一次 test 的值；直接写入目标仍只求值一次，
+        // 不需要先制造快照再删除两臂相同的分支。
+        prefix.push(assign_stmt(target, prepared_test));
+        return prefix;
+    }
     let (cond, current_value) = if captures_current
         && matches!(
             prepared_test,
@@ -560,6 +604,8 @@ fn materialize_decision_target(
                 (HirLValue::Local(left), HirExpr::LocalRef(right)) if left == right)
                 || matches!((&target, &value),
                     (HirLValue::Temp(left), HirExpr::TempRef(right)) if left == right)
+                || matches!((&target, &value),
+                    (HirLValue::Param(left), HirExpr::ParamRef(right)) if left == right)
             {
                 return Vec::new();
             }
@@ -570,6 +616,8 @@ fn materialize_decision_target(
                 (HirLValue::Local(left), HirExpr::LocalRef(right)) if left == right)
                 || matches!((&target, expr),
                     (HirLValue::Temp(left), HirExpr::TempRef(right)) if left == right)
+                || matches!((&target, expr),
+                    (HirLValue::Param(left), HirExpr::ParamRef(right)) if left == right)
             {
                 // 该终端沿用目标的当前 SSA 值，没有原写入；直接保留空路径，
                 // 不先合成自赋值再丢失短路控制关系。全局和上值不领取此许可。
@@ -595,18 +643,11 @@ fn prepare_pure_expr(
         HirExpr::Decision(_) | HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)
             if expr_contains_eliminable_decision(&expr) =>
         {
-            let local = state.alloc_local();
-            let mut prefix = vec![empty_local_decl(local)];
-            prefix.extend(materialize_expr_into_target(
-                expr,
-                HirLValue::Local(local),
-                state,
-                safety,
-            ));
-            (prefix, HirExpr::LocalRef(local))
+            materialize_value(expr, state, safety)
         }
         HirExpr::TableAccess(access) => {
             let sources = access.sources;
+            let preserve_index_syntax = access.preserve_index_syntax;
             let method_setup_protocol = access.method_setup_protocol;
             let metamethod_free = access.metamethod_free;
             let (prefix, exprs) =
@@ -626,6 +667,7 @@ fn prepare_pure_expr(
                     base,
                     key,
                     method_setup_protocol,
+                    preserve_index_syntax,
                 })),
             )
         }
@@ -739,6 +781,7 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
             base: collapse_expr_to_pure(access.base, safety)?,
             key: collapse_expr_to_pure(access.key, safety)?,
             method_setup_protocol: access.method_setup_protocol,
+            preserve_index_syntax: access.preserve_index_syntax,
         }))),
         HirExpr::Unary(unary) => Some(HirExpr::Unary(Box::new(HirUnaryExpr {
             source_site: unary.source_site,
@@ -1070,7 +1113,7 @@ fn assign_stmt(target: HirLValue, value: HirExpr) -> HirStmt {
         values: HirValuePack::fixed(vec![value]),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
-        generic_for_dispatch_release: None,
+        root_release: None,
         method_rewrite_transaction: None,
     }))
 }

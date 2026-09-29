@@ -2,6 +2,8 @@
 -- unluac: expect-contains [[<close>]]
 -- unluac: expect-ast-count [[close-binding]] [[15]]
 -- unluac: expect-ast-count [[table-list-field]] [[23]] [[@proto=0]]
+-- 调用与索引快照应由原帧恢复，不为原有 70 个 binding 增添中转声明。
+-- unluac: expect-ast-max [[local-binding]] [[70]]
 
 local function acquire(log, name)
     log[#log + 1] = "open:" .. name

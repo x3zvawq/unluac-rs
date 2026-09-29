@@ -1,9 +1,19 @@
+-- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
+-- unluac: expect-count [[type(shared_value)]] [[2]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=3]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-max [[local-binding]] [[4]]
+-- unluac: expect-ast-count [[assign]] [[5]]
+-- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=0]]
 global<const> assert, print, type
--- 只有权限声明的循环体可规约；合同保护读写权限和执行结果，不固定五个语法循环。
+-- 空正文可用直接 while 表达；权限声明可整理，原条件的读取与判断仍须保留。
 global shared_value = 1
+local body_calls, condition_calls = 0, 0
 local function run()
     repeat
         local body_function = function()
+            body_calls = body_calls + 1
             global<const> shared_value
             repeat
                 do
@@ -14,6 +24,7 @@ local function run()
         end
         assert(body_function() == 1)
     until (function()
+        condition_calls = condition_calls + 1
         repeat
             global<const> shared_value
         until type(shared_value) == "number"
@@ -23,6 +34,7 @@ local function run()
 end
 run()
 assert(shared_value == 2)
+assert(body_calls == 1 and condition_calls == 1)
 global repeat_peer = 3
 repeat
     do global<const> * end

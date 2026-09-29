@@ -43,21 +43,22 @@ pub(super) fn coalesce_disjoint_temps(
         blocked.extend(homes.iter().copied());
     }
     let mut groups = BTreeMap::<HomeSlotKey, Vec<CarryBinding>>::new();
-    // 值决策折叠后，根块中已有声明与后续同槽逻辑更新可能各自提升为 Local。
+    // 根块中已有声明与后续同槽逻辑或一元更新可能各自提升为 Local。
     // 更新不必紧邻或读取旧值；声明仍支配整个根块后缀，旧快照能否共存由下方
     // 整图干扰证明判断。不把声明前的 Temp 归入后置 owner，也不删除原初始化。
     let mut local_updates = BTreeMap::new();
     let mut definition_preserving_updates = BTreeSet::new();
+    let mut unary_write_homes = BTreeSet::new();
     let mut empty_carried = BTreeSet::new();
     let mut initialized_owners = BTreeMap::new();
     let mut copy_owners = BTreeMap::new();
-    let mut preceding_reads = BTreeSet::new();
+    let mut preceding_reads = BTreeMap::new();
     let carrier_locals = (0..proto.temp_count)
         .map(TempId)
         .filter(|&temp| facts.is_loop_carrier_temp(temp) || facts.is_phi_carrier_temp(temp))
         .filter_map(|temp| facts.promoted_local_for_temp(temp))
         .collect::<BTreeSet<_>>();
-    for stmt in &proto.body.stmts {
+    for (statement_index, stmt) in proto.body.stmts.iter().enumerate() {
         // 根块的声明支配其后控制语句内的低槽写回。只收集原高槽 COPY，
         // 不把子块的新计算或同槽分配猜成外层变量；旧值干扰仍由整图活跃性核对。
         visit::for_each_nested_block(stmt, &mut |block| {
@@ -93,7 +94,7 @@ pub(super) fn coalesce_disjoint_temps(
                         && let Some(home) = facts.trusted_local_home_slot(*target)
                         && let Some(&seed) = copy_owners.get(&home)
                         && seed != *target
-                        && preceding_reads.contains(&seed)
+                        && preceding_reads.contains_key(&seed)
                         && facts
                             .trusted_local_home_slot(*source)
                             .is_some_and(|source| source.slot() > home.slot())
@@ -107,7 +108,7 @@ pub(super) fn coalesce_disjoint_temps(
             std::slice::from_ref(stmt),
             &mut BindingReadCollector(|binding| {
                 if let crate::hir::common::HirBinding::Local(local) = binding {
-                    preceding_reads.insert(local);
+                    preceding_reads.entry(local).or_insert(statement_index);
                 }
             }),
         );
@@ -132,7 +133,7 @@ pub(super) fn coalesce_disjoint_temps(
                 && update.initializer_merge_transaction.is_none()
                 && let Some(&(seed, _)) = initialized_owners.get(&home)
                 && seed != *target
-                && preceding_reads.contains(&seed)
+                && preceding_reads.contains_key(&seed)
             {
                 local_updates.insert(*target, (seed, home));
                 empty_carried.insert(*target);
@@ -146,18 +147,33 @@ pub(super) fn coalesce_disjoint_temps(
             *target,
             !matches!(value, HirExpr::Nil | HirExpr::Boolean(_)),
         ));
+        let unary_write = matches!(value, HirExpr::Unary(unary)
+            // 首次只供当前一元操作的 seed 仍属于完整 initializer，不能冻结为
+            // 独立声明；只有先前语句已消费的 owner 才承接这次后续写回。
+            if preceding_reads.get(&seed).is_some_and(|read| *read < statement_index)
+                && facts.unary_result_home(unary) == Some(home)
+                && unary.source_site
+                    .and_then(|source| facts.operation_result_temp(source))
+                    .and_then(|temp| facts.promoted_local_for_temp(temp)) == Some(*target));
         if seed != *target
             // 未被读取的 nil/Boolean seed 可能只是 Decision 的准备写，不能因合并
             // 赋予它永久声明身份，阻断完整返回或 Boolean initializer 的原帧恢复。
-            && (preserve_unread_initializer || preceding_reads.contains(&seed))
+            && (preserve_unread_initializer || preceding_reads.contains_key(&seed))
             && update.initializer_merge_transaction.is_none()
             && (matches!(value, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
+                || unary_write
                 // for preheader 的调用可能夹在 seed 与合成 carrier COPY 之间。
                 // 声明位置不动；同槽初始化的归属仍由下方整图干扰与协议边界证明。
                 || matches!(value, HirExpr::LocalRef(source)
                     if *source == seed && carrier_locals.contains(target)))
         {
             local_updates.insert(*target, (seed, home));
+            if unary_write {
+                // 原一元操作仍在此处写回同一槽，只认回既有声明；嵌套 NOT 等操作
+                // 均保留，不改变求值位置或逐 Def 的准备事实。旧快照仍由整图检查。
+                definition_preserving_updates.insert(*target);
+                unary_write_homes.insert(home);
+            }
         }
     }
     // 子块中的 seed 同样支配其词法后缀；for 的 iterator 准备可夹在 seed
@@ -168,6 +184,21 @@ pub(super) fn coalesce_disjoint_temps(
     let mut phi_inputs = BTreeSet::new();
     let mut literal_writes = BTreeSet::new();
     let temp_reads = collect_temp_reads_in_proto(proto);
+    let mut frame_inputs = BTreeSet::new();
+    for stmt in &proto.body.stmts {
+        visit::visit_stmt_structure(stmt, &mut |stmt| {
+            let HirStmt::Return(ret) = stmt else { return };
+            for (index, value) in ret.values.fixed.iter().enumerate() {
+                if let HirExpr::TempRef(temp) = value
+                    && facts.fixed_return_input(ret, index) == Some(*temp)
+                    && !facts.is_phi_carrier_temp(*temp)
+                    && !facts.is_loop_carrier_temp(*temp)
+                {
+                    frame_inputs.insert(*temp);
+                }
+            }
+        });
+    }
     ScopedCarrierDeclarations {
         facts,
         updates: &mut scoped_updates,
@@ -183,10 +214,22 @@ pub(super) fn coalesce_disjoint_temps(
                 if empty {
                     empty_carried.insert(target);
                 }
+                return true;
             }
+            false
         },
     }
-    .block(&proto.body, &mut BTreeMap::new());
+    .block(&proto.body, &mut BTreeMap::new(), true);
+    let graph =
+        if phi_inputs.is_empty() && literal_writes.iter().all(|temp| temp_reads.contains(temp)) {
+            None
+        } else {
+            let Ok(graph) = HirFlowGraph::for_proto(&proto.body, safety) else {
+                return false;
+            };
+            retain_dominated_temp_owners(&graph, &mut scoped_temps);
+            Some(graph)
+        };
     // Boolean initializer 的入口写由完整值帧消费；不能先接到前一代 local，
     // 否则它会反过来阻止前一帧退休其 scratch 声明。
     let mut pending_value_locals = BTreeSet::new();
@@ -263,6 +306,71 @@ pub(super) fn coalesce_disjoint_temps(
             }
         }
     }
+    let mut definition_preserving_temps = BTreeSet::new();
+    for stmt in &proto.body.stmts {
+        visit::visit_stmt_structure(stmt, &mut |stmt| {
+            if let HirStmt::Assign(assign) = stmt
+                && let Some(HirLValue::Temp(first)) = assign.targets.first()
+                && let Some(original) = facts.nil_write_temps(*first)
+                && original.len() == assign.targets.len()
+                && assign.values.tail.is_none()
+                && assign.values.fixed.len() == original.len()
+                && assign
+                    .values
+                    .fixed
+                    .iter()
+                    .all(|value| matches!(value, HirExpr::Nil))
+                && assign.targets.iter().zip(original).all(|(target, temp)| {
+                    *target == HirLValue::Temp(*temp) && !temp_reads.contains(temp)
+                })
+            {
+                // 原 LOADNIL 整组仍在原点清除这些槽；一次性区域的合流声明已在
+                // 外层拥有同一 home 时，接回初始化身份，不新增或移动任何写入。
+                // 原批次来源与无读 seed 限定候选，旧值和捕获仍交给下面的整图证明。
+                for &temp in original {
+                    if let Some(home) = facts.trusted_temp_home_slot(temp)
+                        && let Some(group) = groups.get_mut(&home)
+                        && matches!(group.first(), Some(CarryBinding::Local(_)))
+                    {
+                        group.push(CarryBinding::Temp(temp));
+                        definition_preserving_temps.insert(temp);
+                    }
+                }
+            }
+            let Some((temp, HirExpr::Binary(binary))) = stmt.scalar_temp_assignment() else {
+                return;
+            };
+            let Some(source) = binary.source_site else {
+                return;
+            };
+            if temp_reads.contains(&temp) || facts.operation_result_temp(source) != Some(temp) {
+                return;
+            }
+            let Some(home) = facts.operation_result_home(source) else {
+                return;
+            };
+            let Some(group) = groups.get_mut(&home) else {
+                return;
+            };
+            let Some(&CarryBinding::Local(owner)) = group.first() else {
+                return;
+            };
+            if [&binary.lhs, &binary.rhs]
+                .into_iter()
+                .enumerate()
+                .any(|(index, value)| {
+                    *value == HirExpr::LocalRef(owner)
+                        && facts.direct_binary_operand_home(binary, index) == Some(home)
+                })
+            {
+                // 原二元操作读取并写回入口 owner 的同一 home；无后续读取不使原写
+                // 变成可删除的 scratch。仅认回目标，求值、Def 和覆盖位置均保留；
+                // 捕获、协议及旧值干扰仍由下面共用证明拒绝。
+                group.push(CarryBinding::Temp(temp));
+                definition_preserving_temps.insert(temp);
+            }
+        });
+    }
     let mut local_only_homes = BTreeSet::new();
     let mut grouped_locals = groups.values().flatten().copied().collect::<BTreeSet<_>>();
     // 分支 carrier 的入口也可能位于循环体内。相邻声明保证 seed 与 carrier
@@ -314,7 +422,6 @@ pub(super) fn coalesce_disjoint_temps(
     }
     // 显式 phi 写回将循环/分支 Temp 连到既有声明；同槽本身不构成身份。
     // 每次读写都必须处于同一声明的词法后缀，随后仍由整图活跃性排除快照干扰。
-    let mut definition_preserving_temps = BTreeSet::new();
     for (temp, owner) in scoped_temps {
         let Some(owner) = owner else { continue };
         let inert_write = literal_writes.contains(&temp)
@@ -358,7 +465,7 @@ pub(super) fn coalesce_disjoint_temps(
     for &binding in &identity.value_captured {
         block_binding_homes(binding, facts, &scoped_groups, &mut blocked);
     }
-    // 原 GETTABLE 写回和合流空声明都只认回已声明 carrier；不移除实际定义或
+    // 原 GETTABLE/一元写回和合流空声明都只认回已声明 carrier；不移除实际定义或
     // 求值，按 source/Def 索引的准备协议仍有效。空声明的首次有效写另经 CFG 验证。
     let definition_preserving_homes = scoped_groups
         .iter()
@@ -394,7 +501,9 @@ pub(super) fn coalesce_disjoint_temps(
                 .is_some_and(|home| definition_preserving_homes.contains(&home))
             && matches!(proto.inline_dispositions.temp(temp),
                 crate::hir::common::HirInlineDisposition::Preserve(reasons)
-                if reasons.iter().all(|reason| *reason == crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix))
+                if reasons.iter().all(|reason| *reason == crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix
+                    || *reason == crate::hir::common::HirInlineRetentionReason::BooleanValueContext
+                        && facts.promoted_local_for_temp(temp).is_some_and(retained_entry_local)))
         {
             continue;
         }
@@ -408,9 +517,12 @@ pub(super) fn coalesce_disjoint_temps(
                 .is_some_and(|home| scoped_groups.contains_key(&home))
             && matches!(proto.inline_dispositions.local(local),
                 crate::hir::common::HirInlineDisposition::Preserve(reasons)
-                if reasons.iter().all(|reason| *reason == crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix))
+                if reasons.iter().all(|reason| *reason == crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix
+                    || *reason == crate::hir::common::HirInlineRetentionReason::BooleanValueContext
+                        && retained_entry_local(local)))
         {
             // owner 的声明及原槽保持不动，后续同槽 COPY 不破坏前缀保留义务。
+            // BooleanValueContext 也仍由入口 owner 持有，不把原布尔计算或 LOAD/TEST 内联掉。
             continue;
         }
         block_binding_homes(binding, facts, &scoped_groups, &mut blocked);
@@ -420,8 +532,10 @@ pub(super) fn coalesce_disjoint_temps(
         proto,
         &mut ProtocolHomes {
             facts,
+            frame_inputs: &mut frame_inputs,
             scoped_groups: &scoped_groups,
             definition_preserving_homes: &definition_preserving_homes,
+            unary_write_homes: &unary_write_homes,
             blocked: &mut blocked,
         },
     );
@@ -473,8 +587,14 @@ pub(super) fn coalesce_disjoint_temps(
         }
     }
 
-    // 无读者的写入留给 dead-temps；吸收到活跃 carrier 会使它们失去独立死写身份。
+    // 其它无读者的写入留给 dead-temps；不能仅凭同槽把独立 scratch 吸收到 carrier。
     for temp in temp_reads {
+        // 候选拒绝[LayerBoundary]：原 CALL/RETURN 的独立准备 Def 不是同槽循环状态。
+        // 把它并入 carrier 会让准备写成为状态更新并迫使声明越过循环出口；
+        // 保留该成员的版本身份，交给调用/返回帧消费，其它状态成员仍可独立收敛。
+        if frame_inputs.contains(&temp) {
+            continue;
+        }
         if let Some(home) = facts.trusted_temp_home_slot(temp)
             && !blocked.contains(&home)
             && !local_only_homes.contains(&home)
@@ -493,8 +613,12 @@ pub(super) fn coalesce_disjoint_temps(
         .iter()
         .flat_map(|(&home, temps)| temps.iter().map(move |&temp| (temp, home)))
         .collect::<BTreeMap<_, _>>();
-    let Ok(graph) = HirFlowGraph::for_proto(&proto.body, safety) else {
-        return false;
+    let graph = match graph {
+        Some(graph) => graph,
+        None => match HirFlowGraph::for_proto(&proto.body, safety) {
+            Ok(graph) => graph,
+            Err(_) => return false,
+        },
     };
     let events = graph
         .nodes()
@@ -653,9 +777,15 @@ struct ScopedCarrierDeclarations<'a, F> {
     candidate: F,
 }
 
-impl<F: FnMut(LocalId, LocalId, bool)> ScopedCarrierDeclarations<'_, F> {
-    fn block(&mut self, block: &HirBlock, owners: &mut BTreeMap<HomeSlotKey, LocalId>) {
+impl<F: FnMut(LocalId, LocalId, bool) -> bool> ScopedCarrierDeclarations<'_, F> {
+    fn block(
+        &mut self,
+        block: &HirBlock,
+        owners: &mut BTreeMap<HomeSlotKey, LocalId>,
+        collect_updates: bool,
+    ) {
         let mut previous = Vec::new();
+        let mut before_transfer = collect_updates;
         for stmt in &block.stmts {
             let mut touches = BTreeSet::new();
             visit::visit_stmt_header(
@@ -693,16 +823,20 @@ impl<F: FnMut(LocalId, LocalId, bool)> ScopedCarrierDeclarations<'_, F> {
                 && assign.values.tail.is_none()
             {
                 for (target, value) in assign.targets.iter().zip(&assign.values.fixed) {
-                    if let (HirLValue::Local(local), HirExpr::TempRef(temp)) = (target, value)
-                        && self
-                            .facts
-                            .trusted_local_home_slot(*local)
-                            .is_some_and(|home| {
-                                self.facts.trusted_temp_home_slot(*temp) == Some(home)
-                                    && owners.get(&home) == Some(local)
-                            })
+                    let (local, temp) = match (target, value) {
+                        (HirLValue::Local(local), HirExpr::TempRef(temp))
+                        | (HirLValue::Temp(temp), HirExpr::LocalRef(local)) => (*local, *temp),
+                        _ => continue,
+                    };
+                    if self
+                        .facts
+                        .trusted_local_home_slot(local)
+                        .is_some_and(|home| {
+                            self.facts.trusted_temp_home_slot(temp) == Some(home)
+                                && owners.get(&home) == Some(&local)
+                        })
                     {
-                        self.phi_inputs.insert(*temp);
+                        self.phi_inputs.insert(temp);
                     }
                 }
             }
@@ -716,22 +850,26 @@ impl<F: FnMut(LocalId, LocalId, bool)> ScopedCarrierDeclarations<'_, F> {
             if let HirStmt::LocalDecl(decl) = stmt
                 && decl.initializer_merge_transaction.is_none()
             {
-                if let ([target], [HirExpr::LocalRef(source)], None) = (
-                    decl.bindings.as_slice(),
-                    decl.values.fixed.as_slice(),
-                    &decl.values.tail,
-                ) && self
-                    .facts
-                    .trusted_local_home_slot(*source)
-                    .is_some_and(|home| owners.get(&home) == Some(source))
+                if before_transfer
+                    && let ([target], [HirExpr::LocalRef(source)], None) = (
+                        decl.bindings.as_slice(),
+                        decl.values.fixed.as_slice(),
+                        &decl.values.tail,
+                    )
+                    && self
+                        .facts
+                        .trusted_local_home_slot(*source)
+                        .is_some_and(|home| owners.get(&home) == Some(source))
                 {
                     (self.candidate)(*source, *target, false);
                 }
-                if let ([target], [value], None) = (
-                    decl.bindings.as_slice(),
-                    decl.values.fixed.as_slice(),
-                    &decl.values.tail,
-                ) && let Some(home) = self.facts.trusted_local_home_slot(*target)
+                if before_transfer
+                    && let ([target], [value], None) = (
+                        decl.bindings.as_slice(),
+                        decl.values.fixed.as_slice(),
+                        &decl.values.tail,
+                    )
+                    && let Some(home) = self.facts.trusted_local_home_slot(*target)
                     && let Some(&seed) = owners.get(&home)
                     && seed != *target
                 {
@@ -765,13 +903,18 @@ impl<F: FnMut(LocalId, LocalId, bool)> ScopedCarrierDeclarations<'_, F> {
                     let Some(home) = self.facts.trusted_local_home_slot(target) else {
                         continue;
                     };
-                    if decl.values.is_empty() {
-                        if let Some(&seed) = owners.get(&home) {
-                            (self.candidate)(seed, target, true);
-                        }
-                    } else {
-                        previous.push((home, owners.insert(home, target)));
+                    if decl.values.is_empty()
+                        && before_transfer
+                        && let Some(&seed) = owners.get(&home)
+                        && (self.candidate)(seed, target, true)
+                    {
+                        // 已接回 seed 的合流空声明继续使用同一候选 owner，避免把
+                        // 后续写拆成互相冲突的两组；整图证明失败仍撤回整个 home。
+                        continue;
                     }
+                    // 空声明也建立词法 owner；其结果由子块写入后，后续原 COPY
+                    // 仍可认回同槽声明。是否存在旧值快照继续由整图活跃性证明。
+                    previous.push((home, owners.insert(home, target)));
                 }
             }
             if let HirStmt::LocalRootRelease(local) = stmt
@@ -780,9 +923,13 @@ impl<F: FnMut(LocalId, LocalId, bool)> ScopedCarrierDeclarations<'_, F> {
                 previous.push((home, owners.remove(&home)));
             }
             if matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_)) {
-                break;
+                // label 后仍收集每次 Temp 读写的词法 owner；显式 phi 的双向交接
+                // 另由同一 CFG 的支配关系核对。旧 Local 更新候选仍限于直线前缀。
+                before_transfer = false;
             }
-            visit::for_each_nested_block(stmt, &mut |child| self.block(child, owners));
+            visit::for_each_nested_block(stmt, &mut |child| {
+                self.block(child, owners, before_transfer);
+            });
         }
         // 外层声明支配子块，兄弟分支的局部 owner 则不能沿 DFS 泄漏。
         for (home, old) in previous.into_iter().rev() {
@@ -790,6 +937,45 @@ impl<F: FnMut(LocalId, LocalId, bool)> ScopedCarrierDeclarations<'_, F> {
                 owners.insert(home, local);
             } else {
                 owners.remove(&home);
+            }
+        }
+    }
+}
+
+fn retain_dominated_temp_owners(
+    graph: &HirFlowGraph<'_>,
+    owners: &mut BTreeMap<TempId, Option<LocalId>>,
+) {
+    let dominance = graph.dominance();
+    let mut declarations = BTreeMap::new();
+    for (index, node) in graph.nodes().iter().enumerate() {
+        if let HirFlowNodeKind::Stmt(HirStmt::LocalDecl(decl)) = node.kind() {
+            for &local in &decl.bindings {
+                declarations.insert(local, index);
+            }
+        }
+    }
+    for (index, node) in graph.nodes().iter().enumerate() {
+        let mut touches = BTreeSet::new();
+        node.kind()
+            .visit_evaluation(&mut BindingReadCollector(|binding| {
+                touches.insert(binding);
+            }));
+        node.kind()
+            .visit_evaluation(&mut BindingWriteCollector(|binding| {
+                touches.insert(binding);
+            }));
+        for binding in touches {
+            if let HirBinding::Temp(temp) = binding
+                && let Some(owner) = owners.get_mut(&temp)
+                && let Some(local) = *owner
+                && declarations.get(&local).is_none_or(|&declaration| {
+                    declaration == index || !dominance.dominates(declaration, index, |node| node)
+                })
+            {
+                // 候选拒绝[SemanticBarrier:Scope]：某次读写能绕过声明，或仍在其
+                // initializer 中；改成 Local 会访问尚未进入作用域的身份。
+                *owner = None;
             }
         }
     }
@@ -869,7 +1055,7 @@ fn restore_local_update_assignments(
                 values: std::mem::take(&mut decl.values),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
-                generic_for_dispatch_release: None,
+                root_release: None,
                 method_rewrite_transaction: None,
             }));
         }
@@ -897,7 +1083,7 @@ fn prune_entry_carrier_seeds(
             && assign.values.tail.is_none()
             && assign.initializer_merge_transaction.is_none()
             && assign.generic_for_initializer_producer.is_none()
-            && assign.generic_for_dispatch_release.is_none()
+            && assign.root_release.is_none()
             && assign.method_rewrite_transaction.is_none()
             && assign.targets.len() == assign.values.fixed.len()
             && assign.values.fixed.iter().all(|value| {
@@ -1017,12 +1203,36 @@ fn block_binding_homes(
 
 struct ProtocolHomes<'a> {
     facts: &'a ProtoPromotionFacts,
+    frame_inputs: &'a mut BTreeSet<TempId>,
     scoped_groups: &'a BTreeMap<HomeSlotKey, BTreeSet<CarryBinding>>,
     definition_preserving_homes: &'a BTreeSet<HomeSlotKey>,
+    unary_write_homes: &'a BTreeSet<HomeSlotKey>,
     blocked: &'a mut BTreeSet<HomeSlotKey>,
 }
 
 impl ProtocolHomes<'_> {
+    fn protect_call_input(&mut self, temp: TempId, frame: Option<HomeSlotKey>) {
+        if self
+            .facts
+            .trusted_temp_home_slot(temp)
+            .zip(frame)
+            .is_some_and(|(home, frame)| {
+                self.unary_write_homes.contains(&home) && home.slot() >= frame.slot()
+            })
+        {
+            // 一元写回候选不能冻结原调用准备区中的声明；后续同槽写只是 scratch
+            // 复用，保留 Def 并不足以把该准备声明变成贯穿调用之后的 carrier。
+            block_binding_homes(
+                CarryBinding::Temp(temp),
+                self.facts,
+                self.scoped_groups,
+                self.blocked,
+            );
+        } else {
+            self.protect(temp);
+        }
+    }
+
     fn protect(&mut self, temp: TempId) {
         if self
             .facts
@@ -1043,6 +1253,26 @@ impl ProtocolHomes<'_> {
 
 impl HirVisitor<'_> for ProtocolHomes<'_> {
     fn visit_call(&mut self, call: &HirCallExpr) {
+        if let HirExpr::TempRef(temp) = call.callee
+            && let Some(frame) = self.facts.native_call_frame(call)
+            && frame.callee == temp
+            && frame.results == Some(crate::transformer::ResultPack::Ignore)
+            && !self.facts.is_phi_carrier_temp(temp)
+            && !self.facts.is_loop_carrier_temp(temp)
+        {
+            // 零结果 CALL 不把结果写回 callee 槽；后继准备或循环状态只是槽复用。
+            // 保留独立输入版本供完整帧消费；有结果 CALL 的原槽交接仍由帧 owner 证明。
+            self.frame_inputs.insert(temp);
+        }
+        let frame_home = self
+            .facts
+            .native_call_frame(call)
+            .map(|frame| frame.home)
+            .or_else(|| {
+                self.facts
+                    .native_fastcall_frame(call)
+                    .map(|frame| frame.home)
+            });
         if let Some(frame) = self.facts.native_call_frame(call)
             && let HirExpr::LocalRef(local) = call.callee
             && self.facts.promoted_local_for_temp(frame.callee) == Some(local)
@@ -1050,17 +1280,17 @@ impl HirVisitor<'_> for ProtocolHomes<'_> {
         {
             // 尚在原准备槽的 callee 依赖独立 producer 身份；待完整调用消费后再合并。
             // 已恢复成低槽源变量的读取不再消费该证书，不阻止它后面的同槽交接。
-            self.protect(frame.callee);
+            self.protect_call_input(frame.callee, frame_home);
         }
         // 已树化的 Boolean 参数也持有原 producer 协议，未必仍出现在 argument_roots。
         // 合并其 Local 会退休比较写回/FASTCALL 证书；先由完整调用 owner 消费该参数。
         for index in 0..call.args.fixed.len() {
             if let Some(producer) = self.facts.call_argument_value(call, index) {
-                self.protect(producer);
+                self.protect_call_input(producer, frame_home);
             }
         }
         for root in &call.argument_roots {
-            self.protect(root.producer);
+            self.protect_call_input(root.producer, frame_home);
         }
     }
 

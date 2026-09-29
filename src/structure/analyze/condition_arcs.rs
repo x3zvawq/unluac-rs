@@ -214,6 +214,7 @@ pub(super) fn condition_node_can_be_absorbed(
 pub(super) struct ConditionSafetyWorkspace {
     value_headers: BTreeSet<super::super::BlockRef>,
     source_initializers: Vec<bool>,
+    shared_evaluation_defs: Vec<bool>,
     epoch: usize,
     needed_instr_epochs: Vec<usize>,
     def_epochs: Vec<usize>,
@@ -237,6 +238,9 @@ impl ConditionSafetyWorkspace {
         }
         Self {
             source_initializers,
+            shared_evaluation_defs: super::dependencies::shared_fixed_evaluation_defs(
+                proto, dataflow,
+            ),
             // 取值 DAG 的 phi 结果由 ValueDecision 消费；外层条件不能把它吞成
             // 只有 bool 出口的节点，否则 condition region 会嵌入另一个控制 owner。
             value_headers: candidates
@@ -324,10 +328,7 @@ pub(super) fn block_has_unabsorbed_effects(
                 LowInstr::LoadNil(_) | LowInstr::LoadBool(_) | LowInstr::LoadConst(_)
                     | LowInstr::LoadInteger(_) | LowInstr::LoadNumber(_) | LowInstr::Move(_))
                 && dataflow.instr_defs[index].iter().any(|def| {
-                    dataflow.def_uses[def.index()].len() > 1
-                        || dataflow.def_uses[def.index()].first().is_some_and(|site| {
-                            dataflow.instr_effects[site.instr.index()].repeats_fixed_use(site.reg)
-                        })
+                    workspace.shared_evaluation_defs[def.index()]
                         || !dataflow.def_phi_uses[def.index()].is_empty()
                 }))
             || dataflow.effect_summaries.get(index).is_none_or(|summary| {
@@ -392,6 +393,7 @@ pub(super) fn truncate_condition_at(
         },
         result_reg: None,
         result_phi_id: None,
+        loop_entry: None,
         entry_value: None,
         value_incomings: Vec::new(),
         reducible: true,

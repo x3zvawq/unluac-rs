@@ -198,7 +198,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             .iter()
             .zip(temps)
             .filter(|(result, temp)| !self.repeat_stage_is_direct(result.target, **temp))
-            .map(|(_, temp)| HirLValue::Temp(*temp))
+            .map(|(_, temp)| self.lowering.bindings.lvalue_for_temp(*temp))
             .collect::<Vec<_>>();
         if targets.is_empty() {
             return Ok(Vec::new());
@@ -443,8 +443,8 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             };
             // 真实寄存器写已投影到 for binding；这里只移除同身份的合成 phi copy，
             // 不生成 repeat stage 来保存一个源码变量之外无人读取的重复结果。
-            // 普通 captured phi 也可能读为 LocalRef，但提前 break 仍需保存独立 stage；
-            // 只有绑定分析明确发布的 for 投影才能省略这整个合成动作。
+            // 单条 captured phi 读为 LocalRef 不足以证明全部出口共址；for 投影可
+            // 直接省略动作，其余 stage 由绑定 owner 验证全部输入后统一投影。
             if self.lowering.bindings.for_binding_phi_locals[copy.phi_id.index()]
                 .is_some_and(|local| value == HirExpr::LocalRef(local))
             {
@@ -462,7 +462,8 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 _ => None,
             };
             let target = if let Some(stage) = staged_target {
-                HirLValue::Temp(stage)
+                // stage 可由 binding owner 认回已有声明；与普通 phi 写使用同一身份投影。
+                self.lowering.bindings.lvalue_for_temp(stage)
             } else {
                 self.lowering.bindings.lvalue_for_temp(phi_target)
             };

@@ -2,7 +2,7 @@
 //!
 //! 消费共享常量与无事件证明，保留原操作和可观察求值。
 
-use super::super::common::{AstExpr, AstModule, AstTargetDialect, AstUnaryOpKind};
+use super::super::common::{AstBinaryOpKind, AstExpr, AstModule, AstTargetDialect, AstUnaryOpKind};
 use super::ReadabilityContext;
 use super::expr_analysis::{
     constant_truthiness, expr_is_boolean_valued, is_discard_safe_expr_for_target,
@@ -25,6 +25,18 @@ struct LiteralFoldPass {
 
 impl AstRewritePass for LiteralFoldPass {
     fn rewrite_expr(&mut self, expr: &mut AstExpr) -> bool {
+        if let AstExpr::Binary(binary) = expr
+            && binary.op == AstBinaryOpKind::Eq
+            && let Some(lhs) = primitive_kind_order(&binary.lhs)
+            && let Some(rhs) = primitive_kind_order(&binary.rhs)
+            && lhs > rhs
+        {
+            // EQK/EQI 和 JIT 的常量比较会交换两侧的寄存器/常量位置；按原始
+            // 字面量种类稳定排序，避免再编译翻转后引入不同的准备声明。
+            // 两侧均无求值事件或元方法，保留原比较，不经 f64 转换或按值折叠。
+            std::mem::swap(&mut binary.lhs, &mut binary.rhs);
+            return true;
+        }
         let replacement = match expr {
             AstExpr::Binary(binary) if !binary.original_operation => {
                 primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs, self.target)
@@ -59,5 +71,16 @@ impl AstRewritePass for LiteralFoldPass {
         };
         *expr = replacement;
         true
+    }
+}
+
+fn primitive_kind_order(expr: &AstExpr) -> Option<u8> {
+    match expr {
+        AstExpr::Nil => Some(0),
+        AstExpr::Boolean(_) => Some(1),
+        AstExpr::Integer(_) => Some(2),
+        AstExpr::Number(_) => Some(3),
+        AstExpr::String(_) => Some(4),
+        _ => None,
     }
 }

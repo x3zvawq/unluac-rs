@@ -1,5 +1,8 @@
 -- unluac: expect-contains [[ // ]]
 -- unluac: expect-contains [[ % ]]
+-- unluac: expect-ast-count [[function]] [[6]]
+-- unluac: expect-ast-count [[if]] [[5]]
+-- unluac: expect-ast-max [[local-binding]] [[23]]
 
 local function reject_floor_zero()
     local numerator = 1
@@ -39,13 +42,19 @@ assert(not pcall(reject_float_bit_not))
 
 -- 动态输入即使结果无读，也必须逐次执行元方法；不能借用字面量整数证明。
 local events = {}
+local value
 local function method(name)
-    return function()
+    return function(lhs, rhs)
+        if name == "not" then
+            assert(lhs == value and rhs == value)
+        else
+            assert(lhs == value and rhs == 3)
+        end
         events[#events + 1] = name
         return 17
     end
 end
-local value = setmetatable({}, {
+value = setmetatable({}, {
     __idiv = method("floor"),
     __mod = method("mod"),
     __band = method("and"),
@@ -72,3 +81,7 @@ local function discard_dynamic_ops(input)
 end
 discard_dynamic_ops(value)
 assert(table.concat(events, ",") == "floor,mod,and,or,xor,shl,shr,not")
+assert(#events == 8)
+discard_dynamic_ops(value)
+assert(table.concat(events, ",") == "floor,mod,and,or,xor,shl,shr,not,floor,mod,and,or,xor,shl,shr,not")
+assert(#events == 16)

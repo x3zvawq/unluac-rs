@@ -396,6 +396,13 @@ pub(super) fn merge_structured_owners(
                     .map_or(DiagnosticUnresolved, RegionResult)
             }
         }
+        (LoopCarried(loop_), RegionResult(result)) | (RegionResult(result), LoopCarried(loop_))
+            if owner_index.is_value_decision(result)
+                && owner_index.more_specific(loop_, result) == Some(result) =>
+        {
+            // 本轮 ValueDecision 拥有具体写回；loop 仍拥有入口与未改值回边。
+            RegionResult(result)
+        }
         (LoopCarried(_), _) => left,
         (_, LoopCarried(_)) => right,
         (RegionInput(input), RegionResult(result)) | (RegionResult(result), RegionInput(input)) => {

@@ -249,7 +249,7 @@ pub(super) fn collect_upvalue_literals(
                 || assign.is_phi_transfer
                 || assign.initializer_merge_transaction.is_some()
                 || assign.generic_for_initializer_producer.is_some()
-                || assign.generic_for_dispatch_release.is_some()
+                || assign.root_release.is_some()
                 || assign.method_rewrite_transaction.is_some()
             {
                 valid = false;
@@ -317,7 +317,7 @@ fn entry_nil_upvalues(
         if site.index() != writes.len()
             || assign.initializer_merge_transaction.is_some()
             || assign.generic_for_initializer_producer.is_some()
-            || assign.generic_for_dispatch_release.is_some()
+            || assign.root_release.is_some()
             || assign.method_rewrite_transaction.is_some()
             || context.barred.contains(&home)
             || context.closed.contains(&home)
@@ -450,9 +450,9 @@ pub(super) fn collect_comparisons(
             .iter()
             .enumerate()
             .map(|(offset, &position)| {
-                let (_, value) = scalar_local(run[position])?;
+                let (local, value) = scalar_local(run[position])?;
                 let slot = base.slot() + offset;
-                builder.boolean_frame = Some(slot);
+                builder.boolean_frame = facts.trusted_local_home_slot(local);
                 let value = builder.expr(value, position, slot, None, false, true, None)?;
                 builder.finish_event(position)?;
                 Some(value)
@@ -514,7 +514,7 @@ fn comparison_declaration<'a>(
         HirStmt::Assign(assign)
             if assign.initializer_merge_transaction.is_none()
                 && assign.generic_for_initializer_producer.is_none()
-                && assign.generic_for_dispatch_release.is_none()
+                && assign.root_release.is_none()
                 && assign.method_rewrite_transaction.is_none() =>
         {
             let previous = index.checked_sub(1)?;
@@ -770,6 +770,30 @@ pub(super) fn collect_calls(
     if dialect != DecompileDialect::Luau {
         return Vec::new();
     }
+    let nils = facts
+        .nil_write_groups()
+        .filter_map(|group| {
+            let [temp] = group else { return None };
+            let local = facts.promoted_local_for_temp(*temp)?;
+            let home = facts.trusted_temp_home_slot(*temp)?;
+            (facts.trusted_local_home_slot(local) == Some(home)
+                && facts
+                    .complete_local_definition_write_homes(local)
+                    .iter()
+                    .copied()
+                    .eq([home]))
+            .then_some((local, home))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let nil_result = |stmt: &HirStmt, slot: usize| {
+        let (local, HirExpr::Nil) = scalar_local(stmt)? else {
+            return None;
+        };
+        let home = *nils.get(&local)?;
+        (home.slot() == slot && !context.closed.contains(&home)
+            && matches!(stmt, HirStmt::LocalDecl(decl) if decl.initializer_merge_transaction.is_none()))
+            .then_some(local)
+    };
     let mut plans = Vec::new();
     let mut floor = 0;
     let mut cursor = 0;
@@ -805,11 +829,13 @@ pub(super) fn collect_calls(
             continue;
         }
         let width = top - base.slot();
-        let mut calls = Vec::new();
+        let mut members = Vec::new();
         let mut next = index;
         for offset in 0..width {
             while let Some(Some(entry)) = flat.get(next) {
-                if matches!(scalar_local(entry.stmt), Some((_, HirExpr::Call(_)))) {
+                if matches!(scalar_local(entry.stmt), Some((_, HirExpr::Call(_))))
+                    || nil_result(entry.stmt, base.slot() + offset).is_some()
+                {
                     break;
                 }
                 if scalar_binding(entry.stmt).is_none()
@@ -825,6 +851,13 @@ pub(super) fn collect_calls(
             let Some(entry) = flat.get(next).and_then(|entry| *entry) else {
                 break;
             };
+            if let Some(local) = nil_result(entry.stmt, base.slot() + offset) {
+                // 固定宽度 CALL 的低槽 COPY 与后续 LOADNIL 共同初始化声明组。
+                // nil 保持原写入位置和宽度，不把它当作开放返回值的额外结果。
+                members.push((next, next, local));
+                next += 1;
+                continue;
+            }
             let Some((owner, HirExpr::Call(call))) = scalar_local(entry.stmt) else {
                 break;
             };
@@ -882,18 +915,18 @@ pub(super) fn collect_calls(
             {
                 break;
             }
-            calls.push((next, end, local));
+            members.push((next, end, local));
             next = end + 1;
         }
         // 每个候选窗口只建一次 Def 索引；拒绝后也不从其内部反复扫描增长前缀。
         cursor = cursor.max(next);
         let start = floor;
         floor = cursor;
-        if calls.len() != width {
+        if members.len() != width {
             continue;
         }
         if let Some(plan) = call_plan(
-            context, facts, dialect, flat, empty, start, next, base, &calls,
+            context, facts, dialect, flat, empty, start, next, base, &members,
         ) {
             plans.push(plan);
         }
@@ -914,7 +947,7 @@ fn call_plan(
     start: usize,
     end: usize,
     base: HomeSlotKey,
-    calls: &[(usize, usize, LocalId)],
+    members: &[(usize, usize, LocalId)],
 ) -> Option<Plan> {
     let entries = flat[start..end]
         .iter()
@@ -931,14 +964,20 @@ fn call_plan(
         }
     }
     let mut builder = frame_builder(context, &run, facts, dialect, base.slot())?;
-    builder.declaration_reserved_top = Some(base.slot() + calls.len());
+    builder.declaration_reserved_top = Some(base.slot() + members.len());
     let mut values = Vec::new();
-    for &(call_index, copy_index, local) in calls {
+    for &(call_index, copy_index, local) in members {
         let index = indices[&call_index];
-        let (_, HirExpr::Call(call)) = scalar_local(run[index])? else {
+        let (_, value) = scalar_local(run[index])?;
+        if *value == HirExpr::Nil {
+            values.push(HirExpr::Nil);
+            builder.finish_event(index)?;
+            continue;
+        }
+        let HirExpr::Call(call) = value else {
             return None;
         };
-        let (_, home) = call_result(call, local, base.slot() + calls.len(), facts)?;
+        let (_, home) = call_result(call, local, base.slot() + members.len(), facts)?;
         values.push(HirExpr::Call(Box::new(builder.call(
             call,
             index,
@@ -963,7 +1002,7 @@ fn call_plan(
         sink,
         base,
         values: values.into(),
-        result_locals: calls.iter().map(|(_, _, local)| *local).collect(),
+        result_locals: members.iter().map(|(_, _, local)| *local).collect(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         luau_compound_global: false,

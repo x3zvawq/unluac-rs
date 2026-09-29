@@ -3,6 +3,9 @@
 -- unluac: expect-contains [[return]]
 -- unluac: expect-not-contains [[goto]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[11]]
+-- unluac: expect-ast-count [[if]] [[5]]
 local objects = {
     world = {
         first = { definition = "BIRD" },
@@ -13,8 +16,10 @@ local objects = {
 
 local currentBirdIndex = 0
 local disabled = 0
+local calls = {}
 
 local function getNextBird(index)
+    calls[#calls + 1] = index
     if index == 1 then
         return "first"
     end
@@ -46,4 +51,25 @@ end
 
 local result = replace_next_bird()
 assert(result == "next" and disabled == 0)
+assert(table.concat(calls, ",") == "1,2")
 print("regress_31_numeric_for_terminal_branch_coverage#1", result)
+
+currentBirdIndex, disabled, calls = 1, 0, {}
+assert(replace_next_bird() == 2 and disabled == 2)
+assert(table.concat(calls, ",") == "2,3,3,4,5,6,7,8")
+currentBirdIndex, disabled, calls = 2, 0, {}
+assert(replace_next_bird() == 1 and disabled == 1)
+assert(table.concat(calls, ",") == "3,4,5,6,7,8,9")
+
+getNextBird = function(index)
+    calls[#calls + 1] = index
+    if index == 2 then
+        return "next"
+    end
+end
+currentBirdIndex, disabled, calls = 0, 0, {}
+assert(replace_next_bird() == 2 and disabled == 2)
+assert(table.concat(calls, ",") == "1,2,3,3,4,5,6,7")
+currentBirdIndex, disabled, calls = 2, 0, {}
+assert(replace_next_bird() == 1 and disabled == 1)
+assert(table.concat(calls, ",") == "3,4,5,6,7,8,9")

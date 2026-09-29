@@ -11,8 +11,12 @@
 -- unluac: expect-ast-count [[do-block]] [[1]] [[@debug=stripped]] [[@dialect=luajit]]
 -- Luau 把只读 cell 编译为 ByValue capture，不发 CLOSE；移除 debug 后没有独立块边界证据。
 -- unluac: expect-ast-count [[do-block]] [[0]] [[@debug=stripped]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-max [[local-binding]] [[8]]
 local reader
+local inspections = 0
 local function inspect()
+    inspections = inspections + 1
     if debug and debug.getlocal then
         for index = 1, 20 do
             local name = debug.getlocal(2, index)
@@ -34,6 +38,8 @@ local function run(flag)
 end
 run(true)
 assert(reader() == "after")
+local first_reader = reader
 run(false)
 assert(reader() == "before")
+assert(first_reader ~= reader and first_reader() == "after" and inspections == 2)
 print("scope_10_captured_branch_close", "OK")

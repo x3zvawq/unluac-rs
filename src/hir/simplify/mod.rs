@@ -217,7 +217,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "eliminate-decisions",
         phase: PassPhase::Deferred,
-        depends_on: &[DecisionShape],
+        depends_on: HIR_SHAPE_INPUTS,
         // Decision 线性化不只是删掉一个表达式节点：它会插入 if/block、home-free local、
         // temp/local assignment，并暴露新的逻辑、布尔壳和 table 相邻形状。把这些真实产出
         // 全部标脏，Normal consumers 才能在 owner 消费后重新审计原候选。
@@ -241,7 +241,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         name: "close-scopes",
         phase: PassPhase::Deferred,
         depends_on: &[BlockStructure],
-        invalidates: &[BlockStructure, LocalBinding, TempChain],
+        invalidates: &[BlockStructure, LocalBinding, TempChain, LabelGoto],
     },
     PassDescriptor {
         name: "carried-locals",
@@ -258,7 +258,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "dead-labels",
         phase: PassPhase::Deferred,
-        depends_on: &[LabelGoto],
+        depends_on: &[LabelGoto, BlockStructure],
         invalidates: &[LabelGoto, BlockStructure, TempChain],
     },
     PassDescriptor {
@@ -317,6 +317,28 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         depends_on: HIR_SHAPE_INPUTS,
         // 原 nil 声明前缀已交词法事务，未消费项与 Boolean 预写仍按原证明清理。
         invalidates: &[TempChain, LocalBinding, BlockStructure, TablePattern],
+    },
+    PassDescriptor {
+        name: "lookup-decision-frames",
+        phase: PassPhase::Final,
+        depends_on: HIR_SHAPE_INPUTS,
+        // 候选在当前声明前缀重新验证；未能提交者在同次消费中物化，不能无限等待。
+        invalidates: &[
+            DecisionShape,
+            BooleanPattern,
+            LogicalExpr,
+            TablePattern,
+            TempChain,
+            LocalBinding,
+            BlockStructure,
+        ],
+    },
+    PassDescriptor {
+        name: "tail-loop-conditions",
+        phase: PassPhase::Final,
+        depends_on: HIR_SHAPE_INPUTS,
+        // 原调用准备和声明边界稳定后才确定尾条件；新 repeat 的根与局部归属重新审理。
+        invalidates: &[BlockStructure, LocalBinding, TempChain],
     },
 ];
 
@@ -433,12 +455,22 @@ pub(super) fn simplify_hir(
                             safety,
                         ),
                         7 => locals::promote_temps_to_locals_in_proto_with_facts(
-                            proto, facts, safety, dialect,
+                            proto,
+                            facts,
+                            safety,
+                            dialect,
+                            proto.id == chunk_entry,
                         ),
                         8 => branch_control_folding::fold_branch_control_in_proto(
                             proto, facts, safety,
                         ),
-                        9 => decision::eliminate_remaining_decisions_in_proto(proto, facts, safety),
+                        9 => {
+                            let deferred =
+                                call_frames::deferred_lookup_decisions(proto, facts, dialect);
+                            decision::eliminate_remaining_decisions_in_proto(
+                                proto, facts, safety, &deferred,
+                            )
+                        }
                         10 => debug_scopes::materialize_tail_debug_scopes_in_proto(proto, dialect),
                         11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto, safety),
                         12 => carried_locals::collapse_carried_local_handoffs_in_proto(
@@ -477,6 +509,21 @@ pub(super) fn simplify_hir(
                             safety,
                             dead_temps::DeadTempStage::Final,
                         ),
+                        23 => {
+                            let restored = call_frames::restore_lookup_decision_frames(
+                                proto,
+                                facts,
+                                dialect,
+                                proto.id == chunk_entry,
+                            );
+                            decision::eliminate_remaining_decisions_in_proto(
+                                proto,
+                                facts,
+                                safety,
+                                &std::collections::BTreeSet::new(),
+                            ) || restored
+                        }
+                        24 => branch_control_folding::fold_tail_loop_conditions_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })

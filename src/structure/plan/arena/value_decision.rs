@@ -126,6 +126,9 @@ pub(super) fn freeze_value_decision(
 
     let mut operands = evidence.operands.clone();
     for operand in &mut operands {
+        operand.route_values = operand
+            .proven_route_values(cfg, dataflow, &nodes)
+            .ok_or_else(|| StructureError::invalid("value operand has invalid route value"))?;
         operand.current_values = operand
             .proven_current_values(proto, dataflow, &nodes)
             .ok_or_else(|| {
@@ -154,6 +157,7 @@ pub(super) fn freeze_value_decision(
         .incoming
         .iter()
         .filter(|incoming| incoming.value != SsaValue::Phi(phi.id))
+        .filter(|incoming| candidate.loop_entry.is_none() || incoming.edge != candidate.loop_entry)
         .map(|incoming| {
             incoming.edge.ok_or_else(|| {
                 StructureError::invalid("value decision result phi has a synthetic incoming")
@@ -222,6 +226,7 @@ pub(super) fn freeze_value_decision(
         merge,
         shared_exit_action,
         result_phi,
+        loop_entry: candidate.loop_entry,
         absorbed_phis: Vec::new(),
         operands,
         result_reg,

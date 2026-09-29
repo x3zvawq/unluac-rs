@@ -336,6 +336,7 @@ pub(super) fn validate_prefixes(
     });
     let temp_scopes = TemporaryScopes::new(&proto.body, removed);
     let mut scan = PrefixScan {
+        trailing_label_exits: super::lexical_cfg::trailing_label_exits(&proto.body),
         facts,
         removed,
         candidates,
@@ -511,6 +512,7 @@ impl TemporaryScopes {
 }
 
 struct PrefixScan<'a> {
+    trailing_label_exits: BTreeSet<crate::hir::common::HirLabelId>,
     facts: &'a ProtoPromotionFacts,
     removed: &'a [bool],
     candidates: &'a BTreeMap<usize, PrefixRequest>,
@@ -760,6 +762,11 @@ impl PrefixScan<'_> {
                 | HirStmt::Return(_)
                 | HirStmt::Break
                 | HirStmt::Continue => {}
+                HirStmt::Goto(goto) if self.trailing_label_exits.contains(&goto.target) => {}
+                HirStmt::Label(label) if self.trailing_label_exits.contains(&label.id) => {
+                    // 共享词法证书确认所有入口只退出到祖先尾部；跳转不引入声明槽。
+                    // 当前扫描仍逐项核对资源和声明，不把该证书当作跨边移动许可。
+                }
                 HirStmt::ToBeClosed(tbc)
                     if matches!(tbc.value, crate::hir::common::HirExpr::LocalRef(local)
                         if self.declared.contains(&local)

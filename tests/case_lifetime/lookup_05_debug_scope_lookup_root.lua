@@ -1,4 +1,8 @@
 -- debug end 恢复寄存器复用，不能在下一条可观察 GGET 之前主动清槽。
+-- unluac: expect-ast-max [[local-binding]] [[9]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[do-block]] [[2]] [[@debug=retained]]
+-- unluac: expect-count [[regress_525_missing_gc("collect")]] [[2]]
 local gc, next_key = collectgarbage, next
 local env = _G
 local weak = setmetatable({}, { __mode = "k" })

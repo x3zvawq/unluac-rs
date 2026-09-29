@@ -38,13 +38,16 @@ pub(super) fn analyze_branches(
     BTreeMap<BlockRef, SinglePassFenceFact>,
 ) {
     let branch_index = BranchIndex::new(cfg, graph_facts, loop_candidates);
-    let mut irreducible_blocks = vec![false; cfg.blocks.len()];
-    for block in irreducible_regions
-        .iter()
-        .flat_map(|region| region.blocks.iter())
-    {
-        irreducible_blocks[block.index()] = true;
+    let mut irreducible_owner = vec![None; cfg.blocks.len()];
+    for (index, region) in irreducible_regions.iter().enumerate() {
+        for block in &region.blocks {
+            irreducible_owner[block.index()] = Some(index);
+        }
     }
+    let irreducible_blocks = irreducible_owner
+        .iter()
+        .map(Option::is_some)
+        .collect::<Vec<_>>();
     let mut branch_candidates: Vec<_> = cfg
         .block_order
         .iter()
@@ -110,6 +113,20 @@ pub(super) fn analyze_branches(
                     .flatten()
             })
             .or_else(|| {
+                (!irreducible_blocks[header.index()])
+                    .then(|| {
+                        classify_cleanup_exit_guard(
+                            proto,
+                            cfg,
+                            graph_facts,
+                            header,
+                            then_entry,
+                            else_entry,
+                        )
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
                 // loop 内的 continue/break 会把严格后支配点推到 loop 外；必须先用
                 // loop owner 与 frontier 汇入事实恢复词法 tail，再考虑普通后支配单臂。
                 // 不可规约 SCC 则始终留给 island。
@@ -139,6 +156,27 @@ pub(super) fn analyze_branches(
                         )
                     })
                     .flatten()
+            })
+            .or_else(|| {
+                let owner = irreducible_owner[header.index()]?;
+                let then_inside = irreducible_owner[then_entry.index()] == Some(owner);
+                let else_inside = irreducible_owner[else_entry.index()] == Some(owner);
+                let (exit, continuation, invert_hint) = match (then_inside, else_inside) {
+                    (false, true) => (then_entry, else_entry, false),
+                    (true, false) => (else_entry, then_entry, true),
+                    _ => return None,
+                };
+                // SCC 外的边不能再回到同一 SCC，否则目标本就属于该分量。
+                // 因而只把退出边交给 guard；继续路径仍由 island 持有，不用外部
+                // 后支配点把其余循环体包进另一臂。边动作仍由最终计划核对。
+                Some(BranchCandidate {
+                    header,
+                    then_entry: exit,
+                    else_entry: None,
+                    merge: Some(continuation),
+                    kind: BranchKind::Guard,
+                    invert_hint,
+                })
             })
             .or_else(|| Some(classify_guard_branch(header, then_entry, else_entry)))
         })

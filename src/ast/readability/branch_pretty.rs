@@ -46,7 +46,8 @@ impl AstRewritePass for BranchPrettyPass {
         block.stmts = flattened_stmts;
         let merged_continues = merge_adjacent_continues(&mut block.stmts);
         let folded_terminal_guard = fold_terminal_guard_return(block, kind);
-        changed || merged_continues || folded_terminal_guard
+        let normalized_terminal_guard = normalize_terminal_guard_polarity(block);
+        changed || merged_continues || folded_terminal_guard || normalized_terminal_guard
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
@@ -652,6 +653,46 @@ fn flatten_terminating_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
 
     if_stmt.else_block = Some(else_block);
     Err(AstStmt::If(if_stmt))
+}
+
+fn normalize_terminal_guard_polarity(block: &mut AstBlock) -> bool {
+    let [.., AstStmt::If(if_stmt), tail] = block.stmts.as_mut_slice() else {
+        return false;
+    };
+    let is_direct_exit = |stmt: &AstStmt| {
+        matches!(
+            stmt,
+            AstStmt::Return(_) | AstStmt::Break | AstStmt::Continue
+        )
+    };
+    if if_stmt.preserves_arm_order
+        || if_stmt.else_block.is_some()
+        || !matches!(&if_stmt.cond, AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not)
+        || !matches!(if_stmt.then_block.stmts.as_slice(), [stmt] if is_direct_exit(stmt))
+        || !is_direct_exit(tail)
+    {
+        return false;
+    }
+
+    if matches!(
+        (&if_stmt.then_block.stmts[0], &*tail),
+        (AstStmt::Return(_), AstStmt::Return(_))
+    ) {
+        // 候选拒绝[LayerBoundary]：双 return 的空出口 guard 由
+        // fold_terminal_guard_return 规范化；反转其方向会在同一 pass 内反复恢复旧形。
+        return false;
+    }
+
+    // 候选接受：两条直接终止语句是互斥的完整两臂，没有声明、label 或额外求值
+    // 需要越过作用域；return 的值包与 break/continue 的最近循环 owner 均保持不变。
+    // 与显式 else 的否定整理保持同一方向，避免回编译把隐含另一臂反复翻转。
+    let AstExpr::Unary(unary) = std::mem::replace(&mut if_stmt.cond, AstExpr::Boolean(false))
+    else {
+        unreachable!("validated terminal guard condition must remain a unary not");
+    };
+    if_stmt.cond = unary.expr;
+    std::mem::swap(&mut if_stmt.then_block.stmts[0], tail);
+    true
 }
 
 /// 收回前层已经证明为常量的 `if`，但不越过诊断、跳转或词法作用域边界。

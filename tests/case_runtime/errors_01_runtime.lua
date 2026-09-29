@@ -39,10 +39,11 @@ local function test_coroutine()
         return value * 2
     end)
 
-    local _, first = coroutine.resume(co, 10)
-    local _, second = coroutine.resume(co)
-    local _, third = coroutine.resume(co)
+    local ok1, first = coroutine.resume(co, 10)
+    local ok2, second = coroutine.resume(co)
+    local ok3, third = coroutine.resume(co)
 
+    assert(ok1 and ok2 and ok3 and first == 11 and second == 13 and third == 26)
     print("common_11_runtime#2", first, second, third, coroutine.status(co))
 end
 
@@ -57,6 +58,7 @@ local function test_xpcall()
     end
 
     local ok, res = xpcall(fail, handler)
+    assert(not ok and res == "handled:oops")
     print("common_11_runtime#3", ok, res)
 end
 
@@ -98,6 +100,8 @@ local function test_xpcall_reuse()
         return risky("bad")
     end, handler)
 
+    assert(ok1 and a1 == "safe" and b1 == 12 and c1 == 18)
+    assert(not ok2 and res2 == "handled<boom:bad>")
     print("common_11_runtime#5", ok1, a1, b1, c1)
     print("common_11_runtime#5", ok2, res2)
 end
@@ -161,3 +165,12 @@ test_coro_resume_loop()
 -- unluac: expect-ast-max [[local-decl]] [[0]] [[@dialect=lua5.4]] [[@proto=13]]
 -- unluac: expect-ast-max [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=19]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@dialect=lua5.4]] [[@proto=20]]
+
+-- resume 循环只需 producer、co、results 和两个返回值；表尾索引应留在写入表达式内。
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=1]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=luau]]

@@ -41,9 +41,14 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let preserves_test = self.condition_reads_literal(payload.condition);
         let mut branch = branch_stmt(cond, self.finish_emission(region, then_block)?, else_block);
         if let HirStmt::If(if_stmt) = &mut branch {
-            // PolicyBoundary：原 TEST 即使读取已知常量也不是合成控制壳；两臂相同
-            // 不能授权 value folding 将它改成恒值后再消除。
-            if_stmt.preserves_empty_test = preserves_test;
+            // PolicyBoundary：原 TEST 即使读取已知常量或两臂只剩 fallthrough，
+            // 也不是合成控制壳；不能按值域或空臂删除这个独立检查。
+            if_stmt.preserves_empty_test = preserves_test
+                || (if_stmt.then_block.stmts.is_empty()
+                    && if_stmt
+                        .else_block
+                        .as_ref()
+                        .is_none_or(|arm| arm.stmts.is_empty()));
             if_stmt.preserves_arm_order = self.lowering.proto.constants.len() >= 256;
         }
         stmts.push(branch);
@@ -201,12 +206,90 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 },
             )],
         ));
+        if let Some(previous) = self.retired_value_input(selected, target) {
+            let mut release = assign_stmt(
+                vec![self.lowering.bindings.lvalue_for_temp(previous)],
+                vec![HirExpr::Nil],
+            );
+            let HirStmt::Assign(assign) = &mut release else {
+                unreachable!()
+            };
+            assign.root_release = Some(crate::hir::common::HirRootRelease::ValueOverwrite {
+                result: target,
+                released: previous,
+            });
+            stmts.push(release);
+        }
         stmts.extend_plain(self.lower_edge_effects(region, selected.shared_exit_action)?);
         #[cfg(debug_assertions)]
         for block in selected.blocks().filter(|block| *block != header) {
             self.mark_block_emitted(region, block, "plan emits one value block more than once")?;
         }
         Ok(stmts)
+    }
+
+    /// 分支结果覆盖已有 binding 时，合流值和旧根退休是两个独立义务。
+    /// 无观察的整段决策允许在结果写入后统一退休，不能把这个许可用于含调用的臂。
+    fn retired_value_input(
+        &self,
+        selected: &crate::structure::ValueDecisionPlan,
+        target: TempId,
+    ) -> Option<TempId> {
+        let lowering = self.lowering;
+        if lowering.target != crate::decompile::DecompileDialect::Luau
+            || lowering.dataflow.reg_is_captured(selected.result_reg)
+        {
+            return None;
+        }
+        let mut previous = None;
+        for leaf in &selected.leaves {
+            let SsaValue::Def(def) = leaf.physical_value else {
+                return None;
+            };
+            if lowering.dataflow.def_overwrites_unknown_scratch(def) {
+                return None;
+            }
+            let Some(SsaValue::Phi(phi)) = lowering.dataflow.def_overwritten_value(def) else {
+                return None;
+            };
+            if previous.is_some_and(|previous| previous != phi) {
+                return None;
+            }
+            previous = Some(phi);
+        }
+        let previous = lowering.bindings.phi_temps[previous?.index()];
+        let scope = lowering.bindings.temp_debug_scopes[previous.index()]?;
+        if lowering.bindings.temp_debug_scopes[target.index()] == Some(scope)
+            || lowering.bindings.lvalue_for_temp(target)
+                == lowering.bindings.lvalue_for_temp(previous)
+            || lowering.promotion_facts.trusted_temp_home_slot(previous)
+                != lowering.promotion_facts.trusted_temp_home_slot(target)
+            || lowering
+                .promotion_facts
+                .trusted_temp_home_slot(target)
+                .is_none()
+        {
+            return None;
+        }
+        let header = selected.header()?;
+        let predicate = selected.nodes[selected.entry.index()].predicate;
+        for block in selected.blocks() {
+            let range = lowering.cfg.blocks[block.index()].instrs;
+            let start = if block == header {
+                predicate.index()
+            } else {
+                range.start.index()
+            };
+            if lowering.dataflow.effect_summaries[start..range.end()]
+                .iter()
+                .any(|effect| effect.may_observe_gc_roots())
+            {
+                // 候选拒绝[ProofIncomplete:Lifetime]：不同路径的覆盖点与观察交织，
+                // 不能把各臂退休延迟到共同合流；保留各自的原根事务。
+                return None;
+            }
+        }
+        Some(previous)
     }
 
     fn absorb_value_entry_call(

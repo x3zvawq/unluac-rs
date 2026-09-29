@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirAssign, HirBinaryOpKind, HirBinding, HirBlock, HirCallExpr, HirExpr,
-    HirGenericForDispatchRelease, HirLValue, HirSourceSite, HirStmt, HirUnaryOpKind, HirValuePack,
-    LocalId, ParamId, TempId,
+    HirGenericForDispatchRelease, HirInlineRetentionReason, HirLValue, HirSourceSite, HirStmt,
+    HirUnaryOpKind, HirValuePack, LocalId, ParamId, TempId,
 };
 use crate::hir::expr_safety::{HirEvalEffects, HirExprSafety};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
@@ -25,6 +25,162 @@ pub(super) use events::{RootEventBlock, RootEventIndex, RootEventStmt};
 use lookup_values::ScalarValues;
 
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
+
+/// 合成的旧值退休只服务于 GC；全量显式写已证明为非资源值时可以撤销。
+/// 原 LOADNIL/Boolean 写没有此来源，不能借用值域证明删除实际操作。
+pub(super) fn remove_inert_value_releases(
+    proto: &mut crate::hir::common::HirProto,
+    safety: HirExprSafety,
+    dialect: crate::decompile::DecompileDialect,
+) -> bool {
+    fn binding(stmt: &HirStmt) -> Option<HirBinding> {
+        let HirStmt::Assign(assign) = stmt else {
+            return None;
+        };
+        if !matches!(
+            assign.root_release,
+            Some(crate::hir::common::HirRootRelease::ValueOverwrite { .. })
+        ) {
+            return None;
+        }
+        let ([target], [HirExpr::Nil], None) = (
+            assign.targets.as_slice(),
+            assign.values.fixed.as_slice(),
+            &assign.values.tail,
+        ) else {
+            return None;
+        };
+        match target {
+            HirLValue::Temp(temp) => Some(HirBinding::Temp(*temp)),
+            HirLValue::Local(local) => Some(HirBinding::Local(*local)),
+            _ => None,
+        }
+    }
+    if dialect != crate::decompile::DecompileDialect::Luau {
+        return false;
+    }
+    let mut has_release = false;
+    for stmt in &proto.body.stmts {
+        crate::hir::visit::visit_stmt_structure(stmt, &mut |stmt| {
+            has_release |= binding(stmt).is_some()
+        });
+    }
+    if !has_release {
+        return false;
+    }
+    let inert = super::object_flow::gc_inert_bindings(proto, safety);
+    fn block(body: &mut HirBlock, inert: &BTreeSet<HirBinding>) -> bool {
+        let before = body.stmts.len();
+        body.stmts
+            .retain(|stmt| binding(stmt).is_none_or(|binding| !inert.contains(&binding)));
+        let mut changed = before != body.stmts.len();
+        for stmt in &mut body.stmts {
+            super::walk::for_each_nested_block_mut(stmt, &mut |child| {
+                changed |= block(child, inert)
+            });
+        }
+        changed
+    }
+    block(&mut proto.body, &inert)
+}
+
+/// Locals 已把旧根和无观察覆盖归到同一身份时，由原写承担退休。
+/// 只撤销合成 nil；覆盖绑定继续发布原写保留义务，不能再独立删除真实写入。
+pub(super) fn remove_coalesced_root_releases(
+    proto: &mut crate::hir::common::HirProto,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    if proto.physical_root_locals.is_empty() {
+        return false;
+    }
+    struct Releases<'a> {
+        facts: &'a ProtoPromotionFacts,
+        roots: &'a BTreeSet<LocalId>,
+        retained: Vec<(TempId, LocalId, HirInlineRetentionReason)>,
+    }
+    impl super::walk::HirRewritePass for Releases<'_> {
+        fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+            let mut removed = vec![false; block.stmts.len()];
+            for (index, pair) in block.stmts.windows(2).enumerate() {
+                let [HirStmt::Assign(release), HirStmt::Assign(write)] = pair else {
+                    continue;
+                };
+                let Some(crate::hir::common::HirRootRelease::CopyOverwrite {
+                    overwrite: Some(overwrite),
+                    released,
+                    ..
+                }) = &release.root_release
+                else {
+                    continue;
+                };
+                let ([HirLValue::Local(local)], [HirExpr::Nil], None) = (
+                    release.targets.as_slice(),
+                    release.values.fixed.as_slice(),
+                    &release.values.tail,
+                ) else {
+                    continue;
+                };
+                if write.targets.as_slice() != [HirLValue::Local(*local)]
+                    || write.values.tail.is_some()
+                    || write.root_release.is_some()
+                    || !self.roots.contains(local)
+                    || self.facts.promoted_local_for_temp(*overwrite) != Some(*local)
+                {
+                    continue;
+                }
+                let reason = match write.values.fixed.as_slice() {
+                    [HirExpr::Boolean(_)] => HirInlineRetentionReason::BooleanValueContext,
+                    [HirExpr::LocalRef(input)] if input != local => {
+                        HirInlineRetentionReason::RootOverwrite
+                    }
+                    [HirExpr::ParamRef(_)] => HirInlineRetentionReason::RootOverwrite,
+                    // 候选拒绝[ProofIncomplete]：RHS 读取旧目标或能调用/分配时，不能省略独立的退休端点。
+                    _ => continue,
+                };
+                let Some(home) = self.facts.trusted_temp_home_slot(*overwrite) else {
+                    continue;
+                };
+                // 候选拒绝[ProofIncomplete]：展示身份相同不足以证明原覆盖；旧根、新 Def
+                // 和当前 Local 都须保有同一完整 home，且没有独立释放对象。
+                if self.facts.trusted_local_home_slot(*local) != Some(home)
+                    || released.is_empty()
+                    || released.iter().any(|temp| {
+                        self.facts.promoted_local_for_temp(*temp) != Some(*local)
+                            || self.facts.trusted_temp_home_slot(*temp) != Some(home)
+                    })
+                {
+                    continue;
+                }
+                // Boolean 或独立绑定读取不观察 GC；相邻、同身份的原写直接结束旧根。
+                // 两个真实写没有 release 来源，仍保留各自操作，不能当作重复 nil 清理。
+                removed[index] = true;
+                self.retained.push((*overwrite, *local, reason));
+            }
+            if !removed.iter().any(|removed| *removed) {
+                return false;
+            }
+            let mut index = 0;
+            block.stmts.retain(|_| {
+                let keep = !removed[index];
+                index += 1;
+                keep
+            });
+            true
+        }
+    }
+    let mut pass = Releases {
+        facts,
+        roots: &proto.physical_root_locals,
+        retained: Vec::new(),
+    };
+    let changed = super::walk::rewrite_block(&mut proto.body, &mut pass);
+    for (temp, local, reason) in pass.retained {
+        // 退休和实际覆盖是同一事务；不能先删合成 nil，再删除或内联真正结束旧根的写。
+        proto.inline_dispositions.preserve_temp(temp, reason);
+        proto.inline_dispositions.preserve_local(local, reason);
+    }
+    changed
+}
 
 /// 当前语句中必须只有一个仍匹配 producer 的参数交接端点；共享给内联和身份物化。
 pub(super) fn stmt_has_argument_root_handoff(stmt: &HirStmt, temp: TempId) -> bool {
@@ -803,7 +959,7 @@ pub(super) fn collect_call_root_lifetimes(
                     // 前层已证明最后值读取后、首个观察前覆盖时，读取不升级根事务。
                     if stmts[root.root_index]
                         .scalar_temp_assignment()
-                        .is_some_and(|(temp, _)| facts.call_result_root_ends_after_value_use(temp))
+                        .is_some_and(|(temp, _)| facts.result_root_ends_after_value_use(temp))
                     {
                         return false;
                     }
@@ -1426,13 +1582,15 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
                     .or_insert(Some(home));
             }
             for (temp, home) in release_homes {
-                let generic_for_dispatch_release = home.and_then(|home| {
+                let root_release = home.and_then(|home| {
                     let (dispatch, results) = dispatch_results.as_ref()?;
-                    Some(HirGenericForDispatchRelease {
-                        dispatch: *dispatch,
-                        result_def: *results.get(&home)?,
-                        released: temp,
-                    })
+                    Some(crate::hir::common::HirRootRelease::GenericForDispatch(
+                        HirGenericForDispatchRelease {
+                            dispatch: *dispatch,
+                            result_def: *results.get(&home)?,
+                            released: temp,
+                        },
+                    ))
                 });
                 new_stmts.push(HirStmt::Assign(Box::new(HirAssign {
                     luau_function_declaration: false,
@@ -1444,7 +1602,7 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
-                    generic_for_dispatch_release,
+                    root_release,
                     method_rewrite_transaction: None,
                 })));
             }

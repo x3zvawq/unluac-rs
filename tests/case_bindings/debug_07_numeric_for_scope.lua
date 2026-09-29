@@ -1,4 +1,7 @@
 -- numeric-for 迭代的尾部机械块不延长 debug binding 到下一轮，也不吞掉原始比较。
+-- unluac: expect-ast-count [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[assign]] [[2]]
+-- unluac: expect-ast-count [[numeric-for]] [[2]]
 -- unluac: expect-ast-count [[do-block]] [[0]]
 -- unluac: expect-contains [[item == 1 or item == 2]]
 local observations = {}

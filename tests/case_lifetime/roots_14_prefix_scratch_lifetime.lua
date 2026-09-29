@@ -1,7 +1,12 @@
 -- 原 nil 声明前缀与 CONCAT 输入 COPY 共同结束旧全局读取的 scratch 根。
 -- 字符串前缀保留、词法末端及后缀构造器必须由同一原帧事务验证。
+-- unluac: expect-ast-max [[local-binding]] [[13]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=3]]
 local weak = setmetatable({}, { __mode = "v" })
 local events = {}
+local lookups = 0
 local previous = getmetatable(_G)
 local left = setmetatable({}, {
     __concat = function(_, suffix)
@@ -14,6 +19,7 @@ local left = setmetatable({}, {
 setmetatable(_G, {
     __index = function(_, name)
         if name == "concat_prefix_dead_value" then
+            lookups = lookups + 1
             local value = {}
             weak[1] = value
             return value
@@ -38,4 +44,5 @@ end
 check()
 setmetatable(_G, previous)
 assert(table.concat(events, ",") == "false")
+assert(lookups == 1 and #events == 1 and weak[1] == nil)
 print("concat-prefix", table.concat(events, ","))

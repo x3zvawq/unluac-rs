@@ -50,7 +50,7 @@ pub(super) fn remove_readonly_parameter_phis(
                     if assign.is_phi_transfer
                         && assign.initializer_merge_transaction.is_none()
                         && assign.generic_for_initializer_producer.is_none()
-                        && assign.generic_for_dispatch_release.is_none()
+                        && assign.root_release.is_none()
                         && assign.method_rewrite_transaction.is_none() =>
                 {
                     Some(*param)
