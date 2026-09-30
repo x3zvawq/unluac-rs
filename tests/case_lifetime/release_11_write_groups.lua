@@ -2,6 +2,8 @@
 -- 覆盖合并 nil、分支内 nil、limit/step 槽及多个顺序覆盖；GC 残值按各 VM 原运行比较。
 -- unluac: expect-ast-max [[local-binding]] [[47]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=3]]
+-- unluac: expect-ast-count [[call]] [[3]] [[@proto=3]]
 -- unluac: expect-ast-count [[function]] [[11]]
 -- unluac: expect-ast-count [[numeric-for]] [[9]]
 local snapshots = {}

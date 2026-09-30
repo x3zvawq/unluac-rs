@@ -102,7 +102,6 @@ pub(super) fn collect_debug_groups(
                 base,
                 values: values.into(),
                 result_locals: locals,
-                discarded_result: None,
                 assignment_targets: Vec::new(),
                 luau_compound_global: false,
                 indexed_target: None,
@@ -279,7 +278,6 @@ pub(super) fn collect_upvalue_literals(
                 .collect::<Vec<_>>()
                 .into(),
             result_locals: Vec::new(),
-            discarded_result: None,
             assignment_targets: targets,
             luau_compound_global: false,
             indexed_target: None,
@@ -351,7 +349,6 @@ fn entry_nil_upvalues(
             base,
             values: vec![HirExpr::Nil; writes.len()].into(),
             result_locals: Vec::new(),
-            discarded_result: None,
             assignment_targets: writes
                 .iter()
                 .rev()
@@ -472,7 +469,6 @@ pub(super) fn collect_comparisons(
             base,
             values: values.into(),
             result_locals: seeds.into_iter().map(|(_, local)| local).collect(),
-            discarded_result: None,
             assignment_targets: Vec::new(),
             luau_compound_global: false,
             indexed_target: None,
@@ -671,7 +667,6 @@ pub(super) fn collect(
             base,
             values: values.into(),
             result_locals: seeds.into_iter().map(|(_, local)| local).collect(),
-            discarded_result: None,
             assignment_targets: Vec::new(),
             luau_compound_global: false,
             indexed_target: None,
@@ -1003,7 +998,6 @@ fn call_plan(
         base,
         values: values.into(),
         result_locals: members.iter().map(|(_, _, local)| *local).collect(),
-        discarded_result: None,
         assignment_targets: Vec::new(),
         luau_compound_global: false,
         indexed_target: None,

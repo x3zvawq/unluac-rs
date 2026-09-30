@@ -4,6 +4,13 @@
 -- unluac: expect-ast-max [[local-binding]] [[12]]
 -- unluac: expect-ast-count [[function]] [[2]]
 -- unluac: expect-ast-count [[do-block]] [[1]]
+-- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-max [[assign]] [[2]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=1]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[assign]] [[2]] [[@proto=1]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=1]] [[@dialect=luajit]]
+-- unluac: expect-max-count [[local ]] [[6]]
 
 local weak = setmetatable({}, { __mode = "v" })
 local released_during_dispatch = false

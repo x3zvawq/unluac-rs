@@ -58,9 +58,10 @@ pub(super) struct LexicalCfg {
     has_external_exit: bool,
 }
 
-/// 当前树中只退出到同块或祖先块尾部的 label。尾 label 不进入本块新声明的作用域；
+/// 当前树中只转移到同块或祖先块、且不进入新声明作用域的 label。
+/// 向前入口不能越过声明；回跳可以离开 label 之后的声明域，尾 label 位于本块声明域之外。
 /// 此证书仅解释控制位置，不授权移动求值、声明或资源边界，改写后必须重建。
-pub(super) fn trailing_label_exits(block: &HirBlock) -> BTreeSet<HirLabelId> {
+pub(super) fn label_scope_exits(block: &HirBlock) -> BTreeSet<HirLabelId> {
     struct Scan {
         cursor: usize,
         labels: BTreeMap<HirLabelId, Option<std::ops::Range<usize>>>,
@@ -69,6 +70,8 @@ pub(super) fn trailing_label_exits(block: &HirBlock) -> BTreeSet<HirLabelId> {
     impl Scan {
         fn block(&mut self, block: &HirBlock) {
             let start = self.cursor;
+            let mut declaration_boundary = start;
+            let mut labels = Vec::new();
             let trailing = block
                 .stmts
                 .iter()
@@ -80,16 +83,39 @@ pub(super) fn trailing_label_exits(block: &HirBlock) -> BTreeSet<HirLabelId> {
                 match stmt {
                     HirStmt::Goto(goto) => self.gotos.push((goto.target, position)),
                     HirStmt::Label(label) => {
-                        // 尾部只剩 labels，当前 cursor 已包含本块全部可能的 goto。
-                        let range = (index >= trailing).then_some(start..self.cursor);
+                        // 前界排除跨声明的向前入口；后界在本块结束时统一封口。
+                        // 后续子块的回跳仅离开声明域，不会进入兄弟块或跳过初始化。
+                        let range_start = if index >= trailing {
+                            start
+                        } else {
+                            declaration_boundary
+                        };
+                        let range = Some(range_start..self.cursor);
                         self.labels
                             .entry(label.id)
                             .and_modify(|value| *value = None)
                             .or_insert(range);
+                        labels.push(label.id);
+                    }
+                    HirStmt::LocalDecl(_) => declaration_boundary = self.cursor,
+                    HirStmt::Assign(assign)
+                        if assign.targets.iter().any(|target| {
+                            matches!(target, crate::hir::common::HirLValue::Temp(_))
+                        }) =>
+                    {
+                        // 未提升的 Temp 仍可能物化为本块声明；身份未固定时不签发
+                        // 跨越它的入口许可，实际前缀仍由 source-frames 逐项核对。
+                        declaration_boundary = self.cursor;
                     }
                     _ => crate::hir::visit::for_each_nested_block(stmt, &mut |child| {
                         self.block(child)
                     }),
+                }
+            }
+            // 每个 label 只更新一次；不按回跳数量重新扫描其后的声明和子块。
+            for label in labels {
+                if let Some(Some(range)) = self.labels.get_mut(&label) {
+                    range.end = self.cursor;
                 }
             }
         }

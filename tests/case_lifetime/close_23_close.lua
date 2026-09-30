@@ -3,6 +3,13 @@
 -- unluac: expect-ast-count [[close-binding]] [[2]] [[@proto=7]]
 -- unluac: expect-ast-max [[local-binding]] [[131]]
 -- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=7]]
+-- 资源关闭屏障后的开放返回保留普通 CALL，但无需 callee 接棒声明。
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=15]]
+-- 分配新表前的独立调用直接初始化结果，只保留后续字段写。
+-- unluac: expect-ast-count [[assign]] [[2]] [[@proto=36]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=43]]
+-- 返回快照直接进入完整返回包，不增加末端接棒声明。
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=62]]
 local function test_tbc_basic()
     local log = {}
 

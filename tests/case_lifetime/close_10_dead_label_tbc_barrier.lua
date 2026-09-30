@@ -7,6 +7,7 @@
 -- unluac: expect-ast-count [[close-binding]] [[1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[do-block]] [[1]]
+-- unluac: expect-count [[assert(]] [[3]]
 
 local closed = 0
 local closer = setmetatable({}, {

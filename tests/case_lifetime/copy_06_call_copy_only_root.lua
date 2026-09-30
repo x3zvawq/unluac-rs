@@ -3,6 +3,8 @@
 -- unluac: expect-ast-max [[local-binding]] [[5]]
 -- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-not-contains [[= collectgarbage]]
+-- unluac: expect-not-contains [[= assert]]
 
 local finalized = false
 local object = {}

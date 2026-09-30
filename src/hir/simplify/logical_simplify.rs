@@ -151,10 +151,11 @@ fn simplify_boolean_coercion(expr: &mut HirExpr) -> bool {
     let HirExpr::LogicalAnd(and) = &or.lhs else {
         unreachable!()
     };
+    let facts = crate::hir::value_facts::value_facts(&and.lhs);
     if !matches!(
         and.lhs,
         HirExpr::LocalRef(_) | HirExpr::ParamRef(_) | HirExpr::TempRef(_)
-    ) && !crate::hir::value_facts::value_facts(&and.lhs).is_gc_inert()
+    ) && !facts.is_gc_inert()
     {
         // 候选拒绝[ProofIncomplete:RootLifetime]：CALL/读取的结果可能仍占原 scratch；
         // 双 NOT 会提前覆盖它。无新增准备的绑定读取及 GC-inert 结果不承担此旧根。
@@ -167,6 +168,16 @@ fn simplify_boolean_coercion(expr: &mut HirExpr) -> bool {
         unreachable!("boolean coercion retains its inner and");
     };
     let mut value = and.lhs;
+    if !facts.is_boolean() && facts.restrict(true).is_boolean() {
+        // 真值已经只能是 true；保留 or false 归一 nil 即可，不向短路叶引入
+        // 重编译后必须保留的显式 NOT。原 operand 的调用、检查和运算均不删除。
+        *expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            lhs: value,
+            rhs: HirExpr::Boolean(false),
+            preserves_boolean_prewrite: false,
+        }));
+        return true;
+    }
     for _ in 0..2 {
         value = HirExpr::Unary(Box::new(HirUnaryExpr {
             op: HirUnaryOpKind::Not,

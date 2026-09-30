@@ -5,6 +5,8 @@
 -- unluac: expect-ast-count [[close-binding]] [[3]]
 -- unluac: expect-ast-count [[repeat]] [[3]]
 -- unluac: expect-ast-count [[repeat-condition-local]] [[1]]
+-- 后续资源激活不应让循环前半段的普通调用留下 callee 中转。
+-- unluac: expect-count [[assert(]] [[6]]
 
 local closed = 0
 local closer = setmetatable({}, {

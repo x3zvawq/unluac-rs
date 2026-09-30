@@ -84,6 +84,41 @@ pub(super) fn remove_inert_value_releases(
     block(&mut proto.body, &inert)
 }
 
+/// 查询合成退休端点所归属的原覆盖及已物化身份；只接受完整 home 一致的单个旧根。
+pub(super) fn copy_release_local(
+    stmt: &HirStmt,
+    overwrite: TempId,
+    facts: &ProtoPromotionFacts,
+) -> Option<LocalId> {
+    let HirStmt::Assign(release) = stmt else {
+        return None;
+    };
+    let Some(crate::hir::common::HirRootRelease::CopyOverwrite {
+        overwrite: Some(target),
+        released,
+        ..
+    }) = &release.root_release
+    else {
+        return None;
+    };
+    let ([HirLValue::Local(local)], [HirExpr::Nil], None) = (
+        release.targets.as_slice(),
+        release.values.fixed.as_slice(),
+        &release.values.tail,
+    ) else {
+        return None;
+    };
+    let home = facts.trusted_temp_home_slot(overwrite)?;
+    (*target == overwrite
+        && facts.trusted_local_home_slot(*local) == Some(home)
+        && !released.is_empty()
+        && released.iter().all(|temp| {
+            facts.promoted_local_for_temp(*temp) == Some(*local)
+                && facts.trusted_temp_home_slot(*temp) == Some(home)
+        }))
+    .then_some(*local)
+}
+
 /// Locals 已把旧根和无观察覆盖归到同一身份时，由原写承担退休。
 /// 只撤销合成 nil；覆盖绑定继续发布原写保留义务，不能再独立删除真实写入。
 pub(super) fn remove_coalesced_root_releases(
@@ -107,7 +142,6 @@ pub(super) fn remove_coalesced_root_releases(
                 };
                 let Some(crate::hir::common::HirRootRelease::CopyOverwrite {
                     overwrite: Some(overwrite),
-                    released,
                     ..
                 }) = &release.root_release
                 else {
@@ -137,18 +171,9 @@ pub(super) fn remove_coalesced_root_releases(
                     // 候选拒绝[ProofIncomplete]：RHS 读取旧目标或能调用/分配时，不能省略独立的退休端点。
                     _ => continue,
                 };
-                let Some(home) = self.facts.trusted_temp_home_slot(*overwrite) else {
-                    continue;
-                };
                 // 候选拒绝[ProofIncomplete]：展示身份相同不足以证明原覆盖；旧根、新 Def
                 // 和当前 Local 都须保有同一完整 home，且没有独立释放对象。
-                if self.facts.trusted_local_home_slot(*local) != Some(home)
-                    || released.is_empty()
-                    || released.iter().any(|temp| {
-                        self.facts.promoted_local_for_temp(*temp) != Some(*local)
-                            || self.facts.trusted_temp_home_slot(*temp) != Some(home)
-                    })
-                {
+                if copy_release_local(&pair[0], *overwrite, self.facts) != Some(*local) {
                     continue;
                 }
                 // Boolean 或独立绑定读取不观察 GC；相邻、同身份的原写直接结束旧根。
@@ -3044,7 +3069,7 @@ fn call_with_inert_dispatch_prefix(stmt: &HirStmt, safety: HirExprSafety) -> Opt
     .then_some(call)
 }
 
-fn direct_call_in_stmt(stmt: &HirStmt) -> Option<&HirCallExpr> {
+pub(super) fn direct_call_in_stmt(stmt: &HirStmt) -> Option<&HirCallExpr> {
     let values = match stmt {
         HirStmt::CallStmt(call_stmt) => return Some(&call_stmt.call),
         HirStmt::LocalDecl(local_decl) => &local_decl.values,

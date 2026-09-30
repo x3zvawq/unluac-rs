@@ -46,13 +46,14 @@ end
 -- common_01_basics#4: 多层嵌套变量遮蔽与条件返回
 -- unluac: expect-count [[print("common_01_basics#4",]] [[3]]
 -- stripped 仍更新原低槽变量，不为 CONCAT 写回增加局部副本。
--- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.1]]
--- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.2]]
--- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.3]]
--- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.4]]
--- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.5]]
+-- PUC/LuaJIT 可保留 root、branch、else 三个原声明；else 仍是高槽调用的前缀。
+-- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.5]]
 -- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=luau]]
--- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=3]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=3]] [[@dialect=luajit]]
 local function test_shadowed_locals()
     local function choose(flag)
         local value = "root"

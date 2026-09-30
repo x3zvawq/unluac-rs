@@ -758,6 +758,7 @@ pub(in crate::hir::simplify) fn restore_entry_frame(
             bindings: locals,
             values,
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))],
     );
     true

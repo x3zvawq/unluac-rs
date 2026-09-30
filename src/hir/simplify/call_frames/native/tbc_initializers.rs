@@ -17,16 +17,14 @@ pub(in crate::hir::simplify) fn restore(
     let mut flat = Vec::new();
     let mut count = 0;
     let mut registrations = BTreeMap::<HomeSlotKey, usize>::new();
-    prefix::coordinates::visit(&proto.body, &mut count, &mut |id, kind, stmt| {
-        if kind != PointKind::Statement || matches!(stmt, HirStmt::Block(_)) {
-            flat.push(None);
-            return;
-        }
-        if let HirStmt::ToBeClosed(tbc) = stmt {
+    // 词法化后的资源块入口没有求值；与普通帧共用遍历，仍在控制边界和
+    // 子域出口切断准备区，允许原 callee 声明与块内 TBC 初始化共同签证。
+    flatten_scope(&proto.body, &mut count, &mut flat);
+    for entry in flat.iter().flatten() {
+        if let HirStmt::ToBeClosed(tbc) = entry.stmt {
             *registrations.entry(facts.tbc_home(tbc.origin)).or_default() += 1;
         }
-        flat.push(Some(FlatStmt { id, stmt }));
-    });
+    }
     if registrations.is_empty() {
         return false;
     }

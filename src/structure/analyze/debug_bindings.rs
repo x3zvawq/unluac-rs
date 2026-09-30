@@ -356,10 +356,11 @@ pub(super) fn ssa_value_at_debug_scope_entry(
             || dataflow.block_entry_value(block, reg),
             super::super::SsaValue::Def,
         );
-    // 循环每轮先覆盖再读取时，pruned SSA 不保留入口 phi。debug 仍明确把
-    // 紧邻 scope 入口前的原写入归给该 local；确认它支配入口，避免把相邻分支
-    // 的末笔写误认成共同初始化，也不以回边重赋值替换原声明。
-    if value == SsaValue::Entry(reg)
+    // 回跳入口可以保留 carried phi，也可能因每轮先覆盖而被 pruned SSA 省去。
+    // debug 紧邻入口前的原写入仍属于初始化；其块须支配入口，不能把相邻分支
+    // 的末笔写当作共同初始化，也不依赖该循环最终是否能用结构化语法表达。
+    if (value == SsaValue::Entry(reg)
+        || matches!(value, SsaValue::Phi(phi) if dataflow.phi_candidates[phi.index()].block == block))
         && let Some(previous) = instr.index().checked_sub(1).map(InstrRef)
         && let Some(def) = dataflow.instr_def_for_reg(previous, reg)
         && proto.lowering_map.pc_map()[previous.index()]

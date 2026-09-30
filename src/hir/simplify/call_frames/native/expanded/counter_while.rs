@@ -265,7 +265,6 @@ pub(super) fn plans(context: NativeFrameContext<'_>, facts: &ProtoPromotionFacts
                 base,
                 values: vec![HirExpr::Call(Box::new(restored))].into(),
                 result_locals: Vec::new(),
-                discarded_result: None,
                 assignment_targets: Vec::new(),
                 luau_compound_global: false,
                 indexed_target: None,

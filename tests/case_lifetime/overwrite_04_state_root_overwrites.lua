@@ -5,6 +5,8 @@
 -- unluac: expect-ast-max [[local-binding]] [[12]]
 -- unluac: expect-ast-count [[function]] [[3]]
 -- unluac: expect-count [[ 9]] [[1]]
+-- 重复目标及带回调的两组赋值保留完整 RHS/写回，不拆成标量中转链。
+-- unluac: expect-ast-max [[assign]] [[2]] [[@proto=0]]
 local weak = setmetatable({}, { __mode = "v" })
 
 local function run(swap, clear_with_nil)

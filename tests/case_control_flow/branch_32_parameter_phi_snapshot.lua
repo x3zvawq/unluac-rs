@@ -1,6 +1,7 @@
 -- 同值 incoming 只代表选择时的快照；之后改写被引用捕获的参数不能改变 chosen。
--- unluac: expect-contains [[assert(r0_46 == not r0_44)]] [[@variant=O2]] [[@debug=stripped]]
--- unluac: expect-ast-count [[local-binding]] [[65]] [[@proto=0]] [[@variant=O2]] [[@debug=stripped]]
+-- NOT 直接作为比较 RHS；允许匿名绑定合并后重新编号。
+-- unluac: expect-count [[== not ]] [[2]] [[@variant=O2]] [[@debug=stripped]]
+-- unluac: expect-ast-max [[local-binding]] [[52]] [[@proto=0]] [[@variant=O2]] [[@debug=stripped]]
 -- unluac: expect-not-contains [[assert(r0_]] [[@variant=O2]] [[@debug=retained]]
 -- unluac: expect-contains [[local chosen]] [[@debug=retained]]
 -- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=5]] [[@variant=O0]]

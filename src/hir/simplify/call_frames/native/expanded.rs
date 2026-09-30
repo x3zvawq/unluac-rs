@@ -549,7 +549,7 @@ pub(in crate::hir::simplify) fn restore(
             }
         });
         plans.sort_unstable_by_key(|plan| plan.sink);
-        let Ok(mut preview) = build_preview(proto, facts, &plans, count) else {
+        let Ok(mut preview) = build_preview(proto, facts, dialect, &plans, count) else {
             continue;
         };
         // 展开体退休旧 epoch 后，同槽 CALL/CLOSURE 等写入才能成为后继声明。
@@ -593,6 +593,7 @@ pub(in crate::hir::simplify) fn restore(
         }
         let Ok(mut preserved) = validate_plan_batch(
             &mut preview,
+            proto,
             &plans,
             facts,
             dialect,
@@ -930,7 +931,6 @@ fn standalone_initializer_frame(
             base: home,
             values: vec![HirExpr::Call(Box::new(rebuilt))].into(),
             result_locals: Vec::new(),
-            discarded_result: None,
             assignment_targets: Vec::new(),
             luau_compound_global: false,
             indexed_target: None,
@@ -957,7 +957,6 @@ fn standalone_initializer_frame(
             base,
             values: vec![value.clone()].into(),
             result_locals: Vec::new(),
-            discarded_result: None,
             assignment_targets: Vec::new(),
             luau_compound_global: false,
             indexed_target: Some((**access).clone()),
@@ -1019,7 +1018,6 @@ fn standalone_initializer_frame(
         base,
         values: vec![value.clone()].into(),
         result_locals: vec![local],
-        discarded_result: None,
         assignment_targets: Vec::new(),
         luau_compound_global: false,
         indexed_target: None,
@@ -1371,7 +1369,6 @@ fn indexed_candidate<'a>(
             base,
             values: vec![HirExpr::Call(Box::new(call))].into(),
             result_locals: vec![result],
-            discarded_result: None,
             assignment_targets: Vec::new(),
             luau_compound_global: false,
             indexed_target: None,
@@ -1550,7 +1547,6 @@ fn invocation_plan(
         base,
         values: vec![HirExpr::Call(Box::new(call))].into(),
         result_locals: vec![result],
-        discarded_result: None,
         assignment_targets: Vec::new(),
         luau_compound_global: false,
         indexed_target: None,

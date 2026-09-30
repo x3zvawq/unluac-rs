@@ -5,6 +5,7 @@ use super::*;
 
 pub(super) mod lookups;
 mod luau;
+pub(super) mod nil;
 pub(super) mod varargs;
 
 /// Luau 参数在整个 proto 中保持原值时，透明 MOVE 链可提供稳定的值身份。
@@ -74,7 +75,7 @@ pub(super) fn collect_readonly_parameter_copies(
         .collect()
 }
 
-/// 首项在高槽准备字面量或旧值快照，再写第二项字面量和第一项 COPY。
+/// 首项在高槽准备字面量或旧值快照，再按原逆序写回两项目标。
 #[derive(Debug, Clone)]
 pub(in crate::hir) struct ScalarPairFrame {
     pub(in crate::hir) temps: [TempId; 3],
@@ -183,7 +184,7 @@ pub(super) fn collect_scalar_pairs(
             return None;
         };
         let second_site = InstrRef(index + 1);
-        let (second_reg, tail, copied_tail) = if let LowInstr::Move(copy) = second {
+        let (mut second_reg, tail, copied_tail) = if let LowInstr::Move(copy) = second {
             if copy.src == last.src || epochs.reference_capture_may_be_open(copy.src, second_site) {
                 return None;
             }
@@ -208,21 +209,48 @@ pub(super) fn collect_scalar_pairs(
                 (reg, None, Some(value))
             },
         };
-        if last.src != snapshot_reg || last.dst == second_reg
+        let mut last = last;
+        let mut second_write = second_site;
+        let mut last_site = InstrRef(index + 2);
+        if second_reg.index() >= snapshot_reg.index() {
+            let Some(LowInstr::Move(final_write)) = proto.instrs.get(index + 3) else { return None; };
+            let literal = dataflow.instr_def_for_reg(second_site, second_reg)?;
+            if copied_tail.is_some() || second_reg.index() != snapshot_reg.index() + 1
+                || last.src != second_reg || last.dst.index() >= snapshot_reg.index()
+                || dataflow.use_value(last_site, last.src) != SsaValue::Def(literal)
+                || fixed_temps[literal.index()] != TempId(literal.index())
+                || !dataflow.def_phi_uses[literal.index()].is_empty()
+                || !matches!(dataflow.def_uses[literal.index()].as_slice(), [use_] if use_.instr == last_site)
+                || epochs.reference_capture_may_be_open(second_reg, second_site)
+                || epochs.epoch_at(second_reg, second_site) != epochs.epoch_at(second_reg, last_site)
+            {
+                // 候选拒绝[ProofIncomplete]：末项高槽必须是仅供当前低槽 COPY 消费的
+                // 原字面量准备；额外读取、合流或捕获需要另一份完整写回证明。
+                return None;
+            }
+            // 重复目标的末项先在高槽准备，再 COPY 回低槽；中间常量写不能因
+            // 最终被快照覆盖而消失。HIR 可已把字面量收进这次 COPY，仍保留三个原写的身份。
+            second_reg = last.dst;
+            second_write = last_site;
+            last_site = InstrRef(index + 3);
+            last = final_write;
+        }
+        if last.src != snapshot_reg
             || last.dst.index() >= last.src.index()
             || second_reg.index() >= last.src.index()
-            || cfg.instr_to_block[index] != cfg.instr_to_block[index + 2]
+            || cfg.instr_to_block[index] != cfg.instr_to_block[last_site.index()]
         {
             return None;
         }
         let regs = [snapshot_reg, second_reg, last.dst];
         let mut temps = [TempId(0); 3];
         let mut homes = [HomeSlotKey::new(0, 0); 3];
-        for (offset, reg) in regs.into_iter().enumerate() {
-            let site = InstrRef(index + offset);
+        for (offset, (reg, site)) in regs.into_iter().zip([first_site, second_write, last_site]).enumerate() {
             let def = dataflow.instr_def_for_reg(site, reg)?;
+            // 只退休高槽快照；两个低槽仍按原逆序写回，捕获 cell 的发布时点不变。
+            // 输入 COPY 已在各自读取处排除开放捕获，不能把该限制再套到写目标上。
             if fixed_temps[def.index()] != TempId(def.index())
-                || epochs.reference_capture_may_be_open(reg, site)
+                || offset == 0 && epochs.reference_capture_may_be_open(reg, site)
             {
                 return None;
             }
@@ -230,7 +258,6 @@ pub(super) fn collect_scalar_pairs(
             homes[offset] = HomeSlotKey::new(reg.index(), epochs.epoch_at(reg, site));
         }
         let first_def = dataflow.instr_def_for_reg(InstrRef(index), regs[0])?;
-        let last_site = InstrRef(index + 2);
         if dataflow.use_value(last_site, last.src) != SsaValue::Def(first_def)
             || !dataflow.def_phi_uses[first_def.index()].is_empty()
             || !matches!(dataflow.def_uses[first_def.index()].as_slice(), [use_] if use_.instr == last_site)
@@ -351,7 +378,27 @@ pub(super) fn collect_parallel(
         if end - write_start < 2 {
             continue;
         }
-        let base = next_target.unwrap();
+        let Some(result) = dataflow.instr_def_for_reg(site, call.callee) else {
+            continue;
+        };
+        let Some(call_offset) = (write_start..end).rev().position(|position| {
+            let LowInstr::Move(copy) = proto.instrs[position] else {
+                unreachable!()
+            };
+            dataflow.use_value(InstrRef(position), copy.src) == SsaValue::Def(result)
+        }) else {
+            continue;
+        };
+        // 被赋值变量可以位于任意低槽；scratch 从原 CALL 的 RHS 序号反推，
+        // 不能把最高目标槽之后误认为空闲区，中间还可能有其它存活声明。
+        let Some(base) = call
+            .callee
+            .index()
+            .checked_sub(call_offset)
+            .filter(|base| *base >= next_target.unwrap())
+        else {
+            continue;
+        };
         let mut start = index;
         while start > 0
             && cfg.instr_to_block[start - 1] == block
@@ -372,12 +419,16 @@ pub(super) fn collect_parallel(
                 let def = dataflow.instr_def_for_reg(at, copy.dst)?;
                 if fixed_temps[def.index()] != TempId(def.index())
                     || [copy.dst, copy.src].iter().any(|&reg| {
-                        epochs.reference_capture_may_be_open(reg, at)
-                            || epochs.epoch_at(reg, at) != epochs.epoch_at(reg, InstrRef(start))
+                        epochs.epoch_at(reg, at) != epochs.epoch_at(reg, InstrRef(start))
                     })
+                    || epochs.reference_capture_may_be_open(copy.src, at)
+                    || (position < write_start
+                        && epochs.reference_capture_may_be_open(copy.dst, at))
                 {
                     return None;
                 }
+                // 最后的低槽写回已在全部 RHS 之后，完整赋值按同一逆序重发这些写。
+                // 目标 cell 可以被捕获；中间准备写和读取已激活 cell 的来源仍不在此授权。
                 tail.push(ParallelWrite {
                     target: TempId(def.index()),
                     source: temp(dataflow.use_value(at, copy.src))?,
@@ -434,6 +485,7 @@ pub(super) fn collect_parallel(
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SwapFrame {
     pub(super) snapshot: TempId,
+    pub(super) writes: [TempId; 2],
     pub(super) left: HirBinding,
     pub(super) right: HirBinding,
     pub(super) left_home: HomeSlotKey,
@@ -448,7 +500,7 @@ pub(super) fn collect(
     epochs: &SlotEpochFacts,
     fixed_temps: &[TempId],
     phi_temps: &[TempId],
-) -> Vec<SwapFrame> {
+) -> BTreeMap<TempId, SwapFrame> {
     proto.instrs.windows(3).enumerate().filter_map(|(index, window)| {
         let [LowInstr::Move(save), LowInstr::Move(second), LowInstr::Move(last)] = window else {
             return None;
@@ -479,13 +531,18 @@ pub(super) fn collect(
         let value = |site, reg| canonical_value_temp(
             dataflow.use_value(site, reg), dataflow.defs.len(), fixed_temps, phi_temps,
         );
-        Some(SwapFrame {
+        let frame = SwapFrame {
             snapshot: TempId(snapshot.index()),
+            writes: [
+                TempId(dataflow.instr_def_for_reg(second_site, second.dst)?.index()),
+                TempId(dataflow.instr_def_for_reg(last_site, last.dst)?.index()),
+            ],
             left: HirBinding::Temp(value(second_site, second.src)?),
             right: HirBinding::Temp(value(first_site, save.src)?),
             left_home: HomeSlotKey::new(second.src.index(), epochs.epoch_at(second.src, first_site)),
             right_home: HomeSlotKey::new(save.src.index(), epochs.epoch_at(save.src, first_site)),
             home: HomeSlotKey::new(save.dst.index(), epochs.epoch_at(save.dst, first_site)),
-        })
+        };
+        Some((frame.snapshot, frame))
     }).collect()
 }

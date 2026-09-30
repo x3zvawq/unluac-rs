@@ -1,9 +1,11 @@
 -- 共同结束的源码 local 跨 if/else 时仍须共享同一 do，不能按 producer 基本块拆开。
--- unluac: expect-ast-min [[do-block]] [[1]] [[@debug=retained]]
--- unluac: expect-ast-min [[if]] [[1]]
+-- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[do-block]] [[1]]
 -- unluac: expect-ast-max [[local-binding]] [[5]]
 -- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]]
+-- unluac: expect-ast-count [[call]] [[5]] [[@proto=1]]
+-- unluac: expect-ast-count [[assign]] [[4]] [[@proto=1]]
 local calls = 0
 local function run(flag, nested)
     local weak = setmetatable({}, { __mode = "k" })

@@ -2,13 +2,18 @@
 -- unluac: expect-contains [[show_overlay()]]
 -- unluac: expect-contains [[hide_overlay()]]
 -- unluac: expect-contains [[r0_0 = screen_pressed()]]
+-- unluac: expect-contains [[r0_7, r0_8 = 0, nil]]
+-- unluac: expect-contains [[r0_11, r0_12, r0_13 = coroutine.resume(r0_10)]]
 -- unluac: expect-not-contains [[goto]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[not not (screen_pressed()]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-max [[local-binding]] [[17]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=7]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=7]]
+-- unluac: expect-ast-max [[local-binding]] [[21]]
 
 local last_pressed = false
 local pressed_edge = false
@@ -72,6 +77,10 @@ local cases = {
     { false, false, true, false, true, "hide" },
     { true, false, false, true, false, "show" },
     { false, true, false, false, false, "hide" },
+    { true, false, nil, false, false, "show" },
+    { false, false, 0, "held", true, "hide" },
+    { true, true, true, nil, false, "hide" },
+    { false, false, true, false, true, "hide" },
 }
 for i, case in ipairs(cases) do
     enabled, hidden, first, second = case[1], case[2], case[3], case[4]
@@ -83,3 +92,26 @@ for i, case in ipairs(cases) do
     assert(coroutine.status(worker) == "suspended")
     print("regress_70#1", i, last, edge, action, calls)
 end
+
+-- 直接覆盖再编译产生的布尔值帧；上值必须在调用修改之后读取，不能先保存旧值。
+local function probe_condition()
+    while true do
+        pressed_edge = condition_read() and not last_pressed or false
+        coroutine.yield(pressed_edge)
+    end
+end
+function condition_read()
+    calls = calls + 1
+    last_pressed = not last_pressed
+    return first
+end
+local condition_worker = coroutine.create(probe_condition)
+for _, case in ipairs(cases) do
+    first = case[3]
+    last_pressed = case[5]
+    calls = 0
+    ok, edge = coroutine.resume(condition_worker)
+    assert(ok and edge == case[5] and pressed_edge == edge and calls == 1,
+        "condition read did not observe the call's write")
+end
+print("condition-frame", "OK")

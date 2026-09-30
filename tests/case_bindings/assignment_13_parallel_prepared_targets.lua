@@ -88,3 +88,33 @@ assert(#observed_rhs == 2 and observed_rhs[1] == expected_last and observed_rhs[
 assert(rhs_target[1] == expected_first and rhs_target[2] == expected_last)
 assert(first_rhs ~= expected_first and last_rhs ~= expected_last)
 print("parallel_upvalue_rhs_snapshot", "OK")
+
+-- 动态 key 的运算改变目标 cell，第一次写回又改变它；观测各方言原有的快照时点。
+local dynamic_target, dynamic_key
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=10]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=10]]
+local function write_dynamic_keys(first, last)
+    dynamic_target[dynamic_key + 1], dynamic_target[dynamic_key + 2] = first, last
+end
+local dynamic_writes = {}
+local first_target, second_target, third_target = {}, {}, {}
+local target_names = {[first_target] = "first", [second_target] = "second", [third_target] = "third"}
+local target_metatable = {__newindex = function(destination, key, value)
+    dynamic_writes[#dynamic_writes + 1] = target_names[destination] .. ":" .. key .. ":" .. value
+    dynamic_target = first_target
+end}
+setmetatable(first_target, target_metatable)
+setmetatable(second_target, target_metatable)
+setmetatable(third_target, target_metatable)
+local key_evaluations = 0
+dynamic_key = setmetatable({}, {__add = function(_, index)
+    key_evaluations = key_evaluations + 1
+    assert(key_evaluations == index)
+    dynamic_target = index == 1 and second_target or third_target
+    return index
+end})
+dynamic_target = first_target
+write_dynamic_keys("left", "right")
+assert(key_evaluations == 2 and #dynamic_writes == 2)
+assert(string.match(dynamic_writes[1], ":2:right$") and string.match(dynamic_writes[2], ":1:left$"))
+print("parallel_dynamic_targets", table.concat(dynamic_writes, ","))

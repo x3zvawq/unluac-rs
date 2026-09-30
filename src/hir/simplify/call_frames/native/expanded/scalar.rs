@@ -53,7 +53,7 @@ pub(super) fn constant_comparisons(
             prefix_at_sink: false,
             luau_function_declaration: false,
             start: index, sink: index, base: frame.home, values: vec![HirExpr::Call(Box::new(call.clone()))].into(),
-            result_locals: Vec::new(), discarded_result: None, assignment_targets: Vec::new(),
+            result_locals: Vec::new(), assignment_targets: Vec::new(),
             luau_compound_global: false, indexed_target: None, continuing_root: None,
             retained_copies: Vec::new(), replayed_effects: Vec::new(), removed: Vec::new(),
         };
@@ -616,6 +616,7 @@ pub(super) fn preserve_updates(proto: &mut HirProto, facts: &mut ProtoPromotionF
                 bindings: vec![local],
                 values,
                 initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })));
         } else {
             statements.push(HirStmt::Assign(Box::new(HirAssign {

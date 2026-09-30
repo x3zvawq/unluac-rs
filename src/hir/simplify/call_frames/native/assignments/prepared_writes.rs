@@ -23,7 +23,14 @@ fn input_home(
 ) -> Option<HomeSlotKey> {
     match &assign.targets[0] {
         HirLValue::Upvalue(_) => Some(facts.upvalue_write_value(assign)?.1),
-        HirLValue::TableAccess(access) => facts.native_table_write_layout(access)?.value,
+        HirLValue::TableAccess(access) => facts
+            .native_table_write_layout(access)
+            .and_then(|layout| layout.value)
+            .or_else(|| {
+                facts
+                    .native_upvalue_table_write_layout(access)
+                    .and_then(|layout| layout.value)
+            }),
         _ => None,
     }
 }
@@ -147,11 +154,20 @@ fn candidate(
         let HirLValue::TableAccess(access) = target else {
             continue;
         };
-        let layout = facts.native_table_write_layout(access)?;
-        if layout.key.is_some()
-            || builder.literal_uses_rk(&access.key, Some((&access.sources, false))) != Some(true)
+        let key = facts
+            .native_table_write_layout(access)
+            .map(|layout| layout.key)
+            .or_else(|| {
+                facts
+                    .native_upvalue_table_write_layout(access)
+                    .map(|layout| layout.key)
+            })?;
+        if let Some(home) = key {
+            if home.slot() < base.slot() {
+                base = home;
+            }
+        } else if builder.literal_uses_rk(&access.key, Some((&access.sources, false))) != Some(true)
         {
-            // 候选拒绝[ProofIncomplete]：动态 key 的原准备事务尚未在此消费。
             return None;
         }
         if let HirExpr::LocalRef(local) = access.base
@@ -170,32 +186,77 @@ fn candidate(
         let HirLValue::TableAccess(access) = target else {
             continue;
         };
-        let layout = facts.native_table_write_layout(access)?;
-        if layout.base.slot() < base.slot()
-            && facts.direct_table_write_input_home(access, 0) == Some(layout.base)
+        let (key, snapshot) = if let Some(layout) = facts.native_table_write_layout(access) {
+            let snapshot = if layout.base.slot() < base.slot()
+                && facts.direct_table_write_input_home(access, 0) == Some(layout.base)
+            {
+                None
+            } else {
+                let value = prepared_value(&builder, &access.base);
+                let (producer, home) = facts.table_write_base_preparation(access, value)?;
+                if home != layout.base
+                    || !super::super::indexed::snapshot_matches_target(
+                        value, home, access, facts, dialect,
+                    )
+                {
+                    // 候选拒绝[TargetConstraint]：目标快照必须重发原 base Def 的读取时点。
+                    return None;
+                }
+                Some((producer, home, matches!(value, HirExpr::UpvalueRef(_))))
+            };
+            (layout.key, snapshot)
+        } else {
+            let layout = facts.native_upvalue_table_write_layout(access)?;
+            if access.base != HirExpr::UpvalueRef(layout.base) {
+                return None;
+            }
+            (layout.key, None)
+        };
+        let target_start = next;
+        let width = usize::from(snapshot.is_some()) + usize::from(key.is_some());
+        if snapshot.is_some_and(|(_, home, _)| !(next..next + width).contains(&home.slot()))
+            || key.is_some_and(|home| !(next..next + width).contains(&home.slot()))
+            || snapshot.is_some_and(|(_, home, _)| key == Some(home))
         {
-            continue;
-        }
-        let value = prepared_value(&builder, &access.base);
-        let (producer, home) = facts.table_write_base_preparation(access, value)?;
-        if home != layout.base
-            || home.slot() != next
-            || !super::super::indexed::snapshot_matches_target(value, home, access, facts, dialect)
-        {
-            // 候选拒绝[TargetConstraint]：所有计算左值必须按源码次序先于 RHS 准备，
-            // SETTABUP 等不同读取时点不能伪造成提前的表快照。
+            // 候选拒绝[TargetConstraint]：每个左值只消费自己的连续准备区，不借用前后目标的 scratch。
             return None;
         }
-        access.base = builder.expr(
-            &access.base,
-            run.len(),
-            next,
-            None,
-            false,
-            true,
-            Some(producer),
-        )?;
-        next += 1;
+        // 5.4+ 的上值表目标在 key 后保存；其它寄存器目标先于 key。
+        // SETTABUP 没有快照，始终保留写回时对原 cell 的读取。
+        let late_base = snapshot.is_some_and(|(_, home, upvalue)| {
+            key.is_some_and(|key| {
+                home.slot() > key.slot()
+                    || upvalue
+                        && matches!(dialect, DecompileDialect::Lua54 | DecompileDialect::Lua55)
+            })
+        });
+        if let Some((producer, home, _)) = snapshot.filter(|_| !late_base) {
+            access.base = builder.expr(
+                &access.base,
+                run.len(),
+                home.slot(),
+                None,
+                false,
+                true,
+                Some(producer),
+            )?;
+        }
+        if let Some(home) = key {
+            access.key =
+                super::super::indexed::prepared_key(&mut builder, access, home, target_start)?;
+        }
+        if let Some((producer, home, _)) = snapshot.filter(|_| late_base) {
+            access.base = builder.expr(
+                &access.base,
+                run.len(),
+                home.slot(),
+                None,
+                false,
+                true,
+                Some(producer),
+            )?;
+        }
+        next += width;
     }
     if next != rhs_base.slot() {
         return None;
@@ -211,41 +272,49 @@ fn candidate(
             values.push(value.clone());
             continue;
         }
-        let (producer, home) = match &assign.targets[0] {
-            HirLValue::Upvalue(_) => facts.upvalue_write_value(assign)?,
-            HirLValue::TableAccess(access) => {
-                let (producer, home) =
-                    facts.table_write_value_preparation(access, prepared_value(&builder, value))?;
-                (Some(producer), home)
-            }
-            _ => return None,
-        };
-        // PUC/JIT 可直接读取末项既有低槽；其它 RHS 必须依次占用连续 scratch。
-        // 不以同名 Local/上值推断原输入，尚存的准备声明仍按确切 Def 消费。
+        let home = input_home(assign, facts)?;
+        // 末项现成低槽没有准备指令，不能先向标量 producer 查询再判断是否直读。
         if home.slot() < rhs_base.slot() {
             if dialect == DecompileDialect::Luau
                 || offset + 1 != ordered.len()
                 || builder.direct_home(value) != Some(home)
             {
-                // 候选拒绝[ProofIncomplete]：既有低槽只可对应方言允许直读的末项。
                 return None;
             }
             values.push(value.clone());
-        } else {
-            if home.slot() != rhs_base.slot() + offset {
-                // 候选拒绝[TargetConstraint]：源码并列 RHS 必须重发原连续准备槽。
-                return None;
-            }
-            values.push(builder.expr(
-                value,
-                run.len(),
-                home.slot(),
-                None,
-                false,
-                true,
-                producer,
-            )?);
+            continue;
         }
+        let (producer, prepared_home) = match &assign.targets[0] {
+            HirLValue::Upvalue(_) => facts.upvalue_write_value(assign)?,
+            HirLValue::TableAccess(access) => {
+                let prepared = prepared_value(&builder, value);
+                if let Some(copy) = facts.table_write_value_copy(access) {
+                    let source = copy.source?;
+                    let matches = match prepared {
+                        HirExpr::LocalRef(local) => {
+                            facts.promoted_local_for_temp(source) == Some(*local)
+                        }
+                        HirExpr::TempRef(temp) => *temp == source,
+                        _ => false,
+                    };
+                    if !matches || builder.direct_home(prepared) != Some(copy.source_home) {
+                        // 候选拒绝[ProofIncomplete:BindingIdentity]：当前 RHS 不能对应原 COPY 的源版本。
+                        return None;
+                    }
+                    (Some(copy.target), copy.target_home)
+                } else {
+                    let (producer, home) = facts.table_write_value_preparation(access, prepared)?;
+                    (Some(producer), home)
+                }
+            }
+            _ => return None,
+        };
+        // 不以同名 Local/上值推断原输入，准备声明按确切 Def 与连续 scratch 消费。
+        if prepared_home != home || home.slot() != rhs_base.slot() + offset {
+            // 候选拒绝[TargetConstraint]：源码并列 RHS 必须重发原连续准备槽。
+            return None;
+        }
+        values.push(builder.expr(value, run.len(), home.slot(), None, false, true, producer)?);
     }
     let first = builder.first_event?;
     if builder.next_event != run.len() {
@@ -260,7 +329,6 @@ fn candidate(
             base,
             values: values.into(),
             result_locals: Vec::new(),
-            discarded_result: None,
             assignment_targets: targets,
             luau_compound_global: false,
             indexed_target: None,

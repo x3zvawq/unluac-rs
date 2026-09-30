@@ -47,6 +47,15 @@ pub struct StructurePlan {
 }
 
 impl StructurePlan {
+    /// 原指令执行前，该槽是否可能有未关闭的 TBC 资源；未知位置不给否定证明。
+    pub(crate) fn tbc_may_be_active_at(
+        &self,
+        reg: crate::transformer::Reg,
+        instr: crate::transformer::InstrRef,
+    ) -> Option<bool> {
+        self.tbc_flow.may_be_active_at(reg, instr)
+    }
+
     pub(crate) fn cleanup_tbc_origins(
         &self,
         instr: crate::transformer::InstrRef,

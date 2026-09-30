@@ -1,5 +1,8 @@
 -- lookup 的原覆盖端点独立于 callback 是否能被识别为 collectgarbage。
 -- unluac: expect-ast-max [[local-binding]] [[8]]
+-- 原交换快照和 copied 共用所需值，后续调用不再额外声明 callee 或 assert 中转。
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=0]]
+-- unluac: expect-not-contains [[ = assert]]
 -- unluac: expect-ast-count [[function]] [[2]]
 local weak = setmetatable({}, {__mode = "k"})
 local function run(gc)

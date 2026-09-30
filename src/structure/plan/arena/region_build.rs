@@ -7,6 +7,7 @@ pub(super) fn build_regions(
     proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
+    dataflow: &DataflowFacts,
     input: &FinalPlanInput,
     loop_snapshot: &LoopRegionSnapshot<'_>,
     flow: &crate::structure::scope::TbcFlowFacts,
@@ -121,6 +122,24 @@ pub(super) fn build_regions(
         }
     }
 
+    // Close 可能只关闭内层捕获 cell，而外层 TBC 仍然活跃。每个 Close 的
+    // 原程序点查询只计算一次，所有 loop 候选共享，不按候选重建 capture flow。
+    let captured_regs = dataflow.reference_captured_regs().collect::<Vec<_>>();
+    let reference_closes = input
+        .scopes
+        .iter()
+        .flat_map(|scope| &scope.close_points)
+        .copied()
+        .filter(|&instr| {
+            let LowInstr::Close(close) = &proto.instrs[instr.index()] else {
+                return false;
+            };
+            let start = captured_regs.partition_point(|reg| reg.index() < close.from.index());
+            captured_regs[start..]
+                .iter()
+                .any(|&reg| dataflow.reference_capture_may_be_open(reg, instr))
+        })
+        .collect::<BTreeSet<_>>();
     let mut admitted_loops = vec![false; input.loops.len()];
     for (index, admitted) in admitted_loops.iter_mut().enumerate() {
         let id = super::super::LoopPlanId(index);
@@ -145,6 +164,7 @@ pub(super) fn build_regions(
                 partition,
                 &input.scopes,
                 flow,
+                &reference_closes,
             )?
         {
             push_residual_seed(&mut residuals, entry, blocks);
@@ -425,6 +445,32 @@ pub(super) fn build_regions(
         }
         pending = protected_pending;
     }
+
+    // 已退回显式跳转区域的出口继续由该区域表达；若 fence 的全部 escape 都
+    // 来自这种区域，额外 repeat 只能混用 goto/break 并制造新的声明作用域。
+    // 按块汇总现有成员事实，候选只检查自身 escape，避免逐 fence 重扫区域。
+    let mut unstructured_exit_sources = vec![false; cfg.blocks.len()];
+    for block in unstructured_blocks
+        .iter()
+        .chain(residuals.iter().map(|seed| &seed.blocks))
+        .flatten()
+    {
+        unstructured_exit_sources[block.index()] = true;
+    }
+    pending.retain(|candidate| {
+        let ContainerKind::SinglePass(id) = candidate.kind else {
+            return true;
+        };
+        let fence = input.branches[id.index()]
+            .region
+            .as_ref()
+            .and_then(|region| region.single_pass_fence.as_ref())
+            .expect("single-pass candidate retains its fence evidence");
+        !fence
+            .escape_edges
+            .iter()
+            .all(|edge| unstructured_exit_sources[cfg.edges[edge.index()].from.index()])
+    });
 
     pending.sort_by_key(|pending| {
         (

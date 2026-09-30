@@ -105,8 +105,8 @@ pub(in crate::hir::analyze) fn branch_call_result_ending_after_test(
     .then_some(def)
 }
 
-/// 原内嵌字面量不占准备槽，可以右置；其余只恢复同块、单用且无开放引用的读取
-/// 快照→CALL。已有源码 local、Phi、MOVE 或跨块值不靠指令号排序；方向改变不删除
+/// 原内嵌字面量不占准备槽，可以右置；匿名单用的运算/读取与字面量沿原同块准备顺序恢复。
+/// 已有源码 local、Phi、MOVE 或跨块值不靠指令号排序；方向改变不删除
 /// producer，后续内联仍消费原事件与根事务。
 fn comparison_reads_right_first(
     lowering: &ProtoLowering<'_>,
@@ -213,8 +213,8 @@ fn comparison_reads_right_first(
         }
         SsaValue::Phi(_) | SsaValue::Entry(_) => true,
     };
-    // 既有低槽引用不复制到 scratch。常量输入或 Length 结果仍在原高槽准备，
-    // 因此可按 `value > constant` / `#value >= index` 发射，且不改变任何准备写。
+    // 既有低槽引用不复制到 scratch。常量、长度或查表结果仍在原高槽准备，
+    // 因此可按 `value > constant` / `item.field >= limit` 发射，不改变任何准备写。
     if let SsaValue::Def(left) = left_value
         && lowering.dataflow.def_block(left) == block
         && anonymous_single_use(left)
@@ -230,8 +230,11 @@ fn comparison_reads_right_first(
         && lowering.dataflow.def_block(right) == block
         && anonymous_single_use(right)
         && available_before(left_value, lowering.dataflow.def_instr(right))
-        && matches!(&lowering.proto.instrs[lowering.dataflow.def_instr(right).index()],
-            LowInstr::UnaryOp(unary) if unary.op == UnaryOpKind::Length)
+        && match &lowering.proto.instrs[lowering.dataflow.def_instr(right).index()] {
+            LowInstr::UnaryOp(unary) => unary.op == UnaryOpKind::Length,
+            LowInstr::GetTable(_) => true,
+            _ => false,
+        }
         && let Some(left) = direct_home(lhs)
         && layout.lhs == Some(left)
         && layout.rhs.is_some_and(|right| left.slot() < right.slot())
@@ -246,12 +249,15 @@ fn comparison_reads_right_first(
     if lowering.dataflow.def_block(right) != block || lowering.dataflow.def_block(left) != block {
         return false;
     }
-    // CALL 或字段/全局读取后的 LOADK 仍占原操作数槽；反向打印会把常量准备
+    // CALL、字段读取或运算后的字面量仍占原操作数槽；反向打印会把常量准备
     // 移到该观察点前。保留原方向，不能因常量值可重排而忽略其物理准备顺序。
     if right_site.index() < left_site.index()
         && matches!(
             lowering.proto.instrs[right_site.index()],
-            LowInstr::Call(_) | LowInstr::GetTable(_)
+            LowInstr::Call(_)
+                | LowInstr::GetTable(_)
+                | LowInstr::UnaryOp(_)
+                | LowInstr::BinaryOp(_)
         )
         && anonymous_single_use(left)
         && anonymous_single_use(right)

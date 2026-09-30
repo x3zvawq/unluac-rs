@@ -516,7 +516,6 @@ pub(super) fn invocation(
         )]
         .into(),
         result_locals: vec![result],
-        discarded_result: None,
         assignment_targets: Vec::new(),
         luau_compound_global: false,
         indexed_target: None,

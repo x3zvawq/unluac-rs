@@ -164,7 +164,6 @@ pub(super) fn parallel_preparations(
             base,
             values: values.into(),
             result_locals: Vec::new(),
-            discarded_result: None,
             assignment_targets: targets,
             luau_compound_global: false,
             indexed_target: None,
@@ -254,7 +253,6 @@ pub(super) fn parallel_literals(
         base,
         values: values.into(),
         result_locals: Vec::new(),
-        discarded_result: None,
         assignment_targets: targets,
         luau_compound_global: false,
         indexed_target: None,
@@ -382,7 +380,6 @@ pub(super) fn parallel_values(
         base: home,
         values: vec![source.clone(), second_value.clone()].into(),
         result_locals: Vec::new(),
-        discarded_result: None,
         assignment_targets: vec![
             write_first.targets[0].clone(),
             write_second.targets[0].clone(),
@@ -511,6 +508,7 @@ pub(super) fn is_rhs_candidate(value: &HirExpr) -> bool {
             | HirExpr::Number(_)
             | HirExpr::String(_)
             | HirExpr::LocalRef(_)
+            | HirExpr::TempRef(_)
             | HirExpr::ParamRef(_)
             | HirExpr::UpvalueRef(_)
             | HirExpr::GlobalRef(_)
@@ -544,6 +542,60 @@ fn comparison_result(value: &HirExpr, facts: &ProtoPromotionFacts) -> Option<Tem
         }
         _ => None,
     }
+}
+
+/// 单字段和并列左值共用原 key Def 与 scratch 证明；调用方验证整个赋值的事件顺序。
+pub(super) fn prepared_key(
+    builder: &mut FrameBuilder<'_>,
+    access: &HirTableAccess,
+    home: HomeSlotKey,
+    base: usize,
+) -> Option<HirExpr> {
+    // Luau 的复合 key 从 key 上一槽开始；PUC/JIT 可复用该目标尚未写入的 base 槽。
+    let previous_key_base =
+        builder
+            .indexed_key_base
+            .replace(if builder.dialect == DecompileDialect::Luau {
+                home.slot()
+            } else {
+                base
+            });
+    let prepared_upvalue = if let HirExpr::LocalRef(local) = access.key {
+        builder
+            .definition(local, builder.run.len())
+            .is_some_and(|index| {
+                matches!(
+                    scalar_local(builder.run[index]),
+                    Some((_, HirExpr::UpvalueRef(_)))
+                )
+            })
+    } else {
+        false
+    };
+    let producer =
+        if prepared_upvalue || matches!(access.key, HirExpr::UpvalueRef(_) | HirExpr::TempRef(_)) {
+            let (producer, original) = builder.facts.table_key_value_preparation(access)?;
+            if original != home {
+                return None;
+            }
+            Some(producer)
+        } else {
+            None
+        };
+    let previous_register_operand =
+        std::mem::replace(&mut builder.register_operand, producer.is_none());
+    let key = builder.expr(
+        &access.key,
+        builder.run.len(),
+        home.slot(),
+        None,
+        false,
+        true,
+        producer,
+    );
+    builder.register_operand = previous_register_operand;
+    builder.indexed_key_base = previous_key_base;
+    key
 }
 
 pub(super) fn plan(
@@ -582,16 +634,17 @@ pub(super) fn plan(
             .unwrap_or((None, None));
         original == Some(*home) && key.is_some_and(|key| home.slot() < key.slot())
     });
-    let (rhs, result_local) = match value {
+    let (rhs, result_binding) = match value {
         value if direct_rhs_home.is_some() => (value, None),
-        HirExpr::LocalRef(local) => {
+        value @ (HirExpr::LocalRef(_) | HirExpr::TempRef(_)) => {
+            let binding = HirBinding::from_expr(value)?;
             // SETLIST/字段写属于同一个构造器 RHS，seed 不一定紧邻最终 SETTABLE。
             // builder 仍核对所选版本及全部中间事件，不能跳过独立语句。
             let (_, rhs) = run
                 .iter()
                 .rev()
-                .find_map(|stmt| scalar_local(stmt).filter(|(target, _)| target == local))?;
-            (rhs, Some(*local))
+                .find_map(|stmt| scalar_binding(stmt).filter(|(target, _)| *target == binding))?;
+            (rhs, Some(binding))
         }
         value => (value, None),
     };
@@ -624,7 +677,7 @@ pub(super) fn plan(
     }
     // 候选拒绝[SemanticBarrier:BindingIdentity]：待退休的 RHS 值版本仍被后缀读取。
     // 现成低槽 RHS 不在本事务删除范围内；不能因此阻止其独立 key/base 准备。
-    if result_local.is_some() && rhs_live_after {
+    if result_binding.is_some() && rhs_live_after {
         return None;
     }
     // 动态 key 后的字面量也有原 LOAD Def；Luau 与 JIT 都须保留其 RHS 槽，
@@ -646,7 +699,7 @@ pub(super) fn plan(
             access,
             value,
             rhs,
-            result_local,
+            result_binding,
         );
     }
     if dialect == DecompileDialect::Luau
@@ -662,7 +715,7 @@ pub(super) fn plan(
         if matches!(rhs, HirExpr::Closure(_) | HirExpr::TableConstructor(_)) {
             facts.luau_allocation_table_write_frame(access, rhs)?;
         } else {
-            result_local?;
+            result_binding?;
             facts.luau_literal_table_write_frame(access, rhs)?;
         }
         return scalar_rhs(
@@ -673,7 +726,7 @@ pub(super) fn plan(
             access,
             value,
             rhs,
-            result_local,
+            result_binding,
         );
     }
     // JIT 的直接低槽 RHS 不需重新准备；算术由 register_arithmetic 逐槽验证，
@@ -702,7 +755,7 @@ pub(super) fn plan(
         (layout.key, layout.value)
     };
     let literal_rhs = value_home.is_none()
-        && result_local.is_none()
+        && result_binding.is_none()
         && matches!(
             rhs,
             HirExpr::Nil
@@ -715,7 +768,10 @@ pub(super) fn plan(
         || matches!(rhs, HirExpr::Call(_))
         || matches!(
             rhs,
-            HirExpr::TableConstructor(_) | HirExpr::TableAccess(_) | HirExpr::GlobalRef(_)
+            HirExpr::TableConstructor(_)
+                | HirExpr::TableAccess(_)
+                | HirExpr::GlobalRef(_)
+                | HirExpr::Closure(_)
         )
         || comparison.is_some()
         || direct_rhs_home.is_some()
@@ -731,7 +787,7 @@ pub(super) fn plan(
             access,
             value,
             rhs,
-            result_local,
+            result_binding,
         );
     }
     // 先证明包含 key 准备的完整帧；若先把较低的 key 当成已有变量，
@@ -748,6 +804,7 @@ pub(super) fn plan(
             let source = match rhs {
                 HirExpr::Binary(binary) => binary.source_site?,
                 HirExpr::Call(call) => call.source_site?,
+                HirExpr::Closure(closure) => closure.source_site?,
                 HirExpr::TableAccess(access) => {
                     let crate::hir::common::HirOperationSources::Single(source) = access.sources
                     else {
@@ -893,36 +950,7 @@ pub(super) fn plan(
         } else {
             None
         };
-        // Luau 的 key 结果槽独立于更低的表快照槽；复合 key 的 scratch 从 key 上一槽开始。
-        builder.indexed_key_base = Some(if dialect == DecompileDialect::Luau {
-            key_home.slot()
-        } else {
-            base.slot()
-        });
-        let previous_register_operand = builder.register_operand;
-        let key_producer = if matches!(access.key, HirExpr::UpvalueRef(_)) {
-            let (producer, home) = facts.table_key_value_preparation(access)?;
-            if home != key_home {
-                return None;
-            }
-            // key 已树化为 cell 读取，原 SETTABLE use→Def 仍证明其准备槽；
-            // 只在完整左值帧中重发该读取，不给任意同名上值开放寄存器操作数许可。
-            Some(producer)
-        } else {
-            None
-        };
-        builder.register_operand = key_producer.is_none();
-        let key = builder.expr(
-            &access.key,
-            run.len(),
-            key_home.slot(),
-            None,
-            false,
-            true,
-            key_producer,
-        )?;
-        builder.register_operand = previous_register_operand;
-        builder.indexed_key_base = None;
+        let key = prepared_key(&mut builder, access, key_home, base.slot())?;
         let target_base = if let Some(base) = early_base {
             base
         } else if let Some((producer, home, _)) = snapshot {
@@ -944,7 +972,7 @@ pub(super) fn plan(
         let value = if literal_rhs || direct_rhs_home.is_some() {
             // RK 常量和既有低槽都不需新 RHS 准备；低槽读取仍留在 key 求值后的写入点。
             rhs.clone()
-        } else if prepared_literal.is_some() || result_local.is_some() {
+        } else if prepared_literal.is_some() || result_binding.is_some() {
             // JIT/Luau 字面量仍在 key 后的原槽加载；连同现存准备声明一起消费，
             // 不能把这个写入当成 PUC 的 RK 直接省掉。
             builder.expr(
@@ -988,17 +1016,18 @@ pub(super) fn plan(
                 )?)),
                 // 字段 RHS 同样在 key 后的相邻槽读取；完整 lookup 由共享 builder 验证，
                 // 不先冻结 key 声明再把其后续同槽值连成一个 Local 身份。
-                HirExpr::TableConstructor(_) | HirExpr::TableAccess(_) | HirExpr::GlobalRef(_) => {
-                    builder.expr(
-                        rhs,
-                        run.len(),
-                        value_home?.slot(),
-                        None,
-                        false,
-                        true,
-                        result,
-                    )?
-                }
+                HirExpr::TableConstructor(_)
+                | HirExpr::TableAccess(_)
+                | HirExpr::GlobalRef(_)
+                | HirExpr::Closure(_) => builder.expr(
+                    rhs,
+                    run.len(),
+                    value_home?.slot(),
+                    None,
+                    false,
+                    true,
+                    result,
+                )?,
                 _ => return None,
             }
         };
@@ -1015,7 +1044,6 @@ pub(super) fn plan(
             base,
             values: vec![value].into(),
             result_locals: Vec::new(),
-            discarded_result: None,
             assignment_targets: Vec::new(),
             luau_compound_global: false,
             indexed_target: Some(HirTableAccess {
@@ -1046,7 +1074,7 @@ pub(super) fn plan(
                     access,
                     value,
                     rhs,
-                    result_local,
+                    result_binding,
                 )
             })
             .flatten()
@@ -1135,7 +1163,6 @@ fn function_declaration(
         base,
         values: vec![closure].into(),
         result_locals: Vec::new(),
-        discarded_result: None,
         assignment_targets: Vec::new(),
         luau_compound_global: false,
         indexed_target: Some(HirTableAccess {
@@ -1216,7 +1243,6 @@ fn prepared_field_target(
         base: home,
         values: vec![value.clone()].into(),
         result_locals: Vec::new(),
-        discarded_result: None,
         assignment_targets: Vec::new(),
         luau_compound_global: false,
         indexed_target: Some(HirTableAccess {
@@ -1242,7 +1268,7 @@ fn scalar_rhs(
     access: &HirTableAccess,
     value: &HirExpr,
     rhs: &HirExpr,
-    result_local: Option<LocalId>,
+    result_binding: Option<HirBinding>,
 ) -> Option<Plan> {
     let layout = facts.native_table_write_layout(access);
     let (key_home, value_home) = if let Some(layout) = layout {
@@ -1312,7 +1338,7 @@ fn scalar_rhs(
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
-            if (value_home.is_none() && result_local.is_none()) || prepared_value.is_some() =>
+            if (value_home.is_none() && result_binding.is_none()) || prepared_value.is_some() =>
         {
             None
         }
@@ -1430,7 +1456,7 @@ fn scalar_rhs(
     } else {
         access.base.clone()
     };
-    let value = if result_local.is_some() {
+    let value = if result_binding.is_some() {
         let previous = builder.register_operand;
         if matches!(rhs, HirExpr::TableAccess(_)) {
             builder.register_operand = true;
@@ -1515,7 +1541,6 @@ fn scalar_rhs(
         base,
         values: vec![value].into(),
         result_locals: Vec::new(),
-        discarded_result: None,
         assignment_targets: Vec::new(),
         luau_compound_global: false,
         indexed_target: Some(HirTableAccess {

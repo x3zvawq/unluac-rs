@@ -4,6 +4,11 @@
 -- unluac: expect-ast-min [[label]] [[3]]
 -- unluac: expect-ast-max [[local-binding]] [[32]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
+-- 每个 run 仅保留计数器与两个原声明；callee、动态键和回调结果不另设中转。
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=4]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=8]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=12]]
+-- unluac: expect-not-contains [[ = #]]
 local function linear_tail()
     local log = {}
     local function resource(name)

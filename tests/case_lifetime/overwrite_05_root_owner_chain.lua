@@ -1,6 +1,8 @@
 -- unluac: expect-ast-max [[local-binding]] [[10]]
 -- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[do-block]] [[1]] [[@debug=retained]]
+-- unluac: expect-ast-count [[do-block]] [[1]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-max [[assign]] [[4]]
 local weak = setmetatable({}, {__mode="v"})
 local nextkey=1
 local function pair()

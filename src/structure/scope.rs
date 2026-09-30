@@ -5,6 +5,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Range,
+    sync::Arc,
 };
 
 use crate::structure::{BlockRef, Cfg, DebugBindingFacts, GraphFacts, StructurePlan};
@@ -23,10 +24,19 @@ pub(super) struct TbcFlowFacts {
     active_in: Vec<BTreeSet<InstrRef>>,
     active_out: Vec<BTreeSet<InstrRef>>,
     may_out: Vec<BTreeSet<InstrRef>>,
+    // 无 TBC 时不分配逐指令表；有 TBC 时，未记录的指令不可达，不能提供否定证明。
+    may_active_before: Option<Vec<Option<Arc<BTreeSet<usize>>>>>,
     close_origins: BTreeMap<InstrRef, BTreeSet<InstrRef>>,
 }
 
 impl TbcFlowFacts {
+    pub(super) fn may_be_active_at(&self, reg: Reg, instr: InstrRef) -> Option<bool> {
+        let Some(before) = &self.may_active_before else {
+            return Some(false);
+        };
+        Some(before.get(instr.index())?.as_ref()?.contains(&reg.index()))
+    }
+
     pub(super) fn close_origins(&self, instr: InstrRef) -> Option<&BTreeSet<InstrRef>> {
         self.close_origins.get(&instr)
     }
@@ -641,6 +651,7 @@ pub(super) fn analyze_tbc_flow(proto: &LoweredProto, cfg: &Cfg) -> TbcFlowFacts 
             active_in: vec![BTreeSet::new(); cfg.blocks.len()],
             active_out: vec![BTreeSet::new(); cfg.blocks.len()],
             may_out: vec![BTreeSet::new(); cfg.blocks.len()],
+            may_active_before: None,
             close_origins: BTreeMap::new(),
         };
     }
@@ -702,6 +713,39 @@ pub(super) fn analyze_tbc_flow(proto: &LoweredProto, cfg: &Cfg) -> TbcFlowFacts 
         }
     }
 
+    // 从已收敛的 may-out 展开程序点事实；普通指令共享集合，只有资源边界复制。
+    // 必须使用 CFG incoming，PC 先后不能排除回边或其他分支遗留的活动资源。
+    let mut may_active_before = vec![None; proto.instrs.len()];
+    for &block in &cfg.block_order {
+        if !cfg.reachable_blocks.contains(&block) || block == cfg.exit_block {
+            continue;
+        }
+        let mut active = Arc::new(
+            cfg.preds[block.index()]
+                .iter()
+                .flat_map(|edge| {
+                    let predecessor = cfg.edges[edge.index()].from;
+                    active_by_reg_out[predecessor.index()].keys().copied()
+                })
+                .collect::<BTreeSet<_>>(),
+        );
+        let range = cfg.blocks[block.index()].instrs;
+        for (before, instr) in may_active_before[range.start.index()..range.end()]
+            .iter_mut()
+            .zip(&proto.instrs[range.start.index()..range.end()])
+        {
+            *before = Some(Arc::clone(&active));
+            match instr {
+                LowInstr::Tbc(tbc) => {
+                    Arc::make_mut(&mut active).insert(tbc.reg.index());
+                }
+                LowInstr::Close(close) => {
+                    Arc::make_mut(&mut active).retain(|reg| *reg < close.from.index());
+                }
+                _ => {}
+            }
+        }
+    }
     let (active_in, active_out) = analyze_definite_tbc_flow(proto, cfg);
     TbcFlowFacts {
         active_in,
@@ -710,6 +754,7 @@ pub(super) fn analyze_tbc_flow(proto: &LoweredProto, cfg: &Cfg) -> TbcFlowFacts 
             .into_iter()
             .map(|by_reg| by_reg.into_values().flatten().collect())
             .collect(),
+        may_active_before: Some(may_active_before),
         close_origins: close_points,
     }
 }

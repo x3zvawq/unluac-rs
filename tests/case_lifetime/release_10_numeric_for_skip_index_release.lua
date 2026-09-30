@@ -2,6 +2,8 @@
 -- 不能因没有表达式读取而消失，也不能在循环前新增保活 holder。
 -- unluac: expect-ast-max [[local-binding]] [[31]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[call]] [[2]] [[@proto=2]]
 -- unluac: expect-ast-count [[function]] [[8]]
 -- unluac: expect-ast-count [[numeric-for]] [[8]]
 local snapshots = {}

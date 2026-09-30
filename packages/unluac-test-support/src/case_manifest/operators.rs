@@ -1259,4 +1259,36 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
         ],
     ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/comparison_15_late_upvalue_length_key.lua",
+        &["comparison", "upvalue", "metamethod", "evaluation-order"],
+        "动态长度键在回调中替换上值表，验证索引读取新表、比较顺序及抛错路径不执行索引。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/comparison_16_ordered_literal_rhs_upvalue.lua",
+        &["comparison", "upvalue", "evaluation-order", "call-frame"],
+        "有序比较的大常量保持寄存器准备，算术右侧读取调用更新后的上值，并验证单值调整与单次求值。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
+                recompile_rounds: Some(1),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(1),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
 ];

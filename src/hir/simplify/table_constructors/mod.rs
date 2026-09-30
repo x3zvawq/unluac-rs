@@ -732,6 +732,7 @@ fn reuse_following_initializers(
                 bindings: vec![local],
                 values: assign.values,
                 initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }));
         }
         if !removed.contains(&index) {

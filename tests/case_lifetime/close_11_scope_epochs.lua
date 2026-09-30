@@ -6,6 +6,10 @@
 -- unluac: expect-ast-max [[local-binding]] [[11]]
 -- unluac: expect-ast-count [[close-binding]] [[3]]
 -- unluac: expect-ast-count [[do-block]] [[2]]
+-- 资源域前后复用的索引准备直接进入字段写，不留下长度中转声明。
+-- unluac: expect-not-contains [[ = #]]
+-- 保留比较字面量的原声明前缀，使返回检查直接调用 assert。
+-- unluac: expect-count [[assert(]] [[4]]
 
 local log = {}
 local close_mt = {

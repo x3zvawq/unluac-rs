@@ -199,7 +199,6 @@ fn candidate(
         base,
         values: values.into(),
         result_locals: Vec::new(),
-        discarded_result: None,
         assignment_targets: targets,
         luau_compound_global: false,
         indexed_target: None,

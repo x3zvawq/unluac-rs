@@ -1,7 +1,10 @@
 -- debug end 恢复寄存器复用，不能在下一条可观察 GGET 之前主动清槽。
 -- unluac: expect-ast-max [[local-binding]] [[9]]
 -- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[do-block]] [[2]] [[@debug=retained]]
+-- 匿名对象也在原覆盖前结束词法声明，避免后续 callee 与布尔实参接棒复用。
+-- unluac: expect-ast-count [[do-block]] [[2]]
+-- unluac: expect-ast-count [[local-function]] [[2]]
+-- unluac: expect-count [[assert(]] [[5]]
 -- unluac: expect-count [[regress_525_missing_gc("collect")]] [[2]]
 local gc, next_key = collectgarbage, next
 local env = _G

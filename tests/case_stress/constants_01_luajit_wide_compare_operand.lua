@@ -1,7 +1,10 @@
 -- regress_133_luajit_wide_compare_operand#1: compare 必须保留 16-bit D 常量索引
 -- unluac: expect-contains [["target-compare"]]
--- unluac: expect-not-contains [["padding-005"]]
--- unluac: expect-not-contains [[local r1_1 = r1_0 == "target-compare"]]
+-- 原字符串写入仍须保留；这里只禁止比较错误地引用低 8 位常量。
+-- unluac: expect-not-contains [[== "padding-005"]]
+-- unluac: expect-count [[== "target-compare"]] [[1]]
+-- 原赋值链和返回帧共用少量绑定，不随 260 条常量写扩散。
+-- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=1]]
 -- 被测常量池属于独立 proto；调用参数放到父 proto，避免向宽 D 索引前插入常量。
 -- unluac: expect-ast-max [[if]] [[0]] [[@proto=1]]
 local function compare(...)

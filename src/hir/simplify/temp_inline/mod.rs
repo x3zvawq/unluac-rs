@@ -1,4 +1,4 @@
-//! 将单次消费的 HIR 临时值收回表达式，并组织完整调用准备区内联。
+//! 将 HIR 临时值收回表达式或调用语句，并组织完整调用准备区内联。
 //!
 //! 消费使用、来源、capture、根及求值语境事实，保留原值宽度和身份。
 
@@ -313,6 +313,11 @@ impl TempInlineWorkspace<'_> {
         lookup_roots.mark_stmts(&mut marked);
         let mut dispatch_operands = BTreeSet::new();
         for (index, stmt) in stmts.iter().enumerate() {
+            // 候选拒绝[LayerBoundary]：原交换的高槽快照属于完整并列赋值；
+            // 只内联其读取会令后续 locals 无法沿用被覆盖的低槽身份。
+            marked[index] |= stmt
+                .scalar_temp_assignment()
+                .is_some_and(|(temp, _)| facts.is_swap_snapshot(temp));
             // locals 会原子物化普通多返回组；其任一结果的确切覆盖都必须留在原 home，
             // 即使该槽自身没有触发保活。否则 nil forwarding 会让物化后的 sibling 无终点
             // （regress_509）。generic initializer 仍由专属 owner 消费整包。
@@ -574,6 +579,15 @@ fn inline_temps_in_block(
                 .inline_dispositions
                 .preserve_temp(temp, HirInlineRetentionReason::TableInitialization);
         }
+        if let Some((temp, HirExpr::ParamRef(_))) = stmt.scalar_temp_assignment()
+            && facts.temp_requires_call_frame(temp)
+        {
+            // 完整调用帧尚未接管的 COPY 不能在 AST 中重新按稳定值内联；原 callee
+            // 槽及其声明前缀仍决定 callback 返回后的残根窗口（scope_03）。
+            changed |= workspace
+                .inline_dispositions
+                .preserve_temp(temp, HirInlineRetentionReason::PhysicalFramePrefix);
+        }
         if let Some((temp, _)) = stmt.scalar_temp_assignment()
             && temp_rebinds_captured_slot(
                 temp,
@@ -588,6 +602,39 @@ fn inline_temps_in_block(
             changed |= workspace
                 .inline_dispositions
                 .preserve_temp(temp, HirInlineRetentionReason::CapturedValueEpoch);
+        }
+        if matches!(workspace.scope, TempInlineScope::All)
+            && let Some((temp, HirExpr::Call(call))) = stmt.scalar_temp_assignment()
+            && workspace.uses.has_unique_definition(temp)
+            && total_use_count(temp, live_use_counts) == 0
+            && !workspace.uses.has_debug_local_hint(temp)
+            && !workspace.inline_dispositions.temp(temp).must_preserve()
+            && !workspace.physical_root_temps[temp.index()]
+            && !physical_root_lifetimes[index]
+            && !facts.temp_requires_call_frame(temp)
+            && facts.temp_definition_is_uncaptured(temp)
+            && facts.temp_definition_tbc_unprotected(temp)
+            && facts.fixed_call_result(call, 0) == Some(temp)
+            && facts.native_call_layout(call).is_some_and(|frame| {
+                matches!(frame.results, Some(crate::transformer::ResultPack::Fixed(pack)) if pack.len == 1)
+            })
+            && kept_rev.last().is_some_and(|next| {
+                next.scalar_temp_assignment().is_some_and(|(target, value)| {
+                    matches!(value, HirExpr::TempRef(_) | HirExpr::LocalRef(_) | HirExpr::ParamRef(_))
+                        && facts.copy_overwrite_predecessor(target) == Some(temp)
+                })
+            })
+        {
+            // 候选接受：未被读取的固定结果立即由原同槽 COPY 覆盖，中间没有求值事件。
+            // 保留 CALL 和覆盖写，只取消无源码身份的结果声明；否则它会在 prefix 分析
+            // 中留下未知 Temp，直到 AST 才被删除并阻止无关返回帧恢复。
+            kept_rev.push(HirStmt::CallStmt(Box::new(crate::hir::common::HirCallStmt {
+                call: call.as_ref().clone(),
+            })));
+            callee_materialized_at = None;
+            changed = true;
+            adjacent_changed = true;
+            continue;
         }
         if let Some((temp, value)) = stmt.scalar_temp_assignment()
             && kept_rev
@@ -663,7 +710,8 @@ fn inline_temps_in_block(
             && !next_stmt.scalar_temp_assignment().is_some_and(|(target, copied)| {
                     matches!(copied, HirExpr::TempRef(source) if *source == temp)
                         && facts.trusted_temp_home_slot(temp) != facts.trusted_temp_home_slot(target)
-                        && (facts.is_scope_end_copy_root_temp(temp)
+                        && (facts.is_swap_snapshot(target)
+                            || facts.is_scope_end_copy_root_temp(temp)
                             || matches!(value, HirExpr::Closure(_))
                             || (matches!(value, HirExpr::TableAccess(_))
                                 && facts.trusted_temp_home_slot(temp).zip(facts.trusted_temp_home_slot(target))
@@ -1633,10 +1681,14 @@ fn occupies_scalar_frame_prefix(
 ) -> bool {
     if !matches!(
         value,
-        HirExpr::Nil | HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::Number(_)
+        HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
     ) {
-        // 可收集值与带求值事件的 producer 仍消费已有 root/求值顺序证明；
-        // 此处只延期此前因值稳定而直接删除的标量声明前缀。
+        // 分配和带求值事件的 producer 仍消费已有 root/求值顺序证明；字面量
+        // 虽可重复读取，其原低槽声明仍可能是后继完整帧所需的前缀。
         return false;
     }
     let prefix = match sink {

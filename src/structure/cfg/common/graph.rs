@@ -95,6 +95,57 @@ impl GraphFacts {
         true
     }
 
+    /// 证明指令窗口只有一个入口；正常末端以外的出口由调用方逐边证明。
+    ///
+    /// 用于存在提前离域的词法块。这里只约束控制边界，不证明出口已完成关闭协议。
+    /// 回边若跳到首块中窗口起点之前，也属于离域，不能因 BlockRef 相同而忽略。
+    pub(crate) fn instruction_window_with_exits(
+        &self,
+        cfg: &Cfg,
+        window: Range<usize>,
+        accepts_exit: impl Fn(EdgeRef) -> bool,
+    ) -> bool {
+        let Some(instructions) = cfg.instr_to_block.get(window.clone()) else {
+            return false;
+        };
+        let (Some(&entry), Some(&exit)) = (instructions.first(), instructions.last()) else {
+            return false;
+        };
+        if !cfg.reachable_blocks.contains(&entry) || !cfg.reachable_blocks.contains(&exit) {
+            return false;
+        }
+        let contains_target = |block: BlockRef| {
+            cfg.blocks
+                .get(block.index())
+                .is_some_and(|block| window.contains(&block.instrs.start.index()))
+        };
+        for run in instructions.chunk_by(|a, b| a == b) {
+            let block = run[0];
+            if !cfg.reachable_blocks.contains(&block) {
+                continue;
+            }
+            let range = cfg.blocks[block.index()].instrs;
+            if !self.dominates(entry, block)
+                || (block != entry && range.start.index() < window.start)
+                || (block != exit && range.end() > window.end)
+                || (block != entry
+                    && cfg.preds[block.index()].iter().any(|edge| {
+                        let from = cfg.edges[edge.index()].from;
+                        cfg.reachable_blocks.contains(&from)
+                            && from != entry
+                            && !contains_target(from)
+                    }))
+                || (block != exit
+                    && cfg.succs[block.index()].iter().any(|&edge| {
+                        !contains_target(cfg.edges[edge.index()].to) && !accepts_exit(edge)
+                    }))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// 返回某个 block 的 dominance frontier。
     ///
     /// 调用方应通过这个查询接口消费 frontier，而不是依赖底层当前恰好用

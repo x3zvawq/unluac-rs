@@ -449,6 +449,18 @@ fn fold_constant_control(
             None
         };
         let arms_are_equal = exact_arms || merged_arm.is_some();
+        if truthiness.is_none()
+            && arms_are_equal
+            && matches!(if_stmt.then_block.stmts.as_slice(), [HirStmt::Return(_)])
+        {
+            // 候选拒绝[PolicyBoundary]：原检查仍须保留；合并两臂返回只会制造
+            // 空测试壳，并不缩短控制表达。保留自然的条件返回及各自原值包。
+            // 后续返回帧也须消费该保留义务，不能转成随后会消除检查的等值 and/or。
+            if_stmt.preserves_empty_test = true;
+            changed = true;
+            rewritten.push(HirStmt::If(if_stmt));
+            continue;
+        }
         let discard_condition = safety.is_discard_safe_without_residual(&if_stmt.cond);
         let selected_then = truthiness.or(arms_are_equal.then_some(true));
         let Some(selected_then) = selected_then else {
@@ -501,6 +513,7 @@ fn fold_constant_control(
                     bindings: vec![local],
                     values: HirValuePack::fixed(vec![condition]),
                     initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 }))],
             })));
         }

@@ -1,8 +1,8 @@
--- 相等返回可共享出口，但参数和调用结果的原 TEST 均须保留。
+-- 相等返回保留自然的条件返回，参数和调用结果的原 TEST 均须保留。
 -- unluac: expect-ast-count [[if]] [[2]]
 -- unluac: expect-ast-count [[local-decl]] [[1]]
 -- unluac: expect-ast-count [[do-block]] [[0]]
--- unluac: expect-count [[return 42]] [[2]]
+-- unluac: expect-count [[return 42]] [[4]]
 local function plain(flag)
     if flag then return 42 else return 42 end
 end

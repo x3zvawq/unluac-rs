@@ -71,8 +71,19 @@ pub(in crate::hir::analyze) fn bind_scalar_slots(
         let consumed_number = numeric_write
             && (!dataflow.def_uses[temp.index()].is_empty()
                 || !dataflow.def_phi_uses[temp.index()].is_empty());
+        // 循环控制区属于原 iterator 初始化协议；即使它只写 nil，也不能与此前
+        // 未读的声明前缀合成一个身份，否则旧作用域无法在新循环帧之前结束。
+        let iterator_input = dataflow.def_uses[temp.index()].iter().any(|site| {
+            matches!(
+                proto.instrs[site.instr.index()],
+                LowInstr::GenericForPrep(_)
+                    | LowInstr::GenericForCall(_)
+                    | LowInstr::GenericForLoop(_)
+            )
+        });
         if !scalar_write
             || consumed_number
+            || iterator_input
             || dataflow.reg_is_reference_captured(def.reg)
             || emission.prefix_is_hoisted(def.block)
         {

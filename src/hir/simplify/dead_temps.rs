@@ -135,7 +135,7 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
     protected_temps.extend(pending.temps.difference(&pending.global_keys).copied());
     if stage == DeadTempStage::BeforeNativeFrames {
         protected_temps.extend(promotion_facts.parallel_target_seeds());
-        // 原无读 nil 仍可能是紧邻全局读取的低槽声明前缀，先交完整 scope 事务。
+        // 原无读 nil 仍可能准备全局读取或分配 COPY 的低槽声明前缀，先交完整 scope 事务。
         // 不把 GC-inert 判定改成永久保留；Final 审理后仍执行原清理。
         protected_temps.extend(super::source_frames::pending_nil_prefix_temps(
             proto,

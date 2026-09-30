@@ -233,6 +233,7 @@ impl OrderedExprExtraction {
                 bindings,
                 values: HirValuePack::fixed(values),
                 initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })));
         }
         self.prefix.append(&mut prefix);
@@ -1091,6 +1092,7 @@ pub(super) fn empty_local_decl(local: LocalId) -> HirStmt {
         bindings: vec![local],
         values: HirValuePack::fixed(Vec::new()),
         initializer_merge_transaction: None,
+        generic_for_initializer_producer: None,
     }))
 }
 
@@ -1099,6 +1101,7 @@ fn local_decl_with_value(local: LocalId, value: HirExpr) -> HirStmt {
         bindings: vec![local],
         values: HirValuePack::fixed(vec![value]),
         initializer_merge_transaction: None,
+        generic_for_initializer_producer: None,
     }))
 }
 

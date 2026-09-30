@@ -44,6 +44,7 @@ pub(super) fn merge_initialized_local_declarations(
         bindings,
         values: HirValuePack::fixed(values),
         initializer_merge_transaction: None,
+        generic_for_initializer_producer: None,
     }));
     block.stmts.drain(start + 1..start + count);
     true

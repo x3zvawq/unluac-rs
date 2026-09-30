@@ -3,9 +3,15 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[r1_0 = nil]]
+-- unluac: expect-ast-count [[assign]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-max [[local-binding]] [[16]]
+-- unluac: expect-max-count [[local ]] [[15]]
 -- unluac: expect-ast-count [[function]] [[5]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=4]]
+-- unluac: expect-ast-count [[assign]] [[3]] [[@proto=4]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=5]]
+-- unluac: expect-ast-count [[assign]] [[4]] [[@proto=5]]
+-- unluac: expect-ast-count [[call]] [[3]] [[@proto=5]]
 local function choose(outer, a, b, probe)
     local x
     if outer then

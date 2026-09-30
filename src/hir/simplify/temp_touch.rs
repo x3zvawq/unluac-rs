@@ -37,6 +37,20 @@ pub(super) fn collect_temp_touch_positions(stmts: &[HirStmt]) -> TempTouchIndex 
     positions
 }
 
+/// 嵌套控制块共用一次词法编号；区间只适用于当前树，不能代表动态执行顺序。
+pub(super) fn collect_temp_tree_touch_positions(
+    stmts: &[HirStmt],
+) -> (super::lexical_cfg::HirStmtTree, TempTouchIndex) {
+    let mut positions = TempTouchIndex::default();
+    let tree = super::lexical_cfg::HirStmtTree::build(stmts, &mut |id, stmt| {
+        crate::hir::visit::visit_stmt_header(
+            stmt,
+            &mut TempRefCollector(|temp| positions.record(temp, id.index())),
+        );
+    });
+    (tree, positions)
+}
+
 pub(super) fn collect_temp_reads_in_proto(proto: &HirProto) -> BTreeSet<TempId> {
     let mut collector = TempReadCollector::default();
     visit_proto(proto, &mut collector);

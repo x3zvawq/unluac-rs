@@ -460,6 +460,7 @@ pub(super) fn simplify_hir(
                             safety,
                             dialect,
                             proto.id == chunk_entry,
+                            locals::PromotionStage::Normal,
                         ),
                         8 => branch_control_folding::fold_branch_control_in_proto(
                             proto, facts, safety,
@@ -503,12 +504,22 @@ pub(super) fn simplify_hir(
                             dialect,
                             proto.id == chunk_entry,
                         ),
-                        22 => dead_temps::remove_dead_temp_materializations_in_proto(
-                            proto,
-                            facts,
-                            safety,
-                            dead_temps::DeadTempStage::Final,
-                        ),
+                        22 => {
+                            // 原值选择、覆盖和调用帧先取得归属；新增声明后先回 Normal，
+                            // 不在同一快照里继续删除可能属于它的准备或根端点。
+                            locals::restore_remaining_initializers(
+                                proto,
+                                facts,
+                                safety,
+                                dialect,
+                                proto.id == chunk_entry,
+                            ) || dead_temps::remove_dead_temp_materializations_in_proto(
+                                proto,
+                                facts,
+                                safety,
+                                dead_temps::DeadTempStage::Final,
+                            )
+                        }
                         23 => {
                             let restored = call_frames::restore_lookup_decision_frames(
                                 proto,

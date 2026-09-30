@@ -271,6 +271,8 @@ impl HirInlineDisposition {
 /// 原因是跨层 capability 的说明，不携带 Structure/SSA 的 home slot 或 def 类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HirInlineRetentionReason {
+    /// 原未读字面量仍是显式初始化，不能当作已消费的寄存器准备删除。
+    SourceInitialization,
     /// 删除快照会让引用捕获观察到另一个 value epoch。
     CapturedValueEpoch,
     /// 常量传播会删除原按值捕获，改变 Fresh 或非自反 capture 的闭包对象身份。
@@ -1156,6 +1158,8 @@ pub struct HirCallStmt {
 pub struct HirLocalDecl {
     pub bindings: Vec<LocalId>,
     pub values: HirValuePack,
+    /// 原循环初始化写提升为声明后仍属于同一 producer occurrence。
+    pub generic_for_initializer_producer: Option<HirGenericForInitializerProducerId>,
     /// 仅授权与同 token、紧邻且形状仍匹配的 assignment 合回 initializer。
     pub initializer_merge_transaction: Option<HirInitializerMergeTransactionId>,
 }

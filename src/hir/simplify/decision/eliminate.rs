@@ -134,6 +134,7 @@ fn eliminate_stmt(
         }
         HirStmt::LocalDecl(local_decl) => {
             let initializer_merge_transaction = local_decl.initializer_merge_transaction;
+            let generic_for_initializer_producer = local_decl.generic_for_initializer_producer;
             let (mut prefix, values, changed) =
                 extract_value_pack(local_decl.values, state, safety);
             prefix.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
@@ -141,6 +142,9 @@ fn eliminate_stmt(
                 values,
                 initializer_merge_transaction: (!changed)
                     .then_some(initializer_merge_transaction)
+                    .flatten(),
+                generic_for_initializer_producer: (!changed)
+                    .then_some(generic_for_initializer_producer)
                     .flatten(),
             })));
             (prefix, changed)

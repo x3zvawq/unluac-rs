@@ -71,6 +71,14 @@ impl<'a> ConstructorShape<'a> {
                 || self.records > allocation.hash_capacity as usize)
     }
 
+    /// 原批量分配形状已填满的肯定证明；其它分配协议不能借此认领独立求值边界。
+    pub(super) fn batched_complete(&self) -> bool {
+        self.table
+            .allocation
+            .batched_capacity_matches(self.arrays, self.records)
+            == Some(true)
+    }
+
     pub(super) fn complete(&self) -> bool {
         self.table
             .allocation

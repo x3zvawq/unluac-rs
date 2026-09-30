@@ -241,6 +241,19 @@ impl<'a> RootEventBlock<'a> {
             .is_some_and(|events| self.contains(&events.reads, ordinal))
     }
 
+    /// 查询既有 Local 的剩余读取；后继原位覆盖不是旧值的活读。
+    pub(in crate::hir::simplify) fn has_local_read_from(
+        self,
+        local: LocalId,
+        ordinal: usize,
+    ) -> bool {
+        self.index
+            .by_local
+            .get(&local)
+            .and_then(|events| self.next(&events.reads, ordinal))
+            .is_some()
+    }
+
     /// 每个候选 local 独立逆扫完整后缀；嵌套事件仍投影成同一直属观察时点。
     pub(super) fn local_touch_positions_rev(
         self,

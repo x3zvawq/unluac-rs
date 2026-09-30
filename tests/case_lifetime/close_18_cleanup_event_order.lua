@@ -4,6 +4,9 @@
 -- unluac: expect-ast-count [[table-list-field]] [[23]] [[@proto=0]]
 -- 调用与索引快照应由原帧恢复，不为原有 70 个 binding 增添中转声明。
 -- unluac: expect-ast-max [[local-binding]] [[70]]
+-- 原索引、比较与调用共同恢复，不留下长度快照和 assert 接棒变量。
+-- unluac: expect-not-contains [[ = #]]
+-- unluac: expect-not-contains [[= assert]]
 
 local function acquire(log, name)
     log[#log + 1] = "open:" .. name
@@ -217,6 +220,8 @@ assert(explicit_scope() == 9)
 print("explicit_scope", 9)
 
 -- Equal returns stay equivalent after the pending cleanup transaction is consumed.
+-- 相同返回保留自然的条件返回，不合并为孤立的空 if。
+-- unluac: expect-count [[return 42]] [[5]]
 do
     local calls, closes = 0, 0
     local function ordinary(flag)

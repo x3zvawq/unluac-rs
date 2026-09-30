@@ -910,7 +910,15 @@ pub(super) fn build(
         domains: &loop_container_blocks,
         equal_nestings: &equal_loop_nestings,
     };
-    let mut arena = build_regions(proto, cfg, graph_facts, &input, &loop_snapshot, &tbc_flow)?;
+    let mut arena = build_regions(
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+        &input,
+        &loop_snapshot,
+        &tbc_flow,
+    )?;
     prune_non_iteration_branch_tail_continues(
         proto,
         cfg,

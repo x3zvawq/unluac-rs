@@ -78,14 +78,26 @@ pub(super) struct PrefixFailures {
     dependent_owners: BTreeSet<usize>,
     rejected: BTreeMap<usize, usize>,
     invalid_from: Option<usize>,
+    reordered_declarations: BTreeSet<usize>,
 }
 
 impl PrefixFailures {
+    /// 原声明的消费导致重声明错位时，先撤回其来源事务；整批重建后再验证后缀请求。
+    pub(super) fn from_dependent_owners(owners: BTreeSet<usize>) -> Self {
+        Self {
+            dependent_owners: owners,
+            rejected: BTreeMap::new(),
+            invalid_from: None,
+            reordered_declarations: BTreeSet::new(),
+        }
+    }
+
     pub(super) fn invalid_from(index: usize) -> Self {
         Self {
             dependent_owners: BTreeSet::new(),
             rejected: BTreeMap::new(),
             invalid_from: Some(index),
+            reordered_declarations: BTreeSet::new(),
         }
     }
 
@@ -98,6 +110,17 @@ impl PrefixFailures {
             .chain(self.dependent_owners.iter().copied())
             .min()
             .expect("prefix failure contains a rejected request or invalid suffix")
+    }
+
+    /// 声明跨过了更高槽的存活声明，且本词法域的后继请求失败；空缺前缀不反推来源。
+    pub(super) fn reordered_declaration(&self, index: usize, scope_end: usize) -> Option<usize> {
+        if !self.reordered_declarations.contains(&index) || self.rejects(index) {
+            return None;
+        }
+        self.rejected
+            .range(index + 1..scope_end)
+            .next()
+            .map(|(&start, _)| start)
     }
 
     pub(super) fn rejects(&self, start: usize) -> bool {
@@ -336,7 +359,7 @@ pub(super) fn validate_prefixes(
     });
     let temp_scopes = TemporaryScopes::new(&proto.body, removed);
     let mut scan = PrefixScan {
-        trailing_label_exits: super::lexical_cfg::trailing_label_exits(&proto.body),
+        label_scope_exits: super::lexical_cfg::label_scope_exits(&proto.body),
         facts,
         removed,
         candidates,
@@ -345,10 +368,13 @@ pub(super) fn validate_prefixes(
         header_slots,
         locals: Vec::new(),
         declared,
+        declared_temps: BTreeSet::new(),
+        temp_slots: Vec::new(),
         pending: BTreeSet::new(),
         preserved: BTreeSet::new(),
         rejected: BTreeMap::new(),
         scope_rejected: None,
+        reordered_declarations: BTreeSet::new(),
         unproven_prefix: false,
         temp_scopes,
         global_keys: global_keys.keys,
@@ -371,6 +397,7 @@ pub(super) fn validate_prefixes(
             dependent_owners: BTreeSet::new(),
             rejected,
             invalid_from,
+            reordered_declarations: scan.reordered_declarations,
         })
     } else {
         Ok(scan.preserved)
@@ -512,7 +539,7 @@ impl TemporaryScopes {
 }
 
 struct PrefixScan<'a> {
-    trailing_label_exits: BTreeSet<crate::hir::common::HirLabelId>,
+    label_scope_exits: BTreeSet<crate::hir::common::HirLabelId>,
     facts: &'a ProtoPromotionFacts,
     removed: &'a [bool],
     candidates: &'a BTreeMap<usize, PrefixRequest>,
@@ -521,10 +548,13 @@ struct PrefixScan<'a> {
     header_slots: usize,
     locals: Vec<Option<LocalId>>,
     declared: BTreeSet<LocalId>,
+    declared_temps: BTreeSet<TempId>,
+    temp_slots: Vec<(usize, TempId)>,
     pending: BTreeSet<usize>,
     preserved: BTreeSet<LocalId>,
     rejected: BTreeMap<usize, usize>,
     scope_rejected: Option<usize>,
+    reordered_declarations: BTreeSet<usize>,
     unproven_prefix: bool,
     temp_scopes: TemporaryScopes,
     global_keys: BTreeMap<TempId, crate::LuaString>,
@@ -569,7 +599,7 @@ impl PrefixScan<'_> {
     fn scan_block_contents(&mut self, block: &HirBlock, keep_scope: bool) -> Result<(), usize> {
         let scope_start = self.locals.len();
         let incoming_unproven = self.unproven_prefix;
-        for stmt in &block.stmts {
+        for (statement, stmt) in block.stmts.iter().enumerate() {
             if self.cursor > self.last_start {
                 break;
             }
@@ -628,8 +658,8 @@ impl PrefixScan<'_> {
             let mut has_temp = false;
 
             let mut reads = BindingReadCollector(|binding| {
-                if let HirBinding::Temp(_) = binding {
-                    has_temp = true;
+                if let HirBinding::Temp(temp) = binding {
+                    has_temp |= !self.declared_temps.contains(&temp);
                 }
             });
             if matches!(
@@ -660,11 +690,21 @@ impl PrefixScan<'_> {
                             continue;
                         }
 
-                        self.unproven_prefix |= self
-                            .facts
-                            .trusted_local_home_slot(local)
-                            .map(HomeSlotKey::slot)
-                            != Some(slot);
+                        let home = self.facts.trusted_local_home_slot(local);
+                        if self
+                            .locals
+                            .last()
+                            .copied()
+                            .flatten()
+                            .and_then(|previous| self.facts.trusted_local_home_slot(previous))
+                            .zip(home)
+                            .is_some_and(|(previous, current)| previous.slot() > current.slot())
+                        {
+                            // 两个现存声明的原 home 顺序已反转，可归因于声明下沉。
+                            // 单纯空缺槽或重复槽可能仍有完整帧准备，不能据此回撤无关 owner。
+                            self.reordered_declarations.insert(index);
+                        }
+                        self.unproven_prefix |= home.map(HomeSlotKey::slot) != Some(slot);
                         if !self.preserved.contains(&local) {
                             self.pending.insert(self.locals.len());
                         }
@@ -731,6 +771,27 @@ impl PrefixScan<'_> {
                     self.block(&while_.body)?;
                 }
                 HirStmt::Assign(assign)
+                    if matches!(block.stmts.get(statement + 1), Some(HirStmt::ToBeClosed(tbc))
+                        if matches!(tbc.declaration(stmt), Some(crate::hir::common::HirTbcDeclaration::Temps { .. }))) =>
+                {
+                    // TBC 配对已经证明整包在 AST 中成为一个声明；Temp 身份不表示缺少
+                    // 源码槽。保留原初始化与激活，只将这组显式声明计入当前词法前缀。
+                    for target in &assign.targets {
+                        let HirLValue::Temp(temp) = target else {
+                            unreachable!()
+                        };
+                        let slot = self.header_slots + self.locals.len();
+                        self.unproven_prefix |= !self.declared_temps.insert(*temp)
+                            || self
+                                .facts
+                                .trusted_temp_home_slot(*temp)
+                                .map(HomeSlotKey::slot)
+                                != Some(slot);
+                        self.temp_slots.push((self.locals.len(), *temp));
+                        self.locals.push(None);
+                    }
+                }
+                HirStmt::Assign(assign)
                     if assign.targets.iter().all(|target| match target {
                         HirLValue::Temp(_) => true,
                         HirLValue::Local(local) => self.declared.contains(local),
@@ -750,7 +811,7 @@ impl PrefixScan<'_> {
                         && assign
                             .targets
                             .iter()
-                            .any(|target| matches!(target, HirLValue::Temp(_)));
+                            .any(|target| matches!(target, HirLValue::Temp(temp) if !self.declared_temps.contains(temp)));
                 }
                 HirStmt::TableSetList(_) => {
                     // 残余批次尚未获得完整源码帧；它的临时声明影响当前块后缀，
@@ -762,9 +823,9 @@ impl PrefixScan<'_> {
                 | HirStmt::Return(_)
                 | HirStmt::Break
                 | HirStmt::Continue => {}
-                HirStmt::Goto(goto) if self.trailing_label_exits.contains(&goto.target) => {}
-                HirStmt::Label(label) if self.trailing_label_exits.contains(&label.id) => {
-                    // 共享词法证书确认所有入口只退出到祖先尾部；跳转不引入声明槽。
+                HirStmt::Goto(goto) if self.label_scope_exits.contains(&goto.target) => {}
+                HirStmt::Label(label) if self.label_scope_exits.contains(&label.id) => {
+                    // 共享词法证书确认所有入口不进入新声明域；跳转不引入声明槽。
                     // 当前扫描仍逐项核对资源和声明，不把该证书当作跨边移动许可。
                 }
                 HirStmt::ToBeClosed(tbc)
@@ -776,6 +837,11 @@ impl PrefixScan<'_> {
                     // TBC 激活已声明的同一槽，不新增声明位置；其资源与关闭边界仍由原
                     // owner 保留。后续帧可以验证该前缀，不能吸收或移动这条 activation。
                 }
+                HirStmt::ToBeClosed(tbc)
+                    if matches!(tbc.value, crate::hir::common::HirExpr::TempRef(temp)
+                        if self.declared_temps.contains(&temp)
+                            && self.facts.trusted_temp_home_slot(temp)
+                                == Some(self.facts.tbc_home(tbc.origin))) => {}
                 HirStmt::LocalRootRelease(local) if self.declared.contains(local) => {}
                 _ => return Err(index),
             }
@@ -788,6 +854,14 @@ impl PrefixScan<'_> {
     }
 
     fn leave_scope(&mut self, scope_start: usize) {
+        while self
+            .temp_slots
+            .last()
+            .is_some_and(|(slot, _)| *slot >= scope_start)
+        {
+            let (_, temp) = self.temp_slots.pop().unwrap();
+            self.declared_temps.remove(&temp);
+        }
         for local in self.locals.drain(scope_start..).flatten() {
             self.declared.remove(&local);
         }

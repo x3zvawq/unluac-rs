@@ -709,8 +709,8 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     ),
     LuaCaseDefinition::new(
         "tests/case_lifetime/roots_10_dead_temp_physical_root.lua",
-        &["callee", "dead-temp", "gc", "overwrite"],
-        "验证HIR保留的dead physical-home copy不能被AST cleanup误删，同时无观察callee仍可内联。",
+        &["callee", "dead-temp", "gc", "overwrite", "metamethod"],
+        "验证无读副本的物理根、显式覆盖释放及环境元方法替换全局callee后的调用中保活。",
         &[
             LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54]).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),
@@ -902,8 +902,14 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     ),
     LuaCaseDefinition::new(
         "tests/case_lifetime/scope_03_end_copy_root_coverage.lua",
-        &["callback", "copy-root", "debug", "scope-end"],
-        "让 source 与未读 duplicate 共享 frame-end root，先经可内联子块改变 HIR，再删除 dead copy；callback GC 时必须仍能从 source 原求值点保住对象，函数结束后释放。",
+        &[
+            "callback",
+            "copy-root",
+            "debug",
+            "scope-end",
+            "residual-root",
+        ],
+        "验证共享 frame-end root 的 source 快照，以及 callback 返回后由独立 caller 观察的残根窗口；重复根交接不能授权调用帧平移。",
         &[
             LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),
@@ -1157,8 +1163,8 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     ),
     LuaCaseDefinition::new(
         "tests/case_lifetime/scope_06_debug_scope_loop_windows.lua",
-        &["debug", "numeric-for", "repeat", "while"],
-        "区分loop body每轮闭合窗口与包住整个while/repeat的窗口，scope结束后scratch必须退休。",
+        &["debug", "numeric-for", "repeat", "while", "metamethod"],
+        "区分每轮与整个while/repeat的根窗口，并验证repeat字段读取先于被__index修改的参数比较，scope结束后scratch必须退休。",
         &[
             LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),
@@ -1643,6 +1649,22 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "二十组Lua5.4生命周期覆盖to-be-closed多出口/重入/尾调用、const迭代及表构造与CALL root的释放和保留。",
         &[
             LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_lifetime/overwrite_09_fixed_result_receiver_cleanup.lua",
+        &["gc-root", "multi-return", "owner", "nil-overwrite"],
+        "固定多结果CALL写回已有低槽接收者，未读nil初始化与最终批量清槽沿用同一身份，避免生成新的无关nil绑定。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),

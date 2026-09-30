@@ -779,6 +779,7 @@ fn lower_proto_one(
                 bindings: copy_root_holders.clone(),
                 values: vec![HirExpr::Nil; copy_root_holders.len()].into(),
                 initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
         );
     }
@@ -1982,6 +1983,7 @@ fn build_composite_factory_proto(
                     bindings: vec![local],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(*value)]),
                     initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })));
             }
         }
@@ -2053,6 +2055,7 @@ fn build_composite_factory_proto(
             bindings: vec![local],
             values: HirValuePack::fixed(vec![closure]),
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         })));
         if index == 0
             && let Some(effect) = plan
@@ -2458,6 +2461,7 @@ fn build_proto_body(
             values: HirValuePack::fixed(vec![HirExpr::Nil; entry_nil_bindings.len()]),
             bindings: entry_nil_bindings,
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))]
     };
     prefix.extend(local_decl_stmts(std::mem::take(
@@ -2477,6 +2481,7 @@ fn build_proto_body(
                         captures: Vec::new(),
                     }))]),
                     initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 }))
             }),
     );

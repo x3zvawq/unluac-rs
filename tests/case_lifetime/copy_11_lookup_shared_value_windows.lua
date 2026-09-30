@@ -2,6 +2,9 @@
 -- unluac: expect-ast-min [[local-decl]] [[32]]
 -- unluac: expect-ast-max [[local-binding]] [[34]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
+-- 整组清零直接写回原目标，不引入 nil 接收变量、逐项接棒或额外作用域。
+-- unluac: expect-ast-max [[assign]] [[4]]
+-- unluac: expect-ast-count [[do-block]] [[0]]
 local weak = setmetatable({}, { __mode = "v" })
 local object = {}
 weak[1] = object

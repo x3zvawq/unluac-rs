@@ -1,7 +1,12 @@
 -- A recovered local reassigned to a collectable value must die before a moved single-pass tail.
--- unluac: expect-ast-max [[local-binding]] [[12]]
+-- unluac: expect-ast-max [[local-binding]] [[11]]
 -- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[function]] [[5]]
+-- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[assign]] [[3]] [[@proto=1]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=5]]
+-- unluac: expect-max-count [[local ]] [[11]]
 
 local weak = setmetatable({}, { __mode = "v" })
 

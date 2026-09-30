@@ -421,7 +421,10 @@ fn fold(mut block: HirBlock, changed: &mut bool) -> Tree {
         }
         // 候选拒绝[ProofIncomplete]：and/or 需要 then 独立恒真及共同返回来源；
         // then 为假值会误选 else，未知真值也不能借参数当前调用的观测放宽。
-        let can_merge = matches!((&then_tree, &else_tree),
+        // 候选拒绝[PolicyBoundary]：前层要求保留的原检查不能变为可被值域整理
+        // 消去的逻辑表达式；即使两臂结果相同，也继续保留控制语句。
+        let can_merge = !preserves_empty_test
+            && matches!((&then_tree, &else_tree),
             (Tree::Value { truthy: Some(true), ret: left, .. }, Tree::Value { ret: right, .. })
                 if left.frame_source == right.frame_source);
         if can_merge {

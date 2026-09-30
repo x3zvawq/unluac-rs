@@ -3,6 +3,9 @@
 -- unluac: expect-ast-count [[close-binding]] [[3]]
 -- unluac: expect-ast-max [[local-binding]] [[9]]
 -- unluac: expect-ast-count [[repeat]] [[0]]
+-- 跳转出口沿用原声明作用域，索引和拼接在完整赋值帧中直接表达。
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-not-contains [[ = #]]
 
 local function exercise(mode)
     local log = {}

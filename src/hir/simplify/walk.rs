@@ -119,6 +119,12 @@ fn rewrite_stmt<P: HirRewritePass>(stmt: &mut HirStmt, pass: &mut P) -> bool {
         }
         _ => None,
     };
+    let original_local_bindings = match stmt {
+        HirStmt::LocalDecl(decl) if decl.generic_for_initializer_producer.is_some() => {
+            Some(decl.bindings.clone())
+        }
+        _ => None,
+    };
     let original_generic_for_iterator = match stmt {
         HirStmt::GenericFor(generic_for)
             if generic_for.initializer_transaction.is_some()
@@ -169,6 +175,13 @@ fn rewrite_stmt<P: HirRewritePass>(stmt: &mut HirStmt, pass: &mut P) -> bool {
         && assign.targets != original_targets
     {
         assign.generic_for_initializer_producer = None;
+        metadata_changed = true;
+    }
+    if let (Some(original_bindings), HirStmt::LocalDecl(decl)) =
+        (original_local_bindings, &mut *stmt)
+        && decl.bindings != original_bindings
+    {
+        decl.generic_for_initializer_producer = None;
         metadata_changed = true;
     }
     if let (Some(original_iterator), HirStmt::GenericFor(generic_for)) =

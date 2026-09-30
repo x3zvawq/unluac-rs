@@ -5,6 +5,10 @@
 -- unluac: expect-ast-max [[local-binding]] [[23]]
 -- 原字节码中的 padding 初始化不能因为后续未读取而消失。
 -- unluac: expect-count [[= 1]] [[1]]
+-- 两次方法调用保留直接语法，回调和 GC 观察不经过函数别名中转。
+-- unluac: expect-ast-count [[method-call]] [[2]]
+-- unluac: expect-not-contains [[= collectgarbage]]
+-- unluac: expect-not-contains [[= assert]]
 
 do
     -- regress_416_copy_local_callback_root: an unread copy local remains a strong root through callback execution

@@ -510,7 +510,9 @@ impl AstRewriteAuthority {
     pub fn may_merge_adjacent_inert_declarations(&self) -> bool {
         self.may_move_scope_start()
             || matches!(self, Self::Hir(HirInlineDisposition::Preserve(reasons))
-                if reasons.iter().all(|reason| *reason == crate::hir::HirInlineRetentionReason::PhysicalFramePrefix))
+                if reasons.iter().all(|reason| matches!(reason,
+                    crate::hir::HirInlineRetentionReason::PhysicalFramePrefix
+                        | crate::hir::HirInlineRetentionReason::SourceInitialization)))
     }
 
     /// 普通父块的尾 do 合并不移动初始化或声明槽，也不改变共同退出时点。
@@ -518,7 +520,9 @@ impl AstRewriteAuthority {
     pub fn may_merge_tail_scope(&self) -> bool {
         !self.must_preserve()
             || matches!(self, Self::Hir(HirInlineDisposition::Preserve(reasons))
-                if reasons.iter().all(|reason| *reason == crate::hir::HirInlineRetentionReason::PhysicalFramePrefix))
+                if reasons.iter().all(|reason| matches!(reason,
+                    crate::hir::HirInlineRetentionReason::PhysicalFramePrefix
+                        | crate::hir::HirInlineRetentionReason::SourceInitialization)))
     }
 
     pub const fn may_shorten_lifetime(&self) -> bool {

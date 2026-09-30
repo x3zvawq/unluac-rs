@@ -308,6 +308,7 @@ fn lower_regular_instr_body(
                         bindings: vec![snapshot],
                         values: vec![value].into(),
                         initializer_merge_transaction: None,
+                        generic_for_initializer_producer: None,
                     })));
                     return Some(stmts);
                 }
@@ -340,6 +341,7 @@ fn lower_regular_instr_body(
                         )]
                         .into(),
                         initializer_merge_transaction: None,
+                        generic_for_initializer_producer: None,
                     })));
                 }
                 None => stmts.extend(fixed_assign(
@@ -861,6 +863,7 @@ fn lower_shared_capture_barrier(
             }))]
             .into(),
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))];
     };
     let snapshots = locals
@@ -882,11 +885,13 @@ fn lower_shared_capture_barrier(
             bindings: vec![box_local],
             values: vec![table].into(),
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         })),
         HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: locals,
             values: snapshots.into(),
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         })),
     ]
 }
@@ -917,6 +922,7 @@ fn fixed_assign(
             bindings: decl_locals,
             values,
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))]
     } else {
         let declared = decl_locals
@@ -972,6 +978,7 @@ pub(super) fn local_decl_stmts(locals: Vec<LocalId>) -> Vec<HirStmt> {
             bindings: locals,
             values: HirValuePack::default(),
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))]
     }
 }

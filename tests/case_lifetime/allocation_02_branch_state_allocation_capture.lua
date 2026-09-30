@@ -2,6 +2,9 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- 原始 victim 的释放需要局部身份，但 callee/table 准备不应多出中转声明。
 -- unluac: expect-ast-count [[local-binding]] [[12]]
+-- 接收调用结果后仍须保留清空写，不能改成独立调用加无来源的 nil 声明。
+-- unluac: expect-ast-count [[assign]] [[4]] [[@proto=3]]
+-- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=3]]
 
 local function make()
     return "tag", {}, {}

@@ -213,6 +213,14 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
     }
 
     for stmt in &block.stmts {
+        let producer = match stmt {
+            HirStmt::Assign(assign) => assign.generic_for_initializer_producer,
+            HirStmt::LocalDecl(decl) => decl.generic_for_initializer_producer,
+            _ => None,
+        };
+        if let Some(producer) = producer {
+            let _ = writeln!(output, "{indent}initializer-producer {producer:?}");
+        }
         match stmt {
             HirStmt::LocalRootRelease(local) => {
                 let _ = writeln!(output, "{indent}release-local-root l{}", local.index());

@@ -3,6 +3,8 @@
 -- unluac: expect-not-contains [[(function()]]
 -- unluac: expect-ast-count [[local-binding]] [[6]]
 -- unluac: expect-ast-count [[do-block]] [[2]]
+-- 两个独立捕获作用域仍写回同一外层绑定，不另建空的接棒声明。
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 local u
 do
     local count = 0

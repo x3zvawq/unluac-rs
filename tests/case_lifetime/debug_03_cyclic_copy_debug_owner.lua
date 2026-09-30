@@ -1,7 +1,7 @@
 -- assert 值物化形成 label flow；debug source owner 与跨轮副本必须分别退休。
--- unluac: expect-ast-min [[while]] [[1]]
--- 额外预算只包含跨轮 carrier 和 header 查找暂存，布尔实参不应再拆出别名。
--- unluac: expect-ast-max [[local-binding]] [[11]]
+-- owner 的原 COPY 覆盖沿用同一身份，跨轮 copy 独立保活；assert 的函数和布尔实参不落地。
+-- unluac: expect-ast-max [[local-binding]] [[8]] [[@proto=0]]
+-- unluac: expect-not-contains [[ = assert]]
 -- unluac: expect-ast-count [[while]] [[1]]
 -- unluac: expect-ast-count [[break]] [[1]]
 -- unluac: expect-contains [[local owner = make()]] [[@debug=retained]]

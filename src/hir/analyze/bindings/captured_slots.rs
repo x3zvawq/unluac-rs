@@ -193,6 +193,12 @@ pub(super) fn collect_captured_slot_targets(
     let mut value_captured_versions = BTreeSet::new();
     let mut value_capture_pending = Vec::new();
     let mut captured_uses = Vec::new();
+    // 有 debug 时只消费所属 scope 的初始化事实；快照值相同不能合并两个源码声明。
+    let restored_initializers = if proto.debug_locals.is_empty() {
+        restored_cell_initializers(proto, cfg, dataflow, epochs)
+    } else {
+        BTreeMap::new()
+    };
     let mut entry_initializers = BTreeMap::new();
     if proto.debug_locals.is_empty()
         && let Some(prefix) = emission.regular_prefix(cfg.entry_block)
@@ -318,31 +324,33 @@ pub(super) fn collect_captured_slot_targets(
                                 == epochs.epoch_at(reg, InstrRef(start_instr))
                     },
                 );
-            let initializer = debug_initializer.or_else(|| {
-                let initial = dataflow.def_instr(*entry_initializers.get(&reg)?).index();
-                let capture_block = cfg.instr_to_block[instr_index];
-                if graph.block_is_cyclic(capture_block) {
-                    // 入口初始化不参与回边，且捕获仍处于同一 CLOSE epoch，才证明是
-                    // 跨轮共享 cell。每轮关闭的槽在 loop header 有 merge epoch，不能
-                    // 将其初始化外提；每轮先覆盖再捕获时无需存在活的 carried phi。
-                    if graph.block_is_cyclic(cfg.entry_block)
-                        || !graph.dominates(cfg.entry_block, capture_block)
-                        || epochs.epoch_at(reg, InstrRef(initial))
-                            != epochs.epoch_at(reg, InstrRef(instr_index))
-                    {
+            let initializer = debug_initializer
+                .or_else(|| restored_initializers.get(&start_instr).copied())
+                .or_else(|| {
+                    let initial = dataflow.def_instr(*entry_initializers.get(&reg)?).index();
+                    let capture_block = cfg.instr_to_block[instr_index];
+                    if graph.block_is_cyclic(capture_block) {
+                        // 入口初始化不参与回边，且捕获仍处于同一 CLOSE epoch，才证明是
+                        // 跨轮共享 cell。每轮关闭的槽在 loop header 有 merge epoch，不能
+                        // 将其初始化外提；每轮先覆盖再捕获时无需存在活的 carried phi。
+                        if graph.block_is_cyclic(cfg.entry_block)
+                            || !graph.dominates(cfg.entry_block, capture_block)
+                            || epochs.epoch_at(reg, InstrRef(initial))
+                                != epochs.epoch_at(reg, InstrRef(instr_index))
+                        {
+                            return None;
+                        }
+                    } else if !matches!(
+                        dataflow.use_value(InstrRef(instr_index), reg),
+                        SsaValue::Phi(_)
+                    ) {
                         return None;
                     }
-                } else if !matches!(
-                    dataflow.use_value(InstrRef(instr_index), reg),
-                    SsaValue::Phi(_)
-                ) {
-                    return None;
-                }
-                (initial < start_instr
-                    && epochs.epoch_at(reg, InstrRef(initial))
-                        == epochs.epoch_at(reg, InstrRef(start_instr)))
-                .then_some(initial)
-            });
+                    (initial < start_instr
+                        && epochs.epoch_at(reg, InstrRef(initial))
+                            == epochs.epoch_at(reg, InstrRef(start_instr)))
+                    .then_some(initial)
+                });
             let start_instr = initializer.unwrap_or(start_instr);
             let entry_local_safe = epochs.spans_entry(reg);
             let key =
@@ -854,7 +862,7 @@ fn collect_lexical_close_scopes(
                 .insert(fact.reg);
         }
     }
-    // 每个 capture 只入队一次，Close 按槽范围退休组；内部条件不清空尚未关闭的 cell。
+    // 每个 capture 只入队一次，Close 按槽范围退休组；分支私有关闭不能退休其它路径的 cell。
     // 候选在消费处核对支配与窗口边界，不为每条 Close 重扫历史 capture。
     let local_keys = captured_uses
         .iter()
@@ -900,6 +908,23 @@ fn collect_lexical_close_scopes(
     let mut capture_cursor = 0;
     let mut candidates = Vec::new();
     let mut activations = CapturedActivationWindows::new();
+    // 提前出口只接受紧邻控制转移的原 CLOSE。每块一次索引，窗口查询不重扫退出路径。
+    let trailing_closes = cfg
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let prefix = cfg.non_control_instr_range(&proto.instrs, BlockRef(index));
+            let last = prefix.end.checked_sub(1)?;
+            (last >= prefix.start).then_some(last).and_then(|last| {
+                if let LowInstr::Close(close) = &proto.instrs[last] {
+                    Some((last, close.from))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>();
     for (close_instr, instr) in proto.instrs.iter().enumerate() {
         let close_block = cfg.instr_to_block[close_instr];
         while let Some(captured) = captured_uses.get(capture_cursor)
@@ -1004,13 +1029,16 @@ fn collect_lexical_close_scopes(
             // TBC 的 ExplicitClose 不在此域，资源回调与返回值的先后仍由 cleanup owner 保证。
             continue;
         }
-        let closed = pending.split_off(&CapturedSlotKey::new(close.from.index(), 0));
         if !matches!(
             plan.cleanup_disposition(InstrRef(close_instr)),
             Some(CleanupDisposition::LexicalScope(_))
         ) {
+            // goto 私有的 CLOSE 不经过正常续接路径，也不提供词法终点。
+            // 保留初始化到下一词法终点一次退休；届时仍核对 epoch 和逐出口关闭，
+            // 不按每条分支 CLOSE 重扫候选或把旧 cell 直接并入新激活。
             continue;
         }
+        let closed = pending.split_off(&CapturedSlotKey::new(close.from.index(), 0));
         let mut start = None;
         let mut exact = true;
         let mut closed_keys = Vec::new();
@@ -1071,13 +1099,16 @@ fn collect_lexical_close_scopes(
         }
         if exact
             && let Some(start) = start
-            // 内部条件不结束 cell 的词法窗口；跨块候选仍须是同一发射域内的闭合图区间。
-            // 分支私有初始化不支配合流 CLOSE，外来入口或提前出口也不能并入窗口。
+            // 内部条件不结束 cell 的词法窗口；提前出口必须在原位置关闭整个槽后缀。
+            // 外来入口和未关闭的离域路径仍拒绝，不能借源码 do 隐式补一次原本没有的关闭。
             && (cfg.instr_to_block[start] == close_block
                 || (emission.scope_owner(cfg.instr_to_block[start]) == emission.scope_owner(close_block)
                     && emission.regular_prefix(cfg.instr_to_block[start]).is_some_and(|range| range.contains(&start))
                     && emission.regular_prefix(close_block).is_some_and(|range| range.contains(&close_instr))
-                    && graph.closed_instruction_window(cfg, start..close_instr + 1)))
+                    && graph.instruction_window_with_exits(cfg, start..close_instr + 1, |edge| {
+                        trailing_closes[cfg.edges[edge.index()].from.index()]
+                            .is_some_and(|(at, from)| at >= start && from <= close.from)
+                    })))
             // CLOSE 关闭整个后缀；不能遗漏从前驱传入、在本块没有再次 capture 的旧 cell。
             // 查询范围受 VM 固定槽数约束，不随闭包/声明总数增长。
             && captured_regs[captured_regs.partition_point(|reg| reg.index() < close.from.index())..]
@@ -1519,6 +1550,59 @@ fn captured_debug_initializer(
         return None;
     };
     (fact.reg == reg).then(|| dataflow.def_instr(def).index())
+}
+
+/// 原高槽快照写回低槽时，捕获 cell 仍承接快照之前的原定义和中间写入。
+/// 按原 Def 顺序建立索引，不为每个捕获重复回扫 MOVE 链。
+fn restored_cell_initializers(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+) -> BTreeMap<usize, usize> {
+    let mut initializers = BTreeMap::new();
+    for (index, instr) in proto.instrs.iter().enumerate() {
+        let LowInstr::Move(write) = instr else {
+            continue;
+        };
+        if write.src.index() <= write.dst.index() {
+            continue;
+        }
+        let site = InstrRef(index);
+        let SsaValue::Def(snapshot) = dataflow.use_value(site, write.src) else {
+            continue;
+        };
+        let saved = dataflow.def_instr(snapshot);
+        let LowInstr::Move(save) = proto.instrs[saved.index()] else {
+            continue;
+        };
+        let SsaValue::Def(previous) = dataflow.use_value(saved, save.src) else {
+            continue;
+        };
+        let initial = dataflow.def_instr(previous);
+        if save.src != write.dst
+            || save.dst != write.src
+            || dataflow.def_reg(previous) != write.dst
+            || initial.index() >= saved.index()
+            || saved.index() >= index
+            || cfg.instr_to_block[initial.index()] != cfg.instr_to_block[index]
+            || cfg.instr_to_block[saved.index()] != cfg.instr_to_block[index]
+            || epochs.epoch_at(write.dst, initial) != epochs.epoch_at(write.dst, site)
+            || epochs.epoch_at(write.src, saved) != epochs.epoch_at(write.src, site)
+            || epochs.reference_capture_may_be_open(write.dst, saved)
+            || epochs.reference_capture_may_be_open(write.dst, site)
+        {
+            // 候选拒绝[ProofIncomplete]：只有同块、同 epoch 的确切保存/恢复链才证明
+            // 初始写与最终捕获共享身份；已打开的 cell 不从较早快照重新推导激活入口。
+            continue;
+        }
+        let start = initializers
+            .get(&initial.index())
+            .copied()
+            .unwrap_or(initial.index());
+        initializers.insert(index, start);
+    }
+    initializers
 }
 
 pub(super) fn captured_slot_start_instr(

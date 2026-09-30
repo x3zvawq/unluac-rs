@@ -1,7 +1,14 @@
 -- 共享入口的内层所有退出先汇入外层短路尾条件，而不是直接进入其末叶。
 -- unluac: expect-ast-min [[repeat]] [[2]] [[@dialect=luau]] [[@proto=1]]
 -- unluac: expect-ast-max [[goto]] [[0]] [[@dialect=luau]]
--- unluac: expect-contains [[local step, x = 0, 0]] [[@debug=retained]]
+-- 两个原循环状态即可；独立声明与并列声明都不引入中转，初始化由实际运行验证。
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]] [[@debug=retained]] [[@dialect=luajit]]
 -- unluac: expect-contains [[return step, x]] [[@debug=retained]]
 -- unluac: expect-contains [[local b = math.floor(mask / 2) % 2 == 1]] [[@debug=retained]]
 -- unluac: expect-contains [[local c = math.floor(mask / 4) % 2 == 1]] [[@debug=retained]]

@@ -3,6 +3,9 @@
 -- unluac: expect-ast-count [[local-binding]] [[16]]
 -- unluac: expect-ast-count [[close-binding]] [[3]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
+-- 循环参数直接成包，资源域后的调用不复用准备变量。
+-- unluac: expect-count [[, { "value" }, nil, ]] [[1]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
 local close_log = {}
 local close_meta = {
     __close = function(value, err)

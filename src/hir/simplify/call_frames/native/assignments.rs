@@ -4,6 +4,7 @@
 use super::*;
 
 pub(super) mod literal_globals;
+pub(super) mod nil;
 pub(super) mod prepared_writes;
 
 /// 首项字面量、低槽快照或空表与末项空表按原准备顺序逆序发布到低槽。
@@ -101,7 +102,6 @@ pub(super) fn allocation_pair(
             base: frame.homes[0],
             values: vec![left.clone(), HirExpr::TableConstructor(right.clone())].into(),
             result_locals: Vec::new(),
-            discarded_result: None,
             assignment_targets: vec![
                 HirLValue::Local(left_target),
                 HirLValue::Local(right_target),
@@ -245,7 +245,6 @@ pub(super) fn lookup_pack(
             base,
             values: values.into(),
             result_locals: Vec::new(),
-            discarded_result: None,
             assignment_targets: targets,
             luau_compound_global: false,
             indexed_target: None,
@@ -382,7 +381,6 @@ pub(super) fn global_arithmetic(
         base: home,
         values: vec![value].into(),
         result_locals: Vec::new(),
-        discarded_result: None,
         assignment_targets: vec![target.clone()],
         luau_compound_global: compound,
         indexed_target: None,
@@ -489,7 +487,6 @@ pub(super) fn copy_value_initializer(
         base: home,
         values: vec![value].into(),
         result_locals: if writeback { Vec::new() } else { vec![target] },
-        discarded_result: None,
         assignment_targets: if writeback {
             vec![HirLValue::Local(target)]
         } else {
@@ -555,7 +552,6 @@ pub(super) fn scalar_pair(
         || !plain_copy(last.stmt)
         || second.id != first.id + 1
         || last.id != second.id + 1
-        || left == right
         || [left, right].contains(&snapshot)
         || context.closed.contains(&base)
         || context.proto.local_debug_hints[snapshot.index()].is_some()
@@ -587,7 +583,6 @@ pub(super) fn scalar_pair(
         base,
         values: vec![value.clone(), tail.clone()].into(),
         result_locals: Vec::new(),
-        discarded_result: None,
         assignment_targets: vec![HirLValue::Local(left), HirLValue::Local(right)],
         luau_compound_global: false,
         indexed_target: None,
@@ -703,7 +698,6 @@ fn luau_plan(
         base: frame.base,
         values: values.into(),
         result_locals: Vec::new(),
-        discarded_result: None,
         assignment_targets: targets,
         luau_compound_global: false,
         indexed_target: None,
@@ -761,8 +755,11 @@ pub(super) fn parallel(
     let mut targets = Vec::new();
     for write in frame.writes.iter().rev() {
         let target = facts.promoted_local_for_temp(write.target)?;
-        if context.barred.contains(&write.home) || context.closed.contains(&write.home) {
-            // SemanticBarrier:Capture：不能把可观察的逐项 cell 更新移到整组末端。
+        if (frame.luau.is_some() && context.barred.contains(&write.home))
+            || context.closed.contains(&write.home)
+        {
+            // 候选拒绝[SemanticBarrier:Capture]：Luau 仍可能在准备期更新 cell；PUC/JIT
+            // 原事实已证明全部目标写处于 RHS 之后，按原逆序写回不改变捕获 cell 的更新点。
             return None;
         }
         targets.push(HirLValue::Local(target));
@@ -817,7 +814,6 @@ pub(super) fn parallel(
             base: frame.base,
             values: values.into(),
             result_locals: Vec::new(),
-            discarded_result: None,
             assignment_targets: targets,
             luau_compound_global: false,
             indexed_target: None,
@@ -940,7 +936,6 @@ pub(super) fn lookup_result(
         ))]
         .into(),
         result_locals: Vec::new(),
-        discarded_result: None,
         assignment_targets: vec![target.clone()],
         luau_compound_global: false,
         indexed_target: None,

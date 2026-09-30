@@ -752,13 +752,28 @@ impl FrameBuilder<'_> {
             DecompileDialect::Lua54 | DecompileDialect::Lua55
         ) && let Some((producer, home)) = self.facts.table_read_late_upvalue_base(access)
         {
-            if home.slot() != slot || self.native?.closed.contains(&home) {
+            let result = self.facts.table_read_result_home(access)?;
+            if result.slot() != slot
+                || self.native?.closed.contains(&home)
+                || self.native?.closed.contains(&result)
+            {
                 return None;
             }
-            // 原动态 key 先完成，再读取上值 base；源码也在相同结果槽准备 key，
-            // 由 GETUPVAL 占用紧邻高槽。不能套用通常的 base→key 准备布局。
+            // 原动态 key 先完成，再读取上值 base；高槽 key 的一元操作可借用
+            // 尚未读取 base 的结果槽。许可只覆盖本次原布局，不提前合并两次 cell 读取。
             let previous = std::mem::replace(&mut self.register_operand, false);
-            let key = self.expr(&access.key, before, slot, None, false, true, Some(producer));
+            let previous_key_base = self.indexed_key_base;
+            self.indexed_key_base = Some(slot);
+            let key = self.expr(
+                &access.key,
+                before,
+                home.slot(),
+                None,
+                false,
+                true,
+                Some(producer),
+            );
+            self.indexed_key_base = previous_key_base;
             self.register_operand = previous;
             return Some(HirExpr::TableAccess(Box::new(HirTableAccess {
                 key: key?,
@@ -799,7 +814,9 @@ impl FrameBuilder<'_> {
         }
         let base = if direct_base {
             access.base.clone()
-        } else if let Some(home) = self.prepared_upvalue_lookup_base(access) {
+        } else if matches!(access.base, HirExpr::UpvalueRef(_))
+            && let Some(home) = self.prepared_upvalue_lookup_base(access, before)
+        {
             if home != layout.base {
                 return None;
             }
@@ -990,19 +1007,27 @@ impl FrameBuilder<'_> {
         base
     }
 
-    /// 原 GETUPVAL→GETTABLE 的 base 准备；直接 GETTABUP 没有这个寄存器输入。
+    /// 原 GETUPVAL→GETTABLE 的 base 准备；Local 按当前定义时点查询，GETTABUP 没有此寄存器输入。
     pub(super) fn prepared_upvalue_lookup_base(
         &self,
         access: &HirTableAccess,
+        before: usize,
     ) -> Option<HomeSlotKey> {
-        if !matches!(access.base, HirExpr::UpvalueRef(_)) {
+        let value = match &access.base {
+            HirExpr::LocalRef(local) => {
+                let index = self.definition(*local, before)?;
+                scalar_local(self.run[index])?.1
+            }
+            value => value,
+        };
+        if !matches!(value, HirExpr::UpvalueRef(_)) {
             return None;
         }
         let crate::hir::common::HirOperationSources::Single(source) = access.sources else {
             return None;
         };
         self.facts
-            .operation_input_preparation(source, &access.base)
+            .operation_input_preparation(source, value)
             .map(|(_, home)| home)
     }
 
@@ -1076,7 +1101,8 @@ impl FrameBuilder<'_> {
         self.register_arithmetic_inputs(binary, before, input, result)
     }
 
-    fn register_arithmetic_inputs(
+    /// 调用方提供原布局确认的输入与结果 home；分槽运算不得以结果 epoch 替代输入 epoch。
+    pub(super) fn register_arithmetic_inputs(
         &mut self,
         binary: &crate::hir::common::HirBinaryExpr,
         before: usize,
@@ -1088,7 +1114,11 @@ impl FrameBuilder<'_> {
             && !self
                 .facts
                 .operation_result_reference_unaliased(binary.source_site?))
-            || self.native?.closed.contains(&result)
+            // 同槽未来的资源激活不保护当前普通算术定义；输入与结果的完整
+            // home 仍由本帧核对，活动资源槽及真实 TBC 注册值不能取得该证明。
+            || (self.native?.closed.contains(&result)
+                && !self.facts.operation_result_temp(binary.source_site?)
+                    .is_some_and(|temp| self.facts.temp_definition_tbc_unprotected(temp)))
         {
             return None;
         }
@@ -1163,8 +1193,10 @@ impl FrameBuilder<'_> {
             };
             let cdata = self.dialect == DecompileDialect::Luajit
                 && matches!(prepared, HirExpr::Int64(_) | HirExpr::UInt64(_));
+            let upvalue = matches!(prepared, HirExpr::UpvalueRef(_));
             if !rhs_low
-                && (cdata
+                && (upvalue
+                    || cdata
                     || (constant(prepared)
                         && matches!(
                             self.dialect,
@@ -1173,7 +1205,10 @@ impl FrameBuilder<'_> {
                                 | DecompileDialect::Lua53
                         )))
             {
-                if !cdata && self.literal_uses_rk(prepared, Some((&sources, true))) != Some(false) {
+                if !upvalue
+                    && !cdata
+                    && self.literal_uses_rk(prepared, Some((&sources, true))) != Some(false)
+                {
                     return None;
                 }
                 let (producer, home) =
@@ -1182,6 +1217,7 @@ impl FrameBuilder<'_> {
                     return None;
                 }
                 let previous = std::mem::replace(&mut self.register_operand, false);
+                // RHS 上值也由原 use→Def 授权；保持左侧 CALL/运算完成后的读取时点。
                 let rebuilt = self.expr(
                     &binary.rhs,
                     before,

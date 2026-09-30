@@ -1,6 +1,10 @@
 local weak = setmetatable({}, { __mode = "v" })
 -- unluac: expect-ast-count [[close-binding]] [[2]]
 -- unluac: expect-ast-max [[local-binding]] [[14]]
+-- 表目标和首项 RHS 的准备只属于并列赋值，不占用后续资源声明的源码身份。
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=3]]
+-- unluac: expect-count [[weak[1], weak[2] = first, second]] [[2]] [[@debug=retained]]
 local closed = 0
 
 local function allocation_root()

@@ -130,6 +130,7 @@ pub(in crate::hir) fn materialize_runtime_table_operands(
                 bindings: vec![local],
                 values: super::common::HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         })
         .collect()

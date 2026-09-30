@@ -97,6 +97,7 @@ pub(super) fn preserve(
                 bindings: vec![local],
                 values: vec![value].into(),
                 initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         }
         _ => unreachable!("capture binding checked before transaction"),

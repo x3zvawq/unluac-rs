@@ -76,6 +76,7 @@ fn collapse_live_boolean_materialization_shells_in_block(
                     bindings: vec![*local],
                     values: HirValuePack::fixed(vec![value]),
                     initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 }));
                 // 输出仍是声明，不会成为新的分支候选；不必回退或逐次搬移整个尾部。
                 continue;

@@ -2,6 +2,9 @@
 -- unluac: expect-ast-min [[local-decl]] [[32]]
 -- 清空前 31 个 home 不应另声明 30 个 nil 中转值；32 份原 root 仍须保留。
 -- unluac: expect-ast-count [[local-binding]] [[35]]
+-- 原对象发布和两次清零保持直接赋值，不拆成 nil 接棒语句或独立作用域。
+-- unluac: expect-ast-max [[assign]] [[3]]
+-- unluac: expect-ast-count [[do-block]] [[0]]
 local weak = setmetatable({}, { __mode = "v" })
 local function make()
     local object = {}

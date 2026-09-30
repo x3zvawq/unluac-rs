@@ -6,6 +6,8 @@
 -- unluac: expect-ast-count [[assign]] [[1]] [[@proto=11]]
 -- unluac: expect-ast-count [[assign]] [[1]] [[@proto=13]]
 -- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=18]]
+-- 无事件 COPY 只结束旧结果，不删除产生旧结果的调用，也不为返回值增加副本。
+-- unluac: expect-ast-count [[call]] [[2]] [[@proto=18]]
 
 local calls = 0
 

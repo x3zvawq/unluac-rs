@@ -1,5 +1,5 @@
 //! 维护 locals 提升的词法映射和全部 SSA 版本的 home 摘要。
-//! 子块只记录自身增量，退出时回滚；兄弟块不会继承彼此的绑定或冲突。
+//! 词法映射在子块退出时回滚；计划索引增量记录标量与子域输出的绑定和最后需求。
 
 use super::{BTreeMap, HomeSlotKey, LocalId, PromotionCtx, TempId};
 
@@ -7,7 +7,8 @@ use super::{BTreeMap, HomeSlotKey, LocalId, PromotionCtx, TempId};
 pub(super) struct LocalMapping {
     bindings: BTreeMap<TempId, LocalId>,
     homes: BTreeMap<LocalId, BTreeMap<Option<HomeSlotKey>, usize>>,
-    undo: Vec<(TempId, Option<LocalId>, Option<HomeSlotKey>)>,
+    entry_nil_homes: BTreeMap<HomeSlotKey, BTreeMap<LocalId, usize>>,
+    undo: Vec<(TempId, Option<LocalId>, Option<HomeSlotKey>, bool)>,
 }
 
 impl LocalMapping {
@@ -32,24 +33,34 @@ impl LocalMapping {
                     .get(temp.index())
                     .is_none_or(Option::is_none)
         });
+        let entry_nil =
+            ctx.facts.is_entry_nil_phi_temp(temp) && !ctx.facts.is_loop_carrier_temp(temp);
         let previous = self.bindings.insert(temp, local);
         if let Some(previous) = previous {
-            self.remove_home(previous, home);
+            self.remove_home(previous, home, entry_nil);
         }
-        self.add_home(local, home);
-        self.undo.push((temp, previous, home));
+        self.add_home(local, home, entry_nil);
+        self.undo.push((temp, previous, home, entry_nil));
     }
 
-    fn add_home(&mut self, local: LocalId, home: Option<HomeSlotKey>) {
+    fn add_home(&mut self, local: LocalId, home: Option<HomeSlotKey>, entry_nil: bool) {
         *self
             .homes
             .entry(local)
             .or_default()
             .entry(home)
             .or_default() += 1;
+        if entry_nil && let Some(home) = home {
+            *self
+                .entry_nil_homes
+                .entry(home)
+                .or_default()
+                .entry(local)
+                .or_default() += 1;
+        }
     }
 
-    fn remove_home(&mut self, local: LocalId, home: Option<HomeSlotKey>) {
+    fn remove_home(&mut self, local: LocalId, home: Option<HomeSlotKey>, entry_nil: bool) {
         let homes = self
             .homes
             .get_mut(&local)
@@ -64,21 +75,51 @@ impl LocalMapping {
         if homes.is_empty() {
             self.homes.remove(&local);
         }
+        if entry_nil && let Some(home) = home {
+            let owners = self
+                .entry_nil_homes
+                .get_mut(&home)
+                .expect("entry phi has home owner");
+            let count = owners
+                .get_mut(&local)
+                .expect("mapped entry phi contributes owner");
+            *count -= 1;
+            if *count == 0 {
+                owners.remove(&local);
+            }
+            if owners.is_empty() {
+                self.entry_nil_homes.remove(&home);
+            }
+        }
     }
 
     pub(super) fn rollback(&mut self, checkpoint: usize) {
         while self.undo.len() > checkpoint {
-            let (temp, previous, home) = self.undo.pop().unwrap();
+            let (temp, previous, home, entry_nil) = self.undo.pop().unwrap();
             let local = self
                 .bindings
                 .remove(&temp)
                 .expect("inserted temp remains mapped");
-            self.remove_home(local, home);
+            self.remove_home(local, home, entry_nil);
             if let Some(previous) = previous {
                 self.bindings.insert(temp, previous);
-                self.add_home(previous, home);
+                self.add_home(previous, home, entry_nil);
             }
         }
+    }
+
+    /// 已在父域声明的 Entry(nil) region result 拥有原槽；子域同 home 写仍属于这个物理根。
+    pub(super) fn entry_nil_owner(
+        &self,
+        home: HomeSlotKey,
+        ctx: &PromotionCtx<'_>,
+    ) -> Option<LocalId> {
+        let owners = self.entry_nil_homes.get(&home)?;
+        if owners.len() != 1 {
+            return None;
+        }
+        let local = *owners.first_key_value()?.0;
+        (self.reusable_home(local, ctx) == Some(home)).then_some(local)
     }
 
     pub(super) fn reusable_home(
@@ -103,5 +144,69 @@ impl LocalMapping {
         (homes.len() == 1)
             .then(|| *homes.first_key_value().unwrap().0)
             .flatten()
+    }
+}
+
+/// 本次提升计划的 SSA 映射和匿名绑定最后需求；标量与合流阶段共同增量维护。
+#[derive(Default)]
+pub(super) struct PlannedLocalUses {
+    pub(super) bindings: BTreeMap<TempId, LocalId>,
+    pub(super) homes: BTreeMap<TempId, Option<HomeSlotKey>>,
+    pub(super) last_touches: BTreeMap<LocalId, usize>,
+}
+
+impl PlannedLocalUses {
+    pub(super) fn record(
+        &mut self,
+        plan: &super::PromotionPlan,
+        ctx: &PromotionCtx<'_>,
+        events: super::RootEventBlock<'_>,
+    ) {
+        self.bindings
+            .extend(plan.temps.iter().map(|&temp| (temp, plan.local)));
+        self.homes
+            .extend(plan.temps.iter().map(|&temp| (temp, plan.home_slot)));
+        // 所有版本共用最后需求；新增 capture/debug 身份撤销资格，不能只看最近 temp。
+        let anonymous = ctx
+            .local_debug_hints
+            .get(plan.local.index())
+            .is_none_or(Option::is_none)
+            && ctx
+                .local_debug_scopes
+                .get(plan.local.index())
+                .is_none_or(Option::is_none)
+            && super::debug_hint_for_temp_group(ctx.temp_debug_locals, &plan.temps).is_none()
+            && plan
+                .temps
+                .iter()
+                .all(|temp| !ctx.identity_sensitive_temps.contains(temp));
+        if !anonymous {
+            self.last_touches.remove(&plan.local);
+            return;
+        }
+        if matches!(plan.action, super::PromotionAction::AllocateLocal) {
+            self.last_touches.insert(plan.local, plan.decl_index);
+        }
+        if let Some(last) = self.last_touches.get_mut(&plan.local) {
+            for &temp in &plan.temps {
+                *last = (*last).max(events.last_touch(temp).unwrap_or(plan.decl_index));
+            }
+        }
+    }
+}
+
+/// 新声明占用原 home，显式覆盖重新确认该 home 的当前 owner；较高旧窗口随之结束。
+/// 继续借用更高的旧绑定会延长其词法窗口，破坏后续完整表达式帧的声明前缀。
+/// 每个登记项至多移除一次，不为每个覆盖候选重扫其间声明。
+pub(super) fn introduce_overwrite_owner(
+    owners: &mut BTreeMap<usize, LocalId>,
+    home: Option<HomeSlotKey>,
+    local: LocalId,
+) {
+    if let Some(home) = home {
+        let _ = owners.split_off(&home.slot());
+        owners.insert(home.slot(), local);
+    } else {
+        owners.clear();
     }
 }

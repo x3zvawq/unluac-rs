@@ -4,6 +4,7 @@
 -- unluac: expect-ast-count [[function]] [[3]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=3]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=3]]
 local weak = setmetatable({}, { __mode = "v" })
 local events = {}
 local lookups = 0

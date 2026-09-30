@@ -15,6 +15,7 @@ pub(super) fn loop_exit_crosses_resource_boundary(
     partition: &LoopPartitions,
     scopes: &[crate::structure::ScopePlan],
     flow: &crate::structure::scope::TbcFlowFacts,
+    reference_closes: &BTreeSet<InstrRef>,
 ) -> Result<bool, StructureError> {
     if partition.normal_tail.is_some() {
         return Ok(false);
@@ -52,7 +53,7 @@ pub(super) fn loop_exit_crosses_resource_boundary(
     // 沿已有 cleanup connector 保留关闭状态，不能跳过 Close 后再重置生命周期。
     let mut target = entry;
     let mut connectors = BTreeSet::new();
-    let mut closed_resource = false;
+    let mut closed_inner_scope = false;
     let crosses = 'tail: loop {
         if candidate.blocks.contains(&target)
             || candidate.control_blocks.binary_search(&target).is_ok()
@@ -72,11 +73,14 @@ pub(super) fn loop_exit_crosses_resource_boundary(
         let mut event_start = range.start.index();
         if let Ok(index) = scopes.binary_search_by_key(&target, |scope| scope.entry) {
             for &close in &scopes[index].close_points {
-                if closed_resource && event_start < close.index() {
+                if closed_inner_scope && event_start < close.index() {
                     break 'tail true;
                 }
+                // 内层 captured cell 的关闭同样是词法边界；其后的事件仍由
+                // 尚未关闭的 outer 保护，不能并入持有 snapshot 声明的 exit arm。
+                closed_inner_scope |= reference_closes.contains(&close);
                 if let Some(closed) = flow.close_origins(close) {
-                    closed_resource |= !required.is_disjoint(closed);
+                    closed_inner_scope |= !required.is_disjoint(closed);
                     required.retain(|origin| !closed.contains(origin));
                 }
                 if required.is_empty() {
@@ -86,7 +90,7 @@ pub(super) fn loop_exit_crosses_resource_boundary(
             }
         }
         let event_end = cfg.non_control_instr_range(&proto.instrs, target).end;
-        if closed_resource && event_start < event_end {
+        if closed_inner_scope && event_start < event_end {
             break true;
         }
         let Some(next) = crate::structure::loops::transparent_loop_exit_target(proto, cfg, target)

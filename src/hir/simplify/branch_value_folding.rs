@@ -8,7 +8,7 @@ use super::label_refs::count_label_references;
 use super::local_shapes::{empty_single_local_decl_binding, initialized_single_local_decl};
 use super::mention::{block_mentions_local, expr_mentions_local, expr_mentions_temp};
 use super::temp_inline::inline_exposed_branch_value_sinks_in_proto_with_facts;
-use super::temp_touch::collect_temp_touch_positions;
+use super::temp_touch::collect_temp_tree_touch_positions;
 use super::walk::{HirRewritePass, rewrite_block};
 use crate::decompile::{DecompileDialect, ReadabilityOptions};
 use crate::hir::HirLabelId;
@@ -33,8 +33,7 @@ pub(super) fn fold_branch_values_in_proto(
     safety: HirExprSafety,
 ) -> bool {
     let prewrite_changed = boolean_prewrite::restore(proto, facts, dialect);
-    let (exposed_temps, preserved_targets_changed) =
-        fold_root_branch_value_temps(proto, safety, facts);
+    let (exposed_temps, preserved_targets_changed) = fold_branch_value_temps(proto, safety, facts);
     let raw_temp_changed = !exposed_temps.is_empty() || preserved_targets_changed;
     inline_exposed_branch_value_sinks_in_proto_with_facts(
         proto,
@@ -237,6 +236,7 @@ fn fold_nil_fallback_decision_locals_in_block(
             bindings: vec![rewrite.target],
             values: HirValuePack::fixed(vec![HirExpr::LocalRef(rewrite.source)]),
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         stmts.insert(
             index + 1,
@@ -359,6 +359,7 @@ fn fold_branch_value_locals_in_block(
             bindings: vec![binding],
             values: HirValuePack::fixed(vec![value]),
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         })));
         changed = true;
     }
@@ -536,28 +537,83 @@ fn collapsible_bound_assignment(
     Some(assign_binding_value(binding, value))
 }
 
-/// `locals` 之前只处理 proto 根 block 的机械 temp 值树。每个 proto 单独调用，因此同号
-/// TempId 不会跨 child proto 混合；现有 per-stmt touch facts 证明 guard 没有逃出候选语句。
-fn fold_root_branch_value_temps(
+/// 在控制容器中恢复机械 temp 值树；每棵 If 仍作为完整候选原子处理。
+/// 共享词法区间证明 guard 未逃出候选，不按循环层数重建整棵子树的使用索引。
+fn fold_branch_value_temps(
     proto: &mut HirProto,
     safety: HirExprSafety,
     facts: &ProtoPromotionFacts,
 ) -> (Vec<TempId>, bool) {
-    if !proto
-        .body
-        .stmts
-        .iter()
-        .any(|stmt| matches!(stmt, HirStmt::If(_)))
-    {
-        return (Vec::new(), false);
+    use super::lexical_cfg::{HirStmtId, HirStmtTree};
+
+    fn visit_candidates(
+        stmts: &mut [HirStmt],
+        ids: &[HirStmtId],
+        tree: &HirStmtTree,
+        fold: &mut impl FnMut(&mut HirStmt, HirStmtId),
+    ) {
+        for (stmt, &id) in stmts.iter_mut().zip(ids) {
+            if matches!(stmt, HirStmt::If(_)) {
+                // 原子边界：拒绝外层值树后不先改其内层，避免下一轮失去短路 owner。
+                fold(stmt, id);
+            } else {
+                let mut children = tree.stmt(id).children.iter();
+                super::walk::for_each_nested_block_mut(stmt, &mut |block| {
+                    let child = *children.next().expect("unchanged control container");
+                    visit_candidates(&mut block.stmts, tree.block(child), tree, fold);
+                });
+            }
+        }
     }
 
-    let temp_touches = collect_temp_touch_positions(&proto.body.stmts);
+    fn boolean_leaf(block: &HirBlock, target: TempId) -> Option<bool> {
+        let binding = BranchValueBinding::Temp(target);
+        match block.stmts.as_slice() {
+            [HirStmt::Assign(assign)] => match single_assign_value(assign, binding)? {
+                HirExpr::Boolean(value) => Some(*value),
+                _ => None,
+            },
+            [producer, HirStmt::Assign(copy)] => {
+                let (source, HirExpr::Boolean(value)) = producer.scalar_temp_assignment()? else {
+                    return None;
+                };
+                matches!(single_assign_value(copy, binding)?, HirExpr::TempRef(temp) if *temp == source)
+                    .then_some(*value)
+            }
+            _ => None,
+        }
+    }
 
+    if !proto.body.stmts.iter().any(|stmt| {
+        crate::hir::visit::any_stmt_structure(stmt, &mut |stmt| matches!(stmt, HirStmt::If(_)))
+    }) {
+        return (Vec::new(), false);
+    }
+    let (tree, temp_touches) = collect_temp_tree_touch_positions(&proto.body.stmts);
     let mut exposed_temps = Vec::new();
     let mut preserved_targets_changed = false;
     let inline_dispositions = &mut proto.inline_dispositions;
-    for stmt in &mut proto.body.stmts {
+    let mut fold = |stmt: &mut HirStmt, id| {
+        // 函数根块沿用已证明的入口/返回准备边界；控制块里的声明位置还由
+        // locals 和完整帧确定，不能提前消费它们负责的原位写回协议。
+        let in_control_block = tree.block(tree.root_block()).binary_search(&id).is_err();
+
+        if in_control_block
+            && let HirStmt::If(if_stmt) = stmt
+            && let Some(subject) = crate::hir::HirBinding::from_expr(&if_stmt.cond)
+            && std::iter::once(&if_stmt.then_block)
+                .chain(if_stmt.else_block.iter())
+                .any(|block| {
+                    matches!(block.stmts.as_slice(), [HirStmt::Assign(assign)]
+                    if assign.values.tail.is_none()
+                        && matches!(assign.values.fixed.as_slice(), [value]
+                            if crate::hir::HirBinding::from_expr(value) == Some(subject)))
+                })
+        {
+            // 原输入本身也参与结果写回；原位短路 owner 在提升后核对源/目标 cell。
+            // 在这里先构造单定义会抹平该 COPY 与新值写的区别，改变后续声明前缀。
+            return;
+        }
         if let HirStmt::If(if_stmt) = stmt
             && let Some(BranchValueBinding::Temp(target)) =
                 branch_value_binding_in_block(&if_stmt.then_block)
@@ -572,21 +628,38 @@ fn fold_root_branch_value_temps(
                 target,
                 crate::hir::HirInlineRetentionReason::PhysicalFramePrefix,
             );
-            continue;
+            return;
+        }
+        if in_control_block
+            && let HirStmt::If(if_stmt) = stmt
+            && let Some(BranchValueBinding::Temp(target)) =
+                branch_value_binding_in_block(&if_stmt.then_block)
+            && boolean_leaf(&if_stmt.then_block, target).is_some()
+            && if_stmt
+                .else_block
+                .as_ref()
+                .is_some_and(|block| boolean_leaf(block, target).is_some())
+        {
+            // 两个 Boolean 写属于比较物化协议；先提升原绑定，再由 boolean-shells
+            // 核对初始化和调用帧。过早合成单定义会被误当作独立 Boolean value store。
+            return;
         }
         let Some((target, replacement, guards)) =
             collapsible_branch_value_temp(stmt, safety, facts)
         else {
-            continue;
+            return;
         };
         if inline_dispositions.temp(target).must_preserve() {
             // 候选拒绝[LayerBoundary]：Decision 会把多条 target definition 收成一条；
             // 已证明必须保留的 value epoch 不能在这里被重新编码。
-            continue;
+            return;
         }
         let guards_are_mechanical = guards.iter().all(|guard| {
-            // 候选拒绝[SemanticBarrier:ValueFlow]：guard 若还被其它根语句读取，删除其赋值会留下未定义/旧 epoch 的 temp 读取。
-            temp_touches.span(guard).is_some_and(|(first, last)| first == last)
+            // 候选拒绝[SemanticBarrier:ValueFlow]：guard 若还被候选子树外的语句读取，删除其赋值会留下未定义/旧 epoch 的 temp 读取。
+            temp_touches.span(guard).is_some_and(|(first, last)| {
+                let range = &tree.stmt(id).range;
+                range.contains(&first) && range.contains(&last)
+            })
                 // 候选拒绝[SemanticBarrier:DebugScope]：带 debug-local identity 的 temp 是 IR 已保留的源码 binding，HIR 值折叠不能删除。
                 && proto
                     .temp_debug_locals
@@ -598,7 +671,13 @@ fn fold_root_branch_value_temps(
             *stmt = replacement;
             exposed_temps.push(target);
         }
-    }
+    };
+    visit_candidates(
+        &mut proto.body.stmts,
+        tree.block(tree.root_block()),
+        &tree,
+        &mut fold,
+    );
     (exposed_temps, preserved_targets_changed)
 }
 
@@ -623,6 +702,7 @@ fn fold_nil_fallback_alias_locals_in_block(
             bindings: vec![rewrite.target],
             values: HirValuePack::fixed(vec![HirExpr::LocalRef(rewrite.source)]),
             initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         stmts[index + 1] = HirStmt::If(Box::new(HirIf {
             preserves_empty_test: false,

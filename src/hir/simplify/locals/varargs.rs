@@ -223,6 +223,7 @@ pub(super) fn restore(
                 bindings,
                 values: assign.values.clone(),
                 initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }));
         }
         Some(())
