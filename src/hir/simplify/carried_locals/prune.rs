@@ -57,7 +57,15 @@ pub(super) fn prune_redundant_copy_stmts(
     let mut previous_copy = None;
     let mut changed = false;
 
-    block.stmts.retain(|stmt| {
+    block.stmts.retain_mut(|stmt| {
+        if let HirStmt::Assign(assign) = stmt
+            && prune_phi_self_components(assign)
+        {
+            changed = true;
+            if assign.targets.is_empty() {
+                return false;
+            }
+        }
         let copy = single_binding_copy(stmt);
         let redundant_parallel = matches!(
             stmt,
@@ -1291,6 +1299,59 @@ impl HirVisitor<'_> for BindingWriteCollector {
             HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {}
         }
     }
+}
+
+/// 合流转移不新增 VM 写；无回调的并列转移可逐项退休已经同身份的分量。
+fn prune_phi_self_components(assign: &mut HirAssign) -> bool {
+    if !assign.is_phi_transfer
+        || assign.values.tail.is_some()
+        || assign.targets.len() < 2
+        || assign.targets.len() != assign.values.fixed.len()
+        || !assign.values.fixed.iter().all(|value| {
+            carry_binding_from_expr(value).is_some()
+                || matches!(
+                    value,
+                    HirExpr::Nil
+                        | HirExpr::Boolean(_)
+                        | HirExpr::Integer(_)
+                        | HirExpr::Number(_)
+                        | HirExpr::String(_)
+                        | HirExpr::UpvalueRef(_)
+                )
+        })
+    {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：RHS 调用或外部目标可能改变稍后
+        // 自复制恢复的快照；这里只处理原合流的绑定、上值读取与字面量转移。
+        // 上值读取不触发回调，仍保留在其原分量；外部写目标不在下方允许范围内。
+        return false;
+    }
+    let mut targets = BTreeSet::new();
+    if !assign.targets.iter().all(|target| {
+        carry_binding_from_lvalue(target).is_some_and(|binding| targets.insert(binding))
+    }) {
+        // 同一目标写两次时逆序提交可由自复制恢复旧值，不能删除其中一项。
+        return false;
+    }
+    let mut removed = Vec::with_capacity(assign.targets.len());
+    for (target, value) in assign.targets.iter().zip(&assign.values.fixed) {
+        removed.push(redundant_self_assign_binding(target, value).is_some());
+    }
+    if !removed.iter().any(|&remove| remove) {
+        return false;
+    }
+    let mut index = 0;
+    assign.targets.retain(|_| {
+        let keep = !removed[index];
+        index += 1;
+        keep
+    });
+    index = 0;
+    assign.values.fixed.retain(|_| {
+        let keep = !removed[index];
+        index += 1;
+        keep
+    });
+    true
 }
 
 fn redundant_parallel_self_copy(assign: &HirAssign) -> bool {

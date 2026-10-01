@@ -375,7 +375,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 // 提前 break 必须消费同一最终 binding，不能重新制造裸 Temp。
                 .map(|(temp, value)| (self.lowering.bindings.lvalue_for_temp(temp), value))
                 .unzip();
-            body_stmts.push(assign_stmt(targets, values));
+            body_stmts.extend_plain(copy_assignment_stmt(targets, values));
         }
         let backedge_stmts = if protocol.value_plan.backedge_copies.is_empty() {
             self.lower_edge(region, backedge)?.stmts
@@ -418,7 +418,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             }))]);
             if !final_stage.is_empty() {
                 let (targets, values): (Vec<_>, Vec<_>) = final_stage.into_iter().unzip();
-                stmts.push(assign_stmt(targets, values));
+                stmts.extend_plain(copy_assignment_stmt(targets, values));
             }
             if protocol.exit_after_loop {
                 stmts.extend_plain(self.lower_edge(region, exit)?.stmts);
@@ -525,14 +525,16 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let mut stmts = PlannedBlock::from(
             self.lower_loop_value_phase(region, LoopValuePhase::BeforePreheader)?,
         );
-        stmts.append(self.lower_syntax_region_prefix(region, preheader_region, None)?);
-        stmts.extend_plain(self.lower_loop_value_phase(region, LoopValuePhase::BeforeLoop)?);
         if let Some((_, guard)) = &normal_tail {
+            // 私有 Boolean 标志不占原 VM home，也不参与控制值求值；先初始化，
+            // 避免在原 preheader 的完整准备序列与 NumericFor 之间插入合成写入。
             stmts.push(assign_stmt(
                 vec![HirLValue::Temp(*guard)],
                 vec![HirExpr::Boolean(false)],
             ));
         }
+        stmts.append(self.lower_syntax_region_prefix(region, preheader_region, None)?);
+        stmts.extend_plain(self.lower_loop_value_phase(region, LoopValuePhase::BeforeLoop)?);
 
         let start = expr_for_reg_use(
             self.lowering,

@@ -405,6 +405,134 @@ pub(super) fn plain_copy(stmt: &HirStmt) -> bool {
     }
 }
 
+/// 从当前准备操作读取原定义身份，不按被复用的 Local 或物理槽选择结果帧。
+pub(super) fn selection_input(
+    assign: &crate::hir::common::HirAssign,
+    previous: Option<&HirStmt>,
+    facts: &ProtoPromotionFacts,
+) -> Option<TempId> {
+    let [HirExpr::LogicalOr(alternative)] = assign.values.fixed.as_slice() else {
+        return None;
+    };
+    let HirExpr::LogicalAnd(selected) = &alternative.lhs else {
+        return None;
+    };
+    let value = if let HirExpr::LocalRef(input) = selected.lhs {
+        let (owner, value) = scalar_local(previous?)?;
+        (owner == input).then_some(value)?
+    } else {
+        &selected.lhs
+    };
+    let source = match value {
+        HirExpr::Unary(unary) => unary.source_site?,
+        HirExpr::Binary(binary) => binary.source_site?,
+        HirExpr::Call(call) => call.source_site?,
+        HirExpr::TableAccess(access) => {
+            let crate::hir::common::HirOperationSources::Single(source) = access.sources else {
+                return None;
+            };
+            source
+        }
+        _ => return None,
+    };
+    facts.operation_result_temp(source)
+}
+
+/// 原高槽谓词选择两个字面量后写回已有低槽；只退休准备，保留目标声明和原短路求值。
+pub(super) fn selection_writeback(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    run: &[&HirStmt],
+    assign: &crate::hir::common::HirAssign,
+    result: TempId,
+) -> Option<Plan> {
+    let ([HirLValue::Local(target)], [HirExpr::LogicalOr(alternative)], None) = (
+        assign.targets.as_slice(),
+        assign.values.fixed.as_slice(),
+        &assign.values.tail,
+    ) else {
+        return None;
+    };
+    let HirExpr::LogicalAnd(selected) = &alternative.lhs else {
+        return None;
+    };
+    let home = if dialect == DecompileDialect::Luau {
+        facts.trusted_temp_home_slot(result)?
+    } else {
+        let HirExpr::LocalRef(input) = selected.lhs else {
+            return None;
+        };
+        facts.trusted_local_home_slot(input)?
+    };
+    let mut builder = frame_builder(context, run, facts, dialect, home.slot())?;
+    let prepared = if let HirExpr::LocalRef(input) = selected.lhs {
+        scalar_local(run[builder.definition(input, run.len())?])?.1
+    } else {
+        &selected.lhs
+    };
+    let layout =
+        facts.selection_writeback(result, dialect, prepared, &selected.rhs, &alternative.rhs)?;
+    if assign.is_phi_transfer
+        || assign.initializer_merge_transaction.is_some()
+        || assign.root_release.is_some()
+        || assign.method_rewrite_transaction.is_some()
+        || assign.generic_for_initializer_producer.is_some()
+        || matches!(selected.lhs, HirExpr::LocalRef(input)
+            if facts.promoted_local_for_temp(layout.input) != Some(input)
+                || facts.trusted_local_home_slot(input) != Some(layout.input_home))
+        || home != layout.base
+        || facts.promoted_local_for_temp(layout.target) != Some(*target)
+        || facts.trusted_local_home_slot(*target) != Some(layout.target_home)
+        || context.closed.contains(&home)
+        || context.barred.contains(&home)
+        || context.closed.contains(&layout.input_home)
+        || context.barred.contains(&layout.input_home)
+    {
+        return None;
+    }
+    let value = if dialect == DecompileDialect::Luau {
+        builder.luau_logical_value(&assign.values.fixed[0], run.len(), home)?
+    } else {
+        let input = builder.expr(
+            &selected.lhs,
+            run.len(),
+            home.slot(),
+            None,
+            false,
+            true,
+            Some(layout.input),
+        )?;
+        HirExpr::LogicalOr(Box::new(crate::hir::common::HirLogicalExpr {
+            lhs: HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
+                lhs: input,
+                ..selected.as_ref().clone()
+            })),
+            ..alternative.as_ref().clone()
+        }))
+    };
+    let first = builder.first_event?;
+    if first == run.len() || builder.next_event != run.len() {
+        return None;
+    }
+    Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
+        start: first,
+        sink: run.len(),
+        base: home,
+        values: vec![value].into(),
+        result_locals: Vec::new(),
+        assignment_targets: assign.targets.clone(),
+        luau_compound_global: false,
+        indexed_target: None,
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        replayed_effects: Vec::new(),
+        removed: Vec::new(),
+    })
+}
+
 /// MOVE 预写和结果可已提升成同一 local；整个 initializer 在原结果槽重发 COPY。
 pub(super) fn copy_value_initializer(
     context: NativeFrameContext<'_>,
@@ -502,9 +630,9 @@ pub(super) fn copy_value_initializer(
 }
 
 pub(super) struct ScalarPair<'a> {
-    pub(super) left: LocalId,
-    pub(super) right: LocalId,
-    pub(super) copied_input: Option<LocalId>,
+    pub(super) left: HirLValue,
+    pub(super) right: HirLValue,
+    pub(super) copied_input: Option<HirBinding>,
     pub(super) base: HomeSlotKey,
     pub(super) literal_input: Option<&'a HirExpr>,
     pub(super) tail: HirExpr,
@@ -524,14 +652,10 @@ pub(super) fn scalar_pair(
     let (snapshot, value) = scalar_local(first.stmt)?;
     let frame = frames.get(&snapshot)?.as_ref()?;
 
-    let ScalarPair {
-        left,
-        right,
-        copied_input,
-        base,
-        literal_input,
-        ..
-    } = *frame;
+    let (left, right) = (&frame.left, &frame.right);
+    let copied_input = frame.copied_input;
+    let base = frame.base;
+    let literal_input = frame.literal_input;
     let tail = &frame.tail;
     // 候选拒绝[TargetConstraint]：PUC 的双 nil 会改用批量 LOADNIL，不能假定
     // 仍覆盖原高槽；旧值快照则与 JIT 一样先 MOVE 到原准备槽。Luau 另有写回协议。
@@ -541,8 +665,7 @@ pub(super) fn scalar_pair(
             && dialect != DecompileDialect::Luajit)
         || match (copied_input, value) {
             (None, value) => literal_input != Some(value),
-            (Some(input), HirExpr::LocalRef(local)) => input != *local,
-            _ => true,
+            (Some(input), value) => HirBinding::from_expr(value) != Some(input),
         }
     {
         return None;
@@ -552,7 +675,8 @@ pub(super) fn scalar_pair(
         || !plain_copy(last.stmt)
         || second.id != first.id + 1
         || last.id != second.id + 1
-        || [left, right].contains(&snapshot)
+        || *left == HirLValue::Local(snapshot)
+        || *right == HirLValue::Local(snapshot)
         || context.closed.contains(&base)
         || context.proto.local_debug_hints[snapshot.index()].is_some()
         || context.proto.local_debug_scopes[snapshot.index()].is_some()
@@ -566,10 +690,10 @@ pub(super) fn scalar_pair(
     else {
         return None;
     };
-    if second_write.targets.as_slice() != [HirLValue::Local(right)]
+    if second_write.targets.as_slice() != std::slice::from_ref(right)
         || second_write.values.fixed.as_slice() != std::slice::from_ref(tail)
         || second_write.values.tail.is_some()
-        || first_write.targets.as_slice() != [HirLValue::Local(left)]
+        || first_write.targets.as_slice() != std::slice::from_ref(left)
         || first_write.values.fixed.as_slice() != [HirExpr::LocalRef(snapshot)]
         || first_write.values.tail.is_some()
     {
@@ -583,7 +707,7 @@ pub(super) fn scalar_pair(
         base,
         values: vec![value.clone(), tail.clone()].into(),
         result_locals: Vec::new(),
-        assignment_targets: vec![HirLValue::Local(left), HirLValue::Local(right)],
+        assignment_targets: vec![left.clone(), right.clone()],
         luau_compound_global: false,
         indexed_target: None,
         continuing_root: None,

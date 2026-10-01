@@ -273,6 +273,12 @@ pub(super) fn collect_temp_use_counts(proto: &HirProto) -> BTreeMap<TempId, usiz
     collector.counts
 }
 
+pub(super) fn collect_expr_temp_use_counts(expr: &HirExpr) -> BTreeMap<TempId, usize> {
+    let mut collector = TempUseCollector::default();
+    visit_expr(expr, &mut collector);
+    collector.counts
+}
+
 pub(super) fn collect_temp_write_counts(proto: &HirProto) -> BTreeMap<TempId, usize> {
     let mut collector = TempWriteCountCollector::default();
     visit_proto(proto, &mut collector);

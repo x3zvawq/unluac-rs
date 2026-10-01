@@ -1135,6 +1135,22 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_operators/bitwise_04_prepared_metamethod_frames.lua",
+        &[
+            "bitwise",
+            "floor-division",
+            "metamethod",
+            "evaluation-order",
+        ],
+        "整除与位运算完整帧保留低槽查表声明、元方法顺序及异常前后的索引写入边界。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_GE_53).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_operators/boolean_20_shared_predicate_lookup.lua",
         &[
             "short-circuit",
@@ -1287,6 +1303,22 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
                 retain_debug: true,
                 recompile_rounds: Some(1),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/comparison_17_prepared_not_short_circuit.lua",
+        &[
+            "comparison",
+            "short-circuit",
+            "metamethod",
+            "evaluation-order",
+        ],
+        "原生NOT短路返回恢复比较准备，保留四种有序比较的调用方向、次数、提前退出与错误路径。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],

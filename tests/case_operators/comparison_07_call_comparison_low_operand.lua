@@ -45,11 +45,12 @@ assert(multiplies == 1 and additions == 1 and comparisons == 1)
 
 local function compare_parameter(run, expected)
     assert(run() == expected)
+    assert(expected == run())
 end
 local producer_calls = 0
 local producer = function()
     producer_calls = producer_calls + 1
-    return seed
+    return seed, "extra"
 end
 compare_parameter(producer, seed)
 seed = false
@@ -58,7 +59,7 @@ seed = nil
 compare_parameter(producer, nil)
 assert(not pcall(compare_parameter, producer, true))
 assert(select("#", compare_parameter(producer, nil)) == 0)
-assert(producer_calls == 5)
+assert(producer_calls == 9)
 
 local function compare_captured()
     local expected = {}

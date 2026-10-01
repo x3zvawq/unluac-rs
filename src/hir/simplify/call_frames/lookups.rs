@@ -607,7 +607,7 @@ impl FrameBuilder<'_> {
         )))
     }
 
-    /// 原算术 use 读取的 phi 将 MOVE 预写交给完整操作数，不让内部值树先截断准备区。
+    /// 原算术 use 读取的 phi 连同准备写交给完整操作数，保留尚未提升的 Temp 身份。
     fn binary_register_operand(
         &mut self,
         binary: &crate::hir::common::HirBinaryExpr,
@@ -638,9 +638,14 @@ impl FrameBuilder<'_> {
             self.register_operand = previous;
             rebuilt
         } else if let Some(result) = self.facts.binary_value_operand(binary, operand)
-            && self.facts.copy_value_prewrite(result).is_some()
+            && (self.facts.copy_value_prewrite(result).is_some()
+                || matches!(value, HirExpr::TempRef(temp) if *temp == result)
+                || matches!(value, HirExpr::LocalRef(local)
+                    if self.facts.promoted_local_for_temp(result) == Some(*local)))
             && self.facts.trusted_temp_home_slot(result) == Some(expected)
         {
+            // 当前绑定必须属于这次原 phi 读取；递归 builder 再核对完整写域和事件，
+            // 不以相同槽号代替版本身份，也不要求合流值拥有单条 producer 指令。
             let previous = std::mem::replace(&mut self.register_operand, true);
             let rebuilt = self.expr(value, before, slot, None, false, true, Some(result));
             self.register_operand = previous;
@@ -669,7 +674,7 @@ impl FrameBuilder<'_> {
     }
 
     /// 已树化的全局字段不消费外部 producer；只在原同槽 GETGLOBAL/GETTABLE
-    /// 布局可完整重发时供已完成数组的只读证明使用。
+    /// 布局可完整重发时供完整表达式帧的只读证明使用。
     pub(super) fn completed_global_lookup(&self, value: &HirExpr, slot: usize) -> bool {
         let HirExpr::TableAccess(access) = value else {
             return false;
@@ -1131,6 +1136,66 @@ impl FrameBuilder<'_> {
         let lhs_low = direct(&binary.lhs, layout.lhs);
         let rhs_low = direct(&binary.rhs, layout.rhs);
         let constant = |value: &HirExpr| matches!(value, HirExpr::Integer(_) | HirExpr::Number(_));
+        if matches!(
+            self.dialect,
+            DecompileDialect::Lua54 | DecompileDialect::Lua55
+        ) && result == input
+            && constant(&binary.lhs)
+            && layout.rhs == Some(input)
+            && layout.lhs.is_some_and(|home| home.slot() == slot + 1)
+        {
+            // PUC 5.4+ 的非 RK 左常量在右值完成后才载入相邻槽，例如 1/f()。
+            // 原两个输入的 use→Def 与准备次序共同签证，保留运算方向和回调看到的覆盖时点。
+            let right_value = match &binary.rhs {
+                HirExpr::LocalRef(local) => self
+                    .definition(*local, before)
+                    .and_then(|index| scalar_local(self.run[index]))
+                    .map_or(&binary.rhs, |(_, value)| value),
+                value => value,
+            };
+            let (right, right_home) =
+                self.facts
+                    .binary_operand_preparation(binary, 1, right_value)?;
+            let (left, left_home) =
+                self.facts
+                    .binary_operand_preparation(binary, 0, &binary.lhs)?;
+            if right_home != input
+                || Some(left_home) != layout.lhs
+                || self
+                    .facts
+                    .binary_preparation_instruction(binary, 0, &binary.lhs)?
+                    <= self
+                        .facts
+                        .binary_preparation_instruction(binary, 1, right_value)?
+            {
+                // 候选拒绝[ProofIncomplete]：早已准备的左快照不能改成右值调用后的新常量写。
+                return None;
+            }
+            let previous = std::mem::replace(&mut self.register_operand, false);
+            let values = (|| {
+                let rhs = self.expr(&binary.rhs, before, slot, None, false, true, Some(right))?;
+                let lhs = self.expr(
+                    &binary.lhs,
+                    before,
+                    left_home.slot(),
+                    None,
+                    false,
+                    true,
+                    Some(left),
+                )?;
+                Some((lhs, rhs))
+            })();
+            self.register_operand = previous;
+            let (lhs, rhs) = values?;
+            return Some(HirExpr::Binary(Box::new(
+                crate::hir::common::HirBinaryExpr {
+                    lhs,
+                    rhs,
+                    source_site: binary.source_site,
+                    op: binary.op,
+                },
+            )));
+        }
         let lhs = if layout.lhs.is_none() && constant(&binary.lhs) {
             if self.literal_uses_rk(&binary.lhs, Some((&sources, false))) != Some(true) {
                 return None;
@@ -1170,6 +1235,10 @@ impl FrameBuilder<'_> {
                     self.expr(&binary.lhs, before, slot, None, false, true, Some(producer));
                 self.register_operand = previous;
                 rebuilt?
+            } else if !lhs_low && self.facts.binary_value_operand(binary, 0).is_some() {
+                // 只把需重建的 phi 准备交给该证书；既有低槽读取与普通 Def
+                // 继续由 register_operand 消费其已有布局，不重新套用 phi 的 epoch 约束。
+                self.binary_register_operand(binary, 0, before, layout.lhs?)?
             } else {
                 self.register_operand(&binary.lhs, before, slot)?
             }
@@ -1229,6 +1298,8 @@ impl FrameBuilder<'_> {
                 );
                 self.register_operand = previous;
                 rebuilt?
+            } else if !rhs_low && self.facts.binary_value_operand(binary, 1).is_some() {
+                self.binary_register_operand(binary, 1, before, layout.rhs?)?
             } else {
                 self.register_operand(&binary.rhs, before, rhs_slot)?
             }

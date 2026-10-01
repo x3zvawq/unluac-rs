@@ -4,6 +4,8 @@
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[function]] [[11]]
 -- unluac: expect-ast-count [[repeat-condition-local]] [[2]]
+-- 条件快照在每轮 body 内声明，不能留下循环外的空声明和赋值接棒。
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-max [[local-binding]] [[32]]
 local while_state = 1
 local function while_snapshot()
@@ -73,9 +75,7 @@ print(
 )
 
 -- regress_172_temp_inline_eval_regions#5: 方法 lookup 发生在显式参数前，不能越过前置 producer
--- unluac: expect-not-line [[local r0_15 = r0_13]]
--- unluac: expect-not-line [[local r0_16 = r0_14]]
--- unluac: expect-not-line [[local r0_17 = r0_15]]
+-- unluac: expect-count [[:run(]] [[1]]
 local method_log = {}
 local method_receiver = setmetatable({}, {
     __index = function(receiver, name)

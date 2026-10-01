@@ -9,8 +9,10 @@ mod copy_assignments;
 pub(super) use copy_assignments::ParallelFrame as NativeParallelFrame;
 pub(super) use copy_assignments::nil::NilAssignmentFrame as NativeNilAssignmentFrame;
 mod copy_root_retirement;
+mod literal_choices;
 mod operand_preparations;
 mod short_circuit_frames;
+pub(super) use literal_choices::LiteralChoice;
 
 pub(super) use call_roots::NativeCallFrame;
 
@@ -469,6 +471,7 @@ pub(super) struct ProtoPromotionFacts {
     inert_home_overwrites: BTreeMap<TempId, InertHomeOverwrite>,
     copy_predecessors: BTreeMap<TempId, TempId>,
     phi_overwrite_predecessors: BTreeMap<TempId, TempId>,
+    literal_choices: Vec<LiteralChoice>,
     fixed_vararg_predecessors: BTreeMap<TempId, TempId>,
     scalar_load_predecessors: BTreeMap<TempId, (TempId, ScalarLoadValue)>,
     scalar_vararg_temps: BTreeSet<TempId>,
@@ -491,7 +494,7 @@ pub(super) struct ProtoPromotionFacts {
     copy_root_endpoint_producers: BTreeMap<TempId, BTreeSet<TempId>>,
     /// HIR 已把完整 scalar 退休端点原子接回 producer；只授权原定义处的声明物化。
     retargeted_scalar_roots: BTreeSet<TempId>,
-    promoted_local_by_temp: BTreeMap<TempId, LocalId>,
+    promoted_binding_by_temp: BTreeMap<TempId, HirBinding>,
     /// 完整移除的 local 身份在本轮 carried 改写结束时批量归并，避免逐候选扫描 Def 表。
     consumed_local_bindings: BTreeMap<LocalId, HirBinding>,
     local_home_slots: Vec<HomeSlotResolution>,
@@ -568,10 +571,14 @@ pub(super) struct ProtoPromotionFacts {
     comparison_result_writes: BTreeMap<TempId, InstrRef>,
     boolean_condition_frames: BTreeMap<TempId, boolean_frames::BooleanConditionFrame>,
     boolean_value_prewrites: BTreeMap<TempId, (TempId, bool)>,
+    boolean_branch_prewrites: BTreeMap<(TempId, InstrRef), (TempId, bool)>,
     copy_value_prewrites: BTreeMap<TempId, TempId>,
     value_result_copies: BTreeMap<TempId, ImmediateMoveWrite>,
     comparison_results_by_predicate: BTreeMap<InstrRef, Option<TempId>>,
     conditional_value_results: BTreeMap<InstrRef, Option<NativeConditionalValueResult>>,
+    selection_writebacks: BTreeMap<TempId, short_circuit_frames::SelectionWriteback>,
+    /// 最终 COPY 目标反向索引到原选择结果；只导航，消费时仍核对两端的当前身份和 home。
+    selection_copy_sources: BTreeMap<TempId, TempId>,
     short_circuit_scalar_frames:
         BTreeMap<InstrRef, Option<short_circuit_frames::ShortCircuitScalarFrame>>,
     short_circuit_table_frames:
@@ -609,6 +616,16 @@ pub(super) struct NativeConditionalValueResult {
     pub(super) result: TempId,
     pub(super) value: CopyRootScalarValue,
     pub(super) writes: [Option<TempId>; 2],
+}
+
+/// 原谓词、逻辑值准备槽和最终写回目标；Luau 的末尾 COPY 可使三者槽位各不相同。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NativeSelectionWriteback {
+    pub(super) input: TempId,
+    pub(super) input_home: HomeSlotKey,
+    pub(super) base: HomeSlotKey,
+    pub(super) target: TempId,
+    pub(super) target_home: HomeSlotKey,
 }
 
 /// low method setup 与 canonical callee definition 之间的 HIR 私有桥接事实。
@@ -1262,7 +1279,7 @@ impl ProtoPromotionFacts {
         self.calls.get(&source.instr)?.vararg_tail_home
     }
 
-    /// 原 MOVE 覆盖的单个 Def；只连接仍有效的同一 home/epoch，不把 phi 猜成某个入口。
+    /// 原 MOVE 覆盖的 canonical SSA 值；保留 phi 本身，不把它猜成某个入口。
     /// 只授权目标绑定的原位覆盖；来源即使是打开的引用 cell，也仍在原 COPY 处读取。
     /// 穿透来源链另需 move_crosses_reference_cell 的证明，不能由此查询授权。
     pub(super) fn copy_overwrite_predecessor(&self, result: TempId) -> Option<TempId> {
@@ -1286,6 +1303,12 @@ impl ProtoPromotionFacts {
                     && self.trusted_local_home_slot(local) == Some(home))
                 .then_some((initial, local))
             })
+    }
+
+    pub(super) fn literal_choices(&self) -> impl Iterator<Item = &LiteralChoice> {
+        self.literal_choices
+            .iter()
+            .filter(|choice| choice.valid(self))
     }
 
     /// 单个固定 VARARG 结果的原槽；开放或多值 VARARG 不可借此收回成标量省略号。
@@ -1731,6 +1754,24 @@ impl ProtoPromotionFacts {
         !self.upvalue_writes.is_empty()
     }
 
+    /// 分支内部预写仍属于该次合流，且目标槽及捕获身份未失效。
+    pub(super) fn boolean_branch_prewrite(
+        &self,
+        result: TempId,
+        predicate: crate::hir::common::HirSourceSite,
+    ) -> Option<(TempId, bool)> {
+        if self.source_proto != Some(predicate.proto) {
+            return None;
+        }
+        let &(initial, value) = self
+            .boolean_branch_prewrites
+            .get(&(result, predicate.instr))?;
+        let home = self.trusted_temp_home_slot(result)?;
+        (self.trusted_temp_home_slot(initial) == Some(home)
+            && self.temp_definition_reference_unaliased(initial))
+        .then_some((initial, value))
+    }
+
     pub(super) fn has_environment_writes(&self) -> bool {
         self.table_write_layouts
             .values()
@@ -1884,6 +1925,13 @@ impl ProtoPromotionFacts {
             .filter(|prewrite| {
                 self.trusted_temp_home_slot(prewrite.initial) == Some(prewrite.home)
                     && self.trusted_temp_home_slot(prewrite.result) == Some(prewrite.home)
+            })
+            .map(|mut prewrite| {
+                // 原入口写与 CALL 均未打开引用 cell，且上方同一 epoch 排除了中途
+                // CLOSE；后续复用该槽的捕获不能反向冻结本次完整 Boolean 准备。
+                prewrite.reference_uncaptured &=
+                    self.temp_definition_reference_unaliased(prewrite.initial);
+                prewrite
             })
     }
 
@@ -2263,6 +2311,131 @@ impl ProtoPromotionFacts {
         .then_some(result)
     }
 
+    pub(super) fn selection_writebacks(
+        &self,
+        dialect: crate::decompile::DecompileDialect,
+    ) -> impl Iterator<Item = (TempId, TempId, LocalId)> + '_ {
+        self.selection_writebacks
+            .iter()
+            .filter_map(move |(&result, frame)| {
+                let layout = self.selection_layout(result, dialect)?;
+                Some((
+                    frame.input.temp,
+                    result,
+                    self.promoted_local_for_temp(layout.target)?,
+                ))
+            })
+    }
+
+    fn selection_layout(
+        &self,
+        result: TempId,
+        dialect: crate::decompile::DecompileDialect,
+    ) -> Option<NativeSelectionWriteback> {
+        let frame = self.selection_writebacks.get(&result)?;
+        let (base, target, target_home) = if dialect == crate::decompile::DecompileDialect::Luau {
+            let copy = self.value_result_copy(result)?;
+            if copy.source != Some(result)
+                || copy.source_home != frame.home
+                || copy.target_home.slot() >= frame.home.slot()
+                || frame.input.home != HomeSlotKey::new(frame.home.slot() + 1, 0)
+            {
+                return None;
+            }
+            (frame.home, copy.target, copy.target_home)
+        } else {
+            (frame.input.home, result, frame.home)
+        };
+        Some(NativeSelectionWriteback {
+            input: frame.input.temp,
+            input_home: frame.input.home,
+            base,
+            target,
+            target_home,
+        })
+    }
+
+    /// 当前值树仍是原输入及两臂字面量，且结果和各写入身份尚未合并时发布准备槽。
+    pub(super) fn selection_writeback(
+        &self,
+        result: TempId,
+        dialect: crate::decompile::DecompileDialect,
+        input: &HirExpr,
+        truthy: &HirExpr,
+        falsy: &HirExpr,
+    ) -> Option<NativeSelectionWriteback> {
+        let frame = self.selection_frame(result, truthy, falsy)?;
+        frame.input.matches(input).then_some(())?;
+        self.selection_layout(result, dialect)
+    }
+
+    /// 两臂直写或最终 COPY 覆盖同一旧 SSA 值时，Locals 沿原覆盖关系承接已有匿名声明。
+    pub(super) fn selection_predecessor(
+        &self,
+        result: TempId,
+        dialect: crate::decompile::DecompileDialect,
+        value: &HirExpr,
+    ) -> Option<TempId> {
+        let HirExpr::LogicalOr(alternative) = value else {
+            return None;
+        };
+        let HirExpr::LogicalAnd(selected) = &alternative.lhs else {
+            return None;
+        };
+        let (frame, previous, home) =
+            if let Some(&source) = self.selection_copy_sources.get(&result) {
+                if dialect != crate::decompile::DecompileDialect::Luau {
+                    return None;
+                }
+                let frame = self.selection_frame(source, &selected.rhs, &alternative.rhs)?;
+                let layout = self.selection_layout(source, dialect)?;
+                if layout.target != result {
+                    return None;
+                }
+                (
+                    frame,
+                    self.copy_overwrite_predecessor(result)?,
+                    layout.target_home,
+                )
+            } else {
+                let frame = self.selection_frame(result, &selected.rhs, &alternative.rhs)?;
+                (frame, frame.previous, frame.home)
+            };
+        let matches = match selected.lhs {
+            HirExpr::TempRef(input) => input == frame.input.temp,
+            HirExpr::LocalRef(input) => {
+                self.promoted_local_for_temp(frame.input.temp) == Some(input)
+            }
+            _ => frame.input.matches(&selected.lhs),
+        };
+        (matches && self.trusted_temp_home_slot(previous) == Some(home)).then_some(previous)
+    }
+
+    fn selection_frame(
+        &self,
+        result: TempId,
+        truthy: &HirExpr,
+        falsy: &HirExpr,
+    ) -> Option<&short_circuit_frames::SelectionWriteback> {
+        let frame = self.selection_writebacks.get(&result)?;
+        let literal_matches = |original: &HirExpr, value: &HirExpr| match (original, value) {
+            (HirExpr::Number(a), HirExpr::Number(b)) => a.to_bits() == b.to_bits(),
+            _ => original == value,
+        };
+        (literal_matches(&frame.truthy, truthy)
+            && literal_matches(&frame.falsy, falsy)
+            && self.trusted_temp_home_slot(result) == Some(frame.home)
+            && self.trusted_temp_home_slot(frame.input.temp) == Some(frame.input.home)
+            && frame
+                .literal_preparation
+                .is_none_or(|temp| self.trusted_temp_home_slot(temp) == Some(frame.input.home))
+            && frame
+                .writes
+                .iter()
+                .all(|&temp| self.trusted_temp_home_slot(temp) == Some(frame.home)))
+        .then_some(frame)
+    }
+
     /// 当前单结果操作、备用值与 AND/OR 仍匹配原单判定 phi，返回原输入和合流槽。
     pub(super) fn short_circuit_scalar_homes(
         &self,
@@ -2394,7 +2567,7 @@ impl ProtoPromotionFacts {
             })
     }
 
-    /// 当前操作数直接读取原指令位置的同一 local；只证明读取，不退休或合并 cell。
+    /// 当前操作数直接读取原指令位置的同一 binding；只证明读取，不退休或合并 cell。
     pub(super) fn direct_binary_operand_home(
         &self,
         binary: &crate::hir::common::HirBinaryExpr,
@@ -2404,6 +2577,9 @@ impl ProtoPromotionFacts {
         let home = [layout.lhs, layout.rhs].get(operand).copied().flatten()?;
         let value = *[&binary.lhs, &binary.rhs].get(operand)?;
         let direct = match value {
+            HirExpr::TempRef(temp) if self.binary_value_operand(binary, operand) == Some(*temp) => {
+                self.trusted_temp_home_slot(*temp)
+            }
             HirExpr::LocalRef(local) => self.trusted_local_home_slot(*local),
             HirExpr::ParamRef(param) => self.trusted_param_home_slot(*param),
             _ => None,
@@ -2485,8 +2661,8 @@ impl ProtoPromotionFacts {
         .then_some((preparation.temp, preparation.home))
     }
 
-    /// 精确准备指令用于连续展开帧；值与槽匹配仍沿用比较输入的同一证书。
-    pub(super) fn comparison_preparation_instruction(
+    /// 精确准备指令供完整帧核对先后次序；值与槽匹配沿用二元输入的同一证书。
+    pub(super) fn binary_preparation_instruction(
         &self,
         binary: &crate::hir::common::HirBinaryExpr,
         operand: usize,
@@ -2594,6 +2770,16 @@ impl ProtoPromotionFacts {
         value: &crate::hir::common::HirExpr,
     ) -> Option<(TempId, HomeSlotKey)> {
         self.operation_result_home(source)?;
+        if let HirExpr::LocalRef(local) = value
+            && let Some(input) = self.unary_operands.get(&source.instr)
+            && let Some(result) = input.value
+        {
+            // 合流值没有单条 producer 指令；用原一元 use 的 canonical 身份核对
+            // 当前 Local，不能从相同槽号或逻辑树外形猜测它属于这次读取。
+            return (self.promoted_local_for_temp(result) == Some(*local)
+                && self.trusted_temp_home_slot(result) == Some(input.home))
+            .then_some((result, input.home));
+        }
         if let HirExpr::Binary(binary) = value
             && let Some(input) = self.unary_operands.get(&source.instr)
             && let Some(result) = self.comparison_result_temp(binary)
@@ -4386,6 +4572,28 @@ impl ProtoPromotionFacts {
                 .and_modify(|result| *result = None)
                 .or_insert(Some(temp));
         }
+        let selection_writebacks = short_circuit_frames::collect_selections(
+            proto,
+            cfg,
+            dataflow,
+            plan,
+            slot_epochs,
+            fixed_temps,
+            phi_temps,
+        );
+        let value_result_copies = call_roots::value_result_copies(
+            proto,
+            cfg,
+            dataflow,
+            slot_epochs,
+            fixed_temps,
+            phi_temps,
+        );
+        let selection_copy_sources = value_result_copies
+            .iter()
+            .filter(|(source, _)| selection_writebacks.contains_key(source))
+            .map(|(&source, copy)| (copy.target, source))
+            .collect();
         Self {
             entry_allocation_nil_prefix: proto.instrs.first().and_then(|instr| {
                 let LowInstr::NewTable(table) = instr else {
@@ -4403,6 +4611,11 @@ impl ProtoPromotionFacts {
                         len,
                     })
             }),
+            literal_choices: if source == crate::decompile::DecompileDialect::Luau {
+                literal_choices::collect(proto, cfg, dataflow, plan, fixed_temps, phi_temps)
+            } else {
+                Vec::new()
+            },
             call_frame_temps,
             value_operand_prefix_calls: call_roots::value_operand_prefix_calls(
                 proto,
@@ -4423,6 +4636,14 @@ impl ProtoPromotionFacts {
                 phi_temps,
             ),
             boolean_value_prewrites,
+            boolean_branch_prewrites: call_roots::branch_prewrites(
+                proto,
+                cfg,
+                dataflow,
+                plan,
+                fixed_temps,
+                phi_temps,
+            ),
             copy_value_prewrites: call_roots::copy_prewrites(
                 proto,
                 dataflow,
@@ -4430,16 +4651,11 @@ impl ProtoPromotionFacts {
                 fixed_temps,
                 phi_temps,
             ),
-            value_result_copies: call_roots::value_result_copies(
-                proto,
-                cfg,
-                dataflow,
-                slot_epochs,
-                fixed_temps,
-                phi_temps,
-            ),
+            value_result_copies,
             comparison_results_by_predicate,
             conditional_value_results,
+            selection_writebacks,
+            selection_copy_sources,
             short_circuit_scalar_frames: short_circuit_frames::collect_scalars(
                 proto,
                 cfg,
@@ -4871,11 +5087,13 @@ impl ProtoPromotionFacts {
                     {
                         return None;
                     }
-                    let SsaValue::Def(previous) = dataflow.def_overwritten_value(def.id)? else {
-                        return None;
-                    };
-                    (fixed_temps[previous.index()] == TempId(previous.index()))
-                        .then_some((TempId(def.id.index()), TempId(previous.index())))
+                    let previous = canonical_value_temp(
+                        dataflow.def_overwritten_value(def.id)?,
+                        fixed_temps.len(),
+                        fixed_temps,
+                        phi_temps,
+                    )?;
+                    Some((TempId(def.id.index()), previous))
                 })
                 .collect(),
             vararg_copy_frames: copy_assignments::varargs::collect(
@@ -4964,7 +5182,7 @@ impl ProtoPromotionFacts {
             copy_root_overwrites: copy_roots.overwrites,
             retargeted_scalar_roots: BTreeSet::new(),
             copy_root_endpoint_producers,
-            promoted_local_by_temp: BTreeMap::new(),
+            promoted_binding_by_temp: BTreeMap::new(),
             consumed_local_bindings: BTreeMap::new(),
             local_home_slots: Vec::new(),
             invalidated_param_homes: BTreeSet::new(),
@@ -5058,6 +5276,18 @@ impl ProtoPromotionFacts {
                     && !matches!(frame.value, short_circuit_frames::ShortCircuitScalarValue::CopyTemp(source) if temps.contains(&source))
             })
         });
+        self.selection_writebacks.retain(|result, frame| {
+            !temps.contains(result)
+                && !temps.contains(&frame.previous)
+                && !temps.contains(&frame.input.temp)
+                && frame
+                    .literal_preparation
+                    .is_none_or(|temp| !temps.contains(&temp))
+                && !frame.writes.iter().any(|temp| temps.contains(temp))
+        });
+        self.selection_copy_sources.retain(|target, source| {
+            !temps.contains(target) && self.selection_writebacks.contains_key(source)
+        });
         self.short_circuit_table_frames.retain(|_, frame| {
             frame.is_none_or(|frame| {
                 ![frame.input, frame.alternative, frame.result]
@@ -5075,10 +5305,10 @@ impl ProtoPromotionFacts {
             frame.temps.iter().all(|temp| !temps.contains(temp))
                 && frame
                     .copied_input
-                    .is_none_or(|(temp, _)| !temps.contains(&temp))
+                    .is_none_or(|(binding, _)| !matches!(binding, HirBinding::Temp(temp) if temps.contains(&temp)))
                 && frame
                     .copied_tail
-                    .is_none_or(|(temp, _)| !temps.contains(&temp))
+                    .is_none_or(|(binding, _)| !matches!(binding, HirBinding::Temp(temp) if temps.contains(&temp)))
         });
         self.nil_assignment_frames.retain(|frame| {
             !temps.contains(&frame.last)
@@ -5108,6 +5338,10 @@ impl ProtoPromotionFacts {
             .retain(|temp| !temps.contains(temp));
         self.boolean_value_prewrites
             .retain(|result, (initial, _)| !temps.contains(result) && !temps.contains(initial));
+        self.boolean_branch_prewrites
+            .retain(|(result, _), (initial, _)| {
+                !temps.contains(result) && !temps.contains(initial)
+            });
         self.copy_value_prewrites
             .retain(|result, initial| !temps.contains(result) && !temps.contains(initial));
         self.phi_overwrite_predecessors
@@ -5152,7 +5386,7 @@ impl ProtoPromotionFacts {
             .retain(|temp| !temps.contains(temp));
         self.loop_carrier_temps.retain(|temp| !temps.contains(temp));
         self.phi_carrier_temps.retain(|temp| !temps.contains(temp));
-        self.promoted_local_by_temp
+        self.promoted_binding_by_temp
             .retain(|temp, _| !temps.contains(temp));
         self.argument_root_producers
             .retain(|temp| !temps.contains(temp));
@@ -5802,7 +6036,8 @@ impl ProtoPromotionFacts {
             .entry(local)
             .and_modify(|known| *known &= unaliased)
             .or_insert(unaliased);
-        self.promoted_local_by_temp.insert(temp, local);
+        self.promoted_binding_by_temp
+            .insert(temp, HirBinding::Local(local));
     }
 
     /// 身份合并按交集传播，未来同槽的新 capture 不回溯到已证明的原定义。
@@ -5811,8 +6046,21 @@ impl ProtoPromotionFacts {
             && self.reference_unaliased_locals.get(&local) == Some(&true)
     }
 
+    /// 参数归属由 Bindings 确认，和 Local 归属共用原 Def 到当前身份的索引。
+    pub(super) fn record_temp_param_binding(&mut self, temp: TempId, param: ParamId) {
+        self.promoted_binding_by_temp
+            .insert(temp, HirBinding::Param(param));
+    }
+
+    pub(super) fn promoted_binding_for_temp(&self, temp: TempId) -> Option<HirBinding> {
+        self.promoted_binding_by_temp.get(&temp).copied()
+    }
+
     pub(super) fn promoted_local_for_temp(&self, temp: TempId) -> Option<LocalId> {
-        self.promoted_local_by_temp.get(&temp).copied()
+        match self.promoted_binding_for_temp(temp)? {
+            HirBinding::Local(local) => Some(local),
+            _ => None,
+        }
     }
 
     /// 只登记已删除声明且全部读写已转移的 binding；局部 use 改写不能迁移原 Def。
@@ -5857,14 +6105,13 @@ impl ProtoPromotionFacts {
                 resolved.insert(local, target);
             }
         }
-        self.promoted_local_by_temp.retain(|_, local| {
-            match resolved.get(local) {
-                Some(HirBinding::Local(target)) => *local = *target,
-                Some(_) => return false,
-                None => {}
+        for binding in self.promoted_binding_by_temp.values_mut() {
+            if let HirBinding::Local(local) = binding
+                && let Some(&target) = resolved.get(local)
+            {
+                *binding = target;
             }
-            true
-        });
+        }
     }
 
     /// 并行赋值覆盖的原低槽版本先交完整帧，不能因没有读取而提前删除声明前缀。
@@ -5961,51 +6208,56 @@ impl ProtoPromotionFacts {
     }
 
     /// 标量并列写只消费原三个 Def；同 Local 的其它值版本不能代替这些来源。
-    pub(super) fn local_scalar_pair_frames(
+    pub(super) fn scalar_pair_frames(
         &self,
     ) -> impl Iterator<
         Item = (
-            [LocalId; 3],
-            Option<LocalId>,
+            [HirBinding; 3],
+            Option<HirBinding>,
             HirExpr,
             &copy_assignments::ScalarPairFrame,
         ),
     > + '_ {
         self.scalar_pair_frames.iter().filter_map(|frame| {
-            let mut locals = [LocalId(0); 3];
-            for (index, (&temp, &home)) in frame.temps.iter().zip(&frame.homes).enumerate() {
-                let local = self.promoted_local_for_temp(temp)?;
-                if self.trusted_temp_home_slot(temp) != Some(home)
-                    || self.trusted_local_home_slot(local) != Some(home)
+            let home = |binding| match binding {
+                HirBinding::Local(local) => self.trusted_local_home_slot(local),
+                HirBinding::Param(param) => self.trusted_param_home_slot(param),
+                _ => None,
+            };
+            let mut bindings = [HirBinding::Local(LocalId(0)); 3];
+            for (index, (&temp, &original_home)) in frame.temps.iter().zip(&frame.homes).enumerate()
+            {
+                let binding = self.promoted_binding_for_temp(temp)?;
+                if self.trusted_temp_home_slot(temp) != Some(original_home)
+                    || home(binding) != Some(original_home)
                 {
                     return None;
                 }
-                locals[index] = local;
+                bindings[index] = binding;
             }
-            let copied_input = if let Some((temp, home)) = frame.copied_input {
-                let local = self.promoted_local_for_temp(temp)?;
-                if self.trusted_temp_home_slot(temp) != Some(home)
-                    || self.trusted_local_home_slot(local) != Some(home)
-                {
-                    return None;
-                }
-                Some(local)
+            let input = |(original, original_home)| {
+                let binding = match original {
+                    HirBinding::Temp(temp) => {
+                        if self.trusted_temp_home_slot(temp) != Some(original_home) {
+                            return None;
+                        }
+                        self.promoted_binding_for_temp(temp)?
+                    }
+                    binding => binding,
+                };
+                (home(binding) == Some(original_home)).then_some(binding)
+            };
+            let copied_input = if let Some(original) = frame.copied_input {
+                Some(input(original)?)
             } else {
                 None
             };
-            let tail = if let Some((temp, home)) = frame.copied_tail {
-                let local = self.promoted_local_for_temp(temp)?;
-                if self.trusted_temp_home_slot(temp) != Some(home)
-                    || self.trusted_local_home_slot(local) != Some(home)
-                {
-                    return None;
-                }
-                HirExpr::LocalRef(local)
+            let tail = if let Some(original) = frame.copied_tail {
+                input(original)?.expr()
             } else {
                 frame.tail.clone()
             };
-
-            Some((locals, copied_input, tail, frame))
+            Some((bindings, copied_input, tail, frame))
         })
     }
 

@@ -1,6 +1,10 @@
 -- Proto-anchored cdata need no old stack root, but copying a literal can change identity.
 -- unluac: expect-ast-max [[local-binding]] [[9]]
 -- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]]
 local function signed_pair()
     local value = 1LL
     return value, value

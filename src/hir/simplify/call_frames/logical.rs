@@ -222,6 +222,18 @@ impl FrameBuilder<'_> {
                 outer.expr = HirExpr::Unary(Box::new(inner));
                 Some(HirExpr::Unary(Box::new(outer)))
             }
+            HirExpr::TableAccess(access) => {
+                // 仅作谓词的查表与 CALL 一样在结果上方准备；真正取值的末叶
+                // 仍写共同结果槽。原 GETTABLE 的输入布局和事件继续由 lookup owner 核对。
+                let predicate = matches!(
+                    usage,
+                    LogicalUse::Condition {
+                        retain_value: false,
+                        ..
+                    }
+                );
+                self.luau_lookup(access, before, result.slot() + usize::from(predicate))
+            }
             HirExpr::Call(call) => {
                 let predicate = matches!(
                     usage,

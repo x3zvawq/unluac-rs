@@ -653,15 +653,16 @@ fn lower_proto_one(
     for (&temp, &local) in &bindings.temp_decl_locals {
         promotion_facts.record_temp_to_local_merge(temp, local);
     }
-    // debug 与 capture cell 内的后续写已直接降低成同一个 Local；完整赋值帧
+    // 参数、debug 与 capture cell 内的后续写已直接降低成既有绑定；完整赋值帧
     // 仍需要每个原 SSA Def 的身份。与 temp_target 相同，显式绑定覆盖 capture 默认值。
     for (&temp, &target) in bindings
         .captured_temp_targets
         .iter()
         .chain(&bindings.bound_temp_targets)
     {
-        if let BoundSlotTarget::Local(local) = target {
-            promotion_facts.record_temp_local_binding(temp, local);
+        match target {
+            BoundSlotTarget::Local(local) => promotion_facts.record_temp_local_binding(temp, local),
+            BoundSlotTarget::Param(param) => promotion_facts.record_temp_param_binding(temp, param),
         }
     }
     record_loop_binding_local_homes(

@@ -1,6 +1,8 @@
 -- unluac: expect-contains [[-0.0]]
 -- unluac: expect-ast-count [[function]] [[1]]
 -- unluac: expect-ast-max [[local-binding]] [[3]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
 local function run()
     local value = -0.0
     assert(value == 0 and 1 / value == -math.huge and math.type(value) == "float")

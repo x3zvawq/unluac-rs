@@ -262,10 +262,8 @@ fn simplify_logical_and(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> 
         })));
     }
 
-    // 候选拒绝[SemanticBarrier:EvalCount]：`f() and f()` 折成 `f()` 会在首个结果 truthy 时少调用一次。
-    if lhs == rhs && safety.is_repeatable_in_single_value_context(lhs) {
-        return Some(lhs.clone());
-    }
+    // 原 `x and x` 在外层短路中仍可承担两次独立 TEST；可重复读取不授权删掉
+    // 其中一次检查。恢复产生的共同控制应由 Decision 的节点/连边归约消除。
 
     if let Some(replacement) = fold_associative_duplicate_and(lhs, rhs, safety) {
         return Some(replacement);
@@ -304,6 +302,25 @@ fn simplify_logical_and(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> 
 }
 
 fn simplify_logical_or(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> Option<HirExpr> {
+    if let HirExpr::Unary(outer) = lhs
+        && outer.op == HirUnaryOpKind::Not
+        && outer.source_site.is_none()
+        && let HirExpr::Unary(inner) = &outer.expr
+        && inner.op == HirUnaryOpKind::Not
+        && inner.source_site.is_none()
+        && let Some(binding) = HirBinding::from_expr(rhs)
+        && HirBinding::from_expr(&inner.expr) == Some(binding)
+        && safety.is_repeatable_in_single_value_context(rhs)
+    {
+        // 恢复选值产生的 Boolean 包装可直接表达为原 binding and true。
+        // falsy 路径仍返回原 nil/false；原 NOT 指令不属于这个合成外壳。
+        return Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            preserves_boolean_prewrite: false,
+            lhs: binding.expr(),
+            rhs: HirExpr::Boolean(true),
+        })));
+    }
+
     // 候选拒绝[SemanticBarrier:EvalCount]：`f() or f()` 折成 `f()` 会在首个结果 falsy 时少调用一次。
     if lhs == rhs && safety.is_repeatable_in_single_value_context(lhs) {
         return Some(lhs.clone());

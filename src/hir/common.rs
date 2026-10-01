@@ -61,12 +61,21 @@ pub(crate) enum HirLuauInliningBody {
     CapturedAddIdentity,
     /// 只读捕获产生 callable，非尾调用后返回固定标签与一个结果。
     CapturedCallablePair,
+    /// 按已求值的参数真值选择常量，固定结果包包含单返回值的补 nil。
+    LiteralChoice {
+        template: usize,
+        parameters: usize,
+    },
     /// 单参数快照、条件方法调用及字段返回，完整函数体按模板身份配对。
     ConditionalMethod {
         template: usize,
     },
     /// 常量条件选中 repeat 首段，原高槽状态最终写回低槽结果。
     RepeatPrefix {
+        template: usize,
+    },
+    /// 数值遍历命中时提前返回，正常出口执行另一观察；完整模板与只读捕获共同配对。
+    NumericForExit {
         template: usize,
     },
     /// 常量参数选中的计数 while 保留逐次更新、退出比较和原低槽返回。

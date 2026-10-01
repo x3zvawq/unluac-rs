@@ -17,7 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::label_refs::{count_label_references, stmt_has_label_or_goto};
 use super::lexical_cfg::LexicalCfg;
-use super::mention::{CaptureCollector, ToBeClosedTempCollector, stmt_writes_temp};
+use super::mention::{
+    CaptureCollector, ToBeClosedTempCollector, collect_expr_temp_use_counts, stmt_writes_temp,
+};
 use super::root_lifetimes::{
     CallRootLifetimeIndices, RootEventBlock, RootEventIndex, RootEventStmt, RootLifetimeFacts,
     RootOverwritePolicy, collect_call_result_local_roots, collect_call_root_lifetimes,
@@ -130,7 +132,8 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         &identity_sensitive_temps,
         &reference.bindings.params,
     );
-    let root_scopes_changed = root_scopes::restore(proto, facts, safety, &identity_sensitive_temps);
+    // 按值捕获只保存对象值，不延长原槽 cell 的寿命；词法结束点仍由原覆盖与窗口闭合性证明。
+    let root_scopes_changed = root_scopes::restore(proto, facts, safety, &cell_sensitive_temps);
     let event_index = RootEventIndex::new(&proto.body.stmts, facts, safety);
     let constants_fit_rk = super::call_frames::constants_fit_rk(proto);
     let first_new_local = proto.local_count;
@@ -577,7 +580,7 @@ fn promote_block(
         BlockProtection {
             current_plan_temps: &empty,
             descendant_temps: &empty,
-            trailing_root_condition: None,
+            trailing_condition: None,
         },
     )
 }
@@ -585,7 +588,7 @@ fn promote_block(
 struct BlockProtection<'a> {
     current_plan_temps: &'a BTreeSet<TempId>,
     descendant_temps: &'a BTreeSet<TempId>,
-    trailing_root_condition: Option<&'a mut HirExpr>,
+    trailing_condition: Option<&'a mut HirExpr>,
 }
 
 fn promote_block_with_protection(
@@ -601,12 +604,19 @@ fn promote_block_with_protection(
         .extend(collect_call_result_local_roots(
             &block.stmts,
             event_block,
-            protection.trailing_root_condition.as_deref(),
+            protection.trailing_condition.as_deref(),
             ctx.safety,
         ));
 
     let block_uses_outer_temp =
         |temp| outer_uses_temp(temp) || protection.current_plan_temps.contains(&temp);
+    // repeat 尾条件和 body 共用词法域，但不是 body 中的一条语句；保留独立读取集合，
+    // 不把虚拟语句索引塞入后续按真实语句取值的候选遍历。
+    let trailing_reads = protection
+        .trailing_condition
+        .as_deref()
+        .map(collect_expr_temp_use_counts)
+        .unwrap_or_default();
     let plans = collect_plans(
         ctx,
         block,
@@ -614,6 +624,7 @@ fn promote_block_with_protection(
         mapping,
         inherited_sticky_slots,
         &block_uses_outer_temp,
+        &trailing_reads,
     );
     let plan_by_decl = plans.iter().fold(
         BTreeMap::<usize, Vec<&PromotionPlan>>::new(),
@@ -785,7 +796,7 @@ fn promote_block_with_protection(
         }
     }
 
-    if let Some(condition) = protection.trailing_root_condition {
+    if let Some(condition) = protection.trailing_condition {
         changed |= rewrite::expr(condition, mapping.bindings());
     }
     mapping.rollback(checkpoint);
@@ -896,7 +907,17 @@ fn collect_plans(
     inherited_mapping: &LocalMapping,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
+    trailing_reads: &BTreeMap<TempId, usize>,
 ) -> Vec<PromotionPlan> {
+    let trailing_preparation = (!trailing_reads.is_empty())
+        .then(|| {
+            super::temp_inline::repeat_tail_preparation_index(
+                block,
+                |temp| trailing_reads.contains_key(&temp),
+                ctx.facts,
+            )
+        })
+        .flatten();
     let inherited = inherited_mapping.bindings();
     let label_flow_boundary = block.stmts.iter().position(stmt_has_label_or_goto);
     let linear_prefix_end = label_flow_boundary.unwrap_or(block.stmts.len());
@@ -1016,7 +1037,7 @@ fn collect_plans(
     let mut accounted_plans = 0;
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         for plan in &plans[accounted_plans..] {
-            planned.record(plan, ctx, event_block);
+            planned.record(plan, ctx, event_block, trailing_reads, block.stmts.len());
         }
         accounted_plans = plans.len();
         if reserved_alias_indices.contains(&decl_index) {
@@ -1122,6 +1143,7 @@ fn collect_plans(
             && !ctx.identity_sensitive_temps.contains(&temp)
             && temp_debug_locals[temp.index()].is_none()
             && !event_block.has_touch_before(temp, decl_index)
+            && !trailing_reads.contains_key(&temp)
             && event_block.last_touch(temp) == Some(decl_index)
             && let Some(next) = block.stmts.get(decl_index + 1)
             && let Some(locals) =
@@ -1435,7 +1457,8 @@ fn collect_plans(
                         // 新声明的名字在 RHS 中尚不可见；包括 closure capture 在内的
                         // 自引用必须保留独立声明，不能随整组初始化一并提升。
                         || event_block.has_read_at(*temp, decl_index)
-                        || !event_block.has_read_from(*temp, decl_index + 1)
+                        || (!event_block.has_read_from(*temp, decl_index + 1)
+                            && !trailing_reads.contains_key(temp))
                         // 固定 VARARG 保持整包宽度；loop carrier 的跨轮读写即使只落在
                         // 一个顶层循环位置，也需要共享入口声明，不能当作单次中转。
                         || (!vararg_initializer && !facts.is_loop_carrier_temp(*temp) && event_block
@@ -1714,6 +1737,7 @@ fn collect_plans(
             removable_aliases,
             touching_stmt_indices,
         } = promotion_group;
+        let read_by_condition = group.iter().any(|temp| trailing_reads.contains_key(temp));
         let group_has_physical_root = group
             .iter()
             .any(|temp| ctx.physical_root_temps.contains(temp));
@@ -1860,10 +1884,12 @@ fn collect_plans(
                         return None;
                     }
                     let home = home_slot?;
+                    let value = stmt.scalar_temp_assignment()?.1;
                     let previous = facts
-                        .scalar_load_predecessor(root_temp, stmt.scalar_temp_assignment()?.1)?;
+                        .scalar_load_predecessor(root_temp, value)
+                        .or_else(|| facts.selection_predecessor(root_temp, ctx.dialect, value))?;
                     let local = *planned.bindings.get(&previous)?;
-                    // 原常量写仍在原位覆盖同一 home/epoch；旧匿名版本已无后续需求。
+                    // 原常量写或已证明的条件双臂仍在原位覆盖同一 home/epoch；旧匿名版本已无后续需求。
                     // 不把新的 debug/capture 身份合并，也不从相同槽号猜测覆盖前驱。
                     (!has_label_flow
                         && current_slot_locals.get(&home) == Some(&local)
@@ -2174,6 +2200,7 @@ fn collect_plans(
             && sticky_local.is_none()
             && !force_physical_root_local
             && !source_assignment_target
+            && !read_by_condition
             && touching_stmt_indices.is_empty()
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
             && facts.is_unread_literal_initializer(root_temp)
@@ -2197,6 +2224,7 @@ fn collect_plans(
             && !source_closure
             && !source_assignment_target
             && !source_literal
+            && !read_by_condition
             && touching_stmt_indices.is_empty()
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
         {
@@ -2211,6 +2239,7 @@ fn collect_plans(
             && !source_assignment_target
             && !source_literal
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
+            && !read_by_condition
             && std::iter::once(decl_index)
                 .chain(touching_stmt_indices.iter().copied())
                 .all(|index| !event_block.reads_any(index, &group))
@@ -2219,7 +2248,26 @@ fn collect_plans(
             // 不能因新版本没有读取而把它留成与旧 binding 无关的 temp。
             continue;
         }
-        if sticky_local.is_none()
+        if read_by_condition
+            && trailing_preparation == Some(decl_index)
+            && touching_stmt_indices.is_empty()
+            && trailing_reads.get(&root_temp) == Some(&1)
+            && reusable_local.is_none()
+            && !force_physical_root_local
+            && !source_closure
+            && !source_assignment_target
+            && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
+            && debug_scope_for_temp_group(temp_debug_scopes, &group).is_none()
+            && group
+                .iter()
+                .all(|temp| !ctx.identity_sensitive_temps.contains(temp))
+        {
+            // 候选拒绝[LayerBoundary]：紧邻尾条件的唯一准备仍由完整条件帧消费。
+            // 跨过 body 事件的快照和多次条件读取不能借此延迟声明。
+            continue;
+        }
+        if !read_by_condition
+            && sticky_local.is_none()
             && !force_physical_root_local
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
         {
@@ -2235,9 +2283,10 @@ fn collect_plans(
                 // 出现一次不是一次执行；交给 AST 才物化会使后续 HIR 源码帧缺少这个前缀身份。
                 // 原有槽的常量也仍是显式 TEST 的输入；不能变成字面量后删掉原检查，
                 // 或让内层 CALL 失去声明前缀。
-                if event_block
-                    .stmt(first_touch_index.unwrap())
-                    .consumes_only_control_head(use_stmt, &group)
+                if reusable_local.is_none()
+                    && event_block
+                        .stmt(first_touch_index.unwrap())
+                        .consumes_only_control_head(use_stmt, &group)
                     && first_touch_index == Some(decl_index + 1)
                     && !matches!(
                         single_temp_assign_value(stmt, root_temp),
@@ -2255,6 +2304,7 @@ fn collect_plans(
                             )
                         ))
                 {
+                    // 已证明覆盖现存绑定时先接回原身份；这里只延迟尚无归属的条件准备。
                     // 候选拒绝[LayerBoundary]：紧邻控制头的准备仍交完整条件帧恢复。
                     // 跨过其它语句才读取的值必须先物化，否则中间 CALL/构造器的源码前缀
                     // 会缺少它的原槽；不能仅凭最终消费者是条件就永久搁置声明。
@@ -2389,7 +2439,7 @@ fn collect_plans(
     }
 
     for plan in &plans[accounted_plans..] {
-        planned.record(plan, ctx, event_block);
+        planned.record(plan, ctx, event_block, trailing_reads, block.stmts.len());
     }
     accounted_plans = plans.len();
     // 标量计划先收集完毕；其中的 debug 身份可能尚未在当前合流点声明。
@@ -2423,7 +2473,7 @@ fn collect_plans(
     for (decl_index, stmt) in block.stmts[..linear_prefix_end].iter().enumerate() {
         // 合流输出也成为后继覆盖的前驱；只登记新计划，复用冻结的最后需求索引。
         for plan in &plans[accounted_plans..] {
-            planned.record(plan, ctx, event_block);
+            planned.record(plan, ctx, event_block, trailing_reads, block.stmts.len());
             if matches!(plan.action, PromotionAction::AllocateLocal) {
                 mapping::introduce_overwrite_owner(
                     &mut overwrite_owners,
@@ -3403,7 +3453,7 @@ fn rewrite_stmt(
                 BlockProtection {
                     current_plan_temps: &condition_temps,
                     descendant_temps: &condition_temps,
-                    trailing_root_condition: None,
+                    trailing_condition: None,
                 },
             )
             .changed;
@@ -3425,7 +3475,7 @@ fn rewrite_stmt(
                 BlockProtection {
                     current_plan_temps: &BTreeSet::new(),
                     descendant_temps: &condition_temps,
-                    trailing_root_condition: Some(&mut repeat_stmt.cond),
+                    trailing_condition: Some(&mut repeat_stmt.cond),
                 },
             );
             body_result.changed

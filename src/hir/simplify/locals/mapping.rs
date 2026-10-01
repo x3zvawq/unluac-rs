@@ -161,6 +161,8 @@ impl PlannedLocalUses {
         plan: &super::PromotionPlan,
         ctx: &PromotionCtx<'_>,
         events: super::RootEventBlock<'_>,
+        trailing_reads: &BTreeMap<TempId, usize>,
+        tail_index: usize,
     ) {
         self.bindings
             .extend(plan.temps.iter().map(|&temp| (temp, plan.local)));
@@ -189,7 +191,12 @@ impl PlannedLocalUses {
         }
         if let Some(last) = self.last_touches.get_mut(&plan.local) {
             for &temp in &plan.temps {
-                *last = (*last).max(events.last_touch(temp).unwrap_or(plan.decl_index));
+                let end = if trailing_reads.contains_key(&temp) {
+                    tail_index
+                } else {
+                    events.last_touch(temp).unwrap_or(plan.decl_index)
+                };
+                *last = (*last).max(end);
             }
         }
     }

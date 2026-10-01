@@ -232,6 +232,19 @@ pub(super) fn collapse_inferred_if_result_chains(
     if rewrites.is_empty() {
         return false;
     }
+    // 这些 result 的声明及全部使用一起退休；原 phi 的绑定身份必须随交接迁移。
+    for (&source, &target) in &rewrites {
+        if let CarryBinding::Local(local) = source {
+            promotion_facts.record_consumed_local_binding(
+                local,
+                match target {
+                    CarryBinding::Local(local) => crate::hir::HirBinding::Local(local),
+                    CarryBinding::Param(param) => crate::hir::HirBinding::Param(param),
+                    CarryBinding::Temp(temp) => crate::hir::HirBinding::Temp(temp),
+                },
+            );
+        }
+    }
     let rewritten = rewrites.values().copied().collect::<BTreeSet<_>>();
     rewrite_stmts(
         &mut block.stmts,

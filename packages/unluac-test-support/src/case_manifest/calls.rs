@@ -1241,4 +1241,32 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "方法链语法糖、显式self提取调用、变参方法多返回及self赋值作用域。",
         &[LuaCaseConfiguration::new(ALL_DIALECTS)],
     ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/arguments_13_conditional_call_frame.lua",
+        &["short-circuit", "callee", "evaluation-order", "truncation"],
+        "条件参数复用前次匿名结果；false跳过RHS，选中false/nil/0仍单值传递，RHS改写callee后继续调用此前快照。",
+        &[
+            LuaCaseConfiguration::new(LUAJIT_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/arguments_14_prepared_boolean_call.lua",
+        &[
+            "short-circuit",
+            "callee",
+            "evaluation-order",
+            "comparison",
+            "metamethod",
+        ],
+        "普通Boolean参数调用保留callee先读、原生NOT及四种比较的方向、短路、异常与单次交付。",
+        &[LuaCaseConfiguration::new(LUAU_ONLY)
+            .with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            })
+            .with_variants(LUAU_O0_ONLY)],
+    ),
 ];

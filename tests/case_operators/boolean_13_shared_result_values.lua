@@ -3,7 +3,9 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-ast-count [[function]] [[5]]
 -- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[22]]
+-- 合流参数的预写与 callee 属于同一调用帧；后续捕获不能留下额外声明。
+-- unluac: expect-ast-max [[local-binding]] [[20]]
+-- unluac: expect-contains [[assert(r0_8 == false and r0_9 == false)]] [[@dialect=luau]]
 local function choose(value)
     local falsy = value and false
     local truthy = value or true
@@ -67,3 +69,13 @@ assert(o1 == false and o2 == false and additions == 4 and negations == 4)
 a, b, c, d, e = choose("")
 assert(a == false and b == false and c == "" and d == true and e == false)
 assert(select("#", choose(nil)) == 5 and select("#", numeric(nil)) == 2)
+a, b, c, d, e = choose(true)
+assert(a == false and b == false and c == true and d == true and e == false)
+operator_result = 0
+o1, o2 = operators(special)
+assert(o1 == false and o2 == false and additions == 5 and negations == 5)
+assert(operator_trace == string.rep("add,neg,", 5))
+-- RHS 调用修改被捕获的低槽；比较读到的值由各 VM 的原程序输出作 oracle。
+operator_result = 6
+print("comparison-read-after-call", additions == getmetatable(special).__add(special, special))
+assert(additions == 6 and negations == 5)

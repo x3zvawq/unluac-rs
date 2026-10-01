@@ -2,8 +2,17 @@
 -- unluac: expect-count [[= setmetatable({}, {]] [[2]]
 -- unluac: expect-not-contains [[and 1 == 1]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
+-- 一元结果跨 print 保活，但必须在后继 assert 复用原槽前离域。
+-- unluac: expect-ast-min [[do-block]] [[4]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-min [[do-block]] [[5]] [[@dialect=luau]]
 -- unluac: expect-ast-max [[local-binding]] [[20]]
+-- 末尾 COPY 承接原结果声明，不新增接棒变量或 callee 暂存。
+-- unluac: expect-ast-max [[local-binding]] [[16]] [[@debug=stripped]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[assign]] [[3]] [[@proto=0]] [[@dialect=luau]]
 -- unluac: expect-ast-count [[function]] [[6]]
+-- unluac: expect-count [[= -get() and "yes" or "no"]] [[3]] [[@debug=retained]] [[@dialect=lua5.1]]
+-- unluac: expect-count [[= -get() and "yes" or "no"]] [[3]] [[@debug=retained]] [[@dialect=luajit]]
+-- unluac: expect-count [[= -get() and "yes" or "no"]] [[3]] [[@debug=retained]] [[@dialect=luau]]
 do
     local t = {f = function() return "old" end}
     local result = t.f()
@@ -72,4 +81,6 @@ end
 assert(count == 2 and gets == 1)
 result = -get() and "yes" or "no"
 assert(count == 3 and gets == 2 and result == "no")
+result = -get() and "yes" or "no"
+assert(count == 4 and gets == 3 and result == "yes")
 print("scope_11_scalar_call_prefix", count, result)

@@ -413,7 +413,7 @@ impl FrameBuilder<'_> {
                 if home != HomeSlotKey::new(result, 0)
                     || self
                         .facts
-                        .comparison_preparation_instruction(binary, 0, lhs)?
+                        .binary_preparation_instruction(binary, 0, lhs)?
                         .index()
                         != source.instr.index() + 1
                     || comparison.instr.index() != source.instr.index() + 2

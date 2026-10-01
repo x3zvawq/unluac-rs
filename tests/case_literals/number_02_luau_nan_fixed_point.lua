@@ -3,6 +3,7 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[function]] [[1]]
 -- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-max [[local-binding]] [[2]]
 
 local nan = 0 / 0

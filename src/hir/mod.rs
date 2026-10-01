@@ -14,6 +14,7 @@ pub(crate) mod decision;
 mod emission;
 mod error;
 mod expr_safety;
+pub(crate) mod luau_inlining;
 mod promotion;
 mod rewrite;
 mod simplify;

@@ -421,6 +421,16 @@ fn collapse_value_decision_shape(
         if let Some(expr) = short_circuit::collapse_shared_value_continuation(topology, safety) {
             return Some(expr);
         }
+        if let Some(factored) = short_circuit::factor_shared_value_continuation(decision, safety) {
+            return Some(
+                collapse_value_decision_expr(
+                    &analyze_decision(&factored),
+                    safety,
+                    (|_| false) as fn(&HirDecisionNode) -> bool,
+                )
+                .unwrap_or_else(|| HirExpr::Decision(Box::new(factored))),
+            );
+        }
         synthesize::synthesize_value_decision_expr(decision, safety).or_else(|| {
             let mut memo = BTreeMap::new();
             collapse_value_node(decision, decision.entry, &mut memo, safety)

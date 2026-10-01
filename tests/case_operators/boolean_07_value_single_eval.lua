@@ -4,6 +4,11 @@
 -- unluac: expect-ast-count [[function]] [[11]]
 -- unluac: expect-ast-count [[if]] [[0]]
 -- unluac: expect-ast-max [[local-binding]] [[34]]
+-- 首个 CALL 与短路合流共同初始化结果，不拆成 callee 和接棒赋值。
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=1]]
+-- 保留原目标的一次写回；callee、参数及返回准备均留在表达式中。
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=3]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=3]]
 local function run(a, b, c, d)
     local trace = {}
     local function p(tag, value)
@@ -107,4 +112,8 @@ value1, trace1 = run(nil, true, shared, false)
 assert(value1 == shared and trace1 == "a,b,c")
 value1, trace1 = run(nil, nil, false, shared)
 assert(value1 == shared and trace1 == "a,b,d")
+value1, trace1 = run(nil, 0, false, 0)
+assert(value1 == 0 and trace1 == "a,b,c,d")
+value1, trace1 = run(nil, "", shared, nil)
+assert(value1 == shared and trace1 == "a,b,c")
 assert(select("#", run(nil, nil, nil, nil)) == 2)

@@ -1,11 +1,11 @@
-//! 在原槽被下一次调用准备覆盖时，恢复匿名声明的词法末端。
+//! 在原槽被后继调用准备或独立环境读取覆盖时，恢复匿名声明的词法末端。
 //!
 //! 根的保活与覆盖来自共享 lifetime 分析；窗口内身份不得逃逸。先结束旧声明，
 //! 避免 promotion 把后继 callee 合入旧 local 后永久占据它自己的调用准备槽。
 
 use super::*;
 use crate::hir::common::HirCallExpr;
-use crate::hir::simplify::mention::BindingReadCollector;
+use crate::hir::simplify::mention::{BindingReadCollector, BindingWriteCollector};
 use crate::hir::simplify::root_lifetimes::direct_call_in_stmt;
 use crate::hir::simplify::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::visit::visit_stmts;
@@ -44,10 +44,10 @@ pub(super) fn restore(
         sensitive,
         reads,
         debug,
-        call_results: BTreeSet::new(),
+        root_results: BTreeSet::new(),
     };
     let changed = rewrite_proto(proto, &mut pass);
-    proto.physical_root_temps.extend(pass.call_results);
+    proto.physical_root_temps.extend(pass.root_results);
     changed
 }
 
@@ -57,13 +57,13 @@ struct ScopePass<'a> {
     sensitive: &'a BTreeSet<TempId>,
     reads: BTreeMap<TempId, usize>,
     debug: BTreeSet<TempId>,
-    call_results: BTreeSet<TempId>,
+    root_results: BTreeSet<TempId>,
 }
 
 impl HirRewritePass for ScopePass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        // 窗口只能结束于本块的直接调用准备。纯分支不自行建窗，避免每层嵌套 if
-        // 重复索引同一子树；包含调用的子域会在下面的分支边界检查中截断父级扫描。
+        // 只为跨本块直属调用的匿名身份建窗。纯分支不自行索引，避免每层嵌套 if
+        // 重复遍历同一子树；包含调用的子域会在下面的分支边界检查中截断父级扫描。
         if !block
             .stmts
             .iter()
@@ -72,7 +72,11 @@ impl HirRewritePass for ScopePass<'_> {
             return false;
         }
         if block.stmts.iter().any(|stmt| {
-            !scope_statement(stmt) && !matches!(stmt, HirStmt::ToBeClosed(_) | HirStmt::Close(_))
+            !scope_statement(stmt)
+                && !matches!(
+                    stmt,
+                    HirStmt::Block(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_)
+                )
         }) {
             // MissingFact：SETLIST 和未支持的控制结构可能仍属于跨语句协议。
             // 不能把未知节点当成可切分边界，截断在其两侧继续构造的表达式帧。
@@ -116,7 +120,7 @@ impl HirRewritePass for ScopePass<'_> {
 }
 
 /// 已闭合的表写/Boolean 分支和直线循环可留在扫描区；候选窗口另行核对身份与写域。
-/// 显式资源激活/关闭分隔候选区，未支持结构保留整个块；每条语句至多在自身及父区各索引一次。
+/// 已闭合词法子块及显式资源激活/关闭分隔候选区，未支持结构保留整个块；每条语句至多在自身及父区各索引一次。
 fn scope_statement(stmt: &HirStmt) -> bool {
     match stmt {
         // 已有声明留在扫描区，候选窗口仍拒绝包含它；不把声明当分隔符切断跨语句协议。
@@ -195,8 +199,21 @@ impl ScopePass<'_> {
             |temp| !self.sensitive.contains(&temp) && !self.debug.contains(&temp),
             |_| RootOverwritePolicy::Reuse,
         );
+        let scalar_roots =
+            collect_scalar_gc_root_lifetimes(&snapshot, self.facts, self.safety, |temp| {
+                !self.sensitive.contains(&temp) && !self.debug.contains(&temp)
+            });
         let mut windows = BTreeMap::new();
         let call_floors = CallFloors::new(stmts, self.facts);
+        // 直接 callee 的词法末端仍由完整调用准备决定，尤其是参数先于 callee 的 FASTCALL。
+        let callees_in_calls = stmts
+            .iter()
+            .filter_map(direct_call_in_stmt)
+            .filter_map(|call| match call.callee {
+                HirExpr::TempRef(temp) => Some(temp),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
         let mut scanned = 0;
         let mut callees = BTreeMap::new();
         let mut definitions = BTreeMap::new();
@@ -229,44 +246,76 @@ impl ScopePass<'_> {
                             .then_some((index, previous))
                     });
             }
-            if let HirStmt::Assign(assign) = stmt {
-                for target in &assign.targets {
-                    if let HirLValue::Temp(temp) = target {
+            // 参数的 Boolean 结果可仍由互斥分支写入；整个分支是同一个准备位置。
+            // 不把两臂当作两个无关定义，也不把前面的 callee 截在旧词法域内。
+            visit_stmts(
+                std::slice::from_ref(stmt),
+                &mut BindingWriteCollector(|binding| {
+                    if let HirBinding::Temp(temp) = binding {
                         definitions
-                            .entry(*temp)
-                            .and_modify(|entry| *entry = None)
+                            .entry(temp)
+                            .and_modify(|entry| {
+                                if *entry != Some(index) {
+                                    *entry = None;
+                                }
+                            })
                             .or_insert(Some(index));
-                        if let Some(home) = self.facts.trusted_temp_home_slot(*temp) {
+                        if let Some(home) = self.facts.trusted_temp_home_slot(temp) {
                             last_definitions.insert(home, index);
                         }
                     }
-                }
-            }
-            if !matches!(stmt, HirStmt::Assign(_) | HirStmt::CallStmt(_)) {
-                continue;
-            }
-            let Some(call) = direct_call_in_stmt(stmt) else {
-                continue;
-            };
-            let HirExpr::TempRef(callee) = call.callee else {
-                continue;
-            };
-            let Some(Some((callee_start, previous))) = callees.get(&callee).copied() else {
-                continue;
-            };
-            let Some(frame) = self
-                .facts
-                .native_call_frame(call)
-                .or_else(|| self.facts.native_fastcall_frame(call))
-            else {
-                continue;
-            };
-            if frame.callee != callee || self.reads.get(&callee) != Some(&1) {
-                continue;
-            }
-            let Some(end) = self.preparation_start(call, frame.home, index, &definitions) else {
-                continue;
-            };
+                }),
+            );
+            let (home, overwrite, end, previous) =
+                if matches!(stmt, HirStmt::Assign(_) | HirStmt::CallStmt(_))
+                    && let Some(call) = direct_call_in_stmt(stmt)
+                {
+                    let HirExpr::TempRef(callee) = call.callee else {
+                        continue;
+                    };
+                    let Some(Some((callee_start, previous))) = callees.get(&callee).copied() else {
+                        continue;
+                    };
+                    let Some(frame) = self
+                        .facts
+                        .native_call_frame(call)
+                        .or_else(|| self.facts.native_fastcall_frame(call))
+                    else {
+                        continue;
+                    };
+                    if frame.callee != callee || self.reads.get(&callee) != Some(&1) {
+                        continue;
+                    }
+                    let Some(end) = self.preparation_start(call, frame.home, index, &definitions)
+                    else {
+                        continue;
+                    };
+                    (frame.home, callee_start, end, previous)
+                } else if let Some((temp, HirExpr::GlobalRef(global))) =
+                    stmt.scalar_temp_assignment()
+                {
+                    let crate::hir::common::HirOperationSources::Single(source) = global.sources
+                    else {
+                        continue;
+                    };
+                    let Some(home) = self.facts.trusted_temp_home_slot(temp) else {
+                        continue;
+                    };
+                    if self.reads.get(&temp).is_none_or(|&reads| reads < 2)
+                        || callees_in_calls.contains(&temp)
+                        || self.facts.operation_result_temp(source) != Some(temp)
+                        || self.facts.direct_global_read_home(source) != Some(home)
+                    {
+                        // 候选拒绝[LayerBoundary]：单次环境读取可能仍在完整外层调用的准备中；
+                        // 不能让其局部候选先推进扫描，屏蔽包含整个准备区的原调用端点。
+                        continue;
+                    }
+                    // 原低槽环境读取可开始新的独立身份，不必随后作为 callee 使用。
+                    // 单指令来源保证没有尚在旧域中的输入准备，覆盖端点仍由共享 root 分析签发。
+                    (home, index, index, None)
+                } else {
+                    continue;
+                };
             let literal_start = previous.filter(|&start| {
                 stmts[start]
                     .scalar_temp_assignment()
@@ -287,7 +336,8 @@ impl ScopePass<'_> {
             });
             let Some(mut start) = literal_start.or_else(|| {
                 roots
-                    .overwrite_pair_for_home(callee_start, frame.home)
+                    .overwrite_pair_for_home(overwrite, home)
+                    .or_else(|| scalar_roots.overwrite_pair_for_home(overwrite, home))
                     .map(|root| root.root_index())
             }) else {
                 continue;
@@ -301,41 +351,41 @@ impl ScopePass<'_> {
                 // 避免为每个成员的候选重复展开整组目标。
                 if let Some(producer) = direct_call_in_stmt(&stmts[start])
                     && let Some(original) = self.facts.native_call_frame(producer)
-                    && original.home == frame.home
+                    && original.home == home
                     && let Some(targets) = exact_multi_call_home_targets(&stmts[start], self.facts)
                 {
                     if !matches!(original.results, Some(crate::transformer::ResultPack::Fixed(pack))
-                                if pack.start.index() == frame.home.slot() && pack.len == targets.len())
+                                if pack.start.index() == home.slot() && pack.len == targets.len())
                         || targets
                             .iter()
                             .enumerate()
-                            .any(|(offset, (_, home))| home.slot() != frame.home.slot() + offset)
-                        || call_floors.minimum(start + 1, end) < frame.home.slot() + targets.len()
+                            .any(|(offset, (_, member))| member.slot() != home.slot() + offset)
+                        || call_floors.minimum(start + 1, end) < home.slot() + targets.len()
                     {
                         // 候选拒绝[ProofIncomplete]：所有结果必须共同占据原低槽前缀，窗口内调用不能复用其中一员。
                         continue;
                     }
                     let Some(preparation) =
-                        self.preparation_start(producer, frame.home, start, &definitions)
+                        self.preparation_start(producer, home, start, &definitions)
                     else {
                         continue;
                     };
                     start = preparation;
                 } else if let Some((result, value)) = stmts[start].scalar_temp_assignment() {
-                    if self.facts.trusted_temp_home_slot(result) != Some(frame.home) {
+                    if self.facts.trusted_temp_home_slot(result) != Some(home) {
                         continue;
                     }
                     match value {
                         HirExpr::Call(producer) => {
                             if self.facts.native_call_frame(producer).is_none_or(|producer|
-                            producer.home != frame.home
+                            producer.home != home
                                 || !matches!(producer.results, Some(crate::transformer::ResultPack::Fixed(pack))
-                                    if pack.start.index() == frame.home.slot() && pack.len == 1))
+                                    if pack.start.index() == home.slot() && pack.len == 1))
                         {
                             continue;
                         }
                             if self.reads.get(&result) == Some(&1)
-                                && call_floors.minimum(start + 1, end) <= frame.home.slot()
+                                && call_floors.minimum(start + 1, end) <= home.slot()
                             {
                                 // 候选拒绝[LayerBoundary]：单次使用的结果遇到较低/同槽调用时，
                                 // 尚不能证明独立声明域；完整外层调用准备应由帧 owner 消费。
@@ -345,29 +395,53 @@ impl ScopePass<'_> {
                             // callee COPY 与嵌套参数的尚存准备必须一起进入旧域；FASTCALL 的
                             // 参数也可能先于 callee。完整调用仍由帧 owner 重建。
                             let Some(preparation) =
-                                self.preparation_start(producer, frame.home, start, &definitions)
+                                self.preparation_start(producer, home, start, &definitions)
                             else {
                                 continue;
                             };
                             start = preparation;
                         }
                         HirExpr::TableConstructor(table)
-                            if self.facts.allocation_result_home(table) == Some(frame.home) =>
+                            if self.facts.allocation_result_home(table) == Some(home) =>
                         {
                             let floor = call_floors.minimum(start, end);
-                            if floor == usize::MAX || floor <= frame.home.slot() {
+                            if floor == usize::MAX || floor <= home.slot() {
                                 // 候选拒绝[LayerBoundary]：没有跨调用的低槽对象身份时，
                                 // 分配仍属于高槽字段/参数准备，交完整构造器或调用帧消费。
                                 continue;
                             }
                         }
+                        HirExpr::Unary(unary)
+                            if self.facts.unary_result_home(unary) == Some(home) =>
+                        {
+                            let input = match unary.expr {
+                                HirExpr::TempRef(temp) => self.facts.trusted_temp_home_slot(temp),
+                                HirExpr::LocalRef(local) => {
+                                    self.facts.trusted_local_home_slot(local)
+                                }
+                                HirExpr::ParamRef(param) => {
+                                    self.facts.trusted_param_home_slot(param)
+                                }
+                                _ => None,
+                            };
+                            let floor = call_floors.minimum(start + 1, end);
+                            if input.is_none_or(|input| {
+                                input.slot() >= home.slot()
+                                    || self.facts.unary_operand_home(unary) != Some(input)
+                            }) || floor == usize::MAX
+                                || floor <= home.slot()
+                            {
+                                // LayerBoundary：只恢复独立低槽输入之上的原结果声明；
+                                // 同槽或高槽准备仍交给完整表达式帧，不能截断其输入寿命。
+                                continue;
+                            }
+                        }
                         HirExpr::TempRef(_) => {
-                            let Some(initializer) =
-                                self.allocation_copy_start(stmts, start, frame.home)
+                            let Some(initializer) = self.allocation_copy_start(stmts, start, home)
                             else {
                                 continue;
                             };
-                            if call_floors.minimum(initializer, end) <= frame.home.slot() {
+                            if call_floors.minimum(initializer, end) <= home.slot() {
                                 // 候选拒绝[ProofIncomplete]：初始化段内的调用仍须位于低槽接收者之上。
                                 continue;
                             }
@@ -382,7 +456,7 @@ impl ScopePass<'_> {
             if start < scanned || start >= end {
                 continue;
             }
-            if literal_start.is_some() && call_floors.minimum(start, end) <= frame.home.slot() {
+            if literal_start.is_some() && call_floors.minimum(start, end) <= home.slot() {
                 // 常量不承载独立 GC 身份；其词法槽仍须在窗口中的每次调用下方。
                 // 若中途调用已复用该槽，不能把原准备临时量猜成跨调用声明。
                 // 这类参数准备不是可扫描窗口，不能推进 scanned 而屏蔽外围完整结果域。
@@ -391,13 +465,18 @@ impl ScopePass<'_> {
             // 闭合性扫描不重复覆盖旧窗口；调用下界查询独立走区间索引，嵌套的
             // 失败参数候选不会反复遍历大段语句，也不会抢占真正的作用域候选。
             scanned = end;
-            if self.closed_window(&stmts[start..end], frame.home) {
+            if self.closed_window(&stmts[start..end], home) {
                 windows.insert(start, end);
+                if let Some((temp, HirExpr::Unary(_))) = stmts[start].scalar_temp_assignment() {
+                    // 未读的元方法结果仍跨过窗口内调用；先物化这个已证根，
+                    // 后层才能保留它的词法结束点，不能把无源码 local 的块展开。
+                    self.root_results.insert(temp);
+                }
                 // 窗口中的原 CALL 结果仍占据对应槽；不能先丢掉未使用结果，
                 // 再要求后续源码帧验证一个尚无声明的 Temp。只在这个已闭合窗口保留它。
                 for stmt in &stmts[start..end] {
                     if let Some(targets) = exact_multi_call_home_targets(stmt, self.facts) {
-                        self.call_results
+                        self.root_results
                             .extend(targets.into_iter().map(|(temp, _)| temp));
                     }
                     if let Some((temp, HirExpr::Call(call))) = stmt.scalar_temp_assignment()
@@ -406,7 +485,7 @@ impl ScopePass<'_> {
                         && matches!(frame.results, Some(crate::transformer::ResultPack::Fixed(pack))
                             if pack.start.index() == frame.home.slot() && pack.len == 1)
                     {
-                        self.call_results.insert(temp);
+                        self.root_results.insert(temp);
                     }
                 }
             }
@@ -478,6 +557,17 @@ impl ScopePass<'_> {
                     } else {
                         valid = false;
                     }
+                    // Boolean 预写没有出现在结果表达式的读取集合中，但仍属于同一个
+                    // 参数准备事务。不能把它包进旧域，留下跨域的参数结果和 callee。
+                    if let Some((initial, _, _, _)) = self.facts.boolean_value_prewrite(temp)
+                        && let Some(definition) = definitions.get(&initial)
+                    {
+                        if let Some(index) = definition.filter(|index| *index < consumer) {
+                            start = start.min(index);
+                        } else {
+                            valid = false;
+                        }
+                    }
                 }
             }),
         );
@@ -491,6 +581,13 @@ impl ScopePass<'_> {
             match stmt {
                 HirStmt::Assign(assign) => {
                     for target in &assign.targets {
+                        if matches!(target, HirLValue::Upvalue(_))
+                            && self.facts.upvalue_write_value(assign).is_some()
+                        {
+                            // 原 SETUPVAL 不声明窗口外的新 local；保持原位写入，RHS 的读取与捕获
+                            // 仍参加整个窗口的闭合性验证。引用捕获的 cell 不从这里取得离域许可。
+                            continue;
+                        }
                         // 表写入不声明或重绑定 local；整个语句保持原顺序进入词法域，
                         // 其 base/key/value 读取仍参加下方闭合性检查。原写入布局必须可追溯，
                         // 不能把未知物理副作用当作仅有表达式读取的语句。
@@ -577,6 +674,7 @@ impl CallFloors {
                 self.floor = self.floor.min(
                     self.facts
                         .native_call_frame(call)
+                        .or_else(|| self.facts.native_fastcall_frame(call))
                         .map_or(0, |frame| frame.home.slot()),
                 );
             }

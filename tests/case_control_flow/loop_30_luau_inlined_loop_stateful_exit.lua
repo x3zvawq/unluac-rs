@@ -1,7 +1,7 @@
 -- regress_291_luau_inlined_loop_stateful_exit: O2内联loop的normal-only出口不能提前执行
 -- unluac: expect-contains [[for ]]
--- unluac: expect-contains [[if not]]
--- unluac: expect-contains [[break]]
+-- unluac: expect-contains [[--!optimize 2]]
+-- unluac: expect-instruction-count [[call]] [[15]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
@@ -28,18 +28,20 @@ local function any(a)
     return miss()
 end
 
-local first = any({ true })
-local second = any({ false })
+-- 命中前先跨过一次 falsy，命中后不能继续访问下一项；正常出口须遍历完两项。
+local first = any({ false, true, true })
+local second = any({ false, false })
 assert(first == nil, first)
 assert(second == false, second)
 assert(table.concat(calls, ",") == "hit,miss", table.concat(calls, ","))
 print("regress_291_luau_inlined_loop_stateful_exit", table.concat(calls, ","))
--- O2 内联保留两个输入表、两个结果、两个出口标志和两个循环变量；
--- calls 与原三个函数仍在，循环控制及调用准备不增加独立绑定。
--- unluac: expect-ast-count [[local-binding]] [[12]] [[@proto=0]]
--- unluac: expect-ast-count [[numeric-for]] [[2]] [[@proto=0]]
--- unluac: expect-ast-count [[break]] [[2]] [[@proto=0]]
--- unluac: expect-ast-count [[if]] [[4]] [[@proto=0]]
+-- 完整展开体恢复为现存 any 的调用；强制 O2 内联后仍保持原 CALL 数量。
+-- 根函数只保留 calls、三个原函数和两个结果；退出标志和调用准备不成为源码绑定。
+-- unluac: expect-count [[= 1, #]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
+-- unluac: expect-ast-count [[numeric-for]] [[0]] [[@proto=0]]
+-- unluac: expect-ast-count [[break]] [[0]] [[@proto=0]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=0]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
 -- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]]

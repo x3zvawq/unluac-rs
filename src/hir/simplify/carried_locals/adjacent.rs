@@ -250,6 +250,7 @@ pub(super) fn try_collapse_adjacent_local_seed_handoff(
     rewrite_carried_local_in_stmts(&mut tail, carried, seed, promotion_facts);
     block.stmts.append(&mut tail);
     block.stmts.remove(index + 1);
+    promotion_facts.record_consumed_local_binding(carried, crate::hir::HirBinding::Local(seed));
     prune_empty_assign_stmts(block);
     true
 }

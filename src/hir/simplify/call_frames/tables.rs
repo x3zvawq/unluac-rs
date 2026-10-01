@@ -93,6 +93,8 @@ pub(super) struct NestedInitializers {
     pub writes: BTreeSet<usize>,
     /// 索引赋值的键准备；独立提交会截断左值与 RHS 的共同求值区。
     pub indexed_keys: BTreeSet<usize>,
+    /// 原算术仍消费的高槽准备版本；中间可穿插另一个操作数的准备。
+    pub operation_inputs: BTreeSet<usize>,
     /// 已完成构造器被发布到索引目标的语句，最后一个字段不必是 SETLIST。
     pub constructor_results: BTreeSet<usize>,
     /// 同一结果版本由多个后继语句读取，不能作为单次参数准备提前截断。
@@ -116,12 +118,47 @@ pub(super) fn nested_initializers<'a>(
     facts: &ProtoPromotionFacts,
 ) -> NestedInitializers {
     use crate::hir::simplify::mention::{BindingReadCollector, BindingWriteCollector};
-    struct MethodReceivers<'a> {
+    struct FrameUses<'a> {
         facts: &'a ProtoPromotionFacts,
         values: &'a mut BTreeSet<crate::hir::common::TempId>,
+        definitions: &'a BTreeMap<LocalId, usize>,
+        preparations: &'a [Option<&'a HirExpr>],
+        operations: &'a mut BTreeSet<usize>,
+        start: usize,
     }
-    impl HirVisitor<'_> for MethodReceivers<'_> {
+    impl HirVisitor<'_> for FrameUses<'_> {
         fn visit_expr(&mut self, expr: &HirExpr) {
+            if let HirExpr::Binary(binary) = expr
+                && is_scalar_binary_operation(binary.op)
+                && let Some(output) = binary
+                    .source_site
+                    .and_then(|source| self.facts.operation_result_home(source))
+            {
+                for (operand, value) in [&binary.lhs, &binary.rhs].into_iter().enumerate() {
+                    let HirExpr::LocalRef(local) = value else {
+                        continue;
+                    };
+                    let Some(&definition) = self
+                        .definitions
+                        .get(local)
+                        .filter(|&&index| index >= self.start)
+                    else {
+                        continue;
+                    };
+                    let Some(prepared) = self.preparations[definition] else {
+                        continue;
+                    };
+                    // 候选只沿本次 use 的原 Def 延长；槽位复用后的同名 local
+                    // 不能领取旧准备值。删除许可仍由完整帧的事件与前缀证明签发。
+                    if self
+                        .facts
+                        .binary_operand_preparation(binary, operand, prepared)
+                        .is_some_and(|(_, home)| output.slot() < home.slot())
+                    {
+                        self.operations.insert(definition);
+                    }
+                }
+            }
             if let HirExpr::TableAccess(access) = expr
                 && let Some(protocol) = access
                     .method_setup_protocol
@@ -135,6 +172,8 @@ pub(super) fn nested_initializers<'a>(
         }
     }
     let mut method_receivers = BTreeSet::new();
+    let mut operation_inputs = BTreeSet::new();
+    let mut preparations = Vec::new();
     let mut definitions = BTreeMap::<LocalId, usize>::new();
     let mut preparation_start = 0;
     let mut constructor_seeds = BTreeMap::new();
@@ -187,9 +226,13 @@ pub(super) fn nested_initializers<'a>(
                                 written_locals.insert(local);
                             }
                         }),
-                        MethodReceivers {
+                        FrameUses {
                             facts,
                             values: &mut method_receivers,
+                            definitions: &definitions,
+                            preparations: &preparations,
+                            operations: &mut operation_inputs,
+                            start: preparation_start,
                         },
                     ),
                 ),
@@ -312,6 +355,7 @@ pub(super) fn nested_initializers<'a>(
             seeds_by_home.clear();
             preparation_start = index + 1;
         }
+        preparations.push(stmt.and_then(|stmt| scalar_local(stmt).map(|(_, value)| value)));
         dependencies.push(reads);
         if owner.is_some() {
             // RK 常量字段没有单独 producer；仅查看前一条语句会把该写误当成
@@ -341,6 +385,7 @@ pub(super) fn nested_initializers<'a>(
         writes,
         shared_producers,
         indexed_keys,
+        operation_inputs,
         constructor_results,
         method_receivers,
         read: used,
@@ -1879,11 +1924,7 @@ impl FrameBuilder<'_> {
             // 原输入和结果槽，闭包还须核对创建 Def 与低槽 capture。
             // 非空数组复用原 allocation/Batch 证明；字面量和现成 local 不能省掉准备写。
             if !matches!(value, HirExpr::Call(_) | HirExpr::Closure(_) | HirExpr::TableAccess(_) | HirExpr::Unary(_))
-                && !matches!(&value, HirExpr::Binary(binary) if matches!(binary.op,
-                    crate::hir::common::HirBinaryOpKind::Add | crate::hir::common::HirBinaryOpKind::Sub
-                    | crate::hir::common::HirBinaryOpKind::Mul | crate::hir::common::HirBinaryOpKind::Div
-                    | crate::hir::common::HirBinaryOpKind::Mod | crate::hir::common::HirBinaryOpKind::Pow
-                    | crate::hir::common::HirBinaryOpKind::Concat))
+                && !matches!(&value, HirExpr::Binary(binary) if (is_scalar_binary_operation(binary.op) || binary.op == crate::hir::common::HirBinaryOpKind::Concat))
                 // 显式键和值均已按相邻 scratch 重放；O0 的 LOADBOOL/LOADK
                 // 不能因结果是常量就被排除，也不能借无键 scratch 的模板路径提前内嵌。
                 && !(layout.key.is_some() && literal_rk(&value))
@@ -2303,8 +2344,18 @@ impl FrameBuilder<'_> {
             && !definition.is_some_and(|index| self.constructors.contains_key(&index))
         {
             if self.dialect == DecompileDialect::Luajit {
+                // 已完成的嵌套数组/record 仍需自己的字段 scratch；下方 expr 统一
+                // 核对原布局与容量，不能在这里先按“无准备的常量模板”拒绝它。
                 if self.facts.allocation_result_home(table) != Some(home)
-                    || !completed_jit_constructor(table)
+                    || table.trailing_multivalue.is_some()
+                    || !table.implicit_template_fields.is_empty()
+                    || !table.matches_allocation_capacity(
+                        table
+                            .fields
+                            .iter()
+                            .filter(|field| matches!(field, HirTableField::Array(_)))
+                            .count(),
+                    )
                 {
                     return None;
                 }

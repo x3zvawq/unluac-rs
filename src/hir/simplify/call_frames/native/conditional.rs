@@ -1,6 +1,7 @@
-//! 在原结果帧中恢复查表短路值、Boolean 物化与 Luau 条件选值。
+//! 在原结果帧中恢复查表短路值、Boolean 物化、调用条件参数与 Luau 条件选值。
 //! 分支内的准备事件由 FrameBuilder 消费，整个选择及后继条件由同一 native preview 提交。
 
+use super::assignments::plain_copy;
 use super::*;
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirDecisionTestSource,
@@ -174,6 +175,33 @@ fn collect_block(
     }
     for (index, window) in block.stmts.windows(3).enumerate() {
         if dialect == DecompileDialect::Luau
+            && let Some(mut plan) = boolean_return_plan(context, facts, window)
+        {
+            plan.start = starts[index];
+            plan.sink = starts[index + 2];
+            plan.removed = (plan.start..plan.sink).collect();
+            // 原 TEST 由短路树重发；准备声明和合流写仍参与 missing epoch 检查。
+            plan.replayed_effects.push(starts[index + 1]);
+            let mut cursor = starts[index + 1] + 1;
+            for_each_nested_block(&window[1], &mut |arm| {
+                prefix::coordinates::visit(arm, &mut cursor, &mut |id, _, stmt| {
+                    if matches!(stmt, HirStmt::If(_)) {
+                        plan.replayed_effects.push(id);
+                    }
+                });
+            });
+            plans.push(plan);
+        }
+        if let Some(mut plan) = short_circuit_argument_plan(context, facts, dialect, window) {
+            plan.start = starts[index];
+            plan.sink = starts[index + 2];
+            plan.removed = (plan.start..plan.sink).collect();
+            // 控制头由参数值树重发；两臂的准备与结果写仍登记退休 epoch，
+            // 后继读取不能借此次调用继续使用已被消费的旧合流值。
+            plan.replayed_effects.push(starts[index + 1]);
+            plans.push(plan);
+        }
+        if dialect == DecompileDialect::Luau
             && let Some(mut plan) = condition_plan(context, facts, window, reads, original_nil)
         {
             plan.start = starts[index];
@@ -190,6 +218,38 @@ fn collect_block(
                 })
             });
             plans.push(plan);
+        }
+    }
+    if dialect == DecompileDialect::Luau {
+        let mut floor = 0;
+        for (index, stmt) in block.stmts.iter().enumerate() {
+            if let HirStmt::If(select) = stmt
+                && let Some(HirStmt::CallStmt(sink)) = block.stmts.get(index + 1)
+                && let Some(mut plan) = boolean_call_plan(
+                    context,
+                    facts,
+                    &block.stmts[floor..index],
+                    select,
+                    &sink.call,
+                )
+            {
+                plan.start = starts[floor + plan.start];
+                plan.sink = starts[index + 1];
+                plan.removed = (plan.start..plan.sink).collect();
+                plan.replayed_effects.push(starts[index]);
+                let mut cursor = starts[index] + 1;
+                for_each_nested_block(stmt, &mut |arm| {
+                    prefix::coordinates::visit(arm, &mut cursor, &mut |id, kind, stmt| {
+                        if kind == PointKind::Statement && matches!(stmt, HirStmt::If(_)) {
+                            plan.replayed_effects.push(id);
+                        }
+                    });
+                });
+                plans.push(plan);
+            }
+            if !matches!(stmt, HirStmt::LocalDecl(_) | HirStmt::Assign(_)) {
+                floor = index + 1;
+            }
         }
     }
     let mut preparation_start = 0;
@@ -216,6 +276,345 @@ fn collect_block(
             preparation_start = index + 1;
         }
     }
+}
+
+/// 入口 Boolean、分支内准备与单值 RETURN 共用原结果身份；一次消费整条短路链。
+fn boolean_return_plan(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    window: &[HirStmt],
+) -> Option<Plan> {
+    let [initial_stmt, HirStmt::If(select), HirStmt::Return(ret)] = window else {
+        return None;
+    };
+    let (target, HirExpr::Boolean(initial_value)) = scalar_local(initial_stmt)? else {
+        return None;
+    };
+    let result = facts.fixed_return_input(ret, 0)?;
+    let (initial, _, home, original) = facts.boolean_value_prewrite(result)?;
+    if !matches!(initial_stmt, HirStmt::LocalDecl(_))
+        || !plain_copy(initial_stmt)
+        || ret.values.tail.is_some()
+        || ret.values.fixed.as_slice() != [HirExpr::LocalRef(target)]
+        || *initial_value != original
+        || facts.promoted_local_for_temp(initial) != Some(target)
+        || facts.promoted_local_for_temp(result) != Some(target)
+        || facts.trusted_local_home_slot(target) != Some(home)
+        || context.barred.contains(&home)
+        || context.closed.contains(&home)
+        || context.proto.local_debug_hints[target.index()].is_some()
+        || context.proto.local_debug_scopes[target.index()].is_some()
+        || context
+            .proto
+            .inline_dispositions
+            .local(target)
+            .must_preserve()
+        || select.preserves_empty_test
+        || !crate::hir::value_facts::value_facts(&select.cond).is_boolean()
+    {
+        // 候选拒绝[ProofIncomplete]：必须是同一原预写/返回结果，独立源码声明不可退休。
+        return None;
+    }
+    let value = prepared_boolean_value(context, facts, select, target, home, original, result)?;
+    let mut builder = frame_builder(context, &[], facts, DecompileDialect::Luau, home.slot())?;
+    let value = builder.luau_logical_value(&value, 0, home)?;
+    Some(value_plan(home, value))
+}
+
+fn prepared_boolean_value(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    select: &crate::hir::common::HirIf,
+    target: LocalId,
+    home: HomeSlotKey,
+    original: bool,
+    result: TempId,
+) -> Option<HirExpr> {
+    let (selected, inverted) = if select.then_block.stmts.is_empty() {
+        (select.else_block.as_ref()?, true)
+    } else if select
+        .else_block
+        .as_ref()
+        .is_none_or(|arm| arm.stmts.is_empty())
+    {
+        (&select.then_block, false)
+    } else {
+        return None;
+    };
+    let condition = select.cond.clone();
+    let condition = if original ^ inverted {
+        condition.negate()
+    } else {
+        condition
+    };
+    let value = prepared_boolean_arm(context, facts, selected, target, home, result)?;
+    let logical = Box::new(crate::hir::common::HirLogicalExpr {
+        lhs: condition,
+        rhs: value,
+        preserves_boolean_prewrite: false,
+    });
+    let value = if original {
+        HirExpr::LogicalOr(logical)
+    } else {
+        HirExpr::LogicalAnd(logical)
+    };
+    // 外层 RETURN/CALL 一次核对完整值树；递归层只核对自己的准备，不重复扫描已恢复的后缀。
+    Some(value)
+}
+
+/// 普通 CALL 的 callee、Boolean 预写和条件域一并重放；不把参数预写移到 callee 之前。
+fn boolean_call_plan(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    preparation: &[HirStmt],
+    select: &crate::hir::common::HirIf,
+    call: &HirCallExpr,
+) -> Option<Plan> {
+    let ([HirExpr::LocalRef(target)], None) = (call.args.fixed.as_slice(), &call.args.tail) else {
+        return None;
+    };
+    let prewrite = facts.boolean_argument_prewrite(call, 0)?;
+    let frame = facts.native_call_frame(call)?;
+    if call.fastcall.is_some()
+        || call.method != HirMethodCall::None
+        || facts.promoted_local_for_temp(prewrite.initial) != Some(*target)
+        || facts.promoted_local_for_temp(prewrite.result) != Some(*target)
+        || !prewrite.reference_uncaptured
+        || !frame.arguments_unaliased
+        || frame.results != Some(ResultPack::Ignore)
+        || prewrite.home.slot() != frame.home.slot() + 1
+        || facts.trusted_local_home_slot(*target) != Some(prewrite.home)
+        || context.closed.contains(&prewrite.home)
+        || context.proto.local_debug_hints[target.index()].is_some()
+        || context.proto.local_debug_scopes[target.index()].is_some()
+        || select.preserves_empty_test
+        || !crate::hir::value_facts::value_facts(&select.cond).is_boolean()
+    {
+        return None;
+    }
+    let value = prepared_boolean_value(
+        context,
+        facts,
+        select,
+        *target,
+        prewrite.home,
+        prewrite.initial_value,
+        prewrite.result,
+    )?;
+    let mut rebuilt = call.clone();
+    rebuilt.args.fixed[0] = value;
+    let run = preparation.iter().collect::<Vec<_>>();
+    let mut builder = frame_builder(
+        context,
+        &run,
+        facts,
+        DecompileDialect::Luau,
+        frame.home.slot(),
+    )?;
+    let rebuilt = builder.call(
+        &rebuilt,
+        run.len(),
+        frame.home.slot(),
+        true,
+        CallWidth::Ignore,
+    )?;
+    if builder.next_event != run.len() {
+        return None;
+    }
+    let mut plan = value_plan(frame.home, HirExpr::Call(Box::new(rebuilt)));
+    plan.start = builder.first_event?;
+    Some(plan)
+}
+
+fn prepared_boolean_arm(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    block: &HirBlock,
+    target: LocalId,
+    home: HomeSlotKey,
+    result: TempId,
+) -> Option<HirExpr> {
+    if let [initial, HirStmt::If(select)] = block.stmts.as_slice()
+        && !select.preserves_empty_test
+        && let HirExpr::Binary(condition) = &select.cond
+        && let Some((producer, value)) = condition
+            .source_site
+            .and_then(|site| facts.boolean_branch_prewrite(result, site))
+        && scalar_local(initial) == Some((target, &HirExpr::Boolean(value)))
+        && plain_copy(initial)
+        && facts.promoted_local_for_temp(producer) == Some(target)
+        && facts.trusted_local_home_slot(target) == Some(home)
+    {
+        return prepared_boolean_value(context, facts, select, target, home, value, result);
+    }
+    let (last, preparation) = block.stmts.split_last()?;
+    if !preparation
+        .iter()
+        .all(|stmt| scalar_local(stmt).is_some() && plain_copy(stmt))
+    {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：准备区必须完整地进入当前路径的表达式。
+        return None;
+    }
+    let result_value = |stmt: &HirStmt| {
+        matches!(stmt, HirStmt::Assign(assign)
+            if assign.initializer_merge_transaction.is_none()
+                && assign.generic_for_initializer_producer.is_none()
+                && assign.root_release.is_none()
+                && assign.method_rewrite_transaction.is_none())
+            && scalar_local(stmt).is_some_and(|(local, _)| local == target)
+    };
+    let run = preparation.iter().collect::<Vec<_>>();
+    let mut builder = frame_builder(context, &run, facts, DecompileDialect::Luau, home.slot())?;
+    builder.boolean_frame = Some(home);
+    let (value, continuation) = match last {
+        HirStmt::If(select) if !select.preserves_empty_test => {
+            let skipped = |block: &HirBlock| {
+                matches!(block.stmts.as_slice(), [stmt]
+                if result_value(stmt) && scalar_local(stmt).is_some_and(|(_, value)| *value == select.cond))
+            };
+            let (continuation, and) = if skipped(select.else_block.as_ref()?) {
+                (&select.then_block, true)
+            } else if skipped(&select.then_block) {
+                (select.else_block.as_ref()?, false)
+            } else {
+                return None;
+            };
+            (&select.cond, Some((continuation, and)))
+        }
+        stmt if result_value(stmt) => (scalar_local(stmt)?.1, None),
+        _ => return None,
+    };
+    let value = builder.expr(value, run.len(), home.slot(), None, false, true, None)?;
+    if builder.first_event != (!run.is_empty()).then_some(0) || builder.next_event != run.len() {
+        return None;
+    }
+    if let Some((continuation, and)) = continuation {
+        let rhs = prepared_boolean_arm(context, facts, continuation, target, home, result)?;
+        let logical = Box::new(crate::hir::common::HirLogicalExpr {
+            lhs: value,
+            rhs,
+            preserves_boolean_prewrite: false,
+        });
+        Some(if and {
+            HirExpr::LogicalAnd(logical)
+        } else {
+            HirExpr::LogicalOr(logical)
+        })
+    } else {
+        Some(value)
+    }
+}
+
+/// callee 已先准备、条件两臂共同写入原参数槽；整帧消费分支结果而不创建独立声明。
+fn short_circuit_argument_plan(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    window: &[HirStmt],
+) -> Option<Plan> {
+    let [
+        preparation,
+        HirStmt::If(select),
+        HirStmt::CallStmt(consumer),
+    ] = window
+    else {
+        return None;
+    };
+    // 候选拒绝[TargetConstraint]：此处核对 JIT 的单参数结果槽与帧空洞；
+    // Luau 的预写和其它 VM 的条件物化继续由各自的完整协议消费。
+    if dialect != DecompileDialect::Luajit || select.preserves_empty_test {
+        return None;
+    }
+    let call = &consumer.call;
+    let ([HirExpr::LocalRef(result)], None) = (call.args.fixed.as_slice(), &call.args.tail) else {
+        return None;
+    };
+    let frame = facts.native_call_frame(call)?;
+    let original = facts.call_argument_value(call, 0)?;
+    let home = facts.trusted_temp_home_slot(original)?;
+    // 候选拒绝[ProofIncomplete]：参数必须仍是原合流身份，不能从同槽的另一个值版本推断。
+    if !facts.is_phi_carrier_temp(original)
+        || facts.promoted_local_for_temp(original) != Some(*result)
+        || facts.trusted_local_home_slot(*result) != Some(home)
+        || !frame.arguments_unaliased
+        || context.barred.contains(&home)
+        || context.closed.contains(&home)
+        || context.proto.local_debug_hints[result.index()].is_some()
+        || context.proto.local_debug_scopes[result.index()].is_some()
+        || matches!(context.proto.inline_dispositions.local(*result),
+            crate::hir::common::HirInlineDisposition::Preserve(reasons)
+                if reasons.iter().any(|reason| *reason != HirInlineRetentionReason::PhysicalFramePrefix))
+    {
+        return None;
+    }
+    fn result_value(stmt: &HirStmt, result: LocalId) -> Option<&HirExpr> {
+        let HirStmt::Assign(assign) = stmt else {
+            return None;
+        };
+        let (local, value) = scalar_local(stmt)?;
+        // 两臂末端是 Structure 的合流转交，表达式中仍重发原 producer；
+        // 不把写入已有源码变量的普通赋值当成可退休的参数结果。
+        (local == result
+            && assign.is_phi_transfer
+            && assign.initializer_merge_transaction.is_none()
+            && assign.generic_for_initializer_producer.is_none()
+            && assign.root_release.is_none()
+            && assign.method_rewrite_transaction.is_none())
+        .then_some(value)
+    }
+    let false_arm = |block: &HirBlock| matches!(block.stmts.as_slice(), [stmt] if result_value(stmt, *result) == Some(&HirExpr::Boolean(false)));
+    let (selected, inverted) = if false_arm(&select.then_block) {
+        (select.else_block.as_ref()?, true)
+    } else if false_arm(select.else_block.as_ref()?) {
+        (&select.then_block, false)
+    } else {
+        return None;
+    };
+    let (last, arm_preparation) = selected.stmts.split_last()?;
+    let value = result_value(last, *result)?;
+    // 候选拒绝[ProofIncomplete]：值臂只接同一次单结果 CALL；额外控制或独立写不能被树化掉。
+    if !matches!(value, HirExpr::Call(_))
+        || !arm_preparation
+            .iter()
+            .all(|stmt| scalar_local(stmt).is_some() && plain_copy(stmt))
+        || !crate::hir::value_facts::value_facts(&select.cond).is_boolean()
+    {
+        return None;
+    }
+    let run = arm_preparation.iter().collect::<Vec<_>>();
+    let mut arm = frame_builder(context, &run, facts, dialect, frame.home.slot())?;
+    let value = arm.expr(value, run.len(), home.slot(), None, false, true, None)?;
+    if arm.first_event != (!run.is_empty()).then_some(0) || arm.next_event != run.len() {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：每条分支内准备都必须按原顺序由结果表达式消费。
+        return None;
+    }
+    let (condition, not_depth) = synthetic_not_subject(&select.cond);
+    let condition = if (not_depth % 2 != 0) ^ inverted {
+        condition.clone().negate()
+    } else {
+        condition.clone()
+    };
+    let mut rebuilt = call.clone();
+    rebuilt.args.fixed[0] = HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
+        preserves_boolean_prewrite: false,
+        lhs: condition,
+        rhs: value,
+    }));
+    let run = [preparation];
+    let mut builder = frame_builder(context, &run, facts, dialect, frame.home.slot())?;
+    builder.boolean_frame = Some(home);
+    let rebuilt = builder.call(
+        &rebuilt,
+        run.len(),
+        frame.home.slot(),
+        true,
+        CallWidth::Ignore,
+    )?;
+    if builder.first_event != Some(0) || builder.next_event != run.len() {
+        // 候选拒绝[ProofIncomplete]：callee 准备必须属于同一原帧，不能遗留独立声明或跳过事件。
+        return None;
+    }
+    Some(value_plan(frame.home, HirExpr::Call(Box::new(rebuilt))))
 }
 
 fn initializer_plan(

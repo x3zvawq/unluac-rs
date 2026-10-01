@@ -92,7 +92,7 @@ pub(in crate::hir) struct BooleanArgumentPrewrite {
     pub(in crate::hir) initial_value: bool,
     pub(in crate::hir) result: TempId,
     pub(in crate::hir) home: HomeSlotKey,
-    /// 槽仅有值捕获时，其它值版本的快照不能观察这次 Boolean 写回。
+    /// 原 CALL 时没有打开的引用捕获；发布 query 还核对入口写及同一 home/epoch。
     pub(in crate::hir) reference_uncaptured: bool,
 }
 
@@ -432,7 +432,7 @@ pub(super) fn collect(
                             initial_value,
                             result,
                             home: HomeSlotKey::new(reg.index(), epochs.epoch_at(reg, call_ref)),
-                            reference_uncaptured: !dataflow.reg_is_reference_captured(reg),
+                            reference_uncaptured: !epochs.reference_capture_may_be_open(reg, call_ref),
                         })
                     })
                     .collect(),
@@ -847,6 +847,45 @@ pub(super) fn boolean_prewrites(
         );
     }
     prewrites
+}
+
+/// 合流值的 Boolean incoming 在其分支块内先写入结果槽；保留各层预写的独立 Def。
+pub(super) fn branch_prewrites(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    fixed: &[TempId],
+    phis: &[TempId],
+) -> BTreeMap<(TempId, InstrRef), (TempId, bool)> {
+    let mut writes = BTreeMap::new();
+    for phi in plan.phis() {
+        let Some(result) = canonical_value_temp(SsaValue::Phi(phi.phi), fixed.len(), fixed, phis)
+        else {
+            continue;
+        };
+        for incoming in &phi.incomings {
+            let SsaValue::Def(def) = incoming.value else {
+                continue;
+            };
+            let site = dataflow.def_instr(def);
+            let LowInstr::LoadBool(load) = proto.instrs[site.index()] else {
+                continue;
+            };
+            let block = &cfg.blocks[dataflow.def_block(def).index()];
+            let predicate = InstrRef(block.instrs.start.index() + block.instrs.len - 1);
+            if load.dst != phi.reg
+                || site >= predicate
+                || !matches!(proto.instrs[predicate.index()], LowInstr::Branch(_))
+            {
+                continue;
+            }
+            if let Some(initial) = canonical_value_temp(incoming.value, fixed.len(), fixed, phis) {
+                writes.insert((result, predicate), (initial, load.value));
+            }
+        }
+    }
+    writes
 }
 
 /// 可达块入口的首条 MOVE 是显式结果写回；源 SSA 值须只有一个确定的目标及完整 home。

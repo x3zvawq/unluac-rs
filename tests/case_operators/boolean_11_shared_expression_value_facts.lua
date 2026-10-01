@@ -20,6 +20,18 @@
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=lua5.4]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=lua5.5]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=10]] [[@dialect=luajit]]
+-- 原算术和 TEST 都保留；错误路径也不能留下逻辑结果与算术写回的中转。
+-- unluac: expect-count [[) + 4 then]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[16]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=9]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=9]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=9]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=9]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=9]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]] [[@dialect=luajit]]
+-- truthy 分支返回 true，falsy 分支保留 nil/false，不生成重复布尔包装。
+-- unluac: expect-not-contains [[return not not]]
+-- unluac: expect-count [[ and true]] [[1]]
 local events = 0
 local function mark(value)
     events = events + 1
@@ -134,3 +146,6 @@ assert(selected_value(true, false, {}) == false)
 assert(selected_value(false, nil, 0) == true)
 assert(select("#", falsy(nil)) == 1)
 assert(select("#", arithmetic(operand)) == 1 and events == 7)
+events = 0
+assert(selected_number(0) == 7 and selected_number("") == 7 and events == 2)
+assert(selected_value(true, "", false) == true)

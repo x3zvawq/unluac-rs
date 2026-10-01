@@ -441,6 +441,7 @@ fn collapsible_bound_assignment(
             HirExpr::LocalRef(_)
                 | HirExpr::ParamRef(_)
                 | HirExpr::TempRef(_)
+                | HirExpr::UpvalueRef(_)
                 | HirExpr::Nil
                 | HirExpr::Boolean(_)
                 | HirExpr::Integer(_)
@@ -468,6 +469,7 @@ fn collapsible_bound_assignment(
         if let Some((is_or, rhs)) = selection {
             // 原位写回只改变选值语法：保留同一次 TEST、目标声明和 COPY 覆盖。
             // 两臂没有调用或运算，因而不会在旧 root 覆盖前插入新的观察点。
+            // 上值只在原选中分支读取，不提前到 TEST 之前，也不复用其它时点的快照。
             let logical = Box::new(crate::hir::HirLogicalExpr {
                 preserves_boolean_prewrite: false,
                 lhs: if_.cond.clone(),

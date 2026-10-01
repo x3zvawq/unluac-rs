@@ -16,6 +16,8 @@ mod conditional_methods;
 mod control;
 mod counter_while;
 mod factories;
+mod literal_choices;
+mod numeric_exit;
 mod published_tables;
 mod repeat_prefix;
 mod returned_calls;
@@ -38,6 +40,7 @@ pub(in crate::hir::simplify::call_frames) struct Callee {
     returned_call: Option<returned_calls::Body>,
     conditional_method: Option<conditional_methods::Body>,
     repeat_prefix: Option<repeat_prefix::Body>,
+    literal_choice: Option<literal_choices::Body>,
     readonly_captures: Vec<LocalId>,
 }
 
@@ -75,6 +78,7 @@ pub(in crate::hir::simplify) fn restore(
         return false;
     }
     let previous_certificates = module.required_luau_inlining.len();
+    numeric_exit::restore(module, promotion);
     let published = module
         .required_luau_inlining
         .iter()
@@ -108,11 +112,27 @@ pub(in crate::hir::simplify) fn restore(
         .iter()
         .map(|proto| repeat_prefix::body(proto, promotion.get(proto.id.index())?))
         .collect::<Vec<_>>();
+    let literal_choices = module
+        .protos
+        .iter()
+        .map(|proto| literal_choices::body(proto, promotion.get(proto.id.index())?))
+        .collect::<Vec<_>>();
     let bodies = module
         .protos
         .iter()
         .map(|proto| {
             body_key(proto)
+                .or_else(|| {
+                    literal_choices[proto.id.index()].as_ref().map(|_| {
+                        (
+                            HirLuauInliningBody::LiteralChoice {
+                                template: proto.id.index(),
+                                parameters: proto.params.len(),
+                            },
+                            "".into(),
+                        )
+                    })
+                })
                 .or_else(|| counter_while::body_key(proto, promotion.get(proto.id.index())?))
                 .or_else(|| stateful_generic::body_key(proto, promotion.get(proto.id.index())?))
                 .or_else(|| {
@@ -193,6 +213,7 @@ pub(in crate::hir::simplify) fn restore(
             &returned_calls,
             &conditional_methods,
             &repeat_prefixes,
+            &literal_choices,
         )
         .values()
         .any(|callee| {
@@ -225,6 +246,7 @@ pub(in crate::hir::simplify) fn restore(
             &returned_calls,
             &conditional_methods,
             &repeat_prefixes,
+            &literal_choices,
         );
         let scalar_draft = scalar::debug_updates(prepared_proto, facts, &initial_callees);
         let scalar_proto = scalar_draft
@@ -280,15 +302,17 @@ pub(in crate::hir::simplify) fn restore(
             &returned_calls,
             &conditional_methods,
             &repeat_prefixes,
+            &literal_choices,
         );
         callees.retain(|_, callee| !published.contains(&(proto.id, callee.local)));
         if structured {
-            // 候选拒绝[ProofIncomplete:Lifetime]：结构化后缀只覆盖整数捕获准备；带对象的高槽根仍需直线重放证书。
+            // 候选拒绝[ProofIncomplete:Lifetime]：结构化后缀只覆盖已证明的展开帧；其它对象根仍需完整的结构化重放证书。
             callees.retain(|(body, _), _| {
                 matches!(
                     body,
                     HirLuauInliningBody::ValueClosureFactory { .. }
                         | HirLuauInliningBody::ConditionalMethod { .. }
+                        | HirLuauInliningBody::LiteralChoice { .. }
                 )
             });
         }
@@ -411,6 +435,8 @@ pub(in crate::hir::simplify) fn restore(
             }
         }
         expanded.extend(snapshots::plans(context, facts, &root_indices));
+        let choices = literal_choices::plans(context, facts, &root_indices);
+        expanded.extend(choices);
         let mut native_owner = vec![None; count];
         for (owner, plan) in plans.iter().enumerate() {
             for index in plan.removed.iter().copied().chain([plan.sink]) {
@@ -480,6 +506,7 @@ pub(in crate::hir::simplify) fn restore(
                             callee.body,
                             HirLuauInliningBody::SnapshotClosureFactory { .. }
                                 | HirLuauInliningBody::CapturedCallablePair
+                                | HirLuauInliningBody::LiteralChoice { .. }
                                 | HirLuauInliningBody::ConditionalMethod { .. }
                                 | HirLuauInliningBody::RepeatPrefix { .. }
                                 | HirLuauInliningBody::CounterWhile { .. }
@@ -636,6 +663,11 @@ pub(in crate::hir::simplify) fn restore(
         module
             .required_luau_inlining
             .extend(certificates.into_values());
+    }
+    for certificate in &module.required_luau_inlining {
+        if let Some(Some(body)) = literal_choices.get(certificate.child.index()) {
+            literal_choices::publish(body, &mut module.protos[certificate.child.index()]);
+        }
     }
     for (child, inner) in nested_bodies {
         factories::restore_nested_body(&mut module.protos[child.index()], inner);
@@ -986,6 +1018,11 @@ fn standalone_initializer_frame(
             if frame_builder(context, &[], facts, DecompileDialect::Luau, base.slot())
                 .and_then(|builder| builder.completed_luau_constructor(table, base.slot())).is_some()
                 && facts.allocation_result_reference_unaliased(table) => {}
+        HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)
+            if matches!(stmt, HirStmt::LocalDecl(_))
+                && frame_builder(context, &[], facts, DecompileDialect::Luau, base.slot())
+                    .and_then(|mut builder| builder.luau_logical_value(value, 0, base))
+                    .is_some_and(|rebuilt| rebuilt == *value) => {}
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
@@ -1042,6 +1079,7 @@ fn callees(
     returned_calls: &[Option<returned_calls::Body>],
     conditional_methods: &[Option<conditional_methods::Body>],
     repeat_prefixes: &[Option<repeat_prefix::Body>],
+    literal_choices: &[Option<literal_choices::Body>],
 ) -> BTreeMap<(HirLuauInliningBody, crate::LuaString), Callee> {
     struct PcallInputs<'a> {
         facts: &'a ProtoPromotionFacts,
@@ -1184,6 +1222,7 @@ fn callees(
                     returned_call: returned_calls[closure.proto.index()].clone(),
                     conditional_method: conditional_methods[closure.proto.index()].clone(),
                     repeat_prefix: repeat_prefixes[closure.proto.index()].clone(),
+                    literal_choice: literal_choices[closure.proto.index()].clone(),
                     readonly_captures: closure
                         .captures
                         .iter()

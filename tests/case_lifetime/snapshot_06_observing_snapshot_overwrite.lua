@@ -3,6 +3,8 @@
 -- unluac: expect-contains [[snapshot_missing()]]
 -- unluac: expect-ast-max [[local-binding]] [[11]]
 -- unluac: expect-ast-count [[function]] [[4]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=2]]
 local gc = collectgarbage
 local weak = setmetatable({}, {__mode = "v"})
 local phase = 0

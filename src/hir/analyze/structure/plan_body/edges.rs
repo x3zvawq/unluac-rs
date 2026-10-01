@@ -203,7 +203,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         if targets.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(vec![assign_stmt(targets, values)])
+        Ok(copy_assignment_stmt(targets, values).into_iter().collect())
     }
 
     pub(super) fn repeat_stage_is_direct(&self, target: PhiId, stage: TempId) -> bool {

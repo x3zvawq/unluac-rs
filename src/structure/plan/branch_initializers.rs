@@ -1,13 +1,14 @@
-//! 查询冻结条件的互斥布尔结果写回，供 HIR 来源、debug 身份和初始化绑定共同消费。
+//! 查询冻结条件的互斥单值写回，供 HIR 来源、debug 身份和初始化绑定共同消费。
 //! 这里只证明原条件、互斥写入和汇合关系；物理槽 epoch 与源码绑定仍由 HIR 校验。
 
 use super::*;
 use crate::structure::DefId;
 use crate::transformer::{BranchSubject, InstrRef, LowInstr, Reg};
 
-pub(crate) struct BooleanInitializer {
+pub(crate) struct BranchInitializer {
     pub defs: [DefId; 2],
     pub condition: ConditionPlanId,
+    pub condition_inverted: bool,
     pub reg: Reg,
     pub entry: BlockRef,
     pub continuation: BlockRef,
@@ -83,7 +84,23 @@ impl StructurePlan {
         proto: &LoweredProto,
         cfg: &Cfg,
         dataflow: &DataflowFacts,
-    ) -> Option<BooleanInitializer> {
+    ) -> Option<BranchInitializer> {
+        let initializer = self.branch_initializer(owner, cfg, dataflow)?;
+        let [left, right] = initializer
+            .defs
+            .map(|def| &proto.instrs[dataflow.def_instr(def).index()]);
+        (matches!((left, right), (LowInstr::LoadBool(left), LowInstr::LoadBool(right))
+            if left.value != right.value))
+        .then_some(initializer)
+    }
+
+    /// 两臂各有一个固定写入并直接汇合；不证明值类别、求值效果或声明身份。
+    pub(crate) fn branch_initializer(
+        &self,
+        owner: RegionId,
+        cfg: &Cfg,
+        dataflow: &DataflowFacts,
+    ) -> Option<BranchInitializer> {
         let RegionPlan::Branch {
             plan: branch,
             entry,
@@ -95,7 +112,7 @@ impl StructurePlan {
         else {
             return None;
         };
-        let condition = self.branch(*branch)?.condition;
+        let branch = self.branch(*branch)?;
         let arm_value = |arm| {
             let &[block] = self.region_blocks(arm) else {
                 return None;
@@ -113,22 +130,20 @@ impl StructurePlan {
                 // SemanticBarrier:ControlFlow：两臂必须只初始化结果并直接汇合。
                 return None;
             }
-            let LowInstr::LoadBool(value) = proto.instrs[range.start.index()] else {
+            let [def] = dataflow.instr_defs[range.start.index()].as_slice() else {
                 return None;
             };
-            let def = dataflow.instr_def_for_reg(range.start, value.dst)?;
-            Some((def, value))
+            Some((*def, dataflow.def_reg(*def)))
         };
         let (then_def, then_value) = arm_value(*then_arm)?;
         let (else_def, else_value) = arm_value(*else_arm)?;
-        (then_value.dst == else_value.dst && then_value.value != else_value.value).then_some(
-            BooleanInitializer {
-                defs: [then_def, else_def],
-                condition,
-                reg: then_value.dst,
-                entry: *entry,
-                continuation: *continuation,
-            },
-        )
+        (then_value == else_value).then_some(BranchInitializer {
+            defs: [then_def, else_def],
+            condition: branch.condition,
+            condition_inverted: branch.condition_inverted,
+            reg: then_value,
+            entry: *entry,
+            continuation: *continuation,
+        })
     }
 }

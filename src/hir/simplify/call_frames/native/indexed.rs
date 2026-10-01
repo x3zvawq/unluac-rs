@@ -708,7 +708,7 @@ pub(super) fn plan(
         && direct_rhs_home.is_none()
         && !matches!(rhs, HirExpr::Call(_))
         && !matches!(rhs, HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Concat)
-        && !matches!(rhs, HirExpr::Binary(binary) if matches!(binary.op, HirBinaryOpKind::Add | HirBinaryOpKind::Sub | HirBinaryOpKind::Mul | HirBinaryOpKind::Div | HirBinaryOpKind::Mod | HirBinaryOpKind::Pow))
+        && !matches!(rhs, HirExpr::Binary(binary) if is_scalar_binary_operation(binary.op))
     {
         // Luau 的字面量或分配 RHS 仍在原 scratch 准备，再写入目标的固定字段；
         // 不套用 PUC 的 RK 消除规则。CALL/CONCAT 则交下方连续 key/result 帧证明。
@@ -741,7 +741,7 @@ pub(super) fn plan(
                 | HirExpr::TableAccess(_)
                 | HirExpr::Closure(_)
                 | HirExpr::TableConstructor(_)
-        ) || matches!(rhs, HirExpr::Binary(binary) if matches!(binary.op, HirBinaryOpKind::Concat | HirBinaryOpKind::Add | HirBinaryOpKind::Sub | HirBinaryOpKind::Mul | HirBinaryOpKind::Div | HirBinaryOpKind::Mod | HirBinaryOpKind::Pow)))
+        ) || matches!(rhs, HirExpr::Binary(binary) if (is_scalar_binary_operation(binary.op) || binary.op == crate::hir::common::HirBinaryOpKind::Concat)))
     {
         return None;
     }
@@ -764,7 +764,7 @@ pub(super) fn plan(
                 | HirExpr::Number(_)
                 | HirExpr::String(_)
         );
-    if !(matches!(rhs, HirExpr::Binary(binary) if matches!(binary.op, HirBinaryOpKind::Concat | HirBinaryOpKind::Add | HirBinaryOpKind::Sub | HirBinaryOpKind::Mul | HirBinaryOpKind::Div | HirBinaryOpKind::Mod | HirBinaryOpKind::Pow))
+    if !(matches!(rhs, HirExpr::Binary(binary) if (is_scalar_binary_operation(binary.op) || binary.op == crate::hir::common::HirBinaryOpKind::Concat))
         || matches!(rhs, HirExpr::Call(_))
         || matches!(
             rhs,
@@ -1312,16 +1312,8 @@ fn scalar_rhs(
         },
         HirExpr::Call(call) => Some(call.source_site?),
         HirExpr::Binary(binary)
-            if matches!(
-                binary.op,
-                HirBinaryOpKind::Add
-                    | HirBinaryOpKind::Sub
-                    | HirBinaryOpKind::Mul
-                    | HirBinaryOpKind::Div
-                    | HirBinaryOpKind::Mod
-                    | HirBinaryOpKind::Pow
-                    | HirBinaryOpKind::Concat
-            ) =>
+            if (is_scalar_binary_operation(binary.op)
+                || binary.op == crate::hir::common::HirBinaryOpKind::Concat) =>
         {
             Some(binary.source_site?)
         }

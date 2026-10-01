@@ -336,6 +336,21 @@ impl TempInlineWorkspace<'_> {
                                             if pack.len == 1 && pack.start.index() == frame.home.slot())))
                     })
             });
+            // 未读的一元结果可由 Locals 恢复成跨调用的独立声明。即使尚未要求物化根，
+            // 也须保留其原槽覆盖；否则内联 callee 后会丢掉完整作用域事务的结束点。
+            marked[index] |= lookup_roots.owner_overwrites(index).any(|owner| {
+                let Some((temp, HirExpr::Unary(unary))) =
+                    stmts[owner.root_index()].scalar_temp_assignment()
+                else {
+                    return false;
+                };
+                !snapshot.has_read_after(temp, owner.root_index())
+                    && facts.trusted_temp_home_slot(temp) == Some(owner.home())
+                    && facts.unary_result_home(unary) == Some(owner.home())
+                    && facts
+                        .unary_operand_home(unary)
+                        .is_some_and(|input| input.slot() < owner.home().slot())
+            });
             if call_roots.call_dispatch_releases(index).next().is_some()
                 || lookup_roots.call_dispatch_releases(index).next().is_some()
             {
@@ -637,9 +652,10 @@ fn inline_temps_in_block(
             continue;
         }
         if let Some((temp, value)) = stmt.scalar_temp_assignment()
-            && kept_rev
-                .last()
-                .is_some_and(|next| occupies_branch_call_prefix(temp, value, next, facts))
+            && kept_rev.last().is_some_and(|next| {
+                occupies_branch_call_prefix(temp, value, next, facts)
+                    || occupies_binary_input_prefix(temp, value, next, facts)
+            })
         {
             // 后续 locals/inline-exprs 也必须消费同一前缀义务；单轮拒绝内联不足以保留身份。
             changed |= workspace
@@ -1589,6 +1605,36 @@ fn occupies_branch_call_prefix(
         return false;
     };
     super::source_frames::branch_entry_requires_prefix(branch, home, facts)
+}
+
+/// 查表结果先写低槽，再被高槽二元操作读取；该输入声明是结果帧的前缀。
+fn occupies_binary_input_prefix(
+    temp: TempId,
+    value: &HirExpr,
+    sink: &HirStmt,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    if !matches!(value, HirExpr::TableAccess(_)) {
+        return false;
+    }
+    let Some((_, HirExpr::Binary(binary))) = sink.scalar_temp_assignment() else {
+        return false;
+    };
+    let Some(output) = binary
+        .source_site
+        .and_then(|source| facts.operation_result_home(source))
+    else {
+        return false;
+    };
+    [&binary.lhs, &binary.rhs]
+        .into_iter()
+        .enumerate()
+        .any(|(operand, input)| {
+            matches!(input, HirExpr::TempRef(input) if *input == temp)
+                && facts
+                    .binary_operand_preparation(binary, operand, value)
+                    .is_some_and(|(producer, home)| producer == temp && home.slot() < output.slot())
+        })
 }
 
 fn occupies_unary_input_prefix(
@@ -4129,6 +4175,46 @@ impl HirVisitor<'_> for DirectBindingWriteCollector<'_> {
     }
 }
 
+/// 定位尾条件准备，允许其后保留原合流值的纯 COPY；本查询不授权移动求值。
+/// 调用方每个 body 只扫描一次，声明规划与条件内联共同消费这条尾段边界。
+pub(super) fn repeat_tail_preparation_index(
+    body: &HirBlock,
+    is_condition_temp: impl Fn(TempId) -> bool,
+    facts: &ProtoPromotionFacts,
+) -> Option<usize> {
+    for (index, stmt) in body.stmts.iter().enumerate().rev() {
+        let HirStmt::Assign(assign) = stmt else {
+            return None;
+        };
+        let ([target], [value], None) = (
+            assign.targets.as_slice(),
+            assign.values.fixed.as_slice(),
+            &assign.values.tail,
+        ) else {
+            return None;
+        };
+        if matches!(target, HirLValue::Temp(temp) if is_condition_temp(*temp)) {
+            return Some(index);
+        }
+        // 身份提升会把外层 carrier 写成 Local，原 phi-transfer 标记仍属于同一写回。
+        let carrier = match target {
+            HirLValue::Temp(temp) => assign.is_phi_transfer || facts.is_phi_carrier_temp(*temp),
+            HirLValue::Local(_) => assign.is_phi_transfer,
+            _ => false,
+        };
+        if !carrier
+            || !matches!(
+                value,
+                HirExpr::TempRef(_) | HirExpr::LocalRef(_) | HirExpr::ParamRef(_)
+            )
+        {
+            // 候选拒绝[ProofIncomplete]：其它正文尾句尚无可跨越的状态写回证明。
+            return None;
+        }
+    }
+    None
+}
+
 fn inline_repeat_tail_temp(
     repeat_stmt: &mut crate::hir::common::HirRepeat,
     scratch: &mut TempUseScratch,
@@ -4138,37 +4224,17 @@ fn inline_repeat_tail_temp(
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
-    let Some(mut tail_index) = repeat_stmt.body.stmts.len().checked_sub(1) else {
-        return false;
-    };
     let mut condition_temps = BTreeSet::new();
     collect_expr_temp_uses_summary(&repeat_stmt.cond, scratch).for_each(|temp, _| {
         condition_temps.insert(temp);
     });
-    loop {
-        let Some((temp, value)) = repeat_stmt.body.stmts[tail_index].scalar_temp_assignment()
-        else {
-            return false;
-        };
-        if condition_temps.contains(&temp) {
-            break;
-        }
-        // Phi 写回是已证明的状态转交，可能位于 until producer 和 condition 之间。
-        // 这里只跨无求值效果的直接绑定复制；实际依赖和捕获边界在候选处统一验证。
-        if !facts.is_phi_carrier_temp(temp)
-            || !matches!(
-                value,
-                HirExpr::TempRef(_) | HirExpr::LocalRef(_) | HirExpr::ParamRef(_)
-            )
-        {
-            // 候选拒绝[ProofIncomplete]：其它正文尾句尚无可跨越的状态写回证明。
-            return false;
-        }
-        let Some(previous) = tail_index.checked_sub(1) else {
-            return false;
-        };
-        tail_index = previous;
-    }
+    let Some(tail_index) = repeat_tail_preparation_index(
+        &repeat_stmt.body,
+        |temp| condition_temps.contains(&temp),
+        facts,
+    ) else {
+        return false;
+    };
     let Some((temp, value)) = repeat_stmt.body.stmts[tail_index].scalar_temp_assignment() else {
         return false;
     };

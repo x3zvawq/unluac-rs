@@ -3,6 +3,18 @@
 -- unluac: expect-ast-count [[numeric-for]] [[3]]
 -- unluac: expect-ast-count [[generic-for]] [[2]]
 -- unluac: expect-ast-max [[local-binding]] [[57]]
+-- boolean_hell 的共享正文只恢复一次；其余五处 yes 属于预期表和运行断言。
+-- unluac: expect-max-count [["yes"]] [[6]]
+-- 末尾两次原 TEST 都应保留；稳定读取同一 binding 不等于可删除一次检查。
+-- unluac: expect-not-contains [[return r5_0 or "false"]]
+-- unluac: expect-not-contains [[return r10_0 or "false"]]
+-- unluac: expect-contains [[return r5_0 and r5_0 or "false"]] [[@dialect=lua5.1]]
+-- unluac: expect-contains [[return r5_0 and r5_0 or "false"]] [[@dialect=lua5.2]]
+-- unluac: expect-contains [[return r5_0 and r5_0 or "false"]] [[@dialect=lua5.3]]
+-- unluac: expect-contains [[return r5_0 and r5_0 or "false"]] [[@dialect=lua5.4]]
+-- unluac: expect-contains [[return r5_0 and r5_0 or "false"]] [[@dialect=lua5.5]]
+-- unluac: expect-contains [[return r10_0 and r10_0 or "false"]] [[@dialect=luajit]]
+-- unluac: expect-contains [[return r5_0 and r5_0 or "false"]] [[@dialect=luau]]
 -- 数值 for 的常量控制输入不能延用已退休的 print 参数声明。
 -- unluac: expect-ast-max [[local-binding]] [[24]] [[@proto=7]] [[@dialect=luajit]]
 -- unluac: expect-max-count [[= "common_05_boolean_expr#4"]] [[1]] [[@dialect=luajit]]
@@ -12,8 +24,12 @@
 -- JIT 循环的比较参数与结果查表保留完整 assert，只留下预期表和身份观察表。
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=11]] [[@dialect=luajit]]
 -- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=9]] [[@dialect=luajit]]
--- 未融合模板的 hash 展示顺序必须稳定；也允许后续直接恢复完整构造器。
+-- 嵌套模板应恢复为完整构造器，不能遗留 placeholder 或额外字段准备声明。
 -- unluac: expect-not-contains [[{ t = nil, f = nil }]] [[@dialect=luajit]]
+-- unluac: expect-not-contains [[{ branches = nil }]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=7]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[local-decl]] [[5]] [[@proto=7]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[local-decl]] [[5]] [[@proto=4]] [[@dialect=luajit]]
 -- judge 的第二个参数只需两次读取和一次形参声明；再生成不得复制共同条件尾。
 -- unluac: expect-max-count [[p3_1]] [[3]] [[@dialect=luau]]
 -- 嵌套构造器的原槽复用应恢复初始化，不能留下逐轮生成 nil 的匿名空声明。
@@ -183,6 +199,9 @@ local function test_sc_side_effects()
         { true, "", "", "a,b" },
         { true, token, token, "a,b" },
     }
+    -- nil 空位不能被 false 替代；动态模板字段必须仍读取外层同一个 token。
+    assert(cases[1][1] == nil and cases[2][2] == nil)
+    assert(cases[5][2] == token and cases[5][3] == token)
     for _, row in ipairs(cases) do
         local result, log = run_case(row[1], row[2])
         assert(result == row[3] and log == row[4])

@@ -25,6 +25,7 @@ enum PreparedValue {
     Integer(i64),
     Int64(i64),
     UInt64(u64),
+    Complex { real: f64, imag: f64 },
     Number(f64),
     String(crate::LuaString),
 }
@@ -82,6 +83,15 @@ impl OperandPreparation {
             (PreparedValue::Integer(original), HirExpr::Integer(current)) => original == current,
             (PreparedValue::Int64(original), HirExpr::Int64(current)) => original == current,
             (PreparedValue::UInt64(original), HirExpr::UInt64(current)) => original == current,
+            (
+                PreparedValue::Complex { real, imag },
+                HirExpr::Complex {
+                    real: current_real,
+                    imag: current_imag,
+                },
+            ) => {
+                real.to_bits() == current_real.to_bits() && imag.to_bits() == current_imag.to_bits()
+            }
             (PreparedValue::Number(original), HirExpr::Number(current)) => {
                 original.to_bits() == current.to_bits()
             }
@@ -181,6 +191,10 @@ pub(super) fn collect(
             RawLiteralConst::Integer(value) => PreparedValue::Integer(*value),
             RawLiteralConst::Int64(value) => PreparedValue::Int64(*value),
             RawLiteralConst::UInt64(value) => PreparedValue::UInt64(*value),
+            RawLiteralConst::Complex { real, imag } => PreparedValue::Complex {
+                real: *real,
+                imag: *imag,
+            },
             RawLiteralConst::Number(value) => PreparedValue::Number(*value),
             RawLiteralConst::String(value) => {
                 PreparedValue::String(crate::LuaString::from_raw(value))

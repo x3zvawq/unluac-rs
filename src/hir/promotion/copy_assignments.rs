@@ -80,10 +80,10 @@ pub(super) fn collect_readonly_parameter_copies(
 pub(in crate::hir) struct ScalarPairFrame {
     pub(in crate::hir) temps: [TempId; 3],
     pub(in crate::hir) homes: [HomeSlotKey; 3],
-    pub(super) copied_input: Option<(TempId, HomeSlotKey)>,
+    pub(super) copied_input: Option<(HirBinding, HomeSlotKey)>,
     pub(in crate::hir) literal_input: Option<HirExpr>,
     pub(in crate::hir) tail: HirExpr,
-    pub(super) copied_tail: Option<(TempId, HomeSlotKey)>,
+    pub(super) copied_tail: Option<(HirBinding, HomeSlotKey)>,
 }
 
 /// 相邻 RHS 准备包含末项分配，完成后才逆序写回低槽；捕获 cell 的发布时点属于整个事务。
@@ -179,6 +179,13 @@ pub(super) fn collect_scalar_pairs(
     fixed_temps: &[TempId],
     phi_temps: &[TempId],
 ) -> Vec<ScalarPairFrame> {
+    let binding = |value| match value {
+        SsaValue::Entry(reg) if reg.index() < usize::from(proto.signature.num_params) => {
+            Some(HirBinding::Param(ParamId(reg.index())))
+        }
+        value => canonical_value_temp(value, dataflow.defs.len(), fixed_temps, phi_temps)
+            .map(HirBinding::Temp),
+    };
     proto.instrs.windows(3).enumerate().filter_map(|(index, window)| {
         let [first, second, LowInstr::Move(last)] = window else {
             return None;
@@ -188,9 +195,8 @@ pub(super) fn collect_scalar_pairs(
             if copy.src == last.src || epochs.reference_capture_may_be_open(copy.src, second_site) {
                 return None;
             }
-            let input = canonical_value_temp(dataflow.use_value(second_site, copy.src),
-                dataflow.defs.len(), fixed_temps, phi_temps)?;
-            (copy.dst, HirExpr::TempRef(input), Some((input,
+            let input = binding(dataflow.use_value(second_site, copy.src))?;
+            (copy.dst, input.expr(), Some((input,
                 HomeSlotKey::new(copy.src.index(), epochs.epoch_at(copy.src, second_site)))))
         } else {
             let (reg, value) = scalar_literal(proto, second)?;
@@ -200,8 +206,7 @@ pub(super) fn collect_scalar_pairs(
         let (snapshot_reg, copied_input, literal_input) = match first {
             LowInstr::Move(first) if first.src < first.dst
                 && !epochs.reference_capture_may_be_open(first.src, first_site) => {
-                let input = canonical_value_temp(dataflow.use_value(first_site, first.src),
-                    dataflow.defs.len(), fixed_temps, phi_temps)?;
+                let input = binding(dataflow.use_value(first_site, first.src))?;
                 (first.dst, Some((input, HomeSlotKey::new(first.src.index(), epochs.epoch_at(first.src, first_site)))), None)
             }
             _ => {
@@ -269,7 +274,7 @@ pub(super) fn collect_scalar_pairs(
     }).collect()
 }
 
-fn scalar_literal(proto: &LoweredProto, instr: &LowInstr) -> Option<(Reg, HirExpr)> {
+pub(super) fn scalar_literal(proto: &LoweredProto, instr: &LowInstr) -> Option<(Reg, HirExpr)> {
     match instr {
         LowInstr::LoadNil(load) if load.dst.len == 1 => Some((load.dst.start, HirExpr::Nil)),
         LowInstr::LoadBool(load) => Some((load.dst, HirExpr::Boolean(load.value))),

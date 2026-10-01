@@ -171,7 +171,14 @@ impl FrameBuilder<'_> {
                     .call_argument_value(call, index)
                     .or_else(|| roots.get(&index).copied()),
             )?;
-            // 固定前缀的单结果 CALL 已由 expr 核对完整帧；Boolean 等仍需其原预写事务。
+            // expr 已逐事件重放比较的输入；结果 phi 必须仍是当前参数的原写入槽。
+            // 带独立 Boolean 预写的值树仍需专门事务，不能仅因结果相同就漏掉预写。
+            let comparison = facts.boolean_argument_prewrite(call, index).is_none()
+                && matches!(&value, HirExpr::Binary(binary)
+                    if facts.comparison_result_temp(binary).is_some_and(|temp|
+                        facts.call_argument_value(call, index) == Some(temp)
+                            && facts.trusted_temp_home_slot(temp)
+                                == Some(HomeSlotKey::new(argument_home.index() + index, 0))));
             if !matches!(
                 value,
                 HirExpr::Nil
@@ -182,7 +189,8 @@ impl FrameBuilder<'_> {
                     | HirExpr::LocalRef(_)
                     | HirExpr::ParamRef(_)
                     | HirExpr::Call(_)
-            ) {
+            ) && !comparison
+            {
                 return None;
             }
             fixed.push(value);
@@ -498,13 +506,7 @@ impl FrameBuilder<'_> {
                         && matches!(&value, HirExpr::Binary(binary)
                             if binary.source_site.and_then(|site| facts.operation_result_home(site))
                                 .is_some_and(|home| home.slot() == slot)
-                                && matches!(binary.op,
-                                    crate::hir::common::HirBinaryOpKind::Add
-                                    | crate::hir::common::HirBinaryOpKind::Sub
-                                    | crate::hir::common::HirBinaryOpKind::Mul
-                                    | crate::hir::common::HirBinaryOpKind::Div
-                                    | crate::hir::common::HirBinaryOpKind::Mod
-                                    | crate::hir::common::HirBinaryOpKind::Pow));
+                                && is_scalar_binary_operation(binary.op));
                     // CONCAT 的原连续 buffer 已由 expr 整体重发；结果留在参数槽，
                     // 不把消息求值移到前一个参数之前，也不拆成额外源码声明。
                     let concat = !embedded
@@ -568,6 +570,10 @@ impl FrameBuilder<'_> {
                 let home = match &value {
                     HirExpr::LocalRef(local) => facts.trusted_local_home_slot(*local),
                     HirExpr::ParamRef(param) => facts.trusted_param_home_slot(*param),
+                    HirExpr::TempRef(temp) if copy.source == Some(*temp) => {
+                        // 仍未提升的低槽 phi 必须是原 COPY 的准确输入，不能只按同槽猜值。
+                        facts.trusted_temp_home_slot(*temp)
+                    }
                     _ => None,
                 };
                 if home != Some(copy.source_home) {

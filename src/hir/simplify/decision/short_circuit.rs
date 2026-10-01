@@ -82,6 +82,89 @@ pub(super) fn collapse_short_circuit_graph(
     collapse_graph(topology, safety, root_ends, false)
 }
 
+/// 共同正文之外的出口都沿用同一 binding 时，先恢复进入正文的条件。
+/// 分界消费归约后仍共享的节点身份，不按展开后的表达式内容找相同正文。
+pub(super) fn factor_shared_value_continuation(
+    decision: &crate::hir::common::HirDecisionExpr,
+    safety: HirExprSafety,
+) -> Option<crate::hir::common::HirDecisionExpr> {
+    let reduced = prepare_control_materialization(decision.clone(), safety);
+    let topology = super::analyze_decision(&reduced);
+    let mut shared = topology
+        .incoming_counts()
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 1);
+    let (continuation, _) = shared.next()?;
+    if shared.next().is_some() {
+        // 候选拒绝[ProofIncomplete]：多个共享正文尚无唯一条件/正文分界。
+        return None;
+    }
+    let continuation = crate::hir::HirDecisionNodeRef(continuation);
+    let mut prefix_nodes = reduced.nodes.clone();
+    let mut visited = vec![false; prefix_nodes.len()];
+    let mut pending = vec![reduced.entry];
+    let mut fallback = None;
+    while let Some(node_ref) = pending.pop() {
+        if std::mem::replace(&mut visited[node_ref.index()], true) {
+            continue;
+        }
+        let node = &mut prefix_nodes[node_ref.index()];
+        if !safety.is_repeatable_in_single_value_context(&node.test) {
+            // 候选拒绝[ProofIncomplete]：终端沿用 binding 的证明要求前缀不改值，
+            // 也不能把带独立临时根的调用结果先 Boolean 化再进入正文。
+            return None;
+        }
+        for target in [&mut node.truthy, &mut node.falsy] {
+            match target {
+                HirDecisionTarget::Node(next) if *next == continuation => {
+                    *target = HirDecisionTarget::Expr(HirExpr::Boolean(true));
+                }
+                HirDecisionTarget::Node(next) => pending.push(*next),
+                terminal => {
+                    let value = match terminal {
+                        HirDecisionTarget::CurrentValue => &node.test,
+                        HirDecisionTarget::Expr(expr) => expr,
+                        HirDecisionTarget::Node(_) => unreachable!(),
+                    };
+                    if !matches!(
+                        value,
+                        HirExpr::LocalRef(_) | HirExpr::TempRef(_) | HirExpr::ParamRef(_)
+                    ) || fallback.as_ref().is_some_and(|previous| previous != value)
+                    {
+                        // 候选拒绝[ProofIncomplete]：这里只提取沿用同一 binding 的控制，
+                        // 不把其它终端值或不同 CurrentValue 快照合并为一个 fallback。
+                        return None;
+                    }
+                    fallback.get_or_insert_with(|| value.clone());
+                    *terminal = HirDecisionTarget::Expr(HirExpr::Boolean(false));
+                }
+            }
+        }
+    }
+    let fallback = fallback?;
+    let prefix = super::rebuild_decision(reduced.entry, &prefix_nodes).0;
+    let condition = collapse_condition_graph(&super::analyze_decision(&prefix), safety)?;
+    let suffix = super::project_value_decision_target(
+        &topology,
+        &HirDecisionTarget::Node(continuation),
+        HirExpr::Nil,
+        safety,
+    );
+    Some(crate::hir::common::HirDecisionExpr {
+        source_result: decision.source_result,
+        entry: crate::hir::HirDecisionNodeRef(0),
+        nodes: vec![HirDecisionNode {
+            id: crate::hir::HirDecisionNodeRef(0),
+            test: condition,
+            test_source: HirDecisionTestSource::Predicate,
+            truthy: HirDecisionTarget::Expr(suffix),
+            falsy: HirDecisionTarget::Expr(fallback),
+        }],
+        emit_as_luau_if: false,
+    })
+}
+
 pub(super) fn collapse_condition_graph(
     topology: &DecisionFacts<'_>,
     safety: HirExprSafety,

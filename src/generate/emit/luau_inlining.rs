@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod conditional_methods;
 mod counter_while;
+mod literal_choices;
 mod loops;
+mod numeric_exit;
 mod opaque;
 mod repeat_prefix;
 mod returned_calls;
@@ -185,6 +187,7 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 | HirLuauInliningBody::RepeatPrefix { .. }
                 | HirLuauInliningBody::CounterWhile { .. }
                 | HirLuauInliningBody::StatefulGenericWhile { .. }
+                | HirLuauInliningBody::NumericForExit { .. }
         ) && (requirement.result_frame_slots.len() != requirement.occurrences.len()
             || requirement
                 .occurrences
@@ -244,6 +247,9 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                         && declared.insert(local)
                         && if fields[&local].0 == HirLuauInliningBody::CapturedCallablePair {
                             returned_calls::body(&decl.func, fields[&local].1, &opaque_functions)
+                        } else if let HirLuauInliningBody::NumericForExit { template } = fields[&local].0 {
+                            hir.protos.get(template).is_some_and(|proto|
+                                numeric_exit::body(&decl.func, proto, fields[&local].2))
                         } else {
                             callee_body(
                                 &decl.func,
@@ -270,9 +276,9 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                     && let Some(site) = call.required_luau_inlining
                     && let Some(&slot) = result_slots.get(&site)
                 {
-                    // 宏必须作为原单结果声明发射；不允许移入参数树后复用一个估算的 top。
-                    let width = if occurrences.get(&site).and_then(|local| bodies.get(local))
-                        == Some(&HirLuauInliningBody::CapturedCallablePair)
+                    // 宏必须作为原固定结果声明发射；不允许移入参数树后复用一个估算的 top。
+                    let width = if matches!(occurrences.get(&site).and_then(|local| bodies.get(local)),
+                        Some(HirLuauInliningBody::CapturedCallablePair | HirLuauInliningBody::LiteralChoice { .. }))
                     {
                         2
                     } else {
@@ -415,8 +421,12 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 if matches!(loop_.iterator.as_slice(), [AstExpr::Call(call)]
                     if matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if name.text == "ipairs")
                         && call.required_luau_inlining.is_none() && call.method_key.is_none()
-                        && matches!(call.args.as_slice(), [AstExpr::Var(AstNameRef::Local(local))] if !callees.contains_key(local)))
-                    && plain_block(&loop_.body, &callees) => {}
+                        && matches!(call.args.as_slice(), [argument] if plain_expr(argument, &callees))) => {
+                if plain_block(&loop_.body, &callees) { continue; }
+                pending.push((None, active));
+                active += 3 + loop_.bindings.len();
+                pending.extend(loop_.body.stmts.iter().rev().map(|stmt| (Some(stmt), 0)));
+            }
             AstStmt::FunctionDecl(decl) if plain_field_function(decl, &callees) => {}
             AstStmt::Return(ret) if ret.values.is_empty() => {}
             AstStmt::Assign(assign)
@@ -512,12 +522,22 @@ impl InvocationExpressions<'_> {
         let Some(callee) = self.occurrences.get(&site) else {
             return false;
         };
-        self.bodies.get(callee) == Some(&HirLuauInliningBody::CapturedCallablePair)
+        let arguments = match self.bodies.get(callee) {
+            Some(HirLuauInliningBody::CapturedCallablePair) => call.args.is_empty(),
+            Some(HirLuauInliningBody::LiteralChoice { parameters, .. }) => {
+                call.args.len() == *parameters
+                    && call
+                        .args
+                        .iter()
+                        .all(|arg| self.check(arg, top + parameters + 2, true))
+            }
+            _ => false,
+        };
+        arguments
             && top <= 128
             && self.declared.contains(callee)
             && call.callee == AstExpr::Var(AstNameRef::Local(*callee))
             && call.method_key.is_none()
-            && call.args.is_empty()
             && self.seen.insert(site)
     }
 
@@ -562,6 +582,10 @@ impl InvocationExpressions<'_> {
                         }
                     && (!self.scalar_callees.contains(callee)
                         || matches!(call.args[0], AstExpr::Boolean(_)))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::NumericForExit { .. }
+                    ) || numeric_exit::arguments(&call.args))
                     && (!matches!(
                         self.bodies[callee],
                         HirLuauInliningBody::ValueClosureFactory { .. }
@@ -690,6 +714,13 @@ fn callee_body(
     expected_field: &crate::LuaString,
     capture: Option<crate::hir::LocalId>,
 ) -> bool {
+    if let HirLuauInliningBody::LiteralChoice {
+        template,
+        parameters,
+    } = body
+    {
+        return literal_choices::body(func, template, parameters);
+    }
     if let HirLuauInliningBody::StatefulGenericWhile {
         template,
         initial,
@@ -1287,7 +1318,10 @@ fn plain_expr(
                     | AstBinaryOpKind::Ge
                     | AstBinaryOpKind::Concat
             ) || (binary.op == AstBinaryOpKind::Add
-                && matches!(binary.rhs, AstExpr::Integer(_) | AstExpr::Number(_))))
+                && matches!(binary.rhs, AstExpr::Integer(_) | AstExpr::Number(_)))
+                || binary.op == AstBinaryOpKind::Mod
+                    && matches!(binary.lhs, AstExpr::Var(AstNameRef::Local(_)))
+                    && matches!(binary.rhs, AstExpr::Integer(_) | AstExpr::Number(_)))
                 && plain_expr(&binary.lhs, callees)
                 && plain_expr(&binary.rhs, callees)
         }
@@ -1403,14 +1437,22 @@ fn plain_block(
         AstStmt::Return(ret) => plain_values(&ret.values, locals, false),
         AstStmt::CallStmt(stmt) => matches!(&stmt.call, AstCallKind::Call(call)
             if call.required_luau_inlining.is_none() && call.method_key.is_none()
-                && (opaque_callee(call) || matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name))
+                // table.insert 的丢弃结果调用不参与 O2 常量折叠或函数解析；
+                // 限定固定双实参，不能把它加入允许开放返回的 opaque callee 集合。
+                && (opaque_callee(call) || (table_callee(call, "insert") && call.args.len() == 2)
+                    || matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name))
                     if name.text == "assert" || name.text == "print"))
                 && plain_values(&call.args, locals, false)),
         AstStmt::LocalFunctionDecl(decl) => plain_function(&decl.func, locals),
         AstStmt::FunctionDecl(decl) => plain_field_function(decl, locals),
-        AstStmt::If(branch) => plain_expr(&branch.cond, locals)
-            && plain_block(&branch.then_block, locals)
-            && branch.else_block.as_ref().is_none_or(|block| plain_block(block, locals)),
+        AstStmt::If(branch) => {
+            plain_expr(&branch.cond, locals)
+                && plain_block(&branch.then_block, locals)
+                && branch
+                    .else_block
+                    .as_ref()
+                    .is_none_or(|block| plain_block(block, locals))
+        }
         _ => false,
     })
 }

@@ -2,6 +2,9 @@
 -- unluac: expect-ast-count [[local-binding]] [[8]]
 -- unluac: expect-ast-count [[assign]] [[3]]
 -- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=3]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[call]] [[2]] [[@proto=3]] [[@dialect=luau]]
 local stage = 0
 local middle = setmetatable({}, { __add = function(_, right)
     assert(stage == 1 and right == 7)
