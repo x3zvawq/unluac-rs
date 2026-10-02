@@ -496,6 +496,7 @@ fn fold_constant_control(
             // 表达完整短路求值，避免改成无用 local 后令回编译产生不同的值协议。
             let condition = std::mem::replace(&mut if_stmt.cond, HirExpr::Nil);
             rewritten.push(HirStmt::If(Box::new(HirIf {
+                predicate_source: if_stmt.predicate_source,
                 cond: condition,
                 preserves_empty_test: true,
                 preserves_arm_order: if_stmt.preserves_arm_order,
@@ -1367,6 +1368,7 @@ fn fold_leading_branch_escapes(stmts: &mut [HirStmt]) -> bool {
             continue;
         }
         let count = guards.len();
+        branch.predicate_source = None;
         for guard in guards {
             branch.cond = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
                 preserves_boolean_prewrite: false,
@@ -1502,6 +1504,7 @@ fn fold_same_target_goto_guards(stmts: &mut Vec<HirStmt>) -> bool {
                     preserves_boolean_prewrite: false,
                 }));
                 previous.preserves_empty_test |= next.preserves_empty_test;
+                previous.predicate_source = None;
                 previous.preserves_arm_order |= next.preserves_arm_order;
                 changed = true;
                 continue;

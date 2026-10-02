@@ -316,6 +316,7 @@ pub(super) fn legalize_conditional_continues(
 ) -> Result<(), StructureError> {
     let loop_index = LoopRewriteIndex::build(cfg, &input.loops)?;
     if caps.continue_stmt {
+        normalize_tail_test_continues(proto, cfg, &loop_index, input);
         normalize_condition_continue_arms(proto, cfg, graph_facts, &loop_index, input)?;
     }
     let break_rewrites = input
@@ -392,6 +393,87 @@ pub(super) fn legalize_conditional_continues(
         return Ok(());
     }
     Ok(())
+}
+
+/// 同一纯回边前的尾检查链由最近 while 持有。反向索引整条检查链，
+/// 保留其短路 continue；不跨越非分支正文块或其它出口重选普通分支布局。
+fn normalize_tail_test_continues(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    loop_index: &LoopRewriteIndex,
+    input: &mut FinalPlanInput,
+) {
+    let mut owners = vec![None; cfg.blocks.len()];
+    let mut pads = vec![None; cfg.blocks.len()];
+    let mut pending = VecDeque::new();
+    for block_index in 0..cfg.blocks.len() {
+        let block = BlockRef(block_index);
+        let Some((truthy, falsy)) = cfg.predicate_edges(&proto.instrs, block) else {
+            continue;
+        };
+        let target = cfg.edges[truthy.index()].to;
+        if loop_index.fallback_by_block[block_index].is_some() {
+            // 候选拒绝[ProofIncomplete]：交叠候选没有唯一最近词法循环，不能按枚举顺序认领尾检查。
+            continue;
+        }
+        let Some(owner) = loop_index.containing(block).next() else {
+            continue;
+        };
+        let loop_ = &input.loops[owner];
+        let candidate = &loop_.candidate;
+        if candidate.kind_hint != crate::structure::LoopKindHint::WhileLike
+            || candidate.continue_target != Some(candidate.header)
+            || !candidate.blocks.contains(&block)
+        {
+            continue;
+        }
+        owners[block_index] = Some(owner);
+        if target != cfg.edges[falsy.index()].to
+            || !candidate.blocks.contains(&target)
+            || target != candidate.header
+                && !(cfg.blocks[target.index()].instrs.len == 1
+                    && matches!(cfg.terminator(&proto.instrs, target), Some(LowInstr::Jump(jump))
+                        if cfg.instr_to_block[jump.target.index()] == candidate.header))
+        {
+            continue;
+        }
+        pads[block_index] = Some(target);
+        pending.push_back(block);
+    }
+    while let Some(block) = pending.pop_front() {
+        let pad = pads[block.index()].expect("queued tail check has a backedge pad");
+        for &incoming in &cfg.preds[block.index()] {
+            let predecessor = cfg.edges[incoming.index()].from;
+            if pads[predecessor.index()].is_some()
+                || owners[predecessor.index()] != owners[block.index()]
+            {
+                continue;
+            }
+            let Some((left, right)) = cfg.branch_edges(predecessor) else {
+                continue;
+            };
+            if [left, right].into_iter().all(|edge| {
+                let target = cfg.edges[edge.index()].to;
+                target == pad || pads[target.index()] == Some(pad)
+            }) {
+                pads[predecessor.index()] = Some(pad);
+                pending.push_back(predecessor);
+            }
+        }
+    }
+    for (block_index, pad) in pads.into_iter().enumerate() {
+        let Some(pad) = pad else { continue };
+        let (truthy, _) = cfg
+            .predicate_edges(&proto.instrs, BlockRef(block_index))
+            .expect("tail check is an original predicate");
+        if cfg.edges[truthy.index()].to != pad {
+            continue;
+        }
+        let loop_ = &mut input.loops[owners[block_index].expect("tail check has a loop owner")];
+        // 统一消费正谓词边；两臂同后继时也只签发这一臂，保证 roundtrip 极性稳定。
+        loop_.candidate.continue_edges.insert(truthy);
+        loop_.semantic_continue_edges.insert(truthy);
+    }
 }
 
 pub(super) fn normalize_condition_continue_arms(

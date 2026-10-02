@@ -10,6 +10,11 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 父函数直接绑定两组三结果；断言实参不再拆成 callee、参数和结果接棒。
+-- unluac: expect-ast-count [[local-binding]] [[16]] [[@proto=0]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
+-- O2 展开 oracle 的第二轮后仍保留一次 skip 检查，即使两个出口相同也不能删除原分支。
+-- unluac: expect-instruction-count [[branch]] [[5]] [[@proto=3]] [[@variant=O2]]
 -- 嵌套调用准备应完整进入 until，保留 debug 也不增加跨轮 callee carrier。
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=6]]
 -- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=6]]

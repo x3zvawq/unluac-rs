@@ -3,6 +3,8 @@
 -- unluac: expect-ast-count [[break]] [[1]]
 -- unluac: expect-ast-count [[if]] [[2]]
 -- unluac: expect-ast-count [[local-binding]] [[7]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=2]] [[@dialect=luau]]
 local function run(a, b, c, xs)
     local x = 0
     repeat
@@ -38,6 +40,8 @@ assert(reads == 3)
 reads = 0
 assert(run(nil, 0, "", xs) == 0 and reads == 0)
 assert(run("", false, nil, {true}) == 1)
+-- 直接观察短路返回的值，不能只凭循环退出将数值 0 当成任意 truthy 值。
+assert(xs[1] == false and xs[2] == false and xs[3] == 0 and reads == 3)
 print(
     "regress_279_repeat_short_body_scope_break#1",
     nested,

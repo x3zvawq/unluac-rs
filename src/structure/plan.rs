@@ -265,7 +265,7 @@ pub(super) struct LoopPlanInput {
     pub(super) continuation: Option<BlockRef>,
     /// continuation 已由原前向 break 的闭合私有域证明；后续分区只消费，不重扫 CFG。
     pub(super) private_exit_tail: bool,
-    /// 最终复合 condition 与 loop owner 共同证明的显式 continue transfer。
+    /// 最终条件（含同后继尾检查）与 loop owner 共同证明的显式 continue transfer。
     pub(super) semantic_continue_edges: BTreeSet<EdgeRef>,
 }
 

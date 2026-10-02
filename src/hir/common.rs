@@ -39,6 +39,39 @@ pub(crate) struct HirRequiredLuauInlining {
     pub occurrences: Vec<HirSourceSite>,
     /// 固定结果帧须预留原槽；Generate 核对最终声明、赋值或比较参数的词法前缀。
     pub result_frame_slots: BTreeMap<HirSourceSite, usize>,
+    /// 原展开体调用的闭包参数；最终源码须保持其声明解析或创建位置以及捕获身份。
+    pub callable_arguments: BTreeMap<HirSourceSite, HirLuauCallableArgument>,
+    /// nil guard 已消去函数参数的调用；缺少原只读别名事实时第三实参只允许 nil。
+    pub nil_guards: BTreeSet<HirSourceSite>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HirLuauCallableArgument {
+    pub parameter: usize,
+    pub source: HirLuauCallableSource,
+    pub child: HirProtoRef,
+    pub captures: Vec<HirCapture>,
+    /// 双返回调用选择 false 时，与原 fallback 相等且被编译器折叠的整数实参。
+    pub pair_constant: Option<i64>,
+}
+
+/// 读取参数要么解析已有声明，要么在该 occurrence 的参数位置创建原闭包。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HirLuauCallableSource {
+    Declared(LocalId),
+    Expression {
+        site: HirSourceSite,
+        creation: HirClosureCreation,
+    },
+}
+
+impl HirLuauCallableSource {
+    pub(crate) fn declared(self) -> Option<LocalId> {
+        match self {
+            Self::Declared(local) => Some(local),
+            Self::Expression { .. } => None,
+        }
+    }
 }
 
 /// 已匹配完整函数体的编译合同；不能将任意同字段访问当作相同的展开帧。
@@ -59,12 +92,67 @@ pub(crate) enum HirLuauInliningBody {
     },
     CapturedConcatSum,
     CapturedAddIdentity,
+    /// 捕获 cell 按常量增量更新，参数原样返回；用于保留内联后的字面量 TEST。
+    CapturedIncrementIdentity {
+        increment: i64,
+    },
     /// 只读捕获产生 callable，非尾调用后返回固定标签与一个结果。
     CapturedCallablePair,
-    /// 按已求值的参数真值选择常量，固定结果包包含单返回值的补 nil。
+    /// 按已求值参数的真值或标量比较选择常量；固定结果包可包含单返回值的补 nil。
     LiteralChoice {
         template: usize,
         parameters: usize,
+    },
+    /// 封闭标量表达式的完整原指令区间；实参先求值，原返回 COPY 及内部分支一起重放。
+    ValueExpression {
+        template: usize,
+        parameters: usize,
+    },
+    /// 比较后将字面量选值写回首参数，保留原实参初始化及返回 COPY。
+    ParameterWriteback {
+        template: usize,
+    },
+    /// Boolean 初始化与字段谓词共享结果槽，各返回边汇入原低槽 COPY。
+    SeededPredicate {
+        template: usize,
+    },
+    /// 常量 Boolean 控制选择的直线状态操作；最后一个实参仍在原高槽求值。
+    ConstantControl {
+        template: usize,
+        parameters: usize,
+        truth_mask: u8,
+    },
+    /// 数值循环内的条件 repeat；不同 occurrence 可保留索引循环或展开为原 ADD 序列。
+    NumericRepeat {
+        template: usize,
+    },
+    /// 参数计数状态由 continue/break 控制；成组结果必须保留原预留槽。
+    GuardedCounter {
+        template: usize,
+    },
+    /// 可写 Boolean 参数在循环正文清零，末参数控制是否进入。
+    ResetCounter {
+        template: usize,
+    },
+    /// 数组数值遍历返回索引和累积状态，两个低槽结果共同接收原返回 COPY。
+    ArrayFold {
+        template: usize,
+    },
+    /// 短路比较内部调用函数参数；外层和实际函数参数的展开必须共同成立。
+    CallingValue {
+        template: usize,
+    },
+    /// 先调用读取参数，再返回比较结果和原读取值；逐 occurrence 固定选择参数及常量折叠。
+    CallingReadPair {
+        template: usize,
+    },
+    /// 先调用读取参数，再以同一读取值参与两次比较并返回一个短路结果。
+    CallingSharedValue {
+        template: usize,
+    },
+    /// 短路体按两个标签调用同一读取参数，保留两次观察及嵌套选值的顺序。
+    CallingObservedValue {
+        template: usize,
     },
     /// 单参数快照、条件方法调用及字段返回，完整函数体按模板身份配对。
     ConditionalMethod {
@@ -73,6 +161,37 @@ pub(crate) enum HirLuauInliningBody {
     /// 常量条件选中 repeat 首段，原高槽状态最终写回低槽结果。
     RepeatPrefix {
         template: usize,
+    },
+    /// 常量真参数使 repeat 只执行一次查表检查，再写回原常量结果。
+    RepeatLookup {
+        template: usize,
+        key: i64,
+        result: i64,
+    },
+    /// Boolean 参数选中的计数 repeat；保留原加法、可达尾检查及低槽返回。
+    CounterRepeat {
+        template: usize,
+        initial: i64,
+        increment: i64,
+        limit: i64,
+    },
+    /// 常量 guard 选择空遍历与查表退出，随后写回固定字符串。
+    GenericLookupWhile {
+        template: usize,
+        key: i64,
+    },
+    /// 常量短路参数将完整 generic-for 函数专化为一次迭代一次计数。
+    GenericCounter {
+        template: usize,
+        initial: i64,
+        increment: i64,
+        repeats: usize,
+    },
+    /// 捕获状态的单次 generic-for 和低槽返回；iterator 标识原 Fresh 闭包模板。
+    GenericBreak {
+        template: usize,
+        iterator: usize,
+        initial: i64,
     },
     /// 数值遍历命中时提前返回，正常出口执行另一观察；完整模板与只读捕获共同配对。
     NumericForExit {
@@ -1383,6 +1502,8 @@ impl HirReturn {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirIf {
     pub cond: HirExpr,
+    /// 单个原谓词的身份；极性变化不改变身份，合成或合并条件不继承此证书。
+    pub(crate) predicate_source: Option<HirSourceSite>,
     /// 原 branch 的空臂或已知常量条件仍拥有 TEST，不能按值域或相同分支删除。
     pub(crate) preserves_empty_test: bool,
     /// 宽常量池要求两臂保持已恢复的发射顺序，否则 RK 会改变临时槽覆盖。

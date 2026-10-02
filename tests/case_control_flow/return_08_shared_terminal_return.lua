@@ -8,6 +8,7 @@
 -- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]]
 -- unluac: expect-ast-count [[if]] [[10]] [[@proto=4]]
 -- unluac: expect-ast-count [[local-binding]] [[14]]
+-- unluac: expect-ast-count [[local-binding]] [[13]] [[@proto=0]]
 local star_calls, feather_calls = 0, 0
 
 local function showRequiredItemsPopup(level, reason)
@@ -152,4 +153,19 @@ level = setmetatable({ calendar = true, useDateLock = false }, { __index = funct
 end })
 check(true)
 assert(reads == "episode;level;")
+
+-- 并列字段赋值须保留 Lua 5.1 的逆序写回；空表先准备，末项常量直接写入。
+reads = ""
+level = setmetatable({}, { __newindex = function(_, key, value)
+    if key == "seconds_to_open" then
+        assert(reads == "" and value == 10)
+    elseif key == "days" then
+        assert(reads == "seconds_to_open;" and type(value) == "table" and next(value) == nil)
+    else
+        assert(key == "index" and reads == "seconds_to_open;days;" and value == 3)
+    end
+    reads = reads .. key .. ";"
+end })
+level.index, level.days, level.seconds_to_open = 3, {}, 10
+assert(reads == "seconds_to_open;days;index;")
 print = saved_print

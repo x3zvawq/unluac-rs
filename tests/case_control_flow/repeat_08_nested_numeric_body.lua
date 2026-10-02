@@ -18,6 +18,9 @@
 -- unluac: expect-ast-count [[break]] [[1]] [[@proto=2]]
 -- 观察器的短路返回不能留下未使用的 false 初始化。
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
+-- 原展开调用须整体恢复，主函数不留下遍历和中转声明。
+-- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
+-- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=0]]
 local function run(a, xs)
     for _ in xs do
         repeat

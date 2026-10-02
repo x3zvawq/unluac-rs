@@ -321,11 +321,10 @@ impl FrameBuilder<'_> {
                 || !self.homes_match(local, index, slot, None, Some(initial))
                 || context.proto.local_debug_hints[local.index()].is_some()
                 || context.proto.local_debug_scopes[local.index()].is_some()
-                || context
-                    .proto
-                    .inline_dispositions
-                    .local(local)
-                    .must_preserve()
+                // 本事务仍在原槽先写 Boolean，再求值完整参数；保留值语境并不要求独立声明。
+                || matches!(context.proto.inline_dispositions.local(local),
+                    crate::hir::common::HirInlineDisposition::Preserve(reasons)
+                        if reasons.iter().any(|reason| *reason != crate::hir::common::HirInlineRetentionReason::BooleanValueContext))
                 || (context.barred.contains(&home) && !reference_uncaptured)
                 || context.closed.contains(&home)
             {

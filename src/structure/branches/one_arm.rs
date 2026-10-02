@@ -219,6 +219,56 @@ pub(super) fn classify_loop_exit_bounded_one_arm_branch(
             })
             && (loop_exits_at(cfg, candidate, strict_merge) || strict_merge == cfg.exit_block)
     })?;
+    for (escape, normal, invert_hint) in [
+        (then_entry, else_entry, false),
+        (else_entry, then_entry, true),
+    ] {
+        if owner.continue_target == Some(escape)
+            && escape != owner.header
+            && normal != escape
+            && owner.blocks.contains(&normal)
+            && cfg.blocks[escape.index()].instrs.len == 1
+            && cfg.branch_edges(escape).is_some()
+        {
+            // 直接进入纯条件块的是 continue 臂。把它反选成 merge
+            // 会让 enclosing branch 后的共享正文也落到这条已退出正文的路径上。
+            // 含正文更新前缀的控制块不由这个证明覆盖，不能把其原位计算提出分支。
+            return Some(BranchCandidate {
+                header,
+                then_entry: escape,
+                else_entry: None,
+                merge: Some(normal),
+                kind: BranchKind::Guard,
+                invert_hint,
+            });
+        }
+        if owner.continue_target == Some(owner.header)
+            && header != owner.header
+            && escape != owner.header
+            && owner.blocks.contains(&normal)
+            && !branch_index.joins_at(normal, owner.header)
+            && cfg.unique_reachable_successor(escape) == Some(owner.header)
+            && graph_facts.dominates(header, escape)
+            && !branch_index.joins_at(normal, escape)
+            && cfg.succs[escape.index()]
+                .iter()
+                .all(|edge| cfg.edges[edge.index()].kind == EdgeKind::Jump)
+        {
+            // 同轮正常路径绕过这条直接回边时，它是含前缀的 continue 臂。
+            // 不能因该臂在 header 有 frontier 就把它选作 continuation，
+            // 否则另一臂原本汇入共享 tail 的路径也会执行此前缀和 continue。
+            // 正常端点必须仍在本轮内，且先汇入更内侧的共享尾；若它直接
+            // 回到 header 或已经离开循环，则属于原来的 if/else 或退出分类。
+            return Some(BranchCandidate {
+                header,
+                then_entry: escape,
+                else_entry: None,
+                merge: Some(normal),
+                kind: BranchKind::Guard,
+                invert_hint,
+            });
+        }
+    }
     let then_continues =
         then_entry == owner.header || branch_index.joins_at(then_entry, owner.header);
     let else_continues =

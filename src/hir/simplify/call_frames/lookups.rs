@@ -57,6 +57,22 @@ impl FrameBuilder<'_> {
                 value => value,
             };
             match value {
+                HirExpr::Call(call) => {
+                    let producer = self.expanded_call_result(call)?;
+                    (self.facts.binary_value_operand(binary, usize::from(!left)) == Some(producer)
+                        && self.facts.trusted_temp_home_slot(producer)
+                            == Some(HomeSlotKey::new(operand_slot, 0)))
+                    .then_some((left, Some(producer)))
+                }
+                HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_) => {
+                    let producer = self.facts.binary_phi_operand(binary, usize::from(!left))?;
+                    ((self.native?.compared_choices.is_some()
+                        && self.facts.compared_literal_choice(producer).is_some()
+                        || self.has_value_expression(producer))
+                        && self.facts.trusted_temp_home_slot(producer)
+                            == Some(HomeSlotKey::new(operand_slot, 0)))
+                    .then_some((left, Some(producer)))
+                }
                 HirExpr::Binary(arithmetic) => {
                     // 这里只选择原算术结果；输入准备、写域和消费事件由随后的 expr 验证，
                     // 不能要求它预先属于“低槽与常量”的更窄协议。
@@ -564,7 +580,7 @@ impl FrameBuilder<'_> {
             && (layout.rhs.is_none()
                 || self
                     .facts
-                    .operation_input_preparation(binary.source_site?, &binary.rhs)
+                    .binary_operand_preparation(binary, 1, &binary.rhs)
                     .is_some_and(|(_, prepared)| {
                         Some(prepared) == layout.rhs
                             && prepared.slot() == slot + 1 + usize::from(!lhs_low)
@@ -624,9 +640,12 @@ impl FrameBuilder<'_> {
                 .map_or(value, |(_, value)| value),
             value => value,
         };
-        if matches!(prepared, HirExpr::UpvalueRef(_)) {
-            // 左右 GETUPVAL 都从本次算术的 use→Def 取得读取身份和原准备槽，
-            // 不把同名 cell 的早期快照当成本次读取，也不改变左右求值顺序。
+        if matches!(
+            prepared,
+            HirExpr::UpvalueRef(_) | HirExpr::Integer(_) | HirExpr::Number(_)
+        ) {
+            // GETUPVAL 和数字 LOAD 都由本次运算的对应 use→Def 取得准备身份；
+            // 0/0 的两次相同常量写仍属于不同操作数，不能按值匹配成模糊输入。
             let (producer, home) = self
                 .facts
                 .binary_operand_preparation(binary, operand, prepared)?;
@@ -637,7 +656,7 @@ impl FrameBuilder<'_> {
             let rebuilt = self.expr(value, before, slot, None, false, true, Some(producer));
             self.register_operand = previous;
             rebuilt
-        } else if let Some(result) = self.facts.binary_value_operand(binary, operand)
+        } else if let Some(result) = self.facts.binary_phi_operand(binary, operand)
             && (self.facts.copy_value_prewrite(result).is_some()
                 || matches!(value, HirExpr::TempRef(temp) if *temp == result)
                 || matches!(value, HirExpr::LocalRef(local)
@@ -1115,7 +1134,11 @@ impl FrameBuilder<'_> {
         result: HomeSlotKey,
     ) -> Option<HirExpr> {
         let slot = input.slot();
+        let constant = |value: &HirExpr| matches!(value, HirExpr::Integer(_) | HirExpr::Number(_));
         if (self.native?.barred.contains(&result)
+            // 封闭数值运算不读取捕获 cell，也不调用元方法；运算及原低槽写回
+            // 仍由当前事务重发，不能据此删除计算或放宽其它输入的捕获边界。
+            && !(constant(&binary.lhs) && constant(&binary.rhs))
             && !self
                 .facts
                 .operation_result_reference_unaliased(binary.source_site?))
@@ -1135,7 +1158,6 @@ impl FrameBuilder<'_> {
         };
         let lhs_low = direct(&binary.lhs, layout.lhs);
         let rhs_low = direct(&binary.rhs, layout.rhs);
-        let constant = |value: &HirExpr| matches!(value, HirExpr::Integer(_) | HirExpr::Number(_));
         if matches!(
             self.dialect,
             DecompileDialect::Lua54 | DecompileDialect::Lua55
@@ -1235,7 +1257,7 @@ impl FrameBuilder<'_> {
                     self.expr(&binary.lhs, before, slot, None, false, true, Some(producer));
                 self.register_operand = previous;
                 rebuilt?
-            } else if !lhs_low && self.facts.binary_value_operand(binary, 0).is_some() {
+            } else if !lhs_low && self.facts.binary_phi_operand(binary, 0).is_some() {
                 // 只把需重建的 phi 准备交给该证书；既有低槽读取与普通 Def
                 // 继续由 register_operand 消费其已有布局，不重新套用 phi 的 epoch 约束。
                 self.binary_register_operand(binary, 0, before, layout.lhs?)?
@@ -1298,7 +1320,7 @@ impl FrameBuilder<'_> {
                 );
                 self.register_operand = previous;
                 rebuilt?
-            } else if !rhs_low && self.facts.binary_value_operand(binary, 1).is_some() {
+            } else if !rhs_low && self.facts.binary_phi_operand(binary, 1).is_some() {
                 self.binary_register_operand(binary, 1, before, layout.rhs?)?
             } else {
                 self.register_operand(&binary.rhs, before, rhs_slot)?

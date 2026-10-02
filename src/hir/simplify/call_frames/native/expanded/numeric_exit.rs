@@ -388,6 +388,8 @@ pub(super) fn restore(module: &mut HirModule, promotion: &mut [ProtoPromotionFac
                 capture: Some(candidate.template.capture),
                 occurrences: Vec::new(),
                 result_frame_slots: BTreeMap::new(),
+                callable_arguments: Default::default(),
+                nil_guards: Default::default(),
             });
         certificate.occurrences.push(candidate.source);
         certificate

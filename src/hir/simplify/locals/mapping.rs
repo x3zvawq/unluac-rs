@@ -9,6 +9,8 @@ pub(super) struct LocalMapping {
     homes: BTreeMap<LocalId, BTreeMap<Option<HomeSlotKey>, usize>>,
     entry_nil_homes: BTreeMap<HomeSlotKey, BTreeMap<LocalId, usize>>,
     undo: Vec<(TempId, Option<LocalId>, Option<HomeSlotKey>, bool)>,
+    declared_homes: BTreeMap<LocalId, HomeSlotKey>,
+    declared_undo: Vec<LocalId>,
 }
 
 impl LocalMapping {
@@ -16,8 +18,16 @@ impl LocalMapping {
         &self.bindings
     }
 
-    pub(super) fn checkpoint(&self) -> usize {
-        self.undo.len()
+    pub(super) fn checkpoint(&self) -> (usize, usize) {
+        (self.undo.len(), self.declared_undo.len())
+    }
+
+    /// 前轮已物化的声明仍有词法身份；不能因本轮没有 Temp 提升计划而丢失它。
+    pub(super) fn declare(&mut self, local: LocalId, ctx: &PromotionCtx<'_>) {
+        if let Some(home) = ctx.facts.trusted_local_home_slot(local) {
+            assert!(self.declared_homes.insert(local, home).is_none());
+            self.declared_undo.push(local);
+        }
     }
 
     pub(super) fn insert(&mut self, temp: TempId, local: LocalId, ctx: &PromotionCtx<'_>) {
@@ -93,8 +103,12 @@ impl LocalMapping {
         }
     }
 
-    pub(super) fn rollback(&mut self, checkpoint: usize) {
-        while self.undo.len() > checkpoint {
+    pub(super) fn rollback(&mut self, checkpoint: (usize, usize)) {
+        while self.declared_undo.len() > checkpoint.1 {
+            let local = self.declared_undo.pop().unwrap();
+            self.declared_homes.remove(&local);
+        }
+        while self.undo.len() > checkpoint.0 {
             let (temp, previous, home, entry_nil) = self.undo.pop().unwrap();
             let local = self
                 .bindings
@@ -139,7 +153,9 @@ impl LocalMapping {
         {
             return None;
         }
-        let homes = self.homes.get(&local)?;
+        let Some(homes) = self.homes.get(&local) else {
+            return self.declared_homes.get(&local).copied();
+        };
         // 缺失 home、受保护版本或不同 close epoch 都阻止复用，不能仅查询最新版本。
         (homes.len() == 1)
             .then(|| *homes.first_key_value().unwrap().0)

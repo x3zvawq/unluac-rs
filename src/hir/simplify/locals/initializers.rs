@@ -1,10 +1,100 @@
-//! 恢复原 nil 批次与合流声明的初始化归属，保留绑定和物理根。
-//! 消费原批次、精确 home 与当前声明边界，不跨求值或回边移动初始化。
+//! 恢复结构入口、原 nil 批次与合流声明的初始化归属，保留绑定和物理根。
+//! 消费原 Def、精确 home 与当前声明边界，不跨求值或回边移动初始化。
 
 use super::*;
-use crate::hir::common::{HirInlineDisposition, HirInlineRetentionReason, HirValuePack};
+use crate::hir::common::{
+    HirInlineDisposition, HirInlineRetentionReason, HirOperationSources, HirValuePack,
+};
 use crate::hir::simplify::mention::stmts_mentioned_locals;
 use crate::hir::simplify::walk::{HirRewritePass, rewrite_proto};
+
+/// 单次结构壳没有入口求值；在 Temp 身份仍可核验时，将首写交回外层声明 owner。
+pub(super) fn restore_single_pass_entries(
+    proto: &mut HirProto,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    // 候选拒绝[ProofIncomplete:Scope]：显式跳转仍需原声明域的入口证明，不能由词法首写代替。
+    if proto.body.stmts.iter().any(stmt_has_label_or_goto) {
+        return false;
+    }
+    struct Entries<'a> {
+        facts: &'a ProtoPromotionFacts,
+        debug_names: &'a [Option<String>],
+        debug_scopes: &'a [Option<usize>],
+    }
+    impl Entries<'_> {
+        fn is_initializer(&self, stmt: &HirStmt) -> bool {
+            let Some((temp, value)) = stmt.scalar_temp_assignment() else {
+                return false;
+            };
+            let HirStmt::Assign(assign) = stmt else {
+                unreachable!()
+            };
+            // 候选接受[NoOpScopeProof]：只越过无求值的结构入口，原写及顺序完整保留。
+            // 旧物理槽可能含入口残值，不能将移动原写误作删除 Entry(nil) 覆盖。
+            // 候选拒绝[ProofIncomplete:Identity]：捕获定义或已失效 home 缺少独立声明域证明。
+            self.facts.temp_definition_is_uncaptured(temp)
+                // 候选拒绝[PolicyBoundary]：debug 声明入口由 Bindings 的源码窗口持有。
+                && self.debug_names[temp.index()].is_none()
+                && self.debug_scopes[temp.index()].is_none()
+                // 候选拒绝[LayerBoundary]：边转移、源码帧和根释放仍交各自的原子事务 owner 消费。
+                && !assign.is_phi_transfer
+                && assign.initializer_merge_transaction.is_none()
+                && assign.generic_for_initializer_producer.is_none()
+                && assign.root_release.is_none()
+                && assign.method_rewrite_transaction.is_none()
+                && assign.parallel_nil_frame.is_none()
+                && matches!(
+                    value,
+                    HirExpr::Nil
+                        | HirExpr::Boolean(_)
+                        | HirExpr::Integer(_)
+                        | HirExpr::Number(_)
+                        | HirExpr::String(_)
+                )
+        }
+
+        fn block(&self, block: &mut HirBlock, mut prefix: Option<&mut Vec<HirStmt>>) -> bool {
+            let mut changed = false;
+            let mut output = Vec::with_capacity(block.stmts.len());
+            for mut stmt in std::mem::take(&mut block.stmts) {
+                if let Some(destination) = prefix.as_deref_mut()
+                    && self.is_initializer(&stmt)
+                {
+                    destination.push(stmt);
+                    changed = true;
+                    continue;
+                }
+                if let HirStmt::Repeat(repeat) = &mut stmt
+                    && !repeat.preserves_condition
+                    && matches!(repeat.cond, HirExpr::Boolean(true))
+                {
+                    // 嵌套首段直接写入同一外层缓冲，不逐层复制/重扫已移动的初始化序列。
+                    let destination = prefix.as_deref_mut().unwrap_or(&mut output);
+                    changed |= self.block(&mut repeat.body, Some(destination));
+                } else {
+                    crate::hir::simplify::walk::for_each_nested_block_mut(
+                        &mut stmt,
+                        &mut |child| {
+                            changed |= self.block(child, None);
+                        },
+                    );
+                }
+                // 任何原语句都会结束外层首段；后续单次壳仅向自己的相邻位置移交。
+                prefix = None;
+                output.push(stmt);
+            }
+            block.stmts = output;
+            changed
+        }
+    }
+    Entries {
+        facts,
+        debug_names: &proto.temp_debug_locals,
+        debug_scopes: &proto.temp_debug_scopes,
+    }
+    .block(&mut proto.body, None)
+}
 
 pub(super) fn restore(proto: &mut HirProto, facts: &mut ProtoPromotionFacts) -> bool {
     let mut mentioned = stmts_mentioned_locals(&proto.body.stmts);
@@ -74,6 +164,27 @@ struct Restore<'a> {
 }
 
 impl Restore<'_> {
+    fn owns_empty_table_initializer(&self, bindings: &[LocalId], values: &[HirExpr]) -> bool {
+        let ([local], [HirExpr::TableConstructor(table)]) = (bindings, values) else {
+            return false;
+        };
+        let HirOperationSources::Single(source) = table.sources else {
+            return false;
+        };
+        // 空表没有依赖壳内声明的字段求值；原分配仍写入壳外已经持有的同一绑定。
+        table.fields.is_empty()
+            && table.trailing_multivalue.is_none()
+            && self
+                .facts
+                .operation_result_temp(source)
+                .and_then(|temp| self.facts.promoted_local_for_temp(temp))
+                == Some(*local)
+            && self
+                .facts
+                .allocation_result_home(table)
+                .is_some_and(|home| self.facts.trusted_local_home_slot(*local) == Some(home))
+    }
+
     fn restore_single_pass_initializers(&self, block: &mut HirBlock) -> bool {
         let mut declarations = Vec::new();
         let mut bindings = Vec::new();
@@ -95,8 +206,7 @@ impl Restore<'_> {
                 HirStmt::Repeat(repeat)
                     if !repeat.preserves_condition
                         && matches!(repeat.cond, HirExpr::Boolean(true))
-                        && !bindings.is_empty()
-                        && self.nil_groups.contains(&bindings) =>
+                        && !bindings.is_empty() =>
                 {
                     if let Some(HirStmt::Assign(assign)) = repeat.body.stmts.first()
                         && assign.initializer_merge_transaction.is_none()
@@ -112,22 +222,27 @@ impl Restore<'_> {
                             .all(|(target, local)| *target == HirLValue::Local(*local))
                         && assign.values.tail.is_none()
                         && assign.values.fixed.len() == bindings.len()
-                        && assign
-                            .values
-                            .fixed
-                            .iter()
-                            .all(|value| matches!(value, HirExpr::Nil))
+                        && (self.nil_groups.contains(&bindings)
+                            && assign
+                                .values
+                                .fixed
+                                .iter()
+                                .all(|value| matches!(value, HirExpr::Nil))
+                            || self.owns_empty_table_initializer(&bindings, &assign.values.fixed))
                     {
-                        // 壳入口没有求值，首条原 LOADNIL 恰好初始化紧邻的空声明。
-                        // 同一绑定、槽序及原 nil 批次均已确认；把初始化交回声明，
-                        // 不跨任何原操作，也不把会再次执行的循环体写移到循环外。
-                        repeat.body.stmts.remove(0);
+                        // 空声明已在壳外持有同一绑定；合并初始化不扩展分配的词法寿命。
+                        // 原 nil 批次或单次空表分配都在首写处，越过无求值入口不改变顺序。
+                        let HirStmt::Assign(assign) = repeat.body.stmts.remove(0) else {
+                            unreachable!()
+                        };
+                        let mut values = assign.values.fixed.into_iter();
                         for &declaration in &declarations {
                             let HirStmt::LocalDecl(decl) = &mut block.stmts[declaration] else {
                                 unreachable!()
                             };
-                            decl.values =
-                                HirValuePack::fixed(vec![HirExpr::Nil; decl.bindings.len()]);
+                            decl.values = HirValuePack::fixed(
+                                values.by_ref().take(decl.bindings.len()).collect(),
+                            );
                         }
                         changed = true;
                     }

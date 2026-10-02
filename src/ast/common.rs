@@ -233,6 +233,8 @@ pub struct AstReturn {
 /// 函数表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstFunctionExpr {
+    /// 原闭包创建点；参数展开合同不能把同模板的另一次创建当成原对象。
+    pub(crate) source_site: Option<crate::hir::HirSourceSite>,
     pub creation: Option<crate::hir::HirClosureCreation>,
     pub function: HirProtoRef,
     pub params: Vec<ParamId>,

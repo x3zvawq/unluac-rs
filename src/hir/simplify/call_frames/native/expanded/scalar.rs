@@ -6,28 +6,33 @@
 use super::*;
 use crate::hir::common::{HirAssign, HirUnaryExpr, HirUnaryOpKind};
 
-/// O2 的内联发生在常量折叠之后。原比较仍存在时，用现存 identity 模板
+/// O2 的内联发生在常量折叠之后。原比较仍存在时，用现存封闭模板
 /// 重发其字面量 LOAD；否则直接打印常量比较会在重编译时删除这次检查。
 pub(super) fn constant_comparisons(
     context: NativeFrameContext<'_>,
     facts: &ProtoPromotionFacts,
 ) -> Vec<Plan> {
-    let Some(callee) = context
+    let identity = context
         .expanded_callees
-        .and_then(|callees| callees.get(&(HirLuauInliningBody::Identity, "".into())))
-    else {
-        return Vec::new();
-    };
+        .and_then(|callees| callees.get(&(HirLuauInliningBody::Identity, "".into())));
     context.proto.body.stmts.iter().enumerate().filter_map(|(index, stmt)| {
-        if index <= callee.declaration { return None; }
         let HirStmt::CallStmt(stmt) = stmt else { return None; };
         let ([HirExpr::Binary(binary)], None) = (stmt.call.args.fixed.as_slice(), &stmt.call.args.tail) else { return None; };
-        let literal = match binary.lhs {
-            HirExpr::Boolean(_) | HirExpr::Integer(-32768..=32767) => binary.lhs.clone(),
+        let identity_argument = match binary.lhs {
+            HirExpr::Boolean(_) | HirExpr::Integer(-32768..=32767) => Some(binary.lhs.clone()),
             HirExpr::Number(value) if value.fract() == 0.0 && (-32768.0..=32767.0).contains(&value)
-                && value.to_bits() != (-0.0f64).to_bits() => HirExpr::Integer(value as i64),
-            _ => return None,
+                && value.to_bits() != (-0.0f64).to_bits() => Some(HirExpr::Integer(value as i64)),
+            _ => None,
         };
+        let (callee, argument, source) = if let (Some(callee), Some(argument)) = (identity, identity_argument) {
+            (callee, argument, binary.source_site?)
+        } else {
+            let (callee, argument) = context.compared_choices?.constant(&binary.lhs)?;
+            let source = crate::hir::HirSourceSite { proto: context.proto.id,
+                instr: facts.binary_preparation_instruction(binary, 0, &binary.lhs)? };
+            (callee, argument, source)
+        };
+        if index <= callee.declaration { return None; }
         if !matches!(binary.rhs, HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::Number(_) | HirExpr::String(_)) {
             return None;
         }
@@ -59,7 +64,7 @@ pub(super) fn constant_comparisons(
         };
         let HirExpr::Call(call) = &mut plan.values.fixed[0] else { return None; };
         let HirExpr::Binary(binary) = &mut call.args.fixed[0] else { return None; };
-        binary.lhs = factories::factory_call(callee.local, Some(binary.source_site?), vec![literal].into());
+        binary.lhs = factories::factory_call(callee.local, Some(source), vec![argument].into());
         Some(plan)
     }).collect()
 }

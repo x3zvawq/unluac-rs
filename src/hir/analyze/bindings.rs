@@ -388,6 +388,7 @@ pub(super) fn build_bindings(
         &mut phi_temps,
     );
     coalesce_loop_state_temps(
+        proto,
         cfg,
         dataflow,
         structure.plan(),

@@ -23,6 +23,86 @@ pub(crate) struct ComparisonInitializer {
 }
 
 impl StructurePlan {
+    /// 外层值决策可吸收一次比较；两条弧仍须各自只写 Boolean 并直接汇入同一结果。
+    pub(crate) fn decision_comparison_initializers<'a>(
+        &'a self,
+        proto: &'a LoweredProto,
+        cfg: &'a Cfg,
+        dataflow: &'a DataflowFacts,
+    ) -> impl Iterator<Item = ComparisonInitializer> + 'a {
+        self.value_decisions().flat_map(move |(_, decision)| {
+            decision.nodes.iter().filter_map(move |node| {
+                if !matches!(&proto.instrs[node.predicate.index()], LowInstr::Branch(branch)
+                    if matches!(branch.cond.subject, BranchSubject::Compare { .. }))
+                {
+                    return None;
+                }
+                let arm = |arc: &ValueDecisionArcPlan| {
+                    let ValueDecisionTarget::Leaf(id) = arc.target else {
+                        return None;
+                    };
+                    let [entry, terminal] = arc.route.as_slice() else {
+                        return None;
+                    };
+                    let leaf = &decision.leaves[id.index()];
+                    if cfg.edges[entry.index()].from != node.block
+                        || cfg.edges[entry.index()].to != leaf.block
+                        || *terminal != leaf.terminal_edge
+                        || leaf.physical_pred != leaf.block
+                        || leaf.physical_value != leaf.value
+                    {
+                        return None;
+                    }
+                    let def = self.direct_arm_write(leaf.block, decision.merge, cfg, dataflow)?;
+                    (leaf.value == SsaValue::Def(def)
+                        && leaf.latest_local_def == Some(def)
+                        && dataflow.def_reg(def) == decision.result_reg)
+                        .then_some(def)
+                };
+                let defs = [arm(&node.truthy)?, arm(&node.falsy)?];
+                let [left, right] = defs.map(|def| &proto.instrs[dataflow.def_instr(def).index()]);
+                if !matches!((left, right), (LowInstr::LoadBool(left), LowInstr::LoadBool(right))
+                    if left.value != right.value)
+                {
+                    return None;
+                }
+                Some(ComparisonInitializer {
+                    defs,
+                    predicate: node.predicate,
+                    reg: decision.result_reg,
+                    entry: node.block,
+                    continuation: decision.merge,
+                })
+            })
+        })
+    }
+
+    fn direct_arm_write(
+        &self,
+        block: BlockRef,
+        continuation: BlockRef,
+        cfg: &Cfg,
+        dataflow: &DataflowFacts,
+    ) -> Option<DefId> {
+        let terminator = self.block_terminator(block)?;
+        let edge = match terminator.kind {
+            BlockTerminatorKind::Linear { edge: Some(edge) }
+            | BlockTerminatorKind::Jump { edge, .. } => edge,
+            _ => return None,
+        };
+        let range = terminator.instrs;
+        if cfg.edges[edge.index()].to != continuation
+            || range.len != 1 + usize::from(terminator.kind.instr().is_some())
+        {
+            // SemanticBarrier:ControlFlow：臂内只允许一次结果写入及直接汇合。
+            return None;
+        }
+        let [def] = dataflow.instr_defs[range.start.index()].as_slice() else {
+            return None;
+        };
+        Some(*def)
+    }
+
     /// 未使用的新槽初始化仍保留原限制；一般比较写回事实不能授权建立新的源码身份。
     pub(crate) fn unused_comparison_initializer(
         &self,
@@ -117,23 +197,8 @@ impl StructurePlan {
             let &[block] = self.region_blocks(arm) else {
                 return None;
             };
-            let terminator = self.block_terminator(block)?;
-            let edge = match terminator.kind {
-                BlockTerminatorKind::Linear { edge: Some(edge) }
-                | BlockTerminatorKind::Jump { edge, .. } => edge,
-                _ => return None,
-            };
-            let range = terminator.instrs;
-            if cfg.edges[edge.index()].to != *continuation
-                || range.len != 1 + usize::from(terminator.kind.instr().is_some())
-            {
-                // SemanticBarrier:ControlFlow：两臂必须只初始化结果并直接汇合。
-                return None;
-            }
-            let [def] = dataflow.instr_defs[range.start.index()].as_slice() else {
-                return None;
-            };
-            Some((*def, dataflow.def_reg(*def)))
+            let def = self.direct_arm_write(block, *continuation, cfg, dataflow)?;
+            Some((def, dataflow.def_reg(def)))
         };
         let (then_def, then_value) = arm_value(*then_arm)?;
         let (else_def, else_value) = arm_value(*else_arm)?;

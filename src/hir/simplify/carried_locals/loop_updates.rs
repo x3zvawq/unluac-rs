@@ -11,7 +11,7 @@ use crate::hir::expr_safety::{HirEvalEffects, HirExprSafety};
 use crate::hir::promotion::{HomeSlots, ProtoPromotionFacts};
 
 use super::super::label_refs::count_label_references;
-use super::super::lexical_cfg::LexicalCfg;
+use super::super::lexical_cfg::{LexicalCfg, stmt_has_current_owner_continue};
 use super::super::local_shapes::initialized_single_local_decl;
 use super::super::mention::{stmts_captured_locals, stmts_mention_local};
 use super::super::walk::{rewrite_expr, rewrite_stmts};
@@ -630,7 +630,7 @@ fn find_fold(
         // identity 会观察 carried/next 的独立 epoch。
         return None;
     }
-    if prefix.iter().any(stmt_has_candidate_loop_continue) {
+    if prefix.iter().any(stmt_has_current_owner_continue) {
         // 候选拒绝[SemanticBarrier:ControlFlow]：candidate loop 的 Continue 会绕过原尾写回；
         // 提前把 seed 写进 carried 会让下一轮观察本不应提交的新值（见本模块负例）。
         return None;
@@ -709,43 +709,6 @@ fn exact_local_writeback(stmt: &HirStmt) -> Option<(LocalId, LocalId)> {
         return None;
     };
     assign.values.tail.is_none().then_some((*target, *value))
-}
-
-fn stmt_has_candidate_loop_continue(stmt: &HirStmt) -> bool {
-    match stmt {
-        HirStmt::LocalRootRelease(_) => false,
-        HirStmt::Continue => true,
-        HirStmt::If(if_stmt) => {
-            if_stmt
-                .then_block
-                .stmts
-                .iter()
-                .any(stmt_has_candidate_loop_continue)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(|block| block.stmts.iter().any(stmt_has_candidate_loop_continue))
-        }
-        HirStmt::Block(block) => block.stmts.iter().any(stmt_has_candidate_loop_continue),
-        // These loops own every Continue in their bodies. Return/goto are handled by the
-        // terminal/path gates rather than being mistaken for candidate-owned Continue.
-        HirStmt::While(_)
-        | HirStmt::Repeat(_)
-        | HirStmt::NumericFor(_)
-        | HirStmt::GenericFor(_)
-        | HirStmt::LocalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
-    }
 }
 
 fn stmts_contain_terminal_exit(stmts: &[HirStmt]) -> bool {

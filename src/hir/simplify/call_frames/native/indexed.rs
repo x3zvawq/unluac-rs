@@ -6,7 +6,7 @@
 use super::*;
 use crate::hir::common::{HirAssign, HirBinaryOpKind, HirExpr, HirTableAccess};
 
-/// 并列 nil 字段写先保存全部左值，再一次准备 LOADNIL，最后逆序写回。
+/// 并列 nil 字段写保留原左值布局，再一次准备 LOADNIL，最后逆序写回。
 /// 每个目标快照及 RHS 成员都消费原 use→Def，不能拆开后改变元方法前的根覆盖。
 pub(super) fn parallel_preparations(
     context: NativeFrameContext<'_>,
@@ -15,10 +15,14 @@ pub(super) fn parallel_preparations(
     entries: &[Option<FlatStmt<'_>>],
     preparation_end: usize,
 ) -> Option<(Plan, usize)> {
-    if dialect != DecompileDialect::Lua51 {
+    if !matches!(dialect, DecompileDialect::Lua51 | DecompileDialect::Luajit) {
         return None;
     }
     let group = nil_argument_group(entries.get(preparation_end)?.as_ref()?.stmt, facts);
+    let direct_targets = dialect == DecompileDialect::Luajit;
+    if direct_targets && group.is_none() {
+        return None;
+    }
     let first_write = preparation_end + usize::from(group.is_some());
     let width = group.as_ref().map_or(2, |group| group.len());
     let end = first_write + width - 1;
@@ -49,9 +53,16 @@ pub(super) fn parallel_preparations(
     {
         return None;
     }
-    let base = facts.native_table_write_layout(first)?.base;
+    let first_layout = facts.native_table_write_layout(first)?;
+    let base = if direct_targets {
+        first_layout.value?
+    } else {
+        first_layout.base
+    };
     // 先排除普通字段写；只有相邻写回确实属于同一并列帧时才索引准备区。
-    let run = entries[..first_write]
+    // JIT 直接左值没有前置准备；只索引这一条 nil 批次，拒绝时也不重扫增长前缀。
+    let run_start = if direct_targets { preparation_end } else { 0 };
+    let run = entries[run_start..first_write]
         .iter()
         .map(|entry| entry.map(|entry| entry.stmt))
         .collect::<Option<Vec<_>>>()?;
@@ -81,10 +92,25 @@ pub(super) fn parallel_preparations(
             };
             facts.table_write_value_preparation(access, prepared)?
         };
-        if layout.value != Some(home) || layout.base.slot() != next {
+        if layout.value != Some(home) || !direct_targets && layout.base.slot() != next {
             return None;
         }
         rhs.push((value, producer, home));
+        if direct_targets {
+            // JIT 固定字段直接读取原低槽表，不额外制造左值快照。各次 SETTABLE
+            // 仍按原逆序发布；整组 nil 由后面的 builder 一次消费并核对后缀。
+            if layout.base.slot() >= base.slot()
+                || facts.direct_table_write_input_home(access, 0) != Some(layout.base)
+                || layout.key.is_some()
+                || !tables::literal_rk(&access.key)
+                || builder.literal_uses_rk(&access.key, Some((&access.sources, false)))
+                    != Some(true)
+            {
+                return None;
+            }
+            targets.push(HirLValue::TableAccess(Box::new(access.clone())));
+            continue;
+        }
         let (binding, prepared) = HirBinding::from_expr(&access.base).and_then(|binding| {
             run[..preparation_end]
                 .iter()
@@ -151,7 +177,7 @@ pub(super) fn parallel_preparations(
             Some(producer),
         )?);
     }
-    let start = builder.first_event?;
+    let start = run_start + builder.first_event?;
     if builder.next_event != run.len() {
         return None;
     }
@@ -688,6 +714,16 @@ pub(super) fn plan(
     .then(|| facts.table_write_value_preparation(access, rhs))
     .flatten();
     let comparison = comparison_result(rhs, facts);
+    // 原 SETTABLE 的 phi 输入与当前 binding 一起确认短路值身份；完整 builder
+    // 仍逐叶证明读取及结果槽，不能仅凭同槽或相似表达式认领另一版值。
+    let selection = matches!(rhs, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
+        .then(|| facts.table_write_value_phi(access))
+        .flatten()
+        .filter(|result| match result_binding {
+            Some(HirBinding::Temp(temp)) => temp == *result,
+            Some(HirBinding::Local(local)) => facts.promoted_local_for_temp(*result) == Some(local),
+            _ => false,
+        });
     if matches!(rhs, HirExpr::UpvalueRef(_)) {
         // GETUPVAL 的原准备 Def 与字段写布局由同一 owner 核对；所有方言都
         // 需要重发原读取槽，不能把它误送到仅接受字面量的 Luau 分支。
@@ -704,6 +740,7 @@ pub(super) fn plan(
     }
     if dialect == DecompileDialect::Luau
         && comparison.is_none()
+        && selection.is_none()
         && prepared_literal.is_none()
         && direct_rhs_home.is_none()
         && !matches!(rhs, HirExpr::Call(_))
@@ -733,6 +770,7 @@ pub(super) fn plan(
     // 查表由 register_lookup 验证；闭包在 scalar_rhs 核对原创建 Def 与 capture，
     // CALL gap 与连续拼接区仍各自使用原协议。
     if dialect == DecompileDialect::Luajit
+        && selection.is_none()
         && prepared_literal.is_none()
         && direct_rhs_home.is_none()
         && !(matches!(
@@ -774,6 +812,7 @@ pub(super) fn plan(
                 | HirExpr::Closure(_)
         )
         || comparison.is_some()
+        || selection.is_some()
         || direct_rhs_home.is_some()
         || literal_rhs
         || prepared_literal.is_some())
@@ -797,8 +836,8 @@ pub(super) fn plan(
             None
         } else if let Some((temp, _)) = prepared_literal {
             Some(temp)
-        } else if let Some(result) = comparison {
-            // 比较指令本身不写结果；使用原双分支 Boolean 写回，不能借谓词操作数猜 RHS 槽。
+        } else if let Some(result) = comparison.or(selection) {
+            // 比较及短路值使用原合流写回，不能借谓词操作数猜 RHS 槽。
             Some(result)
         } else {
             let source = match rhs {
@@ -1339,6 +1378,15 @@ fn scalar_rhs(
     if let Some(source) = source
         && facts.operation_result_home(source) != Some(value_home?)
     {
+        return None;
+    }
+    if matches!(rhs, HirExpr::Closure(_))
+        && source
+            .and_then(|source| facts.operation_result_temp(source))
+            .is_some_and(|temp| facts.temp_is_published_closure_declaration(temp))
+    {
+        // SemanticBarrier:PhysicalFramePrefix：原闭包槽在字段发布后仍被后续
+        // 观察保活；字段写不承担它的退休责任，须保留原声明作为低槽前缀。
         return None;
     }
     let mut builder = frame_builder(

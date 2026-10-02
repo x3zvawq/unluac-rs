@@ -25,6 +25,15 @@ impl CopyRootRetirements {
         for_instr: impl Fn(InstrRef) -> bool,
     ) -> Self {
         let mut facts = Self::default();
+        let stable_parameters = (0..usize::from(proto.signature.num_params))
+            .map(Reg)
+            .filter(|&reg| {
+                !dataflow.reg_is_reference_captured(reg)
+                    && dataflow
+                        .first_must_write_in_range(reg, 0..proto.instrs.len())
+                        .is_none()
+            })
+            .collect::<BTreeSet<_>>();
         let mut value_captured_defs = vec![false; dataflow.defs.len()];
         for (index, instr) in proto.instrs.iter().enumerate() {
             if let LowInstr::Closure(closure) = instr {
@@ -77,6 +86,18 @@ impl CopyRootRetirements {
                 retirement_points(proto, cfg, dataflow, home, &candidates)
             {
                 let def = &dataflow.defs[temp.index()];
+                if let Some(SsaValue::Entry(parameter)) =
+                    dataflow.canonical_move_value(SsaValue::Def(def.id))
+                    && parameter.index() < home.index()
+                    && stable_parameters.contains(&parameter)
+                    && dataflow.def_uses[temp.index()]
+                        .iter()
+                        .any(|site| for_instr(site.instr))
+                {
+                    // 退休求解已证明高槽在观察期间保活，更低且未改写的参数同时持有同一值。
+                    // for 协议继续负责原 COPY 和隐藏控制槽，不再为它另造独立 holder/清零写。
+                    continue;
+                }
                 if dataflow.def_overwrites_unknown_scratch(def.id)
                     && releases.iter().all(|release| {
                         release.instr.index() > producer.index()

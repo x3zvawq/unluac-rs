@@ -26,6 +26,43 @@ pub(super) enum LexicalCfgFailure {
     ExternalEntry,
 }
 
+/// 当前循环 owner 的 continue；嵌套循环拥有自己的控制转移。
+/// 本查询不进入 child proto，也不把 return/goto 当作 continue 的替代证明。
+pub(super) fn stmt_has_current_owner_continue(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::LocalRootRelease(_) => false,
+        HirStmt::Continue => true,
+        HirStmt::If(if_stmt) => {
+            if_stmt
+                .then_block
+                .stmts
+                .iter()
+                .any(stmt_has_current_owner_continue)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|block| block.stmts.iter().any(stmt_has_current_owner_continue))
+        }
+        HirStmt::Block(block) => block.stmts.iter().any(stmt_has_current_owner_continue),
+        HirStmt::While(_)
+        | HirStmt::Repeat(_)
+        | HirStmt::NumericFor(_)
+        | HirStmt::GenericFor(_)
+        | HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
+    }
+}
+
 /// 当前区域的词法入口事实，不裁剪不可达的 label/goto，也不证明出口或支配关系。
 pub(super) fn validate_region_entry(
     stmts: &[HirStmt],

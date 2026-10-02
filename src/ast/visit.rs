@@ -77,26 +77,28 @@ pub(super) fn visit_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) {
 
 /// 当前函数中被重新写入的 local，包含子闭包的捕获写；不混入 child 的同号身份。
 pub(crate) fn written_locals(block: &AstBlock) -> std::collections::BTreeSet<crate::hir::LocalId> {
+    written_names(block)
+        .into_iter()
+        .filter_map(|name| match name {
+            AstNameRef::Local(local) => Some(local),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 本函数被重写的名字，包含子闭包的捕获写；不进入 child 的身份域。
+pub(crate) fn written_names(block: &AstBlock) -> std::collections::BTreeSet<AstNameRef> {
     #[derive(Default)]
-    struct Writes(std::collections::BTreeSet<crate::hir::LocalId>);
+    struct Writes(std::collections::BTreeSet<AstNameRef>);
     impl AstVisitor for Writes {
         fn visit_name(&mut self, name: &AstNameRef, access: NameAccess) -> ControlFlow<()> {
-            if matches!(access, NameAccess::Write)
-                && let AstNameRef::Local(local) = name
-            {
-                self.0.insert(*local);
+            if matches!(access, NameAccess::Write) {
+                self.0.insert(name.clone());
             }
             ControlFlow::Continue(())
         }
         fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
-            self.0
-                .extend(function.capture_write_names.iter().filter_map(|name| {
-                    if let AstNameRef::Local(local) = name {
-                        Some(*local)
-                    } else {
-                        None
-                    }
-                }));
+            self.0.extend(function.capture_write_names.iter().cloned());
             false
         }
     }

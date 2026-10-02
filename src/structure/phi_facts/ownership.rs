@@ -234,6 +234,7 @@ pub(super) struct RegionOwnerIndex {
     exit: Vec<usize>,
     inside_branch: Vec<bool>,
     value_decision: Vec<bool>,
+    loop_region: Vec<bool>,
 }
 
 impl RegionOwnerIndex {
@@ -278,6 +279,7 @@ impl RegionOwnerIndex {
         let mut exit = vec![usize::MAX; region_count];
         let mut inside_branch = vec![false; region_count];
         let mut value_decision = vec![false; region_count];
+        let mut loop_region = vec![false; region_count];
         let mut clock = 0usize;
         let mut pending = vec![(root, false, false)];
         while let Some((region, leaving, inherited_branch)) = pending.pop() {
@@ -297,6 +299,8 @@ impl RegionOwnerIndex {
             inside_branch[region.index()] = branch;
             value_decision[region.index()] =
                 matches!(plan.region(region), Some(RegionPlan::ValueDecision { .. }));
+            loop_region[region.index()] =
+                matches!(plan.region(region), Some(RegionPlan::Loop { .. }));
             pending.push((region, true, branch));
             for child in children[region.index()].iter().rev() {
                 pending.push((*child, false, branch));
@@ -313,6 +317,7 @@ impl RegionOwnerIndex {
             exit,
             inside_branch,
             value_decision,
+            loop_region,
         })
     }
 
@@ -333,6 +338,13 @@ impl RegionOwnerIndex {
 
     pub(super) fn is_value_decision(&self, region: RegionId) -> bool {
         self.value_decision
+            .get(region.index())
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(super) fn is_loop(&self, region: RegionId) -> bool {
+        self.loop_region
             .get(region.index())
             .copied()
             .unwrap_or(false)
@@ -406,7 +418,15 @@ pub(super) fn merge_structured_owners(
         (LoopCarried(_), _) => left,
         (_, LoopCarried(_)) => right,
         (RegionInput(input), RegionResult(result)) | (RegionResult(result), RegionInput(input)) => {
-            if owner_index.inside_branch(result) || owner_index.is_value_decision(result) {
+            if owner_index.is_loop(input)
+                && !owner_index.is_value_decision(result)
+                && owner_index.more_specific(input, result).is_none()
+            {
+                // 前一分支的结果也是后续兄弟循环的入口。原 header 处的初始化
+                // 必须与该循环的回边归于同一状态；分支仍在原边写入，不借走 phi 身份。
+                // ValueDecision 已吸收原边并负责表达式写回，不能转成额外的边 COPY。
+                RegionInput(input)
+            } else if owner_index.inside_branch(result) || owner_index.is_value_decision(result) {
                 RegionResult(result)
             } else {
                 RegionInput(input)

@@ -7,6 +7,13 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[while false do]]
+-- assert 的短路参数应整体恢复，不能留下独立的 false 预写。
+-- unluac: expect-max-count [[ = false]] [[0]]
+-- 父函数保留调用结果、循环输入和预期值；不再为原调用准备制造接棒变量。
+-- unluac: expect-ast-count [[local-binding]] [[22]] [[@proto=0]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=0]]
+-- O2 的首个调用必须重新内联，其余原 CALL 在每轮回编译中保持。
+-- unluac: expect-instruction-count [[call]] [[9]] [[@proto=0]] [[@variant=O2]]
 -- unluac: expect-contains [[in p1_3 do]]
 -- unluac: expect-ast-count [[repeat]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[2]] [[@proto=1]]

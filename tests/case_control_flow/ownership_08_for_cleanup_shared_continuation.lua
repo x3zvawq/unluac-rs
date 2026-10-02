@@ -42,6 +42,8 @@ end
 assert(run("", false, false, empty_iterator, 7, nil) == 0 and calls == 1)
 -- unluac: expect-ast-count [[local-binding]] [[7]]
 -- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
+-- 其余五次赋值都属于观察计数器，隐藏迭代槽不应另造 holder 赋值和 nil 清理。
+-- unluac: expect-ast-count [[assign]] [[5]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 -- unluac: expect-ast-count [[while]] [[0]]
 print(early, fallback)

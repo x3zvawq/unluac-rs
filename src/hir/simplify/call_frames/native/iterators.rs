@@ -538,8 +538,16 @@ fn fixed_values_plan(
             // SemanticBarrier：独立身份及关闭/capture 义务保留；多值 CALL 由原调用协议恢复。
             return None;
         }
-        values.push(builder.expr(value, index, home.slot(), None, false, true, None)?);
-        builder.finish_event(index)?;
+        if let HirExpr::TableConstructor(table) = value
+            && builder.constructors.contains_key(&index)
+        {
+            // producer 标识原分配；尚未树化的 SETLIST/字段准备属于同一构造器。
+            // 共享 builder 按已预留的控制槽重放整个构造，再接后续 state/control。
+            values.push(builder.constructor(index, table, home.slot())?);
+        } else {
+            values.push(builder.expr(value, index, home.slot(), None, false, true, None)?);
+            builder.finish_event(index)?;
+        }
     }
     // 原 iterator owner 已消费的固定后缀保持在循环头；不把未证明的交错 span 猜成准备区。
     for (offset, value) in for_.iterator.fixed.iter().enumerate().skip(remaining) {

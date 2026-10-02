@@ -16,7 +16,7 @@ fn integer(expr: &AstExpr) -> Option<i64> {
     }
 }
 
-fn observation(stmt: &AstStmt, state: &AstNameRef) -> bool {
+pub(super) fn observation(stmt: &AstStmt, state: &AstNameRef) -> bool {
     matches!(stmt, AstStmt::CallStmt(stmt)
         if matches!(&stmt.call, AstCallKind::Call(call)
             if matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if name.text == "print")

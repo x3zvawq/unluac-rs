@@ -31,10 +31,29 @@ pub(super) fn exact_state_writeback(stmt: &HirStmt, result: CarryBinding) -> Opt
     carry_binding_from_lvalue(target)
 }
 
-/// 纯 binding 并行写回按结果建一次索引；调用方只退休证明为精确快照的对应项。
-pub(super) fn parallel_state_writebacks(
+/// 纯 binding COPY 按结果建一次索引；独立声明继续保留自己的快照身份。
+pub(super) fn immediate_binding_copies(
     stmt: &HirStmt,
 ) -> Option<BTreeMap<CarryBinding, CarryBinding>> {
+    if let HirStmt::LocalDecl(decl) = stmt {
+        let ([target], [source], None) = (
+            decl.bindings.as_slice(),
+            decl.values.fixed.as_slice(),
+            &decl.values.tail,
+        ) else {
+            return None;
+        };
+        if decl.initializer_merge_transaction.is_some()
+            || decl.generic_for_initializer_producer.is_some()
+        {
+            // 候选拒绝[LayerBoundary]：协议初始化仍由其事务 owner 消费，不能在此替换输入。
+            return None;
+        }
+        return Some(BTreeMap::from([(
+            carry_binding_from_expr(source)?,
+            CarryBinding::Local(*target),
+        )]));
+    }
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };

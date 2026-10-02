@@ -20,6 +20,12 @@
 -- 默认返回复杂度上限会保留 nested/observed 的两个长表达式声明；Luau 原返回帧无需此中转。
 -- unluac: expect-ast-max [[local-binding]] [[35]]
 -- unluac: expect-ast-max [[local-binding]] [[33]] [[@dialect=luau]]
+-- O2 展开体按原共享读取、参数初始化和返回槽恢复完整调用；不留下独立的写回中转。
+-- unluac: expect-contains [[assert(shared(flag, expected, read) == expected_shared and calls == 3)]] [[@dialect=luau]] [[@variant=O2]] [[@debug=retained]]
+-- unluac: expect-contains [[assert(observed(]] [[@dialect=luau]] [[@variant=O2]] [[@debug=retained]]
+-- unluac: expect-contains [[local actual = comparison_writeback("old", x, y)]] [[@dialect=luau]] [[@variant=O2]] [[@debug=retained]]
+-- 即使首参数随后被覆盖，原字面量实参仍在完整调用中求值一次。
+-- unluac: expect-count [[("old", ]] [[1]] [[@dialect=luau]] [[@variant=O2]]
 -- 高槽 Boolean 结果写回已有低槽后，不应留下预写声明并使下一轮调用重新分裂。
 -- unluac: expect-max-count [[ = assert]] [[0]] [[@dialect=luau]] [[@variant=O0]] [[@debug=stripped]]
 -- 无写入的合流 pad 不应令后继调用逐轮退回准备别名。

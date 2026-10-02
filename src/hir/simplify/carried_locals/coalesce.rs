@@ -48,6 +48,9 @@ pub(super) fn coalesce_disjoint_temps(
     // 整图干扰证明判断。不把声明前的 Temp 归入后置 owner，也不删除原初始化。
     let mut local_updates = BTreeMap::new();
     let mut definition_preserving_updates = BTreeSet::new();
+    let mut comparison_updates = BTreeSet::new();
+    let mut comparison_definitions = BTreeSet::new();
+    let mut comparison_seeds = BTreeMap::new();
     let mut unary_write_homes = BTreeSet::new();
     let mut empty_carried = BTreeSet::new();
     let mut initialized_owners = BTreeMap::new();
@@ -155,6 +158,35 @@ pub(super) fn coalesce_disjoint_temps(
                 && unary.source_site
                     .and_then(|source| facts.operation_result_temp(source))
                     .and_then(|temp| facts.promoted_local_for_temp(temp)) == Some(*target));
+        let mut subject = value;
+        // 无原指令的 NOT 只记录比较极性，不是额外写入；真实 NOT 仍走上面的一元证明。
+        while let HirExpr::Unary(unary) = subject
+            && unary.op == crate::hir::common::HirUnaryOpKind::Not
+            && unary.source_site.is_none()
+        {
+            subject = &unary.expr;
+        }
+        let comparison_result = if let HirExpr::Binary(binary) = subject {
+            facts.comparison_result_temp(binary).filter(|&result| {
+                facts.promoted_local_for_temp(result) == Some(*target)
+                    && facts.trusted_temp_home_slot(result) == Some(home)
+                    && facts
+                        .complete_temp_definition_write_homes(result)
+                        .iter()
+                        .copied()
+                        .eq([home])
+            })
+        } else {
+            None
+        };
+        if let Some(result) = comparison_result {
+            comparison_seeds.insert(*target, result);
+        }
+        let comparison_write = comparison_result.is_some()
+            && comparison_seeds.contains_key(&seed)
+            && preceding_reads
+                .get(&seed)
+                .is_some_and(|read| *read < statement_index);
         if seed != *target
             // 未被读取的 nil/Boolean seed 可能只是 Decision 的准备写，不能因合并
             // 赋予它永久声明身份，阻断完整返回或 Boolean initializer 的原帧恢复。
@@ -162,17 +194,24 @@ pub(super) fn coalesce_disjoint_temps(
             && update.initializer_merge_transaction.is_none()
             && (matches!(value, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
                 || unary_write
+                || comparison_write
                 // for preheader 的调用可能夹在 seed 与合成 carrier COPY 之间。
                 // 声明位置不动；同槽初始化的归属仍由下方整图干扰与协议边界证明。
                 || matches!(value, HirExpr::LocalRef(source)
                     if *source == seed && carrier_locals.contains(target)))
         {
             local_updates.insert(*target, (seed, home));
-            if unary_write {
-                // 原一元操作仍在此处写回同一槽，只认回既有声明；嵌套 NOT 等操作
+            if comparison_write {
+                comparison_updates.insert(*target);
+                comparison_definitions.extend([comparison_seeds[&seed], comparison_seeds[target]]);
+            }
+            if unary_write || comparison_write {
+                // 原运算仍在此处写回同一槽，只认回既有声明；比较及嵌套 NOT 等操作
                 // 均保留，不改变求值位置或逐 Def 的准备事实。旧快照仍由整图检查。
                 definition_preserving_updates.insert(*target);
-                unary_write_homes.insert(home);
+                if unary_write {
+                    unary_write_homes.insert(home);
+                }
             }
         }
     }
@@ -465,7 +504,7 @@ pub(super) fn coalesce_disjoint_temps(
     for &binding in &identity.value_captured {
         block_binding_homes(binding, facts, &scoped_groups, &mut blocked);
     }
-    // 原 GETTABLE/一元写回和合流空声明都只认回已声明 carrier；不移除实际定义或
+    // 原 GETTABLE/运算写回和合流空声明都只认回已声明 carrier；不移除实际定义或
     // 求值，按 source/Def 索引的准备协议仍有效。空声明的首次有效写另经 CFG 验证。
     let definition_preserving_homes = scoped_groups
         .iter()
@@ -492,6 +531,10 @@ pub(super) fn coalesce_disjoint_temps(
                 .is_some_and(|bindings| bindings.first() == Some(&CarryBinding::Local(local)))
         })
     };
+    // 比较写回保留原 Boolean 物化及所有使用位置；只改为既有 owner 的赋值，
+    // 不把 BooleanValueContext 当作允许内联到条件、删除转换或移动求值的许可。
+    let retained_boolean_local =
+        |local| retained_entry_local(local) || comparison_updates.contains(&local);
 
     for &binding in &identity.preserved {
         if let CarryBinding::Temp(temp) = binding
@@ -503,7 +546,7 @@ pub(super) fn coalesce_disjoint_temps(
                 crate::hir::common::HirInlineDisposition::Preserve(reasons)
                 if reasons.iter().all(|reason| *reason == crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix
                     || *reason == crate::hir::common::HirInlineRetentionReason::BooleanValueContext
-                        && facts.promoted_local_for_temp(temp).is_some_and(retained_entry_local)))
+                        && facts.promoted_local_for_temp(temp).is_some_and(retained_boolean_local)))
         {
             continue;
         }
@@ -519,7 +562,7 @@ pub(super) fn coalesce_disjoint_temps(
                 crate::hir::common::HirInlineDisposition::Preserve(reasons)
                 if reasons.iter().all(|reason| *reason == crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix
                     || *reason == crate::hir::common::HirInlineRetentionReason::BooleanValueContext
-                        && retained_entry_local(local)))
+                        && retained_boolean_local(local)))
         {
             // owner 的声明及原槽保持不动，后续同槽 COPY 不破坏前缀保留义务。
             // BooleanValueContext 也仍由入口 owner 持有，不把原布尔计算或 LOAD/TEST 内联掉。
@@ -536,6 +579,7 @@ pub(super) fn coalesce_disjoint_temps(
             scoped_groups: &scoped_groups,
             definition_preserving_homes: &definition_preserving_homes,
             unary_write_homes: &unary_write_homes,
+            comparison_definitions: &comparison_definitions,
             blocked: &mut blocked,
         },
     );
@@ -1207,6 +1251,7 @@ struct ProtocolHomes<'a> {
     scoped_groups: &'a BTreeMap<HomeSlotKey, BTreeSet<CarryBinding>>,
     definition_preserving_homes: &'a BTreeSet<HomeSlotKey>,
     unary_write_homes: &'a BTreeSet<HomeSlotKey>,
+    comparison_definitions: &'a BTreeSet<TempId>,
     blocked: &'a mut BTreeSet<HomeSlotKey>,
 }
 
@@ -1217,10 +1262,12 @@ impl ProtocolHomes<'_> {
             .trusted_temp_home_slot(temp)
             .zip(frame)
             .is_some_and(|(home, frame)| {
-                self.unary_write_homes.contains(&home) && home.slot() >= frame.slot()
+                (self.unary_write_homes.contains(&home)
+                    || self.comparison_definitions.contains(&temp))
+                    && home.slot() >= frame.slot()
             })
         {
-            // 一元写回候选不能冻结原调用准备区中的声明；后续同槽写只是 scratch
+            // 运算写回候选不能冻结原调用准备区中的声明；后续同槽写只是 scratch
             // 复用，保留 Def 并不足以把该准备声明变成贯穿调用之后的 carrier。
             block_binding_homes(
                 CarryBinding::Temp(temp),

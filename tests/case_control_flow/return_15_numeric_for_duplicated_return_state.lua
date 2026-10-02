@@ -9,6 +9,7 @@
 -- unluac: expect-ast-count [[generic-for]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=4]]
 local function run(a, b, xs)
     local x = 0
     if a then
@@ -56,4 +57,35 @@ prints, iterations = 0, 0
 assert(run(0, "", iterator) == 0 and prints == 0 and iterations == 0)
 assert(not pcall(run, true, false, iterator))
 assert(iterations == 7 and prints == 0)
+
+-- 有限循环变体直接观察更新后的返回值；上面的无限 while 只能观察回边，无法暴露旧状态返回。
+local function run_finite(a, b, xs)
+    local x = 0
+    if a then
+        for _ = 1, 3 do
+            while not b do
+                for _ in xs do
+                    x = x + 1
+                    x = x + 1
+                    x = x + 1
+                end
+                if a then
+                    b = true
+                    continue
+                end
+            end
+            continue
+        end
+    else
+        for _ in xs do
+            print("regress_86_numeric_for_duplicated_return_state#1 body", x)
+        end
+    end
+    return x
+end
+prints, iterations = 0, 0
+assert(run_finite(true, false, iterator) == 3 and iterations == 2 and prints == 0)
+prints, iterations = 0, 0
+assert(run_finite(true, true, iterator) == 0 and iterations == 0 and prints == 0)
+assert(run_finite(false, false, iterator) == 0 and iterations == 2 and prints == 1)
 print = saved_print

@@ -5,6 +5,74 @@
 use super::{HirExpr, HirMethodCall, HirProto, HirStmt, HirUnaryOpKind, ParamId, UpvalueId};
 use crate::LuaString;
 
+mod reset_counter;
+pub(crate) use reset_counter::{ResetCounterTemplate, reset_counter_template};
+mod array_fold;
+pub(crate) use array_fold::{ArrayFoldTemplate, array_fold_names, array_fold_template};
+mod calling_values;
+mod checked_reads;
+pub(crate) mod constant_control;
+mod guarded_counter;
+pub(crate) use guarded_counter::{
+    CounterLoopKind, GuardedCounterTemplate, guarded_counter_template,
+};
+mod numeric_repeat;
+pub(crate) use checked_reads::{CheckedReadTemplate, checked_read_template};
+pub(crate) use numeric_repeat::{NumericRepeatTemplate, numeric_repeat_template};
+mod observed_values;
+mod parameter_writebacks;
+pub(crate) use calling_values::{
+    CapturedReadTemplate, calling_read_pair, calling_shared_value, calling_value_fallback,
+    captured_read_template,
+};
+pub(in crate::hir) use observed_values::selection;
+pub(crate) use observed_values::{
+    ObservedValueTemplate, TracedReadTemplate, observed_value_template, traced_read_template,
+};
+pub(crate) use parameter_writebacks::parameter_writeback_template;
+
+pub(crate) fn small_integer(value: &HirExpr) -> Option<i64> {
+    match value {
+        HirExpr::Integer(value) if i16::try_from(*value).is_ok() => Some(*value),
+        HirExpr::Number(value)
+            if value.fract() == 0.0
+                && (-32768.0..=32767.0).contains(value)
+                && value.to_bits() != (-0.0f64).to_bits() =>
+        {
+            Some(*value as i64)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn increment_identity_template(proto: &HirProto) -> Option<i64> {
+    use super::{HirBinaryOpKind, HirLValue};
+    if proto.params.as_slice() != [ParamId(0)]
+        || proto.upvalues.as_slice() != [UpvalueId(0)]
+        || proto.signature.is_vararg
+        || !proto.children.is_empty()
+        || proto.failure.is_some()
+    {
+        return None;
+    }
+    let [HirStmt::Assign(update), HirStmt::Return(ret)] = proto.body.stmts.as_slice() else {
+        return None;
+    };
+    let [HirExpr::Binary(add)] = update.values.fixed.as_slice() else {
+        return None;
+    };
+    if update.targets.as_slice() != [HirLValue::Upvalue(UpvalueId(0))]
+        || update.values.tail.is_some()
+        || add.op != HirBinaryOpKind::Add
+        || add.lhs != HirExpr::UpvalueRef(UpvalueId(0))
+        || ret.values.tail.is_some()
+        || ret.values.fixed.as_slice() != [HirExpr::ParamRef(ParamId(0))]
+    {
+        return None;
+    }
+    small_integer(&add.rhs)
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct NumericExitTemplate {
     pub hit: LuaString,

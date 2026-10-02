@@ -9,7 +9,10 @@
 -- 原零值准备由完整 global 帧重发，不能继承前一个表分配的中转绑定。
 -- unluac: expect-contains [[global field_gate = 0]]
 -- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=8]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=1]]
+-- 保留 writes/env/first/second 四个原声明，尾调用不能另生 callee/argument 中转。
+-- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=1]]
+-- unluac: expect-contains [[local r1_2, r1_3 = 11, 22]]
+-- unluac: expect-contains [[return table.concat(r1_0, ",")]]
 
 local function test_write_order()
     local writes = {}

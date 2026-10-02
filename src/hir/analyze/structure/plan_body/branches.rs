@@ -41,6 +41,15 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let preserves_test = self.condition_reads_literal(payload.condition);
         let mut branch = branch_stmt(cond, self.finish_emission(region, then_block)?, else_block);
         if let HirStmt::If(if_stmt) = &mut branch {
+            if let Some(condition) = self.lowering.structure.plan().condition(payload.condition)
+                && let [node] = condition.nodes.as_slice()
+                && node.materialized_value.is_none()
+            {
+                if_stmt.predicate_source = Some(crate::hir::common::HirSourceSite {
+                    proto: self.proto,
+                    instr: node.predicate,
+                });
+            }
             // PolicyBoundary：原 TEST 即使读取已知常量或两臂只剩 fallthrough，
             // 也不是合成控制壳；不能按值域或空臂删除这个独立检查。
             if_stmt.preserves_empty_test = preserves_test

@@ -11,6 +11,16 @@
 -- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.5]]
 -- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=luau]]
 -- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=6]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=2]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=2]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=2]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=2]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=6]] [[@dialect=luajit]]
+-- Luau/JIT 的原写回保留初始化的可变身份，不能让后续编译把原加法折成常量。
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=1]] [[@dialect=luau]]
+-- unluac: expect-ast-min [[assign]] [[1]] [[@proto=2]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=7]] [[@dialect=luajit]]
 local function branch_exit(flag)
     local state = 10
     local result = state + 3

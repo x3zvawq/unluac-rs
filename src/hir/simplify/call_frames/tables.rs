@@ -1067,12 +1067,19 @@ impl FrameBuilder<'_> {
         table: &crate::hir::common::HirTableConstructor,
         slot: usize,
     ) -> bool {
+        let Some(home) = self.facts.allocation_result_home(table) else {
+            return false;
+        };
+        if home.slot() != slot {
+            return false;
+        }
+        // 分配与 SETLIST 的对象身份保留完整 home；scratch 位置按原批次查询，不能假设 CLOSE epoch 为零。
         // 空数组只有原 NEWTABLE，没有 SETLIST；仍须在同一槽以零容量分配。
         // 不能因缺少批次来源而阻断外层数组的完整初始化帧。
         if table.fields.is_empty() && table.trailing_multivalue.is_none() {
             return matches!(table.allocation, HirTableAllocation::Luau(_))
                 && table.matches_allocation_capacity(0)
-                && self.facts.allocation_result_home(table) == Some(HomeSlotKey::new(slot, 0));
+                && self.facts.allocation_result_home(table) == Some(home);
         }
         let Some(batch) = self.facts.native_allocation_batch_layout(table) else {
             return false;
@@ -1081,9 +1088,9 @@ impl FrameBuilder<'_> {
         if !matches!(table.allocation, HirTableAllocation::Luau(_))
             || table.trailing_multivalue.is_some()
             || !table.matches_allocation_capacity(table.fields.len())
-            || self.facts.allocation_result_home(table) != Some(HomeSlotKey::new(slot, 0))
-            || batch.base != HomeSlotKey::new(slot, 0)
-            || batch.buffer != HomeSlotKey::new(buffer, 0)
+            || self.facts.allocation_result_home(table) != Some(home)
+            || batch.base != home
+            || batch.buffer.slot() != buffer
             || batch.start_index != 1
             || batch.fixed_width != Some(table.fields.len())
             || !table.fields.iter().enumerate().all(|(offset, field)| {
@@ -1096,7 +1103,7 @@ impl FrameBuilder<'_> {
                         if self.luau_array_frame_matches(nested, buffer + offset)
                             || (completed_luau_template(nested)
                                 && self.facts.allocation_result_home(nested)
-                                    == Some(HomeSlotKey::new(buffer + offset, 0))))
+                                    .is_some_and(|home| home.slot() == buffer + offset)))
                     || self
                         .direct_home(value)
                         .is_some_and(|home| home.slot() < self.base)
@@ -1109,9 +1116,9 @@ impl FrameBuilder<'_> {
                                 _ => false,
                             }
                             && self.facts.unary_result_home(unary)
-                                == Some(HomeSlotKey::new(buffer + offset, 0))
+                                .is_some_and(|home| home.slot() == buffer + offset)
                             && self.facts.unary_operand_home(unary)
-                                == Some(HomeSlotKey::new(buffer + table.fields.len(), 0)))
+                                .is_some_and(|home| home.slot() == buffer + table.fields.len()))
             })
         {
             return false;

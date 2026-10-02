@@ -84,6 +84,9 @@ impl ProtoRefRewrite {
 impl HirRewritePass for ProtoRefRewrite {
     fn rewrite_stmt(&mut self, stmt: &mut crate::hir::common::HirStmt) -> bool {
         match stmt {
+            crate::hir::common::HirStmt::If(branch) => {
+                self.rewrite_source_site(&mut branch.predicate_source)
+            }
             crate::hir::common::HirStmt::Return(ret) => {
                 self.rewrite_source_site(&mut ret.frame_source)
             }

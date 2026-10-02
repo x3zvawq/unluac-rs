@@ -465,6 +465,7 @@ fn materialize_logical_expr_into_target(
         stmts: materialize_expr_into_target(logical.rhs, target, state, safety),
     };
     stmts.push(HirStmt::If(Box::new(HirIf {
+        predicate_source: None,
         preserves_empty_test: false,
         preserves_arm_order: false,
         cond: guard,
@@ -577,6 +578,7 @@ fn materialize_decision_node(
     };
 
     prefix.push(HirStmt::If(Box::new(HirIf {
+        predicate_source: None,
         preserves_empty_test: false,
         preserves_arm_order: false,
         cond,

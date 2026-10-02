@@ -35,6 +35,33 @@ fn input_home(
     }
 }
 
+fn literal_write(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    assign: &crate::hir::common::HirAssign,
+) -> bool {
+    if dialect == DecompileDialect::Luajit && facts.literal_upvalue_write(assign) {
+        return true;
+    }
+    let HirLValue::TableAccess(access) = &assign.targets[0] else {
+        return false;
+    };
+    let value = &assign.values.fixed[0];
+    dialect != DecompileDialect::Luau
+        && tables::literal_rk(value)
+        && facts
+            .native_table_write_layout(access)
+            .map(|layout| layout.value)
+            .or_else(|| {
+                facts
+                    .native_upvalue_table_write_layout(access)
+                    .map(|layout| layout.value)
+            })
+            == Some(None)
+        && context.literal_uses_rk(value, Some((&access.sources, true)), dialect) == Some(true)
+}
+
 fn prepared_value<'a>(builder: &FrameBuilder<'a>, value: &'a HirExpr) -> &'a HirExpr {
     if let HirExpr::LocalRef(local) = value
         && let Some(index) = builder.definition(*local, builder.run.len())
@@ -76,12 +103,9 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
             .and_then(Option::as_ref)
             .and_then(|entry| write(entry.stmt))
         {
-            // JIT 的末项常量由 USETN/USETS/USETP 直接写 cell；逆序发布时
-            // 它先于寄存器 RHS，不占也不推进准备槽序列。
-            if dialect == DecompileDialect::Luajit
-                && index == first_write
-                && facts.literal_upvalue_write(assign)
-            {
+            // 末项 RK 字段写或 JIT 的常量上值写先于寄存器 RHS 发布，
+            // 原布局没有 value 准备槽，不能因此截断整组逆序写回。
+            if index == first_write && literal_write(context, facts, dialect, assign) {
                 index += 1;
                 continue;
             }
@@ -265,10 +289,7 @@ fn candidate(
     for (offset, entry) in ordered.iter().enumerate() {
         let assign = write(entry.stmt)?;
         let value = &assign.values.fixed[0];
-        if dialect == DecompileDialect::Luajit
-            && offset + 1 == ordered.len()
-            && facts.literal_upvalue_write(assign)
-        {
+        if offset + 1 == ordered.len() && literal_write(context, facts, dialect, assign) {
             values.push(value.clone());
             continue;
         }

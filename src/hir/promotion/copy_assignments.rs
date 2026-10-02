@@ -1,12 +1,144 @@
 //! 保存并行赋值的原快照、目标版本和写回顺序。
-//! 只提供同一基本块的原指令事实；源码声明前缀和后继槽复用由 simplify 核对。
+//! 消费原 SSA 与槽位版本；源码声明前缀和后继槽复用由 simplify 核对。
 
 use super::*;
 
 pub(super) mod lookups;
 mod luau;
 pub(super) mod nil;
+pub(super) mod prepared;
 pub(super) mod varargs;
+
+/// 原 COPY 写入从未被 SSA 读取；这里只保存操作身份，不授权删除源码绑定。
+#[derive(Debug, Clone)]
+pub(in crate::hir) struct UnreadCopy {
+    pub instruction: InstrRef,
+    pub after_pc: u32,
+    pub write: ImmediateMoveWrite,
+}
+
+pub(super) fn collect_unread_copies(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+    fixed: &[TempId],
+    phis: &[TempId],
+) -> BTreeMap<TempId, UnreadCopy> {
+    dataflow
+        .defs
+        .iter()
+        .filter_map(|def| {
+            let LowInstr::Move(copy) = proto.instrs[def.instr.index()] else {
+                return None;
+            };
+            let target = TempId(def.id.index());
+            if copy.dst != def.reg
+                || fixed[def.id.index()] != target
+                || !dataflow.def_uses[def.id.index()].is_empty()
+                || !dataflow.def_phi_uses[def.id.index()].is_empty()
+            {
+                return None;
+            }
+            let source = canonical_value_temp(
+                dataflow.use_value(def.instr, copy.src),
+                fixed.len(),
+                fixed,
+                phis,
+            )?;
+            Some((
+                target,
+                UnreadCopy {
+                    instruction: def.instr,
+                    after_pc: *proto
+                        .lowering_map
+                        .pc_map()
+                        .get(def.instr.index() + 1)?
+                        .first()?,
+                    write: ImmediateMoveWrite {
+                        source: Some(source),
+                        target,
+                        source_home: HomeSlotKey::new(
+                            copy.src.index(),
+                            epochs.epoch_at(copy.src, def.instr),
+                        ),
+                        target_home: HomeSlotKey::new(
+                            copy.dst.index(),
+                            epochs.epoch_at(copy.dst, def.instr),
+                        ),
+                    },
+                },
+            ))
+        })
+        .collect()
+}
+
+/// 分支中的连续低槽返回写回沿用入口声明，不能先转成不可变的返回准备。
+pub(super) fn collect_return_writebacks(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+    fixed: &[TempId],
+) -> BTreeMap<TempId, TempId> {
+    let mut writes = BTreeMap::new();
+    for (index, instr) in proto.instrs.iter().enumerate() {
+        let LowInstr::Return(ret) = instr else {
+            continue;
+        };
+        let crate::transformer::ValuePack::Fixed(pack) = ret.values else {
+            continue;
+        };
+        let Some(start) = index.checked_sub(pack.len).filter(|_| pack.len > 0) else {
+            continue;
+        };
+        let LowInstr::Move(first) = proto.instrs[start] else {
+            continue;
+        };
+        if first.dst != pack.start || first.src <= first.dst {
+            continue;
+        }
+        let block = cfg.instr_to_block[index];
+        let frame = (start..index)
+            .enumerate()
+            .map(|(offset, position)| {
+                let site = InstrRef(position);
+                let reg = Reg(pack.start.index() + offset);
+                if cfg.instr_to_block[position] != block
+                    || match &proto.instrs[position] {
+                        LowInstr::Move(copy) => copy.dst != reg,
+                        instr => {
+                            scalar_literal(proto, instr).is_none_or(|(target, _)| target != reg)
+                        }
+                    }
+                {
+                    return None;
+                }
+                let def = dataflow.instr_def_for_reg(site, reg)?;
+                let SsaValue::Def(previous) = dataflow.def_overwritten_value(def)? else {
+                    return None;
+                };
+                let previous_def = &dataflow.defs[previous.index()];
+                // 候选拒绝[ProofIncomplete:Binding]：同块 scratch 准备、未读初值、合流或跨 CLOSE
+                // 不能证明分支前的可变身份；未读初始化仍由其原 owner 处理。
+                if previous_def.block == block
+                    || previous_def.reg != reg
+                    || dataflow.def_uses[previous.index()].is_empty()
+                    || fixed[def.index()] != TempId(def.index())
+                    || fixed[previous.index()] != TempId(previous.index())
+                    || dataflow.use_value(InstrRef(index), reg) != SsaValue::Def(def)
+                    || epochs.epoch_at(reg, previous_def.instr) != epochs.epoch_at(reg, site)
+                {
+                    return None;
+                }
+                Some((TempId(def.index()), TempId(previous.index())))
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(frame) = frame {
+            writes.extend(frame);
+        }
+    }
+    writes
+}
 
 /// Luau 参数在整个 proto 中保持原值时，透明 MOVE 链可提供稳定的值身份。
 /// 每一跳都排除引用捕获；仅检查链首参数会漏掉中间 cell 被回调改写的情况。
@@ -75,6 +207,17 @@ pub(super) fn collect_readonly_parameter_copies(
         .collect()
 }
 
+/// 并列赋值尾项的原值或数值运算身份。
+#[derive(Debug, Clone)]
+pub(in crate::hir) enum ScalarPairTail {
+    Value(HirExpr),
+    /// 原封闭数值运算及其输入准备槽；当前表达式仍须消费逐操作数来源证明。
+    Binary {
+        instruction: InstrRef,
+        input: HomeSlotKey,
+    },
+}
+
 /// 首项在高槽准备字面量或旧值快照，再按原逆序写回两项目标。
 #[derive(Debug, Clone)]
 pub(in crate::hir) struct ScalarPairFrame {
@@ -82,93 +225,8 @@ pub(in crate::hir) struct ScalarPairFrame {
     pub(in crate::hir) homes: [HomeSlotKey; 3],
     pub(super) copied_input: Option<(HirBinding, HomeSlotKey)>,
     pub(in crate::hir) literal_input: Option<HirExpr>,
-    pub(in crate::hir) tail: HirExpr,
+    pub(in crate::hir) tail: ScalarPairTail,
     pub(super) copied_tail: Option<(HirBinding, HomeSlotKey)>,
-}
-
-/// 相邻 RHS 准备包含末项分配，完成后才逆序写回低槽；捕获 cell 的发布时点属于整个事务。
-#[derive(Debug, Clone)]
-pub(in crate::hir) struct AllocationPairFrame {
-    pub(in crate::hir) sites: [InstrRef; 2],
-    pub(in crate::hir) values: [TempId; 2],
-    pub(in crate::hir) writes: [ParallelWrite; 2],
-    pub(in crate::hir) homes: [HomeSlotKey; 2],
-    pub(in crate::hir) literal_input: Option<HirExpr>,
-    pub(in crate::hir) copied_input: Option<(TempId, HomeSlotKey)>,
-}
-
-pub(super) fn collect_allocation_pairs(
-    proto: &LoweredProto,
-    dialect: crate::decompile::DecompileDialect,
-    cfg: &Cfg,
-    dataflow: &DataflowFacts,
-    epochs: &SlotEpochFacts,
-    fixed_temps: &[TempId],
-    phi_temps: &[TempId],
-) -> BTreeMap<InstrRef, AllocationPairFrame> {
-    proto.instrs.windows(3).enumerate().filter_map(|(index, window)| {
-        let [first, LowInstr::NewTable(second), third] = window else {
-            return None;
-        };
-        let first_site = InstrRef(index);
-        let (first_reg, literal_input, copied_input) = match first {
-            LowInstr::NewTable(first) => (first.dst, None, None),
-            LowInstr::Move(first) if first.src < first.dst
-                && !epochs.reference_capture_may_be_open(first.src, first_site) => {
-                let input = canonical_value_temp(dataflow.use_value(first_site, first.src),
-                    dataflow.defs.len(), fixed_temps, phi_temps)?;
-                (first.dst, None, Some((input,
-                    HomeSlotKey::new(first.src.index(), epochs.epoch_at(first.src, first_site)))))
-            }
-            _ => {
-                let (reg, value) = scalar_literal(proto, first)?;
-                (reg, Some(value), None)
-            }
-        };
-        let (left, right, end) = match (third, proto.instrs.get(index + 3)) {
-            (LowInstr::Move(left), _) if dialect == crate::decompile::DecompileDialect::Luajit
-                && second.dst.index() < first_reg.index() => (left, None, index + 2),
-            (LowInstr::Move(right), Some(LowInstr::Move(left)))
-                if second.dst.index() == first_reg.index() + 1 && right.src == second.dst =>
-                (left, Some(right), index + 3),
-            _ => return None,
-        };
-        let right_dst = right.map_or(second.dst, |copy| copy.dst);
-        if left.src != first_reg || left.dst.index() >= first_reg.index()
-            || right_dst.index() >= first_reg.index() || left.dst == right_dst
-            || cfg.instr_to_block[index] != cfg.instr_to_block[end]
-        {
-            return None;
-        }
-        let sites = [InstrRef(index), InstrRef(index + 1)];
-        let mut values = [TempId(0); 2];
-        let mut homes = [HomeSlotKey::new(0, 0); 2];
-        let mut writes = Vec::with_capacity(2);
-        for (offset, (reg, copy)) in [(first_reg, Some(left)), (second.dst, right)].into_iter().enumerate() {
-            let site = sites[offset];
-            let def = dataflow.instr_def_for_reg(site, reg)?;
-            values[offset] = TempId(def.index());
-            homes[offset] = HomeSlotKey::new(reg.index(), epochs.epoch_at(reg, site));
-            let (target, home) = if let Some(copy) = copy {
-                let write_site = InstrRef(end - offset);
-                if epochs.reference_capture_may_be_open(reg, site)
-                    || epochs.epoch_at(reg, site) != epochs.epoch_at(reg, write_site)
-                    || dataflow.use_value(write_site, reg) != SsaValue::Def(def)
-                    || !dataflow.def_phi_uses[def.index()].is_empty()
-                    || !matches!(dataflow.def_uses[def.index()].as_slice(), [use_] if use_.instr == write_site)
-                {
-                    return None;
-                }
-                (TempId(dataflow.instr_def_for_reg(write_site, copy.dst)?.index()),
-                    HomeSlotKey::new(copy.dst.index(), epochs.epoch_at(copy.dst, write_site)))
-            } else {
-                // JIT 末项直接分配到已有低槽；没有提前发布任何前项，也没有额外 COPY。
-                (values[offset], homes[offset])
-            };
-            writes.push(ParallelWrite { target, source: values[offset], home });
-        }
-        Some((sites[1], AllocationPairFrame { sites, values, writes: writes.try_into().ok()?, homes, literal_input, copied_input }))
-    }).collect()
 }
 
 pub(super) fn collect_scalar_pairs(
@@ -187,20 +245,8 @@ pub(super) fn collect_scalar_pairs(
             .map(HirBinding::Temp),
     };
     proto.instrs.windows(3).enumerate().filter_map(|(index, window)| {
-        let [first, second, LowInstr::Move(last)] = window else {
+        let [first, second, third] = window else {
             return None;
-        };
-        let second_site = InstrRef(index + 1);
-        let (mut second_reg, tail, copied_tail) = if let LowInstr::Move(copy) = second {
-            if copy.src == last.src || epochs.reference_capture_may_be_open(copy.src, second_site) {
-                return None;
-            }
-            let input = binding(dataflow.use_value(second_site, copy.src))?;
-            (copy.dst, input.expr(), Some((input,
-                HomeSlotKey::new(copy.src.index(), epochs.epoch_at(copy.src, second_site)))))
-        } else {
-            let (reg, value) = scalar_literal(proto, second)?;
-            (reg, value, None)
         };
         let first_site = InstrRef(index);
         let (snapshot_reg, copied_input, literal_input) = match first {
@@ -214,9 +260,29 @@ pub(super) fn collect_scalar_pairs(
                 (reg, None, Some(value))
             },
         };
-        let mut last = last;
+        let (mut second_reg, tail, copied_tail, second_site, mut last_site) =
+            if let Some((reg, instruction, input)) = scalar_pair_binary_tail(
+                proto, dataflow, epochs, fixed_temps, index, snapshot_reg,
+            ) {
+                (reg, ScalarPairTail::Binary { instruction, input }, None, instruction, InstrRef(instruction.index() + 1))
+            } else {
+                let LowInstr::Move(last) = third else { return None; };
+                let second_site = InstrRef(index + 1);
+                let (reg, value, copied) = if let LowInstr::Move(copy) = second {
+                    if copy.src == last.src || epochs.reference_capture_may_be_open(copy.src, second_site) {
+                        return None;
+                    }
+                    let input = binding(dataflow.use_value(second_site, copy.src))?;
+                    (copy.dst, input.expr(), Some((input,
+                        HomeSlotKey::new(copy.src.index(), epochs.epoch_at(copy.src, second_site)))))
+                } else {
+                    let (reg, value) = scalar_literal(proto, second)?;
+                    (reg, value, None)
+                };
+                (reg, ScalarPairTail::Value(value), copied, second_site, InstrRef(index + 2))
+            };
+        let LowInstr::Move(mut last) = proto.instrs[last_site.index()] else { return None; };
         let mut second_write = second_site;
-        let mut last_site = InstrRef(index + 2);
         if second_reg.index() >= snapshot_reg.index() {
             let Some(LowInstr::Move(final_write)) = proto.instrs.get(index + 3) else { return None; };
             let literal = dataflow.instr_def_for_reg(second_site, second_reg)?;
@@ -238,7 +304,7 @@ pub(super) fn collect_scalar_pairs(
             second_reg = last.dst;
             second_write = last_site;
             last_site = InstrRef(index + 3);
-            last = final_write;
+            last = *final_write;
         }
         if last.src != snapshot_reg
             || last.dst.index() >= last.src.index()
@@ -274,6 +340,75 @@ pub(super) fn collect_scalar_pairs(
     }).collect()
 }
 
+/// 两个数值操作数至多占两个相邻准备槽；窗口有固定上界，不从每个 COPY 回扫前缀。
+fn scalar_pair_binary_tail(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+    fixed: &[TempId],
+    first: usize,
+    snapshot: Reg,
+) -> Option<(Reg, InstrRef, HomeSlotKey)> {
+    use crate::parser::RawLiteralConst;
+    use crate::transformer::ValueOperand;
+    let mut prepared = Vec::new();
+    for offset in 0..=2 {
+        let site = InstrRef(first + offset + 1);
+        let instr = proto.instrs.get(site.index())?;
+        if let LowInstr::BinaryOp(binary) = instr {
+            if binary.dst >= snapshot {
+                return None;
+            }
+            let numeric = |operand| match operand {
+                ValueOperand::Integer(_) => true,
+                ValueOperand::Const(constant) => matches!(
+                    proto.constants[constant.index()],
+                    RawLiteralConst::Integer(_) | RawLiteralConst::Number(_)
+                ),
+                ValueOperand::Reg(reg) => prepared.iter().any(|&(input, def)| {
+                    reg == input && dataflow.use_value(site, reg) == SsaValue::Def(def)
+                }),
+                _ => false,
+            };
+            if !numeric(binary.lhs)
+                || !numeric(binary.rhs)
+                || prepared.iter().any(|&(reg, def)| {
+                    dataflow.def_uses[def.index()].is_empty()
+                        || dataflow.def_uses[def.index()]
+                            .iter()
+                            .any(|use_| use_.instr != site)
+                        || !dataflow.def_phi_uses[def.index()].is_empty()
+                        || epochs.reference_capture_may_be_open(reg, site)
+                        || epochs.epoch_at(reg, dataflow.def_instr(def))
+                            != epochs.epoch_at(reg, site)
+                })
+            {
+                return None;
+            }
+            let input = Reg(snapshot.index() + 1);
+            return Some((
+                binary.dst,
+                site,
+                HomeSlotKey::new(input.index(), epochs.epoch_at(input, site)),
+            ));
+        }
+        let (reg, value) = scalar_literal(proto, instr)?;
+        if reg.index() != snapshot.index() + offset + 1
+            || !matches!(value, HirExpr::Integer(_) | HirExpr::Number(_))
+        {
+            return None;
+        }
+        let def = dataflow.instr_def_for_reg(site, reg)?;
+        if fixed[def.index()] != TempId(def.index())
+            || epochs.reference_capture_may_be_open(reg, site)
+        {
+            return None;
+        }
+        prepared.push((reg, def));
+    }
+    None
+}
+
 pub(super) fn scalar_literal(proto: &LoweredProto, instr: &LowInstr) -> Option<(Reg, HirExpr)> {
     match instr {
         LowInstr::LoadNil(load) if load.dst.len == 1 => Some((load.dst.start, HirExpr::Nil)),
@@ -283,6 +418,8 @@ pub(super) fn scalar_literal(proto: &LoweredProto, instr: &LowInstr) -> Option<(
         LowInstr::LoadConst(load) => {
             use crate::parser::RawLiteralConst;
             let value = match &proto.constants[load.value.index()] {
+                RawLiteralConst::Nil => HirExpr::Nil,
+                RawLiteralConst::Boolean(value) => HirExpr::Boolean(*value),
                 RawLiteralConst::Integer(value) => HirExpr::Integer(*value),
                 RawLiteralConst::Number(value) => HirExpr::Number(*value),
                 RawLiteralConst::String(value) => {

@@ -884,7 +884,9 @@ pub(super) fn build(
     )?;
     let equal_loop_changed =
         normalize_equal_loop_retry_guards(graph_facts, &mut input, &equal_loop_nestings)?;
-    if unknown_loop_changed || equal_loop_changed {
+    let escape_changed =
+        normalize_loop_escape_conditions(cfg, graph_facts, &mut input, &loop_partitions);
+    if unknown_loop_changed || equal_loop_changed || escape_changed {
         loop_partitions =
             build_loop_partitions(proto, cfg, graph_facts, caps, &input, &partition_context)?;
         loop_container_blocks = loop_container_domains(cfg, &loop_partitions);
@@ -1075,6 +1077,8 @@ struct EdgeSemantics {
     loops: LoopQueryIndex,
     forward_routes: ForwardRouteBuilder,
     early_continues: Vec<bool>,
+    /// 已由控制条件及最近循环 owner 证明；自然布局不覆盖显式 transfer。
+    semantic_continues: Vec<bool>,
     internal_transitions: Vec<Option<RegionId>>,
     preheader_edges: Vec<bool>,
     for_syntax_edges: Vec<bool>,

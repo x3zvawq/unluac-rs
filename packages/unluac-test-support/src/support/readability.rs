@@ -71,12 +71,13 @@ pub(super) fn read_readability_assertions(
         if selector.proto.is_some()
             && !directive.starts_with("expect-ast-")
             && directive != "expect-name"
+            && directive != "expect-instruction-count"
         {
             return Err(readability_parse_failure(
                 source_relative,
                 line_no,
                 format!(
-                    "{directive} cannot use @proto; proto scopes require expect-ast-* or expect-name"
+                    "{directive} cannot use @proto; proto scopes require expect-ast-*, expect-name or expect-instruction-count"
                 ),
             ));
         }
@@ -86,11 +87,14 @@ pub(super) fn read_readability_assertions(
                 let operation = match args[0].as_str() {
                     "not" => InstructionOperation::Not,
                     "call" => InstructionOperation::Call,
+                    "branch" => InstructionOperation::Branch,
+                    "add" => InstructionOperation::Add,
+                    "sub" => InstructionOperation::Sub,
                     _ => {
                         return Err(readability_parse_failure(
                             source_relative,
                             line_no,
-                            "expect-instruction-count supports not and call operations",
+                            "expect-instruction-count supports not, call, branch, add and sub operations",
                         ));
                     }
                 };
@@ -745,11 +749,11 @@ pub(super) fn assert_instruction_contracts(
                 line,
                 operation,
                 expected,
-                ..
+                selector,
             } = assertion
                 && assertion_selector_matches(assertion, entry)
             {
-                Some((*line, operation, *expected))
+                Some((*line, operation, *expected, selector.proto))
             } else {
                 None
             }
@@ -758,28 +762,66 @@ pub(super) fn assert_instruction_contracts(
     if expected.is_empty() {
         return Ok(());
     }
-    let mut counts = [0usize; 2];
+    let mut total = [0usize; 5];
+    let mut scoped = Vec::new();
     let mut pending = vec![&lowered.main];
     while let Some(proto) = pending.pop() {
+        let mut counts = [0usize; 5];
         for instr in &proto.instrs {
             match instr {
                 LowInstr::UnaryOp(unary) if unary.op == unluac::transformer::UnaryOpKind::Not => {
                     counts[0] += 1
                 }
                 LowInstr::Call(_) => counts[1] += 1,
+                LowInstr::Branch(_) => counts[2] += 1,
+                LowInstr::BinaryOp(binary)
+                    if binary.op == unluac::transformer::BinaryOpKind::Add =>
+                {
+                    counts[3] += 1
+                }
+                LowInstr::BinaryOp(binary)
+                    if binary.op == unluac::transformer::BinaryOpKind::Sub =>
+                {
+                    counts[4] += 1
+                }
                 _ => {}
             }
         }
-        pending.extend(proto.children.iter().map(AsRef::as_ref));
+        for (total, count) in total.iter_mut().zip(counts) {
+            *total += count;
+        }
+        scoped.push(counts);
+        // 编译树按父先子后深度优先编号；不借用可能插入合成函数的最终 AST arena。
+        pending.extend(proto.children.iter().rev().map(AsRef::as_ref));
     }
-    for (line, operation, expected) in expected {
+    for (line, operation, expected, proto) in expected {
+        let (counts, scope) = if let Some(proto) = proto {
+            let Some(counts) = scoped.get(proto) else {
+                return Err(TestFailure::new(
+                    FailureKind::ReadabilityAssertionFailed,
+                    format!(
+                        "[{stage}] instruction assertion at source line {line}: proto#{proto} does not exist"
+                    ),
+                    format!(
+                        "{}: instruction scope proto#{proto} does not exist",
+                        entry.path
+                    ),
+                ));
+            };
+            (counts, format!("proto#{proto}"))
+        } else {
+            (&total, "full module".to_owned())
+        };
         let (count, name) = match operation {
             InstructionOperation::Not => (counts[0], "NOT"),
             InstructionOperation::Call => (counts[1], "CALL"),
+            InstructionOperation::Branch => (counts[2], "BRANCH"),
+            InstructionOperation::Add => (counts[3], "ADD"),
+            InstructionOperation::Sub => (counts[4], "SUB"),
         };
         if count != expected {
             let summary = format!(
-                "[{stage}] instruction assertion failed at source line {line}: expected {expected} {name} operations, got {count}"
+                "[{stage}] instruction assertion failed at source line {line}: expected {expected} {name} operations in {scope}, got {count}"
             );
             return Err(TestFailure::new(
                 FailureKind::ReadabilityAssertionFailed,

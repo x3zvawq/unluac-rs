@@ -5,8 +5,8 @@
 mod branch_merge;
 mod entry_nil;
 pub(super) use entry_nil::restore_entry_frame;
+mod initializers;
 mod mapping;
-mod nil_initializers;
 mod param_alias;
 mod rewrite;
 mod root_scopes;
@@ -32,7 +32,7 @@ use crate::hir::common::{
     HirLValue, HirLocalDecl, HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
-use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts, UnreadLiteralSlot};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PromotionStage {
@@ -52,7 +52,7 @@ pub(super) fn restore_remaining_initializers(
     for stmt in &proto.body.stmts {
         crate::hir::visit::visit_stmt_structure(stmt, &mut |stmt| {
             pending |= stmt.scalar_temp_assignment().is_some_and(|(temp, value)| {
-                facts.is_unread_literal_initializer(temp)
+                facts.unread_literal_initializer(temp).is_some()
                     && matches!(
                         value,
                         HirExpr::Boolean(_)
@@ -86,6 +86,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let inert_releases_changed =
         super::root_lifetimes::remove_inert_value_releases(proto, safety, dialect);
     let seed_split_changed = super::walk::rewrite_proto(proto, &mut MixedCarrierSeeds { facts });
+    let entry_initializers_changed = initializers::restore_single_pass_entries(proto, facts);
     // 定义数和根块实际绑定压力须同时超限；单纯 SSA 版本多不证明源码局部槽不足。
     // 无 debug 身份时才允许同 home/epoch 复用，避免把源码声明压成同一绑定。
     let compact_home_slots = hir_block_local_pressure(&proto.body) > crate::SOURCE_LOCAL_LIMIT
@@ -257,9 +258,8 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     proto.physical_root_locals.extend(physical_root_locals);
     let coalesced_releases_changed =
         super::root_lifetimes::remove_coalesced_root_releases(proto, facts);
-    let nil_initializers_changed =
-        super::source_frames::restore_split_nil_declarations(proto, facts)
-            | nil_initializers::restore(proto, facts);
+    let initializers_changed = super::source_frames::restore_split_nil_declarations(proto, facts)
+        | initializers::restore(proto, facts);
     let entry_nil_changed = entry_nil::prune_redundant_entry_nil_writes(proto, facts, safety);
     let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts, safety);
     result.changed
@@ -269,9 +269,10 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         || entry_nil_changed
         || alias_changed
         || seed_split_changed
+        || entry_initializers_changed
         || root_scopes_changed
         || parameter_phis_changed
-        || nil_initializers_changed
+        || initializers_changed
 }
 
 struct MixedCarrierSeeds<'a> {
@@ -1888,21 +1889,40 @@ fn collect_plans(
                     let previous = facts
                         .scalar_load_predecessor(root_temp, value)
                         .or_else(|| facts.selection_predecessor(root_temp, ctx.dialect, value))?;
-                    let local = *planned.bindings.get(&previous)?;
+                    let local = planned
+                        .bindings
+                        .get(&previous)
+                        .or_else(|| inherited.get(&previous))
+                        .copied()
+                        .or_else(|| facts.promoted_local_for_temp(previous))?;
+                    let inherited_owner = (inherited.get(&previous) == Some(&local)
+                        || facts.promoted_local_for_temp(previous) == Some(local))
+                        && facts.is_parallel_target_seed(previous)
+                        && inherited_mapping.reusable_home(local, ctx) == Some(home);
+                    let previous_finished = planned
+                        .last_touches
+                        .get(&local)
+                        .map(|last| *last < decl_index)
+                        .unwrap_or_else(|| {
+                            // 父域声明沿原覆盖前驱接回；本分支正文和尾条件都不能再读旧版本。
+                            inherited_owner
+                                && !event_block.has_read_from(previous, decl_index)
+                                && !event_block.has_local_read_from(local, decl_index)
+                                && !trailing_reads.contains_key(&previous)
+                        });
                     // 原常量写或已证明的条件双臂仍在原位覆盖同一 home/epoch；旧匿名版本已无后续需求。
                     // 不把新的 debug/capture 身份合并，也不从相同槽号猜测覆盖前驱。
                     (!has_label_flow
-                        && current_slot_locals.get(&home) == Some(&local)
+                        && current_slot_locals
+                            .get(&home)
+                            .map_or(inherited_owner, |owner| *owner == local)
                         && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
                         && debug_scope_for_temp_group(temp_debug_scopes, &group).is_none()
                         && group
                             .iter()
                             .all(|temp| !ctx.identity_sensitive_temps.contains(temp))
-                        && planned
-                            .last_touches
-                            .get(&local)
-                            .is_some_and(|last| *last < decl_index))
-                    .then_some(local)
+                        && previous_finished)
+                        .then_some(local)
                 })
                 .or_else(|| {
                     if has_label_flow
@@ -2203,7 +2223,14 @@ fn collect_plans(
             && !read_by_condition
             && touching_stmt_indices.is_empty()
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
-            && facts.is_unread_literal_initializer(root_temp)
+            && facts
+                .unread_literal_initializer(root_temp)
+                .is_some_and(|origin| {
+                    origin == UnreadLiteralSlot::Entry
+                        || reusable_local.is_none()
+                            && home_slot
+                                .is_some_and(|home| !current_slot_locals.contains_key(&home))
+                })
             && matches!(
                 single_temp_assign_value(stmt, root_temp),
                 Some(
@@ -3389,7 +3416,11 @@ fn rewrite_stmt(
     match stmt {
         HirStmt::LocalRootRelease(_) => false,
         HirStmt::LocalDecl(local_decl) => {
-            rewrite::value_pack(&mut local_decl.values, mapping.bindings())
+            let changed = rewrite::value_pack(&mut local_decl.values, mapping.bindings());
+            for &local in &local_decl.bindings {
+                mapping.declare(local, ctx);
+            }
+            changed
         }
         HirStmt::GlobalDecl(global_decl) => {
             rewrite::value_pack(&mut global_decl.values, mapping.bindings())

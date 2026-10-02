@@ -115,6 +115,7 @@ impl EdgeSemantics {
             loops,
             forward_routes: ForwardRouteBuilder::new(cfg.edges.len(), arena.regions.len()),
             early_continues: vec![false; cfg.edges.len()],
+            semantic_continues: vec![false; cfg.edges.len()],
             internal_transitions: vec![None; cfg.edges.len()],
             preheader_edges: vec![false; cfg.edges.len()],
             for_syntax_edges: vec![false; cfg.edges.len()],
@@ -388,11 +389,10 @@ impl EdgeSemantics {
                             && reaches_target
                             && explicit_continue
                             && (bypasses_body
-                                || (loop_.continue_edges.contains(edge)
-                                    || input.loops[id.index()]
-                                        .semantic_continue_edges
-                                        .contains(edge))
-                                    && source_edges.len() == 1)
+                                || input.loops[id.index()]
+                                    .semantic_continue_edges
+                                    .contains(edge)
+                                || loop_.continue_edges.contains(edge) && source_edges.len() == 1)
                         {
                             if let Some(route) = forwarding_route {
                                 let installed =
@@ -462,6 +462,9 @@ impl EdgeSemantics {
                             }
                             semantics.continues[edge.index()] = Some(region);
                             semantics.early_continues[edge.index()] = true;
+                            semantics.semantic_continues[edge.index()] = input.loops[id.index()]
+                                .semantic_continue_edges
+                                .contains(edge);
                         }
                     }
                     // 残余 continue 的入口本身不属于前面的 early-continue 候选；但它若
@@ -564,6 +567,7 @@ impl EdgeSemantics {
                                         | crate::structure::LoopKindHint::NumericForLike
                                         | crate::structure::LoopKindHint::GenericForLike
                                 ) && semantics.continues[edge.index()] == Some(region)
+                                    && !semantics.semantic_continues[edge.index()]
                                 {
                                     semantics.continues[edge.index()] = None;
                                     semantics.early_continues[edge.index()] = false;
@@ -788,6 +792,7 @@ impl EdgeSemantics {
             && !self.is_nested_loop_exit_to_ancestor(edge_ref, edge.from, region)
             && !self.exits_nested_loop_before_continue(cfg, edge_ref, edge.from, region)
             && (!self.layout_edges[edge_ref.index()].natural
+                || self.semantic_continues[edge_ref.index()]
                 || self.loops.control_by_block[edge.to.index()] == Some(region))
         {
             // 显式 continue 可以同时是物理 backedge；语义 transfer 必须先于
@@ -967,6 +972,7 @@ impl EdgeSemantics {
             && !self.is_nested_loop_exit_to_ancestor(edge_ref, edge.from, region)
             && !self.exits_nested_loop_before_continue(cfg, edge_ref, edge.from, region)
             && (!self.layout_edges[edge_ref.index()].natural
+                || self.semantic_continues[edge_ref.index()]
                 || self.loops.control_by_block[edge.to.index()] == Some(region))
         {
             if caps.continue_stmt {

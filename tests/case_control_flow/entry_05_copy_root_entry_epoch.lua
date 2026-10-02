@@ -4,6 +4,8 @@
 -- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
 -- reset、copy 与一个跨轮 holder；源码作用域交接不能逐轮增加匿名副本。
 -- unluac: expect-ast-max [[local-binding]] [[3]] [[@debug=retained]] [[@proto=1]]
+-- 去掉 debug 身份后只需 reset 与一个跨轮 holder，不能另增同槽的 copy 接棒。
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@debug=stripped]] [[@proto=1]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[unresolved]]
 local function run(owner, done)

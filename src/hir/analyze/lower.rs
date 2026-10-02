@@ -671,6 +671,13 @@ fn lower_proto_one(
         &bindings,
         &mut promotion_facts,
     );
+    // 循环可见 binding 的 phi 已由原协议分配；原值查询也必须保留该身份，
+    // 不能只留下 home，再让完整调用帧按槽号猜测读取的是哪个循环变量。
+    for (phi, local) in bindings.for_binding_phi_locals.iter().enumerate() {
+        if let Some(local) = local {
+            promotion_facts.record_temp_local_binding(bindings.phi_temps[phi], *local);
+        }
+    }
     promotion_facts.record_binary_local_inputs(proto.instrs.iter().enumerate().filter_map(
         |(index, instr)| {
             let LowInstr::Branch(branch) = instr else {
@@ -786,6 +793,12 @@ fn lower_proto_one(
     }
     let children = lowering.hir_children();
     let mut inline_dispositions = crate::hir::common::HirInlineDispositions::default();
+    for temp in promotion_facts.return_writeback_temps() {
+        inline_dispositions.preserve_temp(
+            temp,
+            crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix,
+        );
+    }
     if let Some(local) = lexical_environment_local {
         inline_dispositions.preserve_local(
             local,
@@ -835,6 +848,8 @@ fn lower_proto_one(
                 capture: None,
                 occurrences,
                 result_frame_slots: BTreeMap::new(),
+                callable_arguments: Default::default(),
+                nil_guards: Default::default(),
             });
     }
     for (index, composite) in lowering
@@ -883,6 +898,8 @@ fn lower_proto_one(
                         }
                     },
                     capture: None,
+                    callable_arguments: BTreeMap::new(),
+                    nil_guards: Default::default(),
                     result_frame_slots: event
                         .calls
                         .keys()

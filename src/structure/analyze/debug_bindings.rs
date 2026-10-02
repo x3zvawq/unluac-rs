@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::structure::{DebugBindingValue, SsaValue, StructurePlan};
+use crate::transformer::Reg;
 
 /// 将源码 local 的生命周期入口锚定到其初始化身份。
 ///
@@ -84,6 +85,7 @@ pub(super) fn analyze_debug_bindings(
 
     let mut facts = DebugBindingFacts {
         by_scope: vec![None; proto.debug_locals.len()],
+        readonly_views: vec![None; proto.debug_locals.len()],
         ..Default::default()
     };
     for (value, scopes) in by_value {
@@ -102,6 +104,27 @@ pub(super) fn analyze_debug_bindings(
             if coincident.is_some() {
                 for &alias in &scopes {
                     facts.by_scope[alias] = Some(facts.accepted.len());
+                }
+            }
+            for &alias in &scopes {
+                let view = &proto.debug_locals[alias];
+                if alias == scope || view.start_pc >= view.end_pc {
+                    continue;
+                }
+                let Some(start) = proto.lowering_map.low_instr_at_or_after_pc(view.start_pc) else {
+                    continue;
+                };
+                let end = proto
+                    .lowering_map
+                    .low_instr_at_or_after_pc(view.end_pc)
+                    .map_or(proto.instrs.len(), |site| site.index());
+                if !dataflow.reg_is_reference_captured(view.reg)
+                    && dataflow
+                        .first_must_write_in_range(view.reg, start.index()..end)
+                        .is_none()
+                {
+                    // 入口 SSA 与外层 owner 已由同一组证明；只读视图不能取得初始化所有权。
+                    facts.readonly_views[alias] = Some(facts.accepted.len());
                 }
             }
             facts.accepted.push(DebugBindingFact {
@@ -139,7 +162,109 @@ pub(super) fn analyze_debug_bindings(
             facts.conflicts.push(DebugBindingConflict { value, scopes });
         }
     }
+    add_unread_views(proto, cfg, graph, dataflow, &mut facts);
     facts
+}
+
+/// 死值没有稀疏 SSA 入口快照；初始化支配子树内无后继覆盖时可证明只读别名。
+fn add_unread_views(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    dataflow: &DataflowFacts,
+    facts: &mut DebugBindingFacts,
+) {
+    // 每块只汇总一次开放写入和 caller-frame 边界。支配子树外的路径若要重新
+    // 到达视图，必经 initializer；同块回边也会重新执行 initializer。
+    let mut clobber = vec![usize::MAX; cfg.blocks.len()];
+    let mut descendants = clobber.clone();
+    for &block in graph.dominator_tree.order.iter().rev() {
+        let range = cfg.blocks[block.index()].instrs;
+        let children = graph.dominator_tree.children[block.index()]
+            .iter()
+            .map(|child| clobber[child.index()])
+            .min()
+            .unwrap_or(usize::MAX);
+        descendants[block.index()] = children;
+        let open = dataflow.instr_effects[range.start.index()..range.end()]
+            .iter()
+            .filter_map(|effect| effect.open_must_def)
+            .map(|reg| reg.index())
+            .min()
+            .unwrap_or(usize::MAX);
+        clobber[block.index()] = children.min(open).min(
+            dataflow
+                .minimum_rooted_prefix(range.start.index()..range.end())
+                .unwrap_or(usize::MAX),
+        );
+    }
+    // 在支配树序上按寄存器索引定义；其它循环复用同槽不影响本次初始化。
+    // 子树外进入任一后代都必经定义块，块内后缀另行检查，故回边不能带入旧版本。
+    let mut definitions = BTreeMap::<Reg, Vec<usize>>::new();
+    for &block in &graph.dominator_tree.order {
+        let position = graph.dominator_tree.preorder_index[block.index()].unwrap();
+        let range = cfg.blocks[block.index()].instrs;
+        for instruction in range.start.index()..range.end() {
+            for &reg in dataflow.instr_effects[instruction].fixed_must_defs() {
+                definitions.entry(reg).or_default().push(position);
+            }
+        }
+    }
+    let mut owners = BTreeMap::new();
+    for (index, owner) in facts.accepted.iter().enumerate() {
+        let DebugBindingValue::Ssa(SsaValue::Def(def)) = owner.value else {
+            continue;
+        };
+        let block = dataflow.def_block(def);
+        let suffix = dataflow.def_instr(def).index() + 1..cfg.blocks[block.index()].instrs.end();
+        let Some(position) = graph.dominator_tree.preorder_index[block.index()] else {
+            continue;
+        };
+        let end = graph.dominator_tree.subtree_end[block.index()].unwrap();
+        let other_definitions = definitions.get(&owner.reg).is_some_and(|sites| {
+            sites.partition_point(|&site| site < end)
+                != sites.partition_point(|&site| site <= position)
+        });
+        if other_definitions
+            || dataflow.reg_is_reference_captured(owner.reg)
+            || descendants[block.index()] <= owner.reg.index()
+            || dataflow
+                .first_must_write_in_range(owner.reg, suffix.clone())
+                .is_some()
+            || dataflow
+                .minimum_rooted_prefix(suffix)
+                .is_some_and(|end| end <= owner.reg.index())
+        {
+            // 候选拒绝[ProofIncomplete:DebugView]：缺少无读取槽的完整 reaching 事实；
+            // 多定义、开放覆盖或 caller-frame 外的残值不能借 debug 名称猜成原绑定。
+            continue;
+        }
+        owners.insert(def, index);
+    }
+    for (scope, view) in proto.debug_locals.iter().enumerate() {
+        if !view.is_source() || facts.readonly_views[scope].is_some() {
+            continue;
+        }
+        let Some(start) = proto.lowering_map.low_instr_at_or_after_pc(view.start_pc) else {
+            continue;
+        };
+        let Some(def) = dataflow.last_fixed_def_in_range(view.reg, 0..start.index()) else {
+            continue;
+        };
+        let Some(&index) = owners.get(&def) else {
+            continue;
+        };
+        let owner = &facts.accepted[index];
+        if owner.scope != scope
+            && owner.start_pc <= view.start_pc
+            && view.start_pc < view.end_pc
+            && view.end_pc <= owner.end_pc
+            && dataflow.def_instr(def) < start
+            && graph.dominates(dataflow.def_block(def), cfg.instr_to_block[start.index()])
+        {
+            facts.readonly_views[scope] = Some(index);
+        }
+    }
 }
 
 /// 候选吸收和最终命名共用作用域入口的 SSA 归属，不以 producer 的活动区间猜初始化。

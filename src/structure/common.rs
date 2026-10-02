@@ -105,10 +105,20 @@ pub struct DebugBindingFacts {
     // 生产者按唯一初始化身份排序，后层只借用，不能破坏二分查询的不变量。
     pub(super) accepted: Vec<DebugBindingFact>,
     pub(super) by_scope: Vec<Option<usize>>,
+    /// 内嵌只读名称视图指向既有初始化 owner，不作为新的声明初始化发布。
+    pub(super) readonly_views: Vec<Option<usize>>,
     pub conflicts: Vec<DebugBindingConflict>,
 }
 
 impl DebugBindingFacts {
+    /// 返回内嵌只读视图的初始化 owner；视图本身不取得新的声明归属。
+    pub fn readonly_view(&self, scope: usize) -> Option<&DebugBindingFact> {
+        self.readonly_views
+            .get(scope)
+            .copied()
+            .flatten()
+            .map(|index| &self.accepted[index])
+    }
     /// 只读且区间重合的别名可共享同一事实；返回的 `scope` 是原表序优先的名称视图，
     /// 不一定等于查询索引，但初始化身份及生命周期相同。
     pub fn for_scope(&self, scope: usize) -> Option<&DebugBindingFact> {

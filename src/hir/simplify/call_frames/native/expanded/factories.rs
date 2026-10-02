@@ -547,3 +547,35 @@ pub(super) fn factory_call(
         boolean_prewrite_arguments: Vec::new(),
     }))
 }
+
+/// 固定双返回随其紧邻的两个低槽写回一起提交；调用者保证 tail 没有跨过控制边界。
+pub(super) fn pair_writeback(plan: &mut Plan, tail: [&HirStmt; 2], facts: &ProtoPromotionFacts) {
+    let [first, second] = plan.result_locals.as_slice() else {
+        return;
+    };
+    let [HirStmt::Assign(left), HirStmt::Assign(right)] = tail else {
+        return;
+    };
+    let ([HirLValue::Local(a)], [HirLValue::Local(b)]) =
+        (left.targets.as_slice(), right.targets.as_slice())
+    else {
+        return;
+    };
+    if left.values.fixed.as_slice() != [HirExpr::LocalRef(*first)]
+        || left.values.tail.is_some()
+        || right.values.fixed.as_slice() != [HirExpr::LocalRef(*second)]
+        || right.values.tail.is_some()
+        || a == b
+        || [a, b].iter().any(|local| {
+            facts
+                .trusted_local_home_slot(**local)
+                .is_none_or(|home| home.slot() >= plan.base.slot())
+        })
+    {
+        return;
+    }
+    plan.result_locals.clear();
+    plan.assignment_targets = vec![HirLValue::Local(*a), HirLValue::Local(*b)];
+    plan.sink += 2;
+    plan.removed = (plan.start..plan.sink).collect();
+}

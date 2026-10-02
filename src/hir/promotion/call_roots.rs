@@ -63,7 +63,7 @@ pub(super) struct NativeCallFacts {
     pub(super) fastcall_callee_before_copies: bool,
 }
 
-/// 普通 CALL 参数的最后一次 MOVE；两端 Def 与时点独立于已合并的展示 Local。
+/// CALL 参数的最后一次 MOVE；来源 Def/phi、目标 Def 与时点独立于已合并的展示 binding。
 #[derive(Debug, Clone, Copy)]
 pub(in crate::hir) struct NativeArgumentCopy {
     pub(in crate::hir) source: TempId,
@@ -284,13 +284,17 @@ pub(super) fn collect(
                         let LowInstr::Move(copy) = &proto.instrs[instruction.index()] else {
                             return None;
                         };
-                        let SsaValue::Def(source) = dataflow.use_value(instruction, copy.src)
-                        else {
-                            return None;
+                        let source = match dataflow.use_value(instruction, copy.src) {
+                            SsaValue::Def(source)
+                                if fixed_temps[source.index()] == TempId(source.index()) =>
+                            {
+                                TempId(source.index())
+                            }
+                            SsaValue::Phi(source) => phi_temps[source.index()],
+                            _ => return None,
                         };
                         if copy.dst != reg
                             || fixed_temps[target.index()] != TempId(target.index())
-                            || fixed_temps[source.index()] != TempId(source.index())
                             || cfg.instr_to_block[instruction.index()]
                                 != cfg.instr_to_block[call_ref.index()]
                             || epochs.reference_capture_may_be_open(copy.src, instruction)
@@ -301,7 +305,7 @@ pub(super) fn collect(
                         Some((
                             reg.index() - args_start.index(),
                             NativeArgumentCopy {
-                                source: TempId(source.index()),
+                                source,
                                 target: TempId(target.index()),
                                 source_home: HomeSlotKey::new(
                                     copy.src.index(),
@@ -888,7 +892,26 @@ pub(super) fn branch_prewrites(
     writes
 }
 
-/// 可达块入口的首条 MOVE 是显式结果写回；源 SSA 值须只有一个确定的目标及完整 home。
+/// 可达 MOVE 的原值身份，以及块入口专用的结果写回视图。
+#[derive(Debug, Clone, Default)]
+pub(super) struct ResultCopies {
+    pub unique: BTreeMap<TempId, ImmediateMoveWrite>,
+    pub by_site: BTreeMap<InstrRef, ImmediateMoveWrite>,
+    pub writes: Vec<ImmediateMoveWrite>,
+    pub state_writes: BTreeMap<TempId, StateCopy>,
+}
+
+/// COPY 保留原目标 Def 及其固定 binding 投影；source 是当前 carrier，producer 是独立原操作。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StateCopy {
+    pub site: InstrRef,
+    /// 目标可能并入旧循环 carrier，不能据此宣称原目标仍是独立 producer。
+    pub target_binding: TempId,
+    pub write: ImmediateMoveWrite,
+    pub producer: Option<InstrRef>,
+}
+
+/// 可达块入口的首条 MOVE 是显式结果写回；按源值的查询仍须只有一个确定目标。
 pub(super) fn value_result_copies(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -896,52 +919,105 @@ pub(super) fn value_result_copies(
     epochs: &SlotEpochFacts,
     fixed_temps: &[TempId],
     phi_temps: &[TempId],
-) -> BTreeMap<TempId, ImmediateMoveWrite> {
+) -> ResultCopies {
     let mut copies = BTreeMap::<TempId, Option<ImmediateMoveWrite>>::new();
+    let mut by_site = BTreeMap::new();
+    let mut writes = Vec::new();
+    let mut state_writes = BTreeMap::new();
     for (index, block) in cfg.blocks.iter().enumerate() {
         if block.instrs.is_empty() || !cfg.reachable_blocks.contains(&BlockRef(index)) {
             continue;
         }
-        let instr = block.instrs.start;
-        let Some(LowInstr::Move(copy)) = proto.instrs.get(instr.index()) else {
-            continue;
-        };
-        let value = dataflow.use_value(instr, copy.src);
-        let Some(result) = canonical_value_temp(value, fixed_temps.len(), fixed_temps, phi_temps)
-        else {
-            continue;
-        };
-        let [def] = dataflow.instr_defs[instr.index()].as_slice() else {
-            continue;
-        };
-        let Some(target) = canonical_value_temp(
-            SsaValue::Def(*def),
-            fixed_temps.len(),
-            fixed_temps,
-            phi_temps,
-        ) else {
-            continue;
-        };
-        let write = ImmediateMoveWrite {
-            source: Some(result),
-            target,
-            source_home: HomeSlotKey::new(copy.src.index(), epochs.epoch_at(copy.src, instr)),
-            target_home: HomeSlotKey::new(copy.dst.index(), epochs.epoch_at(copy.dst, instr)),
-        };
-        // 循环出口也可直接读取未更新的 Def；多个入口 COPY 不构成唯一写回证书。
-        copies
-            .entry(result)
-            .and_modify(|old| {
-                if *old != Some(write) {
-                    *old = None;
+        for offset in block.instrs.start.index()..block.instrs.end() {
+            let instr = InstrRef(offset);
+            let Some(LowInstr::Move(copy)) = proto.instrs.get(instr.index()) else {
+                continue;
+            };
+            let value = dataflow.use_value(instr, copy.src);
+            if let [target] = dataflow.instr_defs[instr.index()].as_slice()
+                && !epochs.reference_capture_may_be_open(copy.src, instr)
+                && !epochs.reference_capture_may_be_open(copy.dst, instr)
+            {
+                let source = match value {
+                    SsaValue::Def(def) => {
+                        Some((fixed_temps[def.index()], Some(dataflow.def_instr(def))))
+                    }
+                    SsaValue::Phi(phi) => Some((phi_temps[phi.index()], None)),
+                    _ => None,
+                };
+                if let Some((source, producer)) = source {
+                    state_writes.insert(
+                        TempId(target.index()),
+                        StateCopy {
+                            site: instr,
+                            target_binding: fixed_temps[target.index()],
+                            write: ImmediateMoveWrite {
+                                source: Some(source),
+                                target: TempId(target.index()),
+                                source_home: HomeSlotKey::new(
+                                    copy.src.index(),
+                                    epochs.epoch_at(copy.src, instr),
+                                ),
+                                target_home: HomeSlotKey::new(
+                                    copy.dst.index(),
+                                    epochs.epoch_at(copy.dst, instr),
+                                ),
+                            },
+                            producer,
+                        },
+                    );
                 }
-            })
-            .or_insert(Some(write));
+            }
+            let Some(result) =
+                canonical_value_temp(value, fixed_temps.len(), fixed_temps, phi_temps)
+            else {
+                continue;
+            };
+            let [def] = dataflow.instr_defs[instr.index()].as_slice() else {
+                continue;
+            };
+            let Some(target) = canonical_value_temp(
+                SsaValue::Def(*def),
+                fixed_temps.len(),
+                fixed_temps,
+                phi_temps,
+            ) else {
+                continue;
+            };
+            let write = ImmediateMoveWrite {
+                source: Some(result),
+                target,
+                source_home: HomeSlotKey::new(copy.src.index(), epochs.epoch_at(copy.src, instr)),
+                target_home: HomeSlotKey::new(copy.dst.index(), epochs.epoch_at(copy.dst, instr)),
+            };
+            writes.push(write);
+            // 直线展开可在回编译后失去多余跳转；COPY 身份不依赖块入口。
+            // 旧结果合流查询仍只消费入口 MOVE，不能扩大其唯一写回合同。
+            if instr != block.instrs.start {
+                continue;
+            }
+            by_site.insert(instr, write);
+            // 循环出口也可直接读取未更新的 Def；多个入口 COPY 不构成唯一写回证书。
+            copies
+                .entry(result)
+                .and_modify(|old| {
+                    if *old != Some(write) {
+                        *old = None;
+                    }
+                })
+                .or_insert(Some(write));
+        }
     }
-    copies
+    let unique = copies
         .into_iter()
         .filter_map(|(result, copy)| Some((result, copy?)))
-        .collect()
+        .collect();
+    ResultCopies {
+        unique,
+        by_site,
+        writes,
+        state_writes,
+    }
 }
 
 /// 值决策入口的 MOVE 与结果 phi 同槽；后层必须连同完整短路值树重发这次准备。

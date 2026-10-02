@@ -1,6 +1,71 @@
-//! effectful unknown-loop 条件的结构归一化。输入 loop partition 与 branch evidence，输出可冻结的 guard/body 边界；不负责后层 HIR 兜底。
+//! 循环退出条件的结构归一化。消费 loop partition 与 branch evidence，发布 guard/body 边界。
 
 use super::*;
+
+/// 完整短路条件的一个出口直接离开本循环时，另一出口是正文 continuation。
+/// 原始首分支的 local join 不能把这段正文包进额外词法域。
+pub(super) fn normalize_loop_escape_conditions(
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    input: &mut FinalPlanInput,
+    partitions: &[LoopPartitions],
+) -> bool {
+    let forest = graph.natural_loop_forest();
+    let mut selected = vec![None; cfg.blocks.len()];
+    let mut ambiguous = vec![false; cfg.blocks.len()];
+    for (index, loop_) in input.loops.iter().enumerate() {
+        let header = loop_.candidate.header.index();
+        ambiguous[header] |= selected[header].replace(index).is_some();
+    }
+    let mut changed = false;
+    for branch in &mut input.branches {
+        let Some(condition) = branch
+            .condition
+            .and_then(|id| input.conditions.get(id.index()))
+        else {
+            continue;
+        };
+        let ShortCircuitExit::BranchExit { truthy, falsy } = condition.candidate.exit else {
+            continue;
+        };
+        let Some(owner) = forest.innermost_loop(branch.branch.header) else {
+            continue;
+        };
+        let header = graph.natural_loops[owner.index()].header.index();
+        if ambiguous[header] {
+            // 候选拒绝[ProofIncomplete]：同 header 的不同源码循环尚不能仅由 natural loop 身份消歧。
+            continue;
+        }
+        let Some(index) = selected[header] else {
+            continue;
+        };
+        let partition = &partitions[index];
+        if !partition.body.contains(&branch.branch.header)
+            || input.loops[index].condition == branch.condition
+        {
+            continue;
+        }
+        let Some(exit) = partition.continuation else {
+            continue;
+        };
+        let body = match (truthy == exit, falsy == exit) {
+            (true, false) if partition.body.contains(&falsy) => falsy,
+            (false, true) if partition.body.contains(&truthy) => truthy,
+            _ => continue,
+        };
+        if branch.branch.then_entry == exit
+            && branch.branch.else_entry.is_none()
+            && branch.branch.merge == Some(body)
+        {
+            continue;
+        }
+        // 不改条件 DAG 和物理 edge route；原 phi/cleanup 仍由重新冻结的边计划承担，
+        // 循环 owner 发射 break。正文回到外围域，避免 scope_12 的对象在尾部观察前离域。
+        rewrite_one_arm_branch(graph, branch, exit, body);
+        changed = true;
+    }
+    changed
+}
 
 pub(super) fn normalize_effectful_unknown_loop_conditions(
     cfg: &Cfg,

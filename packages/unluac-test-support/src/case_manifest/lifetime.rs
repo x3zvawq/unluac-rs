@@ -2,6 +2,22 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_lifetime/scope_12_repeat_tail_root.lua",
+        &["repeat", "scope", "gc", "branch", "metamethod"],
+        "提前退出分支的落入路径保留对象根直到尾部表写入，内联条件准备不能提前结束原声明。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_lifetime/roots_16_jit_return_remainder_root.lua",
         &["comparison", "gc", "multi-return", "cdata", "return-frame"],
         "JIT 比较加载覆盖乘法槽后仍保留取模残根，返回选择式的必要暂存不能跨过可观察 GC 的 cdata 比较。",

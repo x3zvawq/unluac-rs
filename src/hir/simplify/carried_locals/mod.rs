@@ -83,6 +83,12 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
         expr_safety,
         dialect,
     );
+    let identity_facts = if coalesced {
+        // Def 已投影到新的 Local；准备帧的源/目标不能沿用合并前的绑定快照。
+        HandoffIdentityFacts::new(proto, promotion_facts, collect_preserved_bindings(proto))
+    } else {
+        identity_facts
+    };
     let mentions = BindingMentionIndex::new(&proto.body.stmts);
     let changed = branch_copies_changed
         | restored_copies
@@ -194,7 +200,7 @@ fn collapse_handoffs_recursive<'a>(
     changed |= prune_redundant_copy_stmts(
         block,
         &identity_facts.preserved,
-        &identity_facts.call_preparations,
+        &identity_facts.frame_preparations,
         &identity_facts.reference_captured,
     );
     changed
@@ -338,7 +344,7 @@ struct HandoffIdentityFacts {
     value_captured: BTreeSet<CarryBinding>,
     to_be_closed: BTreeSet<CarryBinding>,
     preserved: BTreeSet<CarryBinding>,
-    call_preparations: BTreeSet<(CarryBinding, CarryBinding)>,
+    frame_preparations: BTreeSet<(CarryBinding, CarryBinding)>,
 }
 
 impl HandoffIdentityFacts {
@@ -374,8 +380,8 @@ impl HandoffIdentityFacts {
             value_captured: collector.value_captured,
             to_be_closed: collector.to_be_closed,
             preserved,
-            call_preparations: promotion_facts
-                .call_preparation_local_copies()
+            frame_preparations: promotion_facts
+                .frame_preparation_local_copies()
                 .map(|(target, source)| (CarryBinding::Local(target), CarryBinding::Local(source)))
                 .collect(),
         }

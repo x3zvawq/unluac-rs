@@ -105,6 +105,61 @@ pub(super) fn body_key(
     ))
 }
 
+/// 比较与 assert 的原准备协议；循环匹配只负责比较左值的来源。
+pub(super) struct AssertionFrame<'a> {
+    pub call: &'a HirCallExpr,
+    pub global: &'a HirExpr,
+    pub compare: &'a crate::hir::HirBinaryExpr,
+    pub base: HomeSlotKey,
+    pub result: TempId,
+    pub source: TempId,
+}
+
+pub(super) fn assertion_frame<'a>(
+    call: &'a HirCallExpr,
+    callee: &'a HirStmt,
+    boolean: &'a HirStmt,
+    facts: &ProtoPromotionFacts,
+) -> Option<AssertionFrame<'a>> {
+    let frame = facts.native_fastcall_frame(call)?;
+    let (callee_local, global @ HirExpr::GlobalRef(name)) = scalar_local(callee)? else {
+        return None;
+    };
+    let (boolean, HirExpr::Binary(compare)) = scalar_local(boolean)? else {
+        return None;
+    };
+    let copy = facts.binary_operand_copy(compare, 0)?;
+    if name.key.as_utf8() != Some("assert")
+        || call.callee != HirExpr::LocalRef(callee_local)
+        || call.args.fixed.as_slice() != [HirExpr::LocalRef(boolean)]
+        || call.args.tail.is_some()
+        || !call
+            .fastcall
+            .is_some_and(|f| f.builtin() == 1 && f.fixed_is_direct(0))
+        || frame.results != Some(ResultPack::Ignore)
+        || !frame.arguments_unaliased
+        || facts.comparison_result_temp(compare) != facts.call_argument_value(call, 0)
+        || facts.trusted_temp_home_slot(copy.target)
+            != Some(HomeSlotKey::new(frame.home.slot() + 2, 0))
+        || facts.trusted_temp_home_slot(copy.source?)
+            != Some(HomeSlotKey::new(frame.home.slot() + 3, 0))
+        || facts.native_binary_layout(compare)?.rhs.is_some()
+        || compare.op != HirBinaryOpKind::Eq
+        || integer(&compare.rhs).is_none()
+        || facts.boolean_argument_prewrite(call, 0).is_some()
+    {
+        return None;
+    }
+    Some(AssertionFrame {
+        call,
+        global,
+        compare,
+        base: frame.home,
+        result: copy.target,
+        source: copy.source?,
+    })
+}
+
 pub(super) fn plans(context: NativeFrameContext<'_>, facts: &ProtoPromotionFacts) -> Vec<Plan> {
     let Some(callees) = context.expanded_callees else {
         return Vec::new();
@@ -136,42 +191,19 @@ pub(super) fn plans(context: NativeFrameContext<'_>, facts: &ProtoPromotionFacts
             let HirStmt::CallStmt(statement) = &stmts[sink] else {
                 return None;
             };
-            let call = &statement.call;
-            let frame = facts.native_fastcall_frame(call)?;
-            let (callee_local, global @ HirExpr::GlobalRef(name)) = scalar_local(&stmts[sink - 1])?
-            else {
-                return None;
-            };
-            let (boolean, HirExpr::Binary(compare)) = scalar_local(&stmts[sink - 2])? else {
-                return None;
-            };
-            let base = frame.home;
-            let result_home = HomeSlotKey::new(base.slot() + 2, 0);
+            let AssertionFrame {
+                call,
+                global,
+                compare,
+                base,
+                source,
+                ..
+            } = assertion_frame(&statement.call, &stmts[sink - 1], &stmts[sink - 2], facts)?;
             let state_home = HomeSlotKey::new(base.slot() + 3, 0);
-            let copy = facts.binary_operand_copy(compare, 0)?;
-            let result = copy.target;
-            let source = copy.source?;
-            if name.key.as_utf8() != Some("assert")
-                || call.callee != HirExpr::LocalRef(callee_local)
-                || call.args.fixed.as_slice() != [HirExpr::LocalRef(boolean)]
-                || call.args.tail.is_some()
-                || !call
-                    .fastcall
-                    .is_some_and(|f| f.builtin() == 1 && f.fixed_is_direct(0))
-                || frame.results != Some(ResultPack::Ignore)
-                || !frame.arguments_unaliased
-                || facts.comparison_result_temp(compare) != facts.call_argument_value(call, 0)
-                || facts.trusted_temp_home_slot(result) != Some(result_home)
-                || facts.trusted_temp_home_slot(source) != Some(state_home)
-                || facts.native_binary_layout(compare)?.rhs.is_some()
-                || compare.op != HirBinaryOpKind::Eq
-                || integer(&compare.rhs).is_none()
-                || (base.slot()..=state_home.slot()).any(|slot| {
-                    let home = HomeSlotKey::new(slot, 0);
-                    context.barred.contains(&home) || context.closed.contains(&home)
-                })
-                || facts.boolean_argument_prewrite(call, 0).is_some()
-            {
+            if (base.slot()..=state_home.slot()).any(|slot| {
+                let home = HomeSlotKey::new(slot, 0);
+                context.barred.contains(&home) || context.closed.contains(&home)
+            }) {
                 return None;
             }
             let mut builder =
@@ -183,7 +215,7 @@ pub(super) fn plans(context: NativeFrameContext<'_>, facts: &ProtoPromotionFacts
                 None,
                 true,
                 false,
-                Some(frame.callee),
+                Some(facts.native_fastcall_frame(call)?.callee),
             )? != *global
             {
                 return None;
@@ -244,7 +276,7 @@ pub(super) fn plans(context: NativeFrameContext<'_>, facts: &ProtoPromotionFacts
             }
             let mut restored = call.clone();
             restored.callee = global.clone();
-            let mut compare = compare.as_ref().clone();
+            let mut compare = compare.clone();
             compare.lhs = factories::factory_call(
                 callee.local,
                 Some(site),

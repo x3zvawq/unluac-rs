@@ -183,6 +183,10 @@ fn restore_call_value(
         NativeFrameContext {
             rk_literals: None,
             expanded_callees: None,
+            compared_choices: None,
+            value_expressions: None,
+            calling_values: None,
+            seeded_predicates: None,
             retired_roots: None,
             root_seed_sources: None,
             proto,
@@ -391,6 +395,7 @@ fn fold(mut block: HirBlock, changed: &mut bool) -> Tree {
         let early = tail.as_ref().map(|_| early_return_arm(&branch).unwrap());
         let had_else = branch.else_block.is_some();
         let HirIf {
+            predicate_source,
             mut cond,
             then_block,
             else_block,
@@ -468,6 +473,7 @@ fn fold(mut block: HirBlock, changed: &mut bool) -> Tree {
             let returned = returned.into_block();
             let mut stmts = vec![HirStmt::If(Box::new(if then_returns {
                 HirIf {
+                    predicate_source,
                     preserves_empty_test,
                     preserves_arm_order,
                     cond,
@@ -476,6 +482,7 @@ fn fold(mut block: HirBlock, changed: &mut bool) -> Tree {
                 }
             } else {
                 HirIf {
+                    predicate_source,
                     preserves_empty_test,
                     preserves_arm_order,
                     cond,
@@ -488,6 +495,7 @@ fn fold(mut block: HirBlock, changed: &mut bool) -> Tree {
         }
         return Tree::Block(HirBlock {
             stmts: vec![HirStmt::If(Box::new(HirIf {
+                predicate_source,
                 preserves_empty_test,
                 preserves_arm_order,
                 cond,

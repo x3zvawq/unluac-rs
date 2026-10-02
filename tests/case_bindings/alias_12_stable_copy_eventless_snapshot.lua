@@ -19,11 +19,12 @@
 -- unluac: expect-ast-count [[repeat-condition-local]] [[1]] [[@proto=13]]
 -- unluac: expect-ast-max [[local-decl]] [[4]] [[@proto=13]]
 -- unluac: expect-contains [[r14_0 = p14_0]]
--- 原 nil 初始化与 COPY 在同一 repeat 词法身份上交接；不能在函数入口另造 holder。
+-- 原 nil 初始化与完整并列写回沿用同一 repeat 绑定，不另造高槽 holder 或未读 marker。
 -- unluac: expect-ast-count [[repeat-condition-local]] [[1]] [[@proto=14]]
--- unluac: expect-ast-max [[local-decl]] [[4]] [[@proto=14]]
--- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=14]]
+-- unluac: expect-ast-count [[local-decl]] [[3]] [[@proto=14]]
+-- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=14]]
 -- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=14]]
+-- unluac: expect-contains [[r14_2, r14_3 = r14_1, "parallel"]]
 -- 参数槽覆盖必须保留；另建 local 会让被覆盖的旧参数继续成为强根。
 -- unluac: expect-contains [[until p15_0]]
 -- unluac: expect-contains [[return p15_0]]

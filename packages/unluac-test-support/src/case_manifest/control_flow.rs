@@ -1796,7 +1796,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_control_flow/tail_07_single_pass_empty_continuation.lua",
         &["break", "cleanup", "single-pass"],
-        "允许cleanup后两条fallthrough臂无共享tail时移除single-pass repeat。",
+        "保留单次循环尾部未读初始化及提前break，消除入口空声明与分离初始化。",
         &[
             LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),

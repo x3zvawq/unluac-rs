@@ -14,6 +14,7 @@ use super::{HomeSlotKey, SlotEpochFacts};
 enum PreparedValue {
     Call(InstrRef),
     TableRead(InstrRef),
+    TableAllocation(InstrRef),
     Unary(InstrRef, crate::hir::common::HirUnaryOpKind),
     Binary(InstrRef),
     Upvalue(UpvalueId),
@@ -62,6 +63,10 @@ impl OperandPreparation {
             (PreparedValue::TableRead(read), HirExpr::GlobalRef(global)) => {
                 // 环境常量键读取归一化成 GlobalRef，仍是原 GETTABLE 的同一次 SSA 准备。
                 matches!(global.sources, crate::hir::common::HirOperationSources::Single(source)
+                    if source.instr == *read)
+            }
+            (PreparedValue::TableAllocation(read), HirExpr::TableConstructor(table)) => {
+                matches!(table.sources, crate::hir::common::HirOperationSources::Single(source)
                     if source.instr == *read)
             }
             (PreparedValue::Unary(read, op), HirExpr::Unary(unary)) => {
@@ -155,6 +160,7 @@ pub(super) fn collect(
             PreparedValue::ScalarVararg
         }
         LowInstr::GetTable(_) => PreparedValue::TableRead(read),
+        LowInstr::NewTable(_) => PreparedValue::TableAllocation(read),
         LowInstr::BinaryOp(_) | LowInstr::Concat(_) => PreparedValue::Binary(read),
         LowInstr::UnaryOp(unary) => {
             use crate::hir::common::HirUnaryOpKind;

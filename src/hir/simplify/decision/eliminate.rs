@@ -11,6 +11,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
+use super::super::lexical_cfg::stmt_has_current_owner_continue;
 use super::super::mention::{CaptureCollector, ReferenceCapturedBindings};
 use super::super::walk::rewrite_nested_blocks_in_stmt;
 use super::eliminate_materialize::{
@@ -247,6 +248,7 @@ fn eliminate_stmt(
                 let condition = mem::replace(&mut while_stmt.cond, HirExpr::Boolean(true));
                 let (flag, condition_scope) = materialize_condition_flag(condition, state, safety);
                 let exit_guard = HirStmt::If(Box::new(crate::hir::common::HirIf {
+                    predicate_source: None,
                     preserves_empty_test: false,
                     preserves_arm_order: false,
                     cond: HirExpr::LocalRef(flag).negate(),
@@ -365,41 +367,6 @@ fn repeat_continue_precedes_condition_local(block: &HirBlock, condition: &HirExp
         }
     }
     false
-}
-
-fn stmt_has_current_owner_continue(stmt: &HirStmt) -> bool {
-    match stmt {
-        HirStmt::LocalRootRelease(_) => false,
-        HirStmt::Continue => true,
-        HirStmt::If(if_stmt) => {
-            if_stmt
-                .then_block
-                .stmts
-                .iter()
-                .any(stmt_has_current_owner_continue)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(|block| block.stmts.iter().any(stmt_has_current_owner_continue))
-        }
-        HirStmt::Block(block) => block.stmts.iter().any(stmt_has_current_owner_continue),
-        HirStmt::While(_)
-        | HirStmt::Repeat(_)
-        | HirStmt::NumericFor(_)
-        | HirStmt::GenericFor(_)
-        | HirStmt::LocalDecl(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
-    }
 }
 
 fn repeat_continue_crosses_live_nested_scope(

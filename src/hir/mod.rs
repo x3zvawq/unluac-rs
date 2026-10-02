@@ -6,7 +6,8 @@
 mod analyze;
 mod common;
 pub(crate) use common::{
-    HirLuauInliningBody, HirSourceSite, luau_loop_unroll_blocked, luau_repeat_prefix_costs,
+    HirLuauCallableArgument, HirLuauCallableSource, HirLuauInliningBody, HirRequiredLuauInlining,
+    HirSourceSite, luau_loop_unroll_blocked, luau_repeat_prefix_costs,
 };
 #[cfg(feature = "decompile-debug")]
 mod debug;
@@ -15,6 +16,7 @@ mod emission;
 mod error;
 mod expr_safety;
 pub(crate) mod luau_inlining;
+pub(crate) mod luau_loop_cost;
 mod promotion;
 mod rewrite;
 mod simplify;

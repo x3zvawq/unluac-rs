@@ -7,6 +7,10 @@
 -- unluac: expect-ast-count [[if]] [[1]]
 -- unluac: expect-ast-count [[error]] [[0]]
 -- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=0]]
+-- 全局字段比较留在原短路参数中，不将调用结果与 Boolean 写回拆成接棒变量。
+-- unluac: expect-contains [[assert(r0_1(false) == 0 and box.f == nil and box.read == nil)]]
+-- unluac: expect-contains [[assert(r0_1(true) == 0 and box.f() == 7 and box:read() == 11)]]
+-- unluac: expect-contains [[assert(box:read() == 17)]]
 
 box = { value = 11 }
 local function run(flag)

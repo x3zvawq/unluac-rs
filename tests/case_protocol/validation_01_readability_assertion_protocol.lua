@@ -5,6 +5,9 @@
 -- 结构计数来自最终 AST：字符串里的关键字不算节点，proto 作用域不包含子函数体。
 -- unluac: expect-count [[@literal-if-while-function]] [[1]]
 -- unluac: expect-instruction-count [[not]] [[0]]
+-- 原指令按 proto 单独计数；空 outer 函数不能借用根函数中的检查。
+-- unluac: expect-instruction-count [[branch]] [[8]] [[@proto=0]]
+-- unluac: expect-instruction-count [[branch]] [[0]] [[@proto=1]]
 -- unluac: expect-min-count [[assert(]] [[2]]
 -- unluac: expect-max-count [[@literal-if-while-function]] [[1]]
 -- unluac: expect-contains [[@literal-if-while-function]]

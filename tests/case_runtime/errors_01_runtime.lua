@@ -133,12 +133,15 @@ local function test_pcall_multiret()
 end
 
 -- common_11_runtime#7: while-true 中 coroutine.resume 多返回值赋值 + 条件 break
-local function test_coro_resume_loop()
+local function test_coro_resume_loop(final_value)
     local function producer()
         for i = 1, 5 do
             coroutine.yield(i * 10)
         end
-        return "done"
+        if final_value == "error" then
+            error("producer-failure", 0)
+        end
+        return final_value
     end
 
     local co = coroutine.create(producer)
@@ -151,6 +154,8 @@ local function test_coro_resume_loop()
         end
         results[#results + 1] = val
     end
+    assert(#results == 6 and results[1] == 10 and results[5] == 50)
+    assert(results[6] == (final_value == "error" and "producer-failure" or final_value or "nil"))
     print("common_11_runtime#7", table.concat(results, ","))
 end
 
@@ -160,13 +165,18 @@ test_xpcall()
 test_coroutine_shadow()
 test_xpcall_reuse()
 test_pcall_multiret()
-test_coro_resume_loop()
+test_coro_resume_loop("done")
+test_coro_resume_loop(false)
+test_coro_resume_loop(nil)
+test_coro_resume_loop("error")
 -- handler 的短路 CONCAT 与 resume 多结果初始化保留完整表达式。
 -- unluac: expect-ast-max [[local-decl]] [[0]] [[@dialect=lua5.4]] [[@proto=13]]
 -- unluac: expect-ast-max [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=19]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@dialect=lua5.4]] [[@proto=20]]
 
 -- resume 循环只需 producer、co、results 和两个返回值；表尾索引应留在写入表达式内。
+-- 两条追加路径均在左值中计算索引，包含右值需要短路选择的退出分支。
+-- unluac: expect-count [[ + 1] = ]] [[2]]
 -- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.2]]
 -- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.3]]

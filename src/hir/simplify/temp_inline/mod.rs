@@ -253,6 +253,23 @@ fn inline_temps_in_proto_with_scope(
         inline_dispositions,
         safety,
     );
+    if matches!(workspace.scope, TempInlineScope::All) {
+        for stmt in &proto.body.stmts {
+            crate::hir::visit::visit_stmt_structure(stmt, &mut |stmt| {
+                if let HirStmt::GlobalDecl(decl) = stmt
+                    && let Some(seed) = facts.global_initializer_seed(decl)
+                {
+                    // 低槽声明与高槽 probe/store 准备属于不同身份；原 COPY 可内联，
+                    // seed 本身仍占据后继 CALL/TAILCALL 的源码前缀，不能一并抹掉。
+                    changed |= workspace
+                        .inline_dispositions
+                        .preserve_temp(seed, HirInlineRetentionReason::PhysicalFramePrefix);
+                    workspace.physical_root_temps[seed.index()] = true;
+                    workspace.new_physical_root_temps.insert(seed);
+                }
+            });
+        }
+    }
     for temp in workspace.uses.boolean_value_predicates() {
         changed |= workspace
             .inline_dispositions
@@ -595,7 +612,7 @@ fn inline_temps_in_block(
                 .preserve_temp(temp, HirInlineRetentionReason::TableInitialization);
         }
         if let Some((temp, HirExpr::ParamRef(_))) = stmt.scalar_temp_assignment()
-            && facts.temp_requires_call_frame(temp)
+            && facts.temp_requires_source_frame(temp)
         {
             // 完整调用帧尚未接管的 COPY 不能在 AST 中重新按稳定值内联；原 callee
             // 槽及其声明前缀仍决定 callback 返回后的残根窗口（scope_03）。
@@ -626,7 +643,7 @@ fn inline_temps_in_block(
             && !workspace.inline_dispositions.temp(temp).must_preserve()
             && !workspace.physical_root_temps[temp.index()]
             && !physical_root_lifetimes[index]
-            && !facts.temp_requires_call_frame(temp)
+            && !facts.temp_requires_source_frame(temp)
             && facts.temp_definition_is_uncaptured(temp)
             && facts.temp_definition_tbc_unprotected(temp)
             && facts.fixed_call_result(call, 0) == Some(temp)
@@ -688,8 +705,8 @@ fn inline_temps_in_block(
                 }))
             // 候选拒绝[PolicyBoundary]：DebugScope 标注该 temp 是显式源码 binding，保留其独立声明身份。
             && !workspace.uses.has_debug_local_hint(temp)
-            // 候选拒绝[LayerBoundary]：原低槽分配/初始化、FASTCALL 参数源与 CALL 写回由完整帧共同消费。
-            && !facts.temp_requires_call_frame(temp)
+            // 候选拒绝[LayerBoundary]：原低槽分配/初始化、FASTCALL 参数源与 CALL/RETURN 写回由完整帧共同消费。
+            && !facts.temp_requires_source_frame(temp)
             // 候选拒绝[SemanticBarrier:Capture]：若 closure 已按引用捕获该 home，删除写入会让 closure 观察旧值；见 regress_310。
             && !temp_rebinds_captured_slot(
                 temp,
@@ -3700,7 +3717,7 @@ fn materialization_run_candidate_is_safe(
 ) -> bool {
     // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
     !scratch.has_debug_local_hint(temp)
-        && !facts.temp_requires_call_frame(temp)
+        && !facts.temp_requires_source_frame(temp)
         // 候选拒绝[SemanticBarrier:Capture]：引用捕获该 home 的 closure 必须观察 producer 写入后的值；见 regress_310。
         && !temp_rebinds_captured_slot(
             temp,

@@ -1,6 +1,8 @@
 -- common_15: 组合覆盖内外层 break、repeat 尾条件事件和外层回边状态。
 -- unluac: expect-ast-min [[repeat]] [[2]] [[@dialect=lua5.4]] [[@proto=1]]
 -- unluac: expect-ast-min [[while]] [[1]] [[@dialect=lua5.4]] [[@proto=1]]
+-- outer 尾调用只在未 break 的路径执行；内联后的条件快照也应在本轮正文内声明。
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
 local function observe(early, inner, stop)
     local trace = {}
     local i, total = 0, 0
@@ -75,6 +77,8 @@ end
 -- numeric-for 的零次迭代保留初值；正常结束与提前 break 分别消费自己的状态。
 -- unluac: expect-ast-count [[goto]] [[0]]
 -- unluac: expect-ast-count [[label]] [[0]]
+-- 数组遍历的双返回不应在调用方留下整组参数、状态和返回接棒。
+-- unluac: expect-ast-max [[local-binding]] [[22]] [[@dialect=luau]] [[@variant=O2]] [[@proto=0]]
 local function choose(groups, count)
     local selected = 0
     local remaining = count
@@ -96,4 +100,33 @@ for _, selection in ipairs(selections) do
     local selected, remaining = choose(selection[1], selection[2])
     assert(selected == selection[3] and remaining == selection[4])
     print("for exit state", selected, remaining)
+end
+
+-- 尾函数的表写入会修改比较操作数；比较快照必须先于该效果，break 则跳过两者。
+local function observe_snapshot(early)
+    local value, rounds = 0, 0
+    local trace = setmetatable({}, {
+        __newindex = function(t, key, tag)
+            value = 0
+            rawset(t, key, tag)
+        end,
+    })
+    local function tail(result)
+        trace[#trace + 1] = "tail"
+        return result
+    end
+    repeat
+        rounds = rounds + 1
+        value = 1
+        if early then break end
+        if rounds == 3 then break end
+    until tail(value == 1)
+    return rounds, value, #trace
+end
+for _, early in ipairs({false, true}) do
+    local rounds, value, events = observe_snapshot(early)
+    assert(rounds == 1)
+    assert(value == (early and 1 or 0))
+    assert(events == (early and 0 or 1))
+    print("repeat snapshot", early, rounds, value, events)
 end

@@ -4,6 +4,7 @@
 -- unluac: expect-ast-min [[if]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 -- unluac: expect-ast-count [[local-binding]] [[15]]
+-- unluac: expect-ast-count [[local-binding]] [[12]] [[@proto=0]]
 local frame = {}
 
 function guarded_return_chain(kind, key)
@@ -43,8 +44,18 @@ local cases = {
     { nil, "PRESS", "OTHER" },
     { false, nil, "ESCAPE" },
 }
+-- 第一项查表必须先于三个目标写回；回调修改 value，后续 nil 写须覆盖它。
+-- 若重复读取，第二次回调会看到非 nil；若延后读取，则会看到已写入的 extra。
+cases[1] = setmetatable({ [2] = "PRESS", [3] = "ESCAPE", [4] = "cancel" }, {
+    __index = function(_, index)
+        assert(index == 1 and calls == 0 and value == nil and extra == nil)
+        value = "lookup observed"
+        return false
+    end,
+})
 for i, case in ipairs(cases) do
     handled, value, extra = case[1], nil, "extra"
+    assert(value == nil and extra == "extra")
     action = nil
     local a, b, c = guarded_return_chain(case[2], case[3])
     assert(calls == i and action == case[4])

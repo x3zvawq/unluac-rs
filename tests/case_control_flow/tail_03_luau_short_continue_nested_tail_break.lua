@@ -11,6 +11,9 @@
 -- unluac: expect-ast-count [[generic-for]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=1]]
+-- 有界观察中的多入口和兄弟循环同样只保留一个累积状态。
+-- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=4]]
+-- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=5]]
 local function tested(a, b, c, xs)
     local x = 0
     for i = 1, 3 do
@@ -74,3 +77,64 @@ assert(calls == 7)
 calls = 0
 assert(not pcall(tested, false, false, false, iterator))
 assert(calls == 7)
+
+-- 有界版本实际观察两个入口汇入 repeat 后的状态，覆盖兄弟遍历和嵌套回边。
+local function carried(choose, values)
+    local x = 0
+    for i = 1, 2 do
+        repeat
+            if choose then
+                x = x + 1
+            else
+                for _, value in values do
+                    x = x + value
+                end
+            end
+            repeat
+                for _, value in values do
+                    x = x + value
+                end
+            until x >= 4
+        until x >= 7
+    end
+    return x
+end
+ok, result = pcall(carried, true, {1, 2})
+assert(ok and result == 12)
+ok, result = pcall(carried, false, {1, 2})
+assert(ok and result == 18)
+print("regress_120_carried", result)
+
+-- 外层选择独立后，内层 a=true 的短路 continue 必须直接到 until，不能执行后续 repeat。
+local function independent(outer, a, b, c, values)
+    local x = 0
+    for i = 1, 3 do
+        x = x + 1
+        repeat
+            if outer then
+                if values[x] then break end
+                if a then continue else x = x + 1 end
+            else
+                while b do
+                    x = x + 1
+                    x = x + 1
+                end
+                for _, value in values do
+                    x = x + 1
+                end
+                if a or c then continue end
+            end
+            repeat
+                for _, value in values do
+                    x = x + 1
+                    x = x + 1
+                end
+            until not b
+            if a and b then break end
+        until a
+    end
+    return x
+end
+ok, result = pcall(independent, false, true, false, false, {1})
+assert(ok and result == 6)
+print("regress_120_independent", result)

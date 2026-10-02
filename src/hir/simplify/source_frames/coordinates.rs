@@ -19,20 +19,33 @@ pub(in crate::hir::simplify) fn visit<'a>(
     cursor: &mut usize,
     action: &mut impl FnMut(usize, PointKind, &'a HirStmt),
 ) {
+    visit_scoped(block, cursor, &mut |index, _, kind, stmt| {
+        action(index, kind, stmt)
+    });
+}
+
+/// 与提交遍历相同的词法 owner；repeat 条件属于正文声明域。
+pub(in crate::hir::simplify) fn visit_scoped<'a>(
+    block: &'a HirBlock,
+    cursor: &mut usize,
+    action: &mut impl FnMut(usize, usize, PointKind, &'a HirStmt),
+) {
+    let owner = *cursor;
     for stmt in &block.stmts {
         let index = *cursor;
         *cursor += 1;
-        action(index, PointKind::Statement, stmt);
+        action(index, owner, PointKind::Statement, stmt);
         if let HirStmt::Repeat(repeat) = stmt {
-            visit(&repeat.body, cursor, action);
+            let body_owner = *cursor;
+            visit_scoped(&repeat.body, cursor, action);
             let index = *cursor;
             *cursor += 1;
-            action(index, PointKind::RepeatCondition, stmt);
-            action(*cursor, PointKind::Boundary, stmt);
+            action(index, body_owner, PointKind::RepeatCondition, stmt);
+            action(*cursor, owner, PointKind::Boundary, stmt);
         } else {
             for_each_nested_block(stmt, &mut |child| {
-                visit(child, cursor, action);
-                action(*cursor, PointKind::Boundary, stmt);
+                visit_scoped(child, cursor, action);
+                action(*cursor, owner, PointKind::Boundary, stmt);
             });
         }
     }

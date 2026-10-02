@@ -729,11 +729,17 @@ fn try_collapse_loop_results(
     let require_home_slot = !requires_exact_exits;
     let results = results.into_iter().collect::<Vec<_>>();
     let snapshot_writeback = block.stmts.get(index + 1).and_then(|writeback| {
-        let writebacks = parallel_state_writebacks(writeback)?;
+        let writebacks = immediate_binding_copies(writeback)?;
         results.iter().find_map(|result| {
-            let state = *writebacks.get(result)?;
-            // 精确快照只在紧邻 writeback 被读取；所有 producer 都是同一 state 的独立
-            // copy，因此退休快照不会新增 state 写入。state 可以继续由外层作用域持有。
+            let target = *writebacks.get(result)?;
+            let state = if matches!(writeback, HirStmt::LocalDecl(_)) {
+                exits.first()?.get(result)?.exact_binding()?
+            } else {
+                target
+            };
+            // 精确快照只在紧邻纯 COPY 中被读取；所有 producer 都复制同一 state。
+            // 新声明仍在这里读取状态并保存独立快照，后继 state 写入不能影响它；
+            // 既有状态写回则保持原处理。退休 result 不新增 state 写入或提前后继声明。
             (result_index.is_available_before(state, index)
                 && result_index.reads.span(result) == Some((index + 1, index + 1))
                 && result_index.writes.span(result) == Some((index, index))
@@ -795,7 +801,13 @@ fn try_collapse_loop_results(
     }
     if retains_state {
         // 候选接受：循环内不读 result，全部写入都是不改变 state 的快照；循环外仅有
-        // 紧邻写回。只退休这段事务，既有 state 声明、更新和后续观察保持原位。
+        // 紧邻 COPY。只退休这段事务，既有 state 声明、更新和后继快照声明保持原位。
+        for (&result, &state) in &rewrites {
+            if let (CarryBinding::Temp(result), CarryBinding::Local(state)) = (result, state) {
+                // 此分支已覆盖 result 的全部读写，后层原 COPY 仍需知道其当前 binding。
+                promotion_facts.record_temp_local_binding(result, state);
+            }
+        }
         apply_rewrites_in_range(
             block,
             index..index,

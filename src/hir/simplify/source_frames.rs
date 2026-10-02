@@ -279,10 +279,16 @@ pub(super) fn validate_prefixes(
     } else {
         last_candidate
     };
-    for (slot, &param) in proto.params.iter().enumerate() {
-        if facts.trusted_param_home_slot(param).map(HomeSlotKey::slot) != Some(slot) {
-            return Err(PrefixFailures::invalid_from(0));
-        }
+    // 参数入口布局由原签名与 parlist 顺序固定；值合并可能使其完整 home 集合扩大，
+    // 但不会增加或移动入口声明槽。具体读取仍由各操作的原输入证明，不能在这里重置信任。
+    if proto.params.len() != usize::from(proto.signature.num_params)
+        || proto
+            .params
+            .iter()
+            .enumerate()
+            .any(|(slot, param)| param.index() != slot)
+    {
+        return Err(PrefixFailures::invalid_from(0));
     }
 
     let mut declared = BTreeSet::new();

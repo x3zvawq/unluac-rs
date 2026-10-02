@@ -5,6 +5,7 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[local-binding]] [[11]]
+-- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=0]]
 -- unluac: expect-ast-count [[if]] [[5]]
 local objects = {
     world = {
@@ -54,6 +55,7 @@ assert(result == "next" and disabled == 0)
 assert(table.concat(calls, ",") == "1,2")
 print("regress_31_numeric_for_terminal_branch_coverage#1", result)
 
+-- 每次重置都更新三个捕获 cell；后续调用序列同时观察索引、计数和新空表。
 currentBirdIndex, disabled, calls = 1, 0, {}
 assert(replace_next_bird() == 2 and disabled == 2)
 assert(table.concat(calls, ",") == "2,3,3,4,5,6,7,8")

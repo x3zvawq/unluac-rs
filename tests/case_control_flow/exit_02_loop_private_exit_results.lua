@@ -1,8 +1,10 @@
 -- resume 的双结果应直接声明；用成员数约束接收宽度，不绑定自动变量名。
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[4]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=1]]
+-- co、out 与 resume 双结果共三条声明；退出分支不额外保存表尾索引。
+-- unluac: expect-ast-count [[local-decl]] [[3]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=1]]
+-- unluac: expect-count [=[out[#out + 1] = value or "nil"]=] [[2]] [[@debug=retained]]
 -- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[3]]
 -- unluac: expect-ast-count [[break]] [[3]]

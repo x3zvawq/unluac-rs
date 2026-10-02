@@ -8,15 +8,35 @@ use crate::ast::*;
 use crate::hir::HirLuauInliningBody;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod array_fold;
+mod calling_values;
+mod checked_reads;
 mod conditional_methods;
+mod constant_control;
+mod counter_repeat;
 mod counter_while;
+mod expression_loops;
+mod generic_break;
+mod generic_counter;
+mod generic_lookup;
+mod guarded_counter;
 mod literal_choices;
 mod loops;
 mod numeric_exit;
+mod numeric_repeat;
+mod observed_values;
 mod opaque;
+mod plain;
+mod reset_counter;
+use plain::PlainExpressions;
+mod parameter_writebacks;
+mod repeat_lookup;
 mod repeat_prefix;
 mod returned_calls;
+mod scopes;
+mod seeded_predicates;
 mod stateful_generic;
+mod value_expressions;
 
 // 只展开词法包装，不穿过控制流或函数边界；binding 身份仍属于同一个 caller。
 fn scope_statements(block: &AstBlock) -> Vec<&AstStmt> {
@@ -33,9 +53,57 @@ fn scope_statements(block: &AstBlock) -> Vec<&AstStmt> {
 }
 
 pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool {
-    let requirements = &hir.required_luau_inlining;
-    let statements = scope_statements(&module.body);
-    let opaque_functions = opaque::Functions::new(&statements, hir);
+    let mut by_owner = BTreeMap::<_, Vec<_>>::new();
+    for requirement in &hir.required_luau_inlining {
+        by_owner
+            .entry(requirement.owner)
+            .or_default()
+            .push(requirement);
+    }
+    let functions = scopes::functions(&module.body);
+    let mut validated = BTreeSet::new();
+    for (&owner, requirements) in by_owner.iter().rev() {
+        if owner == module.entry_function {
+            continue;
+        }
+        let Some(instances) = functions.get(&owner) else {
+            return false;
+        };
+        let [function] = instances.as_slice() else {
+            return false;
+        };
+        if !function.params.is_empty()
+            || function.is_vararg
+            || !validate_scope(owner, &function.body, requirements, hir, &validated)
+            || !scopes::costly(function)
+        {
+            return false;
+        }
+        validated.insert(owner);
+    }
+    validate_scope(
+        module.entry_function,
+        &module.body,
+        by_owner
+            .get(&module.entry_function)
+            .map_or(&[], Vec::as_slice),
+        hir,
+        &validated,
+    )
+}
+
+fn validate_scope(
+    owner: crate::hir::HirProtoRef,
+    body: &AstBlock,
+    requirements: &[&crate::hir::HirRequiredLuauInlining],
+    hir: &crate::hir::HirModule,
+    validated: &BTreeSet<crate::hir::HirProtoRef>,
+) -> bool {
+    let statements = scope_statements(body);
+    let Some(mut callable_arguments) = calling_values::Dependencies::new(requirements, hir) else {
+        return false;
+    };
+    let opaque_functions = opaque::Functions::new(&statements, hir, owner, validated);
     let mut callees = BTreeMap::new();
     let mut occurrences = BTreeMap::new();
     let mut result_slots = BTreeMap::new();
@@ -68,6 +136,33 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
         .iter()
         .map(|r| (r.callee, r.body))
         .collect::<BTreeMap<_, _>>();
+    let expression_loops = bodies.values().any(|body| {
+        matches!(
+            body,
+            HirLuauInliningBody::ValueExpression { .. }
+                | HirLuauInliningBody::ParameterWriteback { .. }
+                | HirLuauInliningBody::SeededPredicate { .. }
+                | HirLuauInliningBody::ConstantControl { .. }
+                | HirLuauInliningBody::NumericRepeat { .. }
+                | HirLuauInliningBody::GuardedCounter { .. }
+                | HirLuauInliningBody::ResetCounter { .. }
+                | HirLuauInliningBody::ArrayFold { .. }
+                | HirLuauInliningBody::CallingValue { .. }
+                | HirLuauInliningBody::CallingSharedValue { .. }
+                | HirLuauInliningBody::CallingObservedValue { .. }
+                | HirLuauInliningBody::CallingReadPair { .. }
+        )
+    });
+    let numeric_bindings = if expression_loops {
+        expression_loops::bindings(body)
+    } else {
+        BTreeSet::new()
+    };
+    let mandatory_loops = if expression_loops {
+        expression_loops::mandatory_costs(body)
+    } else {
+        BTreeMap::new()
+    };
     // Luau 对显式重写的 local 不进行函数解析；这些外围调用保持原 CALL。
     let mut opaque_locals = statements
         .iter()
@@ -83,12 +178,32 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
         .flatten()
         .collect::<BTreeSet<_>>();
     opaque_locals.extend(opaque_functions.locals.iter().copied());
+    let written_locals = crate::ast::written_locals(body);
+    let mut nonconstant_locals = written_locals
+        .union(&numeric_bindings)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let Some(constant_controls) = constant_control::Models::new(&statements, &bodies) else {
+        return false;
+    };
+    if bodies.values().any(|body| {
+        matches!(
+            body,
+            HirLuauInliningBody::ConstantControl { .. }
+                | HirLuauInliningBody::NumericRepeat { .. }
+                | HirLuauInliningBody::GuardedCounter { .. }
+                | HirLuauInliningBody::ResetCounter { .. }
+                | HirLuauInliningBody::ArrayFold { .. }
+        )
+    }) {
+        constant_control::extend_runtime_values(body, &mut nonconstant_locals);
+    }
     if bodies
         .values()
         .any(|body| matches!(body, HirLuauInliningBody::ConditionalMethod { .. }))
     {
         // 编译器只会为只读实参复用原槽；后续写入和子闭包写入同样会触发参数 COPY。
-        opaque_locals.extend(crate::ast::written_locals(&module.body));
+        opaque_locals.extend(written_locals.iter().copied());
     }
     for stmt in &statements {
         if let AstStmt::If(branch) = stmt {
@@ -112,6 +227,17 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 (decl.bindings.as_slice(), decl.values.as_slice())
             && name.text == "print"
             && let AstBindingRef::Local(local) = binding.id
+        {
+            opaque_locals.insert(local);
+        }
+    }
+    // getFunctionExpr 追踪 local 初始化但不解析索引结果；只读别名仍保持原 CALL。
+    for stmt in &statements {
+        if let AstStmt::LocalDecl(decl) = stmt
+            && let ([binding], [AstExpr::IndexAccess(_)]) =
+                (decl.bindings.as_slice(), decl.values.as_slice())
+            && let AstBindingRef::Local(local) = binding.id
+            && !written_locals.contains(&local)
         {
             opaque_locals.insert(local);
         }
@@ -184,10 +310,28 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 | HirLuauInliningBody::SnapshotClosureFactory { .. }
                 | HirLuauInliningBody::CapturedCallablePair
                 | HirLuauInliningBody::ConditionalMethod { .. }
+                | HirLuauInliningBody::ValueExpression { .. }
+                | HirLuauInliningBody::ParameterWriteback { .. }
+                | HirLuauInliningBody::SeededPredicate { .. }
+                | HirLuauInliningBody::ConstantControl { .. }
+                | HirLuauInliningBody::NumericRepeat { .. }
+                | HirLuauInliningBody::GuardedCounter { .. }
+                | HirLuauInliningBody::ResetCounter { .. }
+                | HirLuauInliningBody::ArrayFold { .. }
+                | HirLuauInliningBody::CallingValue { .. }
+                | HirLuauInliningBody::CallingSharedValue { .. }
+                | HirLuauInliningBody::CallingObservedValue { .. }
+                | HirLuauInliningBody::CallingReadPair { .. }
                 | HirLuauInliningBody::RepeatPrefix { .. }
+                | HirLuauInliningBody::RepeatLookup { .. }
+                | HirLuauInliningBody::CounterRepeat { .. }
+                | HirLuauInliningBody::GenericLookupWhile { .. }
+                | HirLuauInliningBody::GenericCounter { .. }
                 | HirLuauInliningBody::CounterWhile { .. }
                 | HirLuauInliningBody::StatefulGenericWhile { .. }
                 | HirLuauInliningBody::NumericForExit { .. }
+                | HirLuauInliningBody::CapturedIncrementIdentity { .. }
+                | HirLuauInliningBody::GenericBreak { .. }
         ) && (requirement.result_frame_slots.len() != requirement.occurrences.len()
             || requirement
                 .occurrences
@@ -202,7 +346,7 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 .iter()
                 .map(|(&site, &slot)| (site, slot)),
         );
-        if requirement.owner != module.entry_function
+        if requirement.owner != owner
             || callees
                 .insert(requirement.callee, requirement.child)
                 .is_some()
@@ -217,13 +361,52 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
             }
         }
     }
-    let written_locals = crate::ast::written_locals(&module.body);
     let mut declared = BTreeSet::new();
     let mut seen_occurrences = BTreeSet::new();
     let mut seen_result_slots = BTreeSet::new();
     let mut active = 0usize;
-    let mut pending = module
-        .body
+    let extended_scope = owner != hir.entry
+        || !validated.is_empty()
+        || requirements.iter().any(|requirement| {
+            matches!(
+                requirement.body,
+                HirLuauInliningBody::CapturedIncrementIdentity { .. }
+                    | HirLuauInliningBody::SeededPredicate { .. }
+                    | HirLuauInliningBody::ConstantControl { .. }
+                    | HirLuauInliningBody::NumericRepeat { .. }
+                    | HirLuauInliningBody::GuardedCounter { .. }
+                    | HirLuauInliningBody::ResetCounter { .. }
+                    | HirLuauInliningBody::ArrayFold { .. }
+                    | HirLuauInliningBody::CallingValue { .. }
+                    | HirLuauInliningBody::CallingSharedValue { .. }
+                    | HirLuauInliningBody::CallingObservedValue { .. }
+                    | HirLuauInliningBody::CallingReadPair { .. }
+            )
+        });
+    macro_rules! condition {
+        ($value:expr) => {{
+            InvocationExpressions {
+                shared_factories: &shared_factories,
+                published_globals: &published_globals,
+                bodies: &bodies,
+                constant_controls: &constant_controls,
+                opaque_locals: &opaque_locals,
+                runtime_functions: &opaque_functions.runtime,
+                written_locals: &written_locals,
+                nonconstant_locals: &nonconstant_locals,
+                callable_arguments: &callable_arguments,
+                scalar_callees: &scalar_callees,
+                captured_callees: &captured_callees,
+                callees: &callees,
+                occurrences: &occurrences,
+                declared: &declared,
+                seen: &mut seen_occurrences,
+            }
+            .condition($value, active, &result_slots, &mut seen_result_slots)
+        }};
+    }
+
+    let mut pending = body
         .stmts
         .iter()
         .rev()
@@ -242,6 +425,8 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 let valid = if shared_factories.contains(&local) {
                     declared.insert(local) && shared_closure_factory(&decl.func)
                         && !decl.func.captured_bindings.iter().any(|binding| matches!(binding, AstBindingRef::Local(captured) if callees.contains_key(captured)))
+                } else if callable_arguments.contains(local) {
+                    callable_arguments.declaration(local, &decl.func, hir, &written_locals)
                 } else if let Some(child) = callees.get(&local) {
                     *child == decl.func.function
                         && declared.insert(local)
@@ -250,6 +435,20 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                         } else if let HirLuauInliningBody::NumericForExit { template } = fields[&local].0 {
                             hir.protos.get(template).is_some_and(|proto|
                                 numeric_exit::body(&decl.func, proto, fields[&local].2))
+                        } else if let HirLuauInliningBody::ConstantControl { template, parameters, truth_mask } = fields[&local].0 {
+                            hir.protos.get(template).is_some_and(|proto| constant_control::body(&decl.func, proto, parameters, truth_mask))
+                        } else if let HirLuauInliningBody::ResetCounter { template } = fields[&local].0 {
+                            hir.protos.get(template).is_some_and(|proto| reset_counter::body(&decl.func, proto))
+                        } else if let HirLuauInliningBody::ArrayFold { template } = fields[&local].0 {
+                            hir.protos.get(template).is_some_and(|proto| array_fold::body(&decl.func, proto))
+                        } else if let HirLuauInliningBody::GuardedCounter { template } = fields[&local].0 {
+                            hir.protos.get(template).is_some_and(|proto| guarded_counter::body(&decl.func, proto))
+                        } else if let HirLuauInliningBody::NumericRepeat { template } = fields[&local].0 {
+                            hir.protos.get(template).is_some_and(|proto| numeric_repeat::body(&decl.func, proto))
+                        } else if let HirLuauInliningBody::ParameterWriteback { template } = fields[&local].0 {
+                            hir.protos.get(template).is_some_and(|proto| parameter_writebacks::body(&decl.func, proto))
+                        } else if let HirLuauInliningBody::CallingValue { template } | HirLuauInliningBody::CallingSharedValue { template } | HirLuauInliningBody::CallingObservedValue { template } | HirLuauInliningBody::CallingReadPair { template } = fields[&local].0 {
+                            hir.protos.get(template).is_some_and(|proto| calling_values::body(&decl.func, proto))
                         } else {
                             callee_body(
                                 &decl.func,
@@ -259,10 +458,11 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                             )
                         }
                 } else {
-                    if opaque_functions.locals.contains(&local) {
+                    if validated.contains(&decl.func.function) { true }
+                    else if opaque_functions.locals.contains(&local) {
                         opaque_functions.validate(&decl.func)
                     } else {
-                        plain_function(&decl.func, &callees)
+                        PlainExpressions::new(&callees).function(&decl.func)
                     }
                 };
                 if !valid {
@@ -278,7 +478,7 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 {
                     // 宏必须作为原固定结果声明发射；不允许移入参数树后复用一个估算的 top。
                     let width = if matches!(occurrences.get(&site).and_then(|local| bodies.get(local)),
-                        Some(HirLuauInliningBody::CapturedCallablePair | HirLuauInliningBody::LiteralChoice { .. }))
+                        Some(HirLuauInliningBody::CapturedCallablePair | HirLuauInliningBody::LiteralChoice { .. } | HirLuauInliningBody::CallingReadPair { .. } | HirLuauInliningBody::ArrayFold { .. }))
                     {
                         2
                     } else {
@@ -291,13 +491,35 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                         return false;
                     }
                 }
+                if decl.values.len() > 1 {
+                    for (offset, value) in decl.values.iter().enumerate() {
+                        let value = match value {
+                            AstExpr::SingleValue(value) => value.as_ref(),
+                            other => other,
+                        };
+                        if let AstExpr::Call(call) = value
+                            && let Some(site) = call.required_luau_inlining
+                            && matches!(occurrences.get(&site).and_then(|local| bodies.get(local)),
+                                Some(HirLuauInliningBody::GuardedCounter { .. }))
+                            && (decl.bindings.len() != decl.values.len()
+                                || result_slots.get(&site) != Some(&(active + offset))
+                                || !seen_result_slots.insert(site))
+                        {
+                            return false;
+                        }
+                    }
+                }
                 active += decl.bindings.len();
                 let mut expression = InvocationExpressions {
                     shared_factories: &shared_factories,
                     published_globals: &published_globals,
                     bodies: &bodies,
+                constant_controls: &constant_controls,
                     opaque_locals: &opaque_locals,
+                runtime_functions: &opaque_functions.runtime,
                     written_locals: &written_locals,
+                nonconstant_locals: &nonconstant_locals,
+                    callable_arguments: &callable_arguments,
                     scalar_callees: &scalar_callees,
                     captured_callees: &captured_callees,
                     callees: &callees,
@@ -311,11 +533,11 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 {
                     continue;
                 }
-                if decl.values.iter().any(|value| {
+                if decl.values.iter().enumerate().any(|(index, value)| {
                     !expression.check(
                         value,
                         active,
-                        decl.bindings.len() == 1 && decl.values.len() == 1,
+                        index + 1 < decl.values.len() || decl.bindings.len() == decl.values.len(),
                     )
                 }) {
                     return false;
@@ -325,9 +547,36 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 let AstCallKind::Call(call) = &stmt.call else {
                     return false;
                 };
+                if !literal_choices::comparison_slots(call, active, &occurrences, &bodies, &result_slots, &mut seen_result_slots) {
+                    return false;
+                }
+                for (argument, value) in call.args.iter().enumerate() {
+                    let value = match value {
+                        AstExpr::SingleValue(value) => value.as_ref(),
+                        value => value,
+                    };
+                    if let AstExpr::Call(inner) = value
+                        && let Some(site) = inner.required_luau_inlining
+                        && occurrences.get(&site).and_then(|local| bodies.get(local))
+                            .is_some_and(|body| matches!(body, HirLuauInliningBody::GenericCounter { .. } | HirLuauInliningBody::SeededPredicate { .. }
+                | HirLuauInliningBody::ConstantControl { .. }
+                        | HirLuauInliningBody::NumericRepeat { .. } | HirLuauInliningBody::CallingValue { .. } | HirLuauInliningBody::CallingSharedValue { .. }
+ | HirLuauInliningBody::CallingObservedValue { .. }))
+                        && (result_slots.get(&site) != Some(&(active + 1 + argument))
+                            || !seen_result_slots.insert(site))
+                    {
+                        // 完整观察帧按从左到右的实参槽承接每次展开返回。
+                        return false;
+                    }
+                }
+                if let Some(site) = generic_lookup::comparison_result(call)
+                    && occurrences.get(&site).and_then(|local| bodies.get(local))
+                        .is_some_and(|body| matches!(body, HirLuauInliningBody::GenericLookupWhile { .. }))
+                    && (result_slots.get(&site) != Some(&(active + 2))
+                        || !seen_result_slots.insert(site)) { return false; }
                 if let Some(site) = counter_while::comparison_result(call)
                     && occurrences.get(&site).and_then(|local| bodies.get(local))
-                        .is_some_and(|body| matches!(body, HirLuauInliningBody::CounterWhile { .. }))
+                        .is_some_and(|body| matches!(body, HirLuauInliningBody::CounterWhile { .. } | HirLuauInliningBody::NumericRepeat { .. }))
                     && (result_slots.get(&site) != Some(&(active + 2))
                         || !seen_result_slots.insert(site))
                 {
@@ -343,8 +592,12 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                             shared_factories: &shared_factories,
                             published_globals: &published_globals,
                             bodies: &bodies,
+                constant_controls: &constant_controls,
                             opaque_locals: &opaque_locals,
+                runtime_functions: &opaque_functions.runtime,
                             written_locals: &written_locals,
+                nonconstant_locals: &nonconstant_locals,
+                            callable_arguments: &callable_arguments,
                             scalar_callees: &scalar_callees,
                             captured_callees: &captured_callees,
                             callees: &callees,
@@ -362,6 +615,30 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                     return false;
                 }
             }
+            AstStmt::If(branch) if extended_scope => {
+                if !condition!(&branch.cond) { return false; }
+                pending.push((None, active));
+                if let Some(other) = &branch.else_block {
+                    pending.extend(other.stmts.iter().rev().map(|stmt| (Some(stmt), 0)));
+                    pending.push((None, active));
+                }
+                pending.extend(branch.then_block.stmts.iter().rev().map(|stmt| (Some(stmt), 0)));
+            }
+            AstStmt::Repeat(loop_) if extended_scope => {
+                // 候选拒绝[ProofIncomplete]：带顶层正文声明时，尚未发布 until 的活跃前缀。
+                if scope_statements(&loop_.body).iter().any(|stmt|
+                    matches!(stmt, AstStmt::LocalDecl(_) | AstStmt::LocalFunctionDecl(_)))
+                    || !condition!(&loop_.cond) { return false; }
+                pending.push((None, active));
+                pending.extend(loop_.body.stmts.iter().rev().map(|stmt| (Some(stmt), 0)));
+            }
+            AstStmt::GenericFor(loop_) if extended_scope
+                && matches!(loop_.iterator.as_slice(), [AstExpr::Var(AstNameRef::Local(_))]) => {
+                pending.push((None, active));
+                active += 3 + loop_.bindings.len();
+                pending.extend(loop_.body.stmts.iter().rev().map(|stmt| (Some(stmt), 0)));
+            }
+            AstStmt::Break | AstStmt::Continue if extended_scope => {}
             AstStmt::If(branch) => {
                 let Some(other) = &branch.else_block else {
                     return false;
@@ -393,8 +670,12 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                     shared_factories: &shared_factories,
                     published_globals: &published_globals,
                     bodies: &bodies,
+                constant_controls: &constant_controls,
                     opaque_locals: &opaque_locals,
+                runtime_functions: &opaque_functions.runtime,
                     written_locals: &written_locals,
+                nonconstant_locals: &nonconstant_locals,
+                    callable_arguments: &callable_arguments,
                     scalar_callees: &scalar_callees,
                     captured_callees: &captured_callees,
                     callees: &callees,
@@ -415,20 +696,35 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                 pending.push((None, active));
                 pending.extend(block.stmts.iter().rev().map(|stmt| (Some(stmt), 0)));
             }
-            AstStmt::NumericFor(loop_) if loops::unchanged(loop_, &callees) => {}
+            AstStmt::NumericFor(loop_) if expression_loops
+                && expression_loops::unchanged(loop_, &numeric_bindings, match loop_.binding { AstBindingRef::Local(local) => mandatory_loops.get(&local).copied(), _ => None }) => {
+                pending.push((None, active));
+                active += 3;
+                pending.extend(loop_.body.stmts.iter().rev().map(|stmt| (Some(stmt), 0)));
+            }
+            AstStmt::NumericFor(loop_) if !expression_loops && loops::unchanged(loop_, &callees) => {}
+            AstStmt::GenericFor(loop_)
+                if matches!(loop_.iterator.as_slice(), [value @ AstExpr::TableConstructor(_)]
+                    if PlainExpressions::new(&callees).expr(value)) => {
+                // 表字面量是固定单值；Luau 不展开 generic-for，构造与正文分别核对。
+                pending.push((None, active));
+                active += 3 + loop_.bindings.len();
+                pending.extend(loop_.body.stmts.iter().rev().map(|stmt| (Some(stmt), 0)));
+            }
             // pinned Luau 只展开数值循环；迭代器和循环体仍逐项排除额外内联及常量折叠。
             AstStmt::GenericFor(loop_)
                 if matches!(loop_.iterator.as_slice(), [AstExpr::Call(call)]
                     if matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if name.text == "ipairs")
                         && call.required_luau_inlining.is_none() && call.method_key.is_none()
-                        && matches!(call.args.as_slice(), [argument] if plain_expr(argument, &callees))) => {
-                if plain_block(&loop_.body, &callees) { continue; }
+                        && matches!(call.args.as_slice(), [argument] if PlainExpressions::new(&callees).expr(argument))) => {
+                if PlainExpressions::new(&callees).block(&loop_.body) { continue; }
                 pending.push((None, active));
                 active += 3 + loop_.bindings.len();
                 pending.extend(loop_.body.stmts.iter().rev().map(|stmt| (Some(stmt), 0)));
             }
-            AstStmt::FunctionDecl(decl) if plain_field_function(decl, &callees) => {}
-            AstStmt::Return(ret) if ret.values.is_empty() => {}
+            AstStmt::FunctionDecl(decl) if PlainExpressions::new(&callees).field_function(decl) => {}
+            AstStmt::Return(ret) if ret.values.is_empty()
+                || owner != hir.entry && PlainExpressions::new(&callees).values(&ret.values, false) => {}
             AstStmt::Assign(assign)
                 if assign.targets.len() == 2
                     && assign.values.len() == 1
@@ -448,8 +744,12 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                         shared_factories: &shared_factories,
                         published_globals: &published_globals,
                         bodies: &bodies,
+                constant_controls: &constant_controls,
                         opaque_locals: &opaque_locals,
+                runtime_functions: &opaque_functions.runtime,
                         written_locals: &written_locals,
+                nonconstant_locals: &nonconstant_locals,
+                        callable_arguments: &callable_arguments,
                         scalar_callees: &scalar_callees,
                         captured_callees: &captured_callees,
                         callees: &callees,
@@ -462,15 +762,23 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
                     return false;
                 }
             }
-            AstStmt::Assign(assign) if plain_assign(assign, &callees) => {}
+            AstStmt::Assign(assign) if PlainExpressions::new(&callees).assign(assign)
+                || matches!((assign.targets.as_slice(), assign.values.as_slice()),
+                    ([AstLValue::Name(AstNameRef::Local(local))], [value])
+                    if !callees.contains_key(local)
+                        && runtime_arithmetic(value, &|name| matches!(name, AstNameRef::Local(local) if nonconstant_locals.contains(local)).then_some(true)) == Some(true)) => {}
             AstStmt::Assign(assign) if matches!(assign.targets.as_slice(), [AstLValue::Name(AstNameRef::Local(local))] if opaque_locals.contains(local)) => {
                 if assign.values.len() != 1
                     || !(InvocationExpressions {
                         shared_factories: &shared_factories,
                         published_globals: &published_globals,
                         bodies: &bodies,
+                constant_controls: &constant_controls,
                         opaque_locals: &opaque_locals,
+                runtime_functions: &opaque_functions.runtime,
                         written_locals: &written_locals,
+                nonconstant_locals: &nonconstant_locals,
+                        callable_arguments: &callable_arguments,
                         scalar_callees: &scalar_callees,
                         captured_callees: &captured_callees,
                         callees: &callees,
@@ -492,6 +800,7 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
         }
     }
     seen_occurrences.len() == occurrences.len()
+        && callable_arguments.complete()
         && declared.len() == callees.len()
         && seen_result_slots.len() == result_slots.len()
 }
@@ -501,7 +810,11 @@ struct InvocationExpressions<'a> {
     shared_factories: &'a BTreeSet<crate::hir::LocalId>,
     bodies: &'a BTreeMap<crate::hir::LocalId, HirLuauInliningBody>,
     opaque_locals: &'a BTreeSet<crate::hir::LocalId>,
+    runtime_functions: &'a BTreeMap<crate::hir::LocalId, usize>,
     written_locals: &'a BTreeSet<crate::hir::LocalId>,
+    nonconstant_locals: &'a BTreeSet<crate::hir::LocalId>,
+    constant_controls: &'a constant_control::Models,
+    callable_arguments: &'a calling_values::Dependencies<'a>,
     scalar_callees: &'a BTreeSet<crate::hir::LocalId>,
     captured_callees: &'a BTreeSet<crate::hir::LocalId>,
     callees: &'a BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
@@ -511,6 +824,43 @@ struct InvocationExpressions<'a> {
 }
 
 impl InvocationExpressions<'_> {
+    fn condition(
+        &mut self,
+        expr: &AstExpr,
+        top: usize,
+        slots: &BTreeMap<crate::hir::HirSourceSite, usize>,
+        seen: &mut BTreeSet<crate::hir::HirSourceSite>,
+    ) -> bool {
+        match expr {
+            AstExpr::Call(call) if call.required_luau_inlining.is_some() => {
+                let site = call.required_luau_inlining.unwrap();
+                matches!(
+                    self.occurrences
+                        .get(&site)
+                        .and_then(|local| self.bodies.get(local)),
+                    Some(HirLuauInliningBody::CapturedIncrementIdentity { .. })
+                ) && slots.get(&site) == Some(&top)
+                    && seen.insert(site)
+                    && self.check(expr, top, true)
+            }
+            AstExpr::LogicalAnd(value) | AstExpr::LogicalOr(value) => {
+                self.condition(&value.lhs, top, slots, seen)
+                    && self.condition(&value.rhs, top, slots, seen)
+            }
+            AstExpr::Unary(value)
+                if value.op == AstUnaryOpKind::Not && !value.original_operation =>
+            {
+                self.condition(&value.expr, top, slots, seen)
+            }
+            AstExpr::Boolean(_)
+            | AstExpr::Nil
+            | AstExpr::Integer(_)
+            | AstExpr::Number(_)
+            | AstExpr::String(_) => false,
+            _ => self.check(expr, top, true),
+        }
+    }
+
     // 固定两项返回仍走 Luau targetCount 内联协议；开放返回不会获得此许可。
     fn pair(&mut self, expr: &AstExpr, top: usize) -> bool {
         let AstExpr::Call(call) = expr else {
@@ -523,7 +873,14 @@ impl InvocationExpressions<'_> {
             return false;
         };
         let arguments = match self.bodies.get(callee) {
+            Some(HirLuauInliningBody::ArrayFold { .. }) => {
+                array_fold::arguments(&call.args)
+                    && call.args.iter().all(|arg| self.check(arg, top + 2, true))
+            }
             Some(HirLuauInliningBody::CapturedCallablePair) => call.args.is_empty(),
+            Some(HirLuauInliningBody::CallingReadPair { .. }) => {
+                self.callable_arguments.arguments(call, self.written_locals)
+            }
             Some(HirLuauInliningBody::LiteralChoice { parameters, .. }) => {
                 call.args.len() == *parameters
                     && call
@@ -556,7 +913,23 @@ impl InvocationExpressions<'_> {
                     && call.callee == AstExpr::Var(AstNameRef::Local(*callee))
                     && call.method_key.is_none()
                     && call.args.len()
-                        == if self.captured_callees.contains(callee) {
+                        == if let HirLuauInliningBody::ValueExpression { parameters, .. } =
+                            self.bodies[callee]
+                        {
+                            parameters
+                        } else if let HirLuauInliningBody::ConstantControl { parameters, .. } =
+                            self.bodies[callee]
+                        {
+                            parameters
+                        } else if self.captured_callees.contains(callee)
+                            || matches!(
+                                self.bodies[callee],
+                                HirLuauInliningBody::ParameterWriteback { .. }
+                                    | HirLuauInliningBody::CallingValue { .. }
+                                    | HirLuauInliningBody::CallingSharedValue { .. }
+                                    | HirLuauInliningBody::CallingObservedValue { .. }
+                            )
+                        {
                             3
                         } else if matches!(
                             self.bodies[callee],
@@ -564,22 +937,38 @@ impl InvocationExpressions<'_> {
                                 | HirLuauInliningBody::PublishedTableFactory { .. }
                                 | HirLuauInliningBody::ClosureFactory { .. }
                                 | HirLuauInliningBody::PublishedClosureFactory { .. }
+                                | HirLuauInliningBody::GenericBreak { .. }
                         ) {
                             0
                         } else if matches!(
                             self.bodies[callee],
                             HirLuauInliningBody::RepeatPrefix { .. }
+                                | HirLuauInliningBody::RepeatLookup { .. }
+                                | HirLuauInliningBody::GenericLookupWhile { .. }
                         ) {
                             2
                         } else if matches!(
                             self.bodies[callee],
+                            HirLuauInliningBody::CounterRepeat { .. }
+                                | HirLuauInliningBody::NumericRepeat { .. }
+                                | HirLuauInliningBody::GuardedCounter { .. }
+                                | HirLuauInliningBody::ResetCounter { .. }
+                        ) {
+                            3
+                        } else if matches!(
+                            self.bodies[callee],
                             HirLuauInliningBody::CounterWhile { .. }
                                 | HirLuauInliningBody::StatefulGenericWhile { .. }
+                                | HirLuauInliningBody::GenericCounter { .. }
                         ) {
                             4
                         } else {
                             1
                         }
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::CapturedIncrementIdentity { .. }
+                    ) || matches!(call.args.as_slice(), [AstExpr::Boolean(_)]))
                     && (!self.scalar_callees.contains(callee)
                         || matches!(call.args[0], AstExpr::Boolean(_)))
                     && (!matches!(
@@ -602,9 +991,57 @@ impl InvocationExpressions<'_> {
                     ) || matches!(call.args.as_slice(), [AstExpr::Var(AstNameRef::Local(local))] if !self.opaque_locals.contains(local)))
                     && (!matches!(
                         self.bodies[callee],
+                        HirLuauInliningBody::ValueExpression { .. }
+                    ) || value_expressions::arguments(&call.args, self.written_locals))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::SeededPredicate { .. }
+                    ) || seeded_predicates::arguments(&call.args, self.written_locals))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::CallingValue { .. }
+                            | HirLuauInliningBody::CallingSharedValue { .. }
+                            | HirLuauInliningBody::CallingObservedValue { .. }
+                    ) || self.callable_arguments.arguments(call, self.written_locals))
+                    && (!matches!(
+                        self.bodies[callee],
                         HirLuauInliningBody::RepeatPrefix { .. }
                     ) || call.args.as_slice()
                         == [AstExpr::Boolean(true), AstExpr::Boolean(true)])
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::GenericLookupWhile { .. }
+                    ) || generic_lookup::arguments(&call.args, self.written_locals))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::ResetCounter { .. }
+                    ) || reset_counter::arguments(&call.args))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::CounterRepeat { .. }
+                    ) || counter_repeat::arguments(&call.args))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::NumericRepeat { .. }
+                    ) || numeric_repeat::arguments(&call.args, self.nonconstant_locals))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::GuardedCounter { .. }
+                    ) || guarded_counter::arguments(&call.args))
+                    && (if let HirLuauInliningBody::ConstantControl {
+                        parameters,
+                        truth_mask,
+                        ..
+                    } = self.bodies[callee]
+                    {
+                        constant_control::arguments(&call.args, parameters, truth_mask)
+                    } else {
+                        true
+                    })
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::GenericCounter { .. }
+                    ) || generic_counter::arguments(&call.args))
                     && (!matches!(
                         self.bodies[callee],
                         HirLuauInliningBody::CounterWhile { .. }
@@ -613,12 +1050,34 @@ impl InvocationExpressions<'_> {
                         self.bodies[callee],
                         HirLuauInliningBody::StatefulGenericWhile { .. }
                     ) || stateful_generic::inlined_arguments(&call.args, self.written_locals))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::RepeatLookup { .. }
+                    ) || matches!(
+                        call.args.as_slice(),
+                        [AstExpr::Boolean(true), AstExpr::TableConstructor(_)]
+                    ))
                     && (self.bodies[callee] != HirLuauInliningBody::Identity
                         || matches!(call.args.as_slice(), [AstExpr::Number(value)] if value.is_nan())
                         || matches!(call.args.as_slice(), [AstExpr::Integer(value)] if (-32768..=32767).contains(value))
                         || matches!(call.args.as_slice(), [AstExpr::Boolean(_)]))
-                    && call.args.iter().all(|arg| plain_expr(arg, self.callees))
+                    && call.args.iter().enumerate().all(|(index, arg)| {
+                        PlainExpressions::new(self.callees).expr(arg)
+                            || self.callable_arguments.inline_argument(call, index)
+                    })
                     && self.seen.insert(site)
+            }
+            AstExpr::Call(call)
+                if !fixed_one
+                    && matches!(call.callee, AstExpr::Var(AstNameRef::Local(local))
+                        if self.callees.contains_key(&local) && self.declared.contains(&local)) =>
+            {
+                // pinned Luau 的 multRet 调用始终拒绝内联；不推断其返回宽度。
+                // 原普通 CALL 的每个实参仍须核对，只有最后一项可保持开放返回。
+                call.method_key.is_none()
+                    && call.args.iter().enumerate().all(|(index, arg)| {
+                        self.check(arg, top + 1 + call.args.len(), index + 1 < call.args.len())
+                    })
             }
             AstExpr::Call(call)
                 if matches!(&call.callee,
@@ -626,11 +1085,17 @@ impl InvocationExpressions<'_> {
             {
                 // 原固定参数中的展开结果由 AST 保留单值括号；select 的计数
                 // 调用不参与额外内联，内部 occurrence 仍须通过同一编译合同。
-                call.method_key.is_none()
-                    && matches!(call.args.as_slice(), [AstExpr::String(marker), AstExpr::SingleValue(value)]
+                fixed_one && PlainExpressions::new(self.callees).expr(expr)
+                    || call.method_key.is_none()
+                        && matches!(call.args.as_slice(), [AstExpr::String(marker), AstExpr::SingleValue(value)]
                         if marker.as_utf8() == Some("#")
                             && matches!(value.as_ref(), AstExpr::Call(inner) if inner.required_luau_inlining.is_some()))
-                    && self.check(&call.args[1], top + 3, true)
+                        && self.check(&call.args[1], top + 3, true)
+                    || fixed_one
+                        && call.method_key.is_none()
+                        && matches!(call.args.as_slice(), [AstExpr::String(marker), AstExpr::Call(inner)]
+                            if marker.as_utf8() == Some("#") && inner.required_luau_inlining.is_none())
+                        && self.check(&call.args[1], top + 3, false)
             }
             AstExpr::Var(AstNameRef::Global(name))
                 if self.published_globals.contains(name.text.as_str()) =>
@@ -675,6 +1140,13 @@ impl InvocationExpressions<'_> {
             {
                 self.check(&unary.expr, top + 1, true)
             }
+            AstExpr::Binary(_) | AstExpr::Call(_)
+                if runtime_arithmetic(expr, &|name| {
+                    matches!(name, AstNameRef::Local(local) if self.nonconstant_locals.contains(local)).then_some(true)
+                }) == Some(true) =>
+            {
+                true
+            }
             AstExpr::SingleValue(value) => self.check(value, top, true),
             AstExpr::Call(call) if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local)) if self.shared_factories.contains(&local) && self.declared.contains(&local)) => {
                 fixed_one && top <= 128 && call.method_key.is_none() && call.args.is_empty()
@@ -687,9 +1159,66 @@ impl InvocationExpressions<'_> {
             }
             AstExpr::Call(call)
                 if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local))
+                if matches!(self.bodies.get(&local), Some(HirLuauInliningBody::GenericCounter { .. })) && self.declared.contains(&local)) =>
+            {
+                call.method_key.is_none()
+                    && generic_counter::retained_arguments(&call.args)
+                    && call
+                        .args
+                        .iter()
+                        .all(|arg| PlainExpressions::new(self.callees).expr(arg))
+            }
+            AstExpr::Call(call)
+                if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local))
                 if matches!(self.bodies.get(&local), Some(HirLuauInliningBody::RepeatPrefix { .. })) && self.declared.contains(&local)) =>
             {
                 call.method_key.is_none() && repeat_prefix::retained_arguments(&call.args)
+            }
+            AstExpr::Call(call) if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local)) if matches!(self.bodies.get(&local), Some(HirLuauInliningBody::ConstantControl { .. })) && self.declared.contains(&local)) =>
+            {
+                let AstExpr::Var(AstNameRef::Local(local)) = call.callee else {
+                    unreachable!()
+                };
+                call.method_key.is_none()
+                    && self
+                        .constant_controls
+                        .retained(local, &call.args, self.nonconstant_locals)
+                    && call
+                        .args
+                        .iter()
+                        .all(|arg| PlainExpressions::new(self.callees).expr(arg))
+            }
+            AstExpr::Call(call)
+                if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local))
+                if matches!(self.bodies.get(&local), Some(HirLuauInliningBody::NumericRepeat { .. })) && self.declared.contains(&local)) =>
+            {
+                call.method_key.is_none()
+                    && numeric_repeat::retained(&call.args, self.nonconstant_locals)
+                    && call
+                        .args
+                        .iter()
+                        .all(|arg| PlainExpressions::new(self.callees).expr(arg))
+            }
+            AstExpr::Call(call)
+                if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local))
+                if matches!(self.bodies.get(&local), Some(HirLuauInliningBody::GuardedCounter { .. })) && self.declared.contains(&local)) =>
+            {
+                call.method_key.is_none()
+                    && guarded_counter::retained(&call.args, self.nonconstant_locals)
+                    && call
+                        .args
+                        .iter()
+                        .all(|arg| PlainExpressions::new(self.callees).expr(arg))
+            }
+            AstExpr::Call(call) if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local)) if self.runtime_functions.contains_key(&local)) =>
+            {
+                let AstExpr::Var(AstNameRef::Local(local)) = call.callee else {
+                    unreachable!()
+                };
+                call.required_luau_inlining.is_none() && call.method_key.is_none()
+                    && call.args.len() == self.runtime_functions[&local]
+                    && call.args.iter().all(|arg| matches!(arg,
+                        AstExpr::Var(AstNameRef::Local(local)) if self.nonconstant_locals.contains(local)))
             }
             AstExpr::Call(call) if matches!(call.callee, AstExpr::Var(AstNameRef::Local(local)) if self.opaque_locals.contains(&local)) => {
                 call.method_key.is_none()
@@ -698,12 +1227,15 @@ impl InvocationExpressions<'_> {
                     })
             }
             AstExpr::MethodCall(call) => {
-                plain_expr(&call.receiver, self.callees)
+                PlainExpressions::new(self.callees).expr(&call.receiver)
                     && call.args.iter().enumerate().all(|(index, arg)| {
                         self.check(arg, top + 2 + call.args.len(), index + 1 < call.args.len())
                     })
             }
-            _ => plain_expr(expr, self.callees) && (fixed_one || open_tail_unchanged(expr)),
+            _ => {
+                PlainExpressions::new(self.callees).expr(expr)
+                    && (fixed_one || open_tail_unchanged(expr))
+            }
         }
     }
 }
@@ -714,6 +1246,16 @@ fn callee_body(
     expected_field: &crate::LuaString,
     capture: Option<crate::hir::LocalId>,
 ) -> bool {
+    if let HirLuauInliningBody::SeededPredicate { template } = body {
+        return seeded_predicates::body(func, template);
+    }
+    if let HirLuauInliningBody::ValueExpression {
+        template,
+        parameters,
+    } = body
+    {
+        return value_expressions::body(func, template, parameters);
+    }
     if let HirLuauInliningBody::LiteralChoice {
         template,
         parameters,
@@ -729,6 +1271,27 @@ fn callee_body(
     {
         return stateful_generic::body(func, template, initial, increment, expected_field);
     }
+    if let HirLuauInliningBody::GenericLookupWhile { template, key } = body {
+        return generic_lookup::body(func, template, key, expected_field);
+    }
+    if let HirLuauInliningBody::GenericCounter {
+        template,
+        initial,
+        increment,
+        repeats,
+    } = body
+    {
+        return generic_counter::body(func, template, initial, increment, repeats);
+    }
+    if let HirLuauInliningBody::CounterRepeat {
+        template,
+        initial,
+        increment,
+        limit,
+    } = body
+    {
+        return counter_repeat::body(func, template, initial, increment, limit);
+    }
     if let HirLuauInliningBody::CounterWhile {
         template,
         initial,
@@ -737,6 +1300,20 @@ fn callee_body(
     } = body
     {
         return counter_while::body(func, template, initial, increment, limit);
+    }
+    if let HirLuauInliningBody::GenericBreak {
+        template, initial, ..
+    } = body
+    {
+        return generic_break::body(func, template, initial);
+    }
+    if let HirLuauInliningBody::RepeatLookup {
+        template,
+        key,
+        result,
+    } = body
+    {
+        return repeat_lookup::body(func, template, key, result);
     }
     if let HirLuauInliningBody::RepeatPrefix { template } = body {
         return repeat_prefix::body(func, template);
@@ -774,6 +1351,9 @@ fn callee_body(
     } = body
     {
         return nested_value_closure_factory_body(func, intermediate, result);
+    }
+    if let HirLuauInliningBody::CapturedIncrementIdentity { increment } = body {
+        return scopes::increment_identity(func, capture, increment);
     }
     if body == HirLuauInliningBody::CapturedAddIdentity {
         return captured_identity_body(func, capture);
@@ -1126,7 +1706,7 @@ fn closure_factory_body(
             if matches!(&stmt.call, AstCallKind::Call(call)
                 if matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if name.text=="assert")
                 && call.required_luau_inlining.is_none() && call.method_key.is_none()
-                && plain_values(&call.args, &BTreeMap::new(), false))))
+                && PlainExpressions::new(&BTreeMap::new()).values(&call.args, false))))
 }
 
 fn captured_concat_body(
@@ -1250,211 +1830,18 @@ fn table_callee(call: &AstCallExpr, expected: &str) -> bool {
             AstExpr::Var(AstNameRef::Global(name)) if name.text == "table"))
 }
 
-/// 外围调用不解析 local 函数，避免 O2 额外内联；global 仅作为已核对的 callee，
-/// 同时排除 math 常量折叠与 getfenv/setfenv 对整个模块编译模式的影响。
-fn plain_expr(
-    expr: &AstExpr,
-    callees: &BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
-) -> bool {
-    match expr {
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_) => true,
-        AstExpr::Var(AstNameRef::Global(name)) if name.text == "print" => true,
-        AstExpr::Var(AstNameRef::Local(local)) => !callees.contains_key(local),
-        AstExpr::Var(AstNameRef::Param(_) | AstNameRef::Upvalue(_)) => true,
-        AstExpr::Call(call) => {
-            // pinned Luau 的 select("#", ...) 单结果路径直接计数当前变参，
-            // 不参与函数解析或参数常量折叠；开放尾部仍由 plain_values 拒绝。
-            if matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if name.text == "select")
-            {
-                return call.required_luau_inlining.is_none()
-                    && call.method_key.is_none()
-                    && matches!(call.args.as_slice(), [AstExpr::String(marker), AstExpr::VarArg]
-                        if marker.as_utf8() == Some("#"));
-            }
-            // pcall 不参与 getFunctionExpr；作为其首实参传递的函数值不会额外内联。
-            if matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if name.text == "pcall")
-            {
-                return call.required_luau_inlining.is_none()
-                    && call.method_key.is_none()
-                    && matches!(call.args.first(), Some(AstExpr::Var(AstNameRef::Local(_))))
-                    && plain_values(&call.args[1..], callees, false);
-            }
-            call.required_luau_inlining.is_none()
-                && call.method_key.is_none()
-                && (opaque_callee(call)
-                    || matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name))
-                        if matches!(name.text.as_str(), "getmetatable" | "setmetatable" | "type" | "tostring"))
-                    // max 只在所有参数均为数值常量时折叠；不透明索引调用排除此条件。
-                    || (matches!(&call.callee, AstExpr::FieldAccess(field)
-                        if field.field == "max" && matches!(&field.base,
-                            AstExpr::Var(AstNameRef::Global(name)) if name.text == "math"))
-                        && call.args.iter().any(|arg| matches!(arg, AstExpr::Call(inner)
-                            if matches!(inner.callee, AstExpr::IndexAccess(_))))))
-                && (!matches!(call.callee, AstExpr::IndexAccess(_))
-                    || plain_expr(&call.callee, callees))
-                && plain_values(&call.args, callees, false)
-        }
-        AstExpr::FunctionExpr(function) => plain_function(function, callees),
-        AstExpr::SingleValue(value) => plain_expr(value, callees),
-        AstExpr::FieldAccess(field) => plain_expr(&field.base, callees),
-        AstExpr::IndexAccess(index) => {
-            plain_expr(&index.base, callees) && plain_expr(&index.index, callees)
-        }
-        AstExpr::Unary(unary) => {
-            matches!(unary.op, AstUnaryOpKind::Length | AstUnaryOpKind::Not)
-                && plain_expr(&unary.expr, callees)
-        }
-        AstExpr::Binary(binary) => {
-            (matches!(
-                binary.op,
-                AstBinaryOpKind::Eq
-                    | AstBinaryOpKind::Lt
-                    | AstBinaryOpKind::Le
-                    | AstBinaryOpKind::Gt
-                    | AstBinaryOpKind::Ge
-                    | AstBinaryOpKind::Concat
-            ) || (binary.op == AstBinaryOpKind::Add
-                && matches!(binary.rhs, AstExpr::Integer(_) | AstExpr::Number(_)))
-                || binary.op == AstBinaryOpKind::Mod
-                    && matches!(binary.lhs, AstExpr::Var(AstNameRef::Local(_)))
-                    && matches!(binary.rhs, AstExpr::Integer(_) | AstExpr::Number(_)))
-                && plain_expr(&binary.lhs, callees)
-                && plain_expr(&binary.rhs, callees)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            plain_expr(&logical.lhs, callees) && plain_expr(&logical.rhs, callees)
-        }
-        AstExpr::TableConstructor(table) => {
-            table
-                .fields
-                .iter()
-                .enumerate()
-                .all(|(index, field)| match field {
-                    AstTableField::Array(value) => {
-                        // getFunctionExpr 不解析表内函数值；后续索引调用仍保留原 CALL。
-                        (matches!(value, AstExpr::Var(AstNameRef::Local(local)) if callees.contains_key(local))
-                            || plain_expr(value, callees))
-                            && (index + 1 < table.fields.len() || open_tail_unchanged(value))
-                    }
-                    AstTableField::Record(record) => {
-                        (match &record.key {
-                            AstTableKey::Name(_) => true,
-                            AstTableKey::Expr(key) => plain_expr(key, callees),
-                        }) && plain_expr(&record.value, callees)
-                    }
-                })
-        }
-        _ => false,
-    }
-}
-
 fn opaque_callee(call: &AstCallExpr) -> bool {
     // pinned Luau 不把这几个库调用识别为 builtin；索引调用也不参与 getFunctionExpr。
     ["pack", "freeze", "isfrozen", "concat"]
         .iter()
         .any(|name| table_callee(call, name))
-        || matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if matches!(name.text.as_str(), "next" | "collectgarbage" | "pcall"))
+        || matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if matches!(name.text.as_str(), "next" | "collectgarbage" | "pcall" | "error"))
         || matches!(&call.callee, AstExpr::IndexAccess(_))
 }
 
 fn open_tail_unchanged(expr: &AstExpr) -> bool {
     // O2 的已知单返回 builtin 会把 open 尾部压为一个值；外围不能借 pragma 改变它。
     !matches!(expr, AstExpr::Call(call) if !opaque_callee(call))
-}
-
-fn plain_values(
-    values: &[AstExpr],
-    callees: &BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
-    fixed_one: bool,
-) -> bool {
-    values.iter().enumerate().all(|(index, value)| {
-        plain_expr(value, callees)
-            && (fixed_one || index + 1 < values.len() || open_tail_unchanged(value))
-    })
-}
-
-fn plain_assign(
-    assign: &AstAssign,
-    callees: &BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
-) -> bool {
-    assign.targets.iter().all(|target| match target {
-        AstLValue::Name(name) => plain_expr(&AstExpr::Var(name.clone()), callees),
-        AstLValue::FieldAccess(field) => plain_expr(&field.base, callees),
-        AstLValue::IndexAccess(index) => {
-            plain_expr(&index.base, callees) && plain_expr(&index.index, callees)
-        }
-    }) && plain_values(
-        &assign.values,
-        callees,
-        assign.targets.len() == assign.values.len(),
-    )
-}
-
-fn plain_function(
-    function: &AstFunctionExpr,
-    callees: &BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
-) -> bool {
-    if function.is_vararg
-        || function.named_vararg.is_some()
-        || function.captured_bindings.iter().any(
-            |binding| matches!(binding, AstBindingRef::Local(local) if callees.contains_key(local)),
-        )
-    {
-        return false;
-    }
-    // LocalId 属于 child 自身；进入函数前已排除 required callee 的跨层捕获。
-    let locals = BTreeMap::new();
-    plain_block(&function.body, &locals)
-}
-
-fn plain_field_function(
-    decl: &AstFunctionDecl,
-    callees: &BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
-) -> bool {
-    let path = match &decl.target {
-        AstFunctionName::Plain(path) if !path.fields.is_empty() => path,
-        AstFunctionName::Method(path, _) => path,
-        _ => return false,
-    };
-    plain_expr(&AstExpr::Var(path.root.clone()), callees) && plain_function(&decl.func, callees)
-}
-
-fn plain_block(
-    block: &AstBlock,
-    locals: &BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
-) -> bool {
-    block.stmts.iter().all(|stmt| match stmt {
-        AstStmt::LocalDecl(decl) => plain_values(
-            &decl.values,
-            locals,
-            decl.bindings.len() == decl.values.len(),
-        ),
-        AstStmt::Assign(assign) => plain_assign(assign, locals),
-        AstStmt::Return(ret) => plain_values(&ret.values, locals, false),
-        AstStmt::CallStmt(stmt) => matches!(&stmt.call, AstCallKind::Call(call)
-            if call.required_luau_inlining.is_none() && call.method_key.is_none()
-                // table.insert 的丢弃结果调用不参与 O2 常量折叠或函数解析；
-                // 限定固定双实参，不能把它加入允许开放返回的 opaque callee 集合。
-                && (opaque_callee(call) || (table_callee(call, "insert") && call.args.len() == 2)
-                    || matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name))
-                    if name.text == "assert" || name.text == "print"))
-                && plain_values(&call.args, locals, false)),
-        AstStmt::LocalFunctionDecl(decl) => plain_function(&decl.func, locals),
-        AstStmt::FunctionDecl(decl) => plain_field_function(decl, locals),
-        AstStmt::If(branch) => {
-            plain_expr(&branch.cond, locals)
-                && plain_block(&branch.then_block, locals)
-                && branch
-                    .else_block
-                    .as_ref()
-                    .is_none_or(|block| plain_block(block, locals))
-        }
-        _ => false,
-    })
 }
 
 // 合成工厂只创建一个 reusable closure 或两层依赖；对应 CostModel 为 10/20。
@@ -1500,7 +1887,7 @@ fn shared_closure_body(stmts: &[AstStmt]) -> bool {
                 child.creation,
                 Some(crate::hir::HirClosureCreation::MayReuse { .. })
             ) && child.capture_write_names.is_empty()
-                && plain_function(child, &BTreeMap::new())
+                && PlainExpressions::new(&BTreeMap::new()).function(child)
         }
         [AstStmt::LocalFunctionDecl(owner), AstStmt::Return(ret)] => {
             let [AstExpr::FunctionExpr(child)] = ret.values.as_slice() else {
@@ -1802,4 +2189,44 @@ fn published_closure_factory(
         && readonly_leaf(output, result)
         && published.captured_bindings.is_empty()
         && output.captured_bindings == BTreeSet::from([inner.name])
+}
+
+// 每个运算节点都必须含有不能被常量传播的输入；不能用整棵表达式含 local 掩盖内部纯常量子树。
+fn runtime_arithmetic(
+    expr: &AstExpr,
+    nonconstant: &impl Fn(&AstNameRef) -> Option<bool>,
+) -> Option<bool> {
+    match expr {
+        AstExpr::Integer(_) | AstExpr::Number(_) => Some(false),
+        AstExpr::Var(name) => nonconstant(name),
+        AstExpr::Call(call)
+            if call.required_luau_inlining.is_none()
+                && call.method_key.is_none()
+                && matches!(&call.callee, AstExpr::FieldAccess(field)
+                    if field.field == "floor" && matches!(&field.base,
+                        AstExpr::Var(AstNameRef::Global(name)) if name.text == "math")) =>
+        {
+            let [argument] = call.args.as_slice() else {
+                return None;
+            };
+            // 只有参数依赖不展开循环或显式写入时才保留动态调用，
+            // 不能把 math.floor 的常量实参误作阻止 O2 折叠的证据。
+            (runtime_arithmetic(argument, nonconstant) == Some(true)).then_some(true)
+        }
+        AstExpr::Binary(binary)
+            if matches!(
+                binary.op,
+                AstBinaryOpKind::Add
+                    | AstBinaryOpKind::Sub
+                    | AstBinaryOpKind::Mul
+                    | AstBinaryOpKind::Div
+                    | AstBinaryOpKind::Mod
+            ) =>
+        {
+            let left = runtime_arithmetic(&binary.lhs, nonconstant)?;
+            let right = runtime_arithmetic(&binary.rhs, nonconstant)?;
+            (left || right).then_some(true)
+        }
+        _ => None,
+    }
 }

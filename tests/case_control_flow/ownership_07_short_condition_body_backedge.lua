@@ -13,6 +13,9 @@ local function run(a, b, c)
     return count
 end
 
+-- 三次完整调用共同保留原短路测试，不在调用方留下空测试壳和参数/返回接棒。
+-- unluac: expect-ast-count [[if]] [[0]] [[@dialect=luau]] [[@variant=O2]] [[@proto=0]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@dialect=luau]] [[@variant=O2]] [[@proto=0]]
 local left = run(true, false, true)
 local right = run(false, true, true)
 local blocked = run(true, true, false)

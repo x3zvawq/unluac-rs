@@ -70,6 +70,10 @@ pub(in crate::hir::simplify) fn restore(
                     NativeFrameContext {
                         rk_literals: None,
                         expanded_callees: None,
+                        compared_choices: None,
+                        value_expressions: None,
+                        calling_values: None,
+                        seeded_predicates: None,
                         retired_roots: None,
                         root_seed_sources: None,
                         proto,

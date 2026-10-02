@@ -4,6 +4,7 @@
 -- unluac: expect-contains [[if not r3_0 then]]
 -- unluac: expect-contains [[print("dead")]]
 -- unluac: expect-contains [[p4_0 = r0_0.decrypt(p4_0)]]
+-- unluac: expect-contains [[return r0_0.consume(p4_0)]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
 -- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]]
 -- unluac: expect-ast-count [[if]] [[3]] [[@proto=3]]
@@ -81,3 +82,13 @@ assert(run_if(nil, true, nil) == false and events == "decrypt;")
 events = ""
 value, hole, tail = run_if(false, nil, true)
 assert(value == false and hole == nil and tail == "tail" and events == "consume;")
+
+-- 更新参数后再尾调用，必须读取 decrypt 的新值；恒等 decrypt 无法暴露误读入口值。
+codec.decrypt = function(input)
+    assert(input == "encoded")
+    events = events .. "decrypt;"
+    return "decoded", "ignored"
+end
+events = ""
+value, hole, tail = run_if("encoded", true, false)
+assert(value == "decoded" and hole == nil and tail == "tail" and events == "decrypt;consume;")

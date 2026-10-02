@@ -1,4 +1,4 @@
-//! 保存 PUC/LuaJIT 并行赋值中连续查表、末项直接写低槽及逆序写回的原 Def。
+//! 保存 PUC/LuaJIT 并行赋值中查表与标量准备、末项直接写低槽及逆序写回的原 Def。
 //! 这里只识别无额外左值准备的固定键读取；源码声明和后继 scratch 复用由完整帧验证。
 
 use super::*;
@@ -9,6 +9,7 @@ pub(in crate::hir) struct LookupRead {
     pub(in crate::hir) site: InstrRef,
     pub(in crate::hir) value: TempId,
     pub(in crate::hir) home: HomeSlotKey,
+    pub(in crate::hir) literal: Option<HirExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,31 +46,41 @@ pub(in crate::hir::promotion) fn collect(
         let frame = (|| {
             let mut at = start;
             loop {
-                let LowInstr::GetTable(read) = *proto.instrs.get(at)? else {
-                    return None;
+                let (dst, literal) = match proto.instrs.get(at)? {
+                    LowInstr::GetTable(read) => {
+                        let AccessBase::Reg(table) = read.base else {
+                            return None;
+                        };
+                        if read.kind != GetTableKind::Normal
+                            || !matches!(read.key, AccessKey::Const(_) | AccessKey::Integer(_))
+                            || table.index() >= base
+                        {
+                            return None;
+                        }
+                        inputs.insert(table);
+                        (read.dst, None)
+                    }
+                    instr => {
+                        let (dst, value) = scalar_literal(proto, instr)?;
+                        (dst, Some(value))
+                    }
                 };
-                let AccessBase::Reg(table) = read.base else {
-                    return None;
-                };
-                if read.kind != GetTableKind::Normal
-                    || !matches!(read.key, AccessKey::Const(_) | AccessKey::Integer(_))
-                    || table.index() >= base
-                    || cfg.instr_to_block[at] != block
-                    || (read.dst.index() >= base && read.dst.index() != base + reads.len())
+                if cfg.instr_to_block[at] != block
+                    || (dst.index() >= base && dst.index() != base + reads.len())
                 {
                     return None;
                 }
-                inputs.insert(table);
                 let site = InstrRef(at);
-                let def = dataflow.instr_def_for_reg(site, read.dst)?;
+                let def = dataflow.instr_def_for_reg(site, dst)?;
                 reads.push(LookupRead {
                     site,
                     value: TempId(def.index()),
-                    home: HomeSlotKey::new(read.dst.index(), epochs.epoch_at(read.dst, site)),
+                    home: HomeSlotKey::new(dst.index(), epochs.epoch_at(dst, site)),
+                    literal,
                 });
                 at += 1;
                 index = at;
-                if read.dst.index() < base {
+                if dst.index() < base {
                     break;
                 }
             }
@@ -89,6 +100,15 @@ pub(in crate::hir::promotion) fn collect(
                 if dataflow.use_value(site, source)
                     != SsaValue::Def(crate::structure::DefId(read.value.index()))
                 {
+                    return None;
+                }
+                if read.literal.is_some()
+                    && (!matches!(dataflow.def_uses[read.value.index()].as_slice(), [use_] if use_.instr == site)
+                        || !dataflow.def_phi_uses[read.value.index()].is_empty()
+                        || epochs.reference_capture_may_be_open(source, read.site)
+                        || epochs.epoch_at(source, site) != read.home.epoch)
+                {
+                    // 标量准备须只供这次原 COPY 使用，才能保留到整组赋值提交时退休。
                     return None;
                 }
                 let target = match instr {

@@ -49,25 +49,155 @@ fn no_index(expr: &HirExpr, index: LocalId) -> bool {
 }
 
 pub(super) fn direct_condition(expr: &HirExpr, facts: &ProtoPromotionFacts) -> bool {
-    let mut expr = expr;
-    while let HirExpr::Unary(unary) = expr {
-        if unary.source_site.is_some() || unary.op != crate::hir::HirUnaryOpKind::Not {
+    fn check(expr: &HirExpr, facts: &ProtoPromotionFacts, remaining: &mut usize) -> bool {
+        if *remaining == 0 {
             return false;
         }
-        expr = &unary.expr;
+        *remaining -= 1;
+        let mut expr = expr;
+        while let HirExpr::Unary(unary) = expr {
+            if unary.source_site.is_some() || unary.op != crate::hir::HirUnaryOpKind::Not {
+                return false;
+            }
+            expr = &unary.expr;
+        }
+        if let HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) = expr {
+            return check(&logical.lhs, facts, remaining) && check(&logical.rhs, facts, remaining);
+        }
+        let HirExpr::Binary(binary) = expr else {
+            return false;
+        };
+        let HirExpr::LocalRef(local) = &binary.lhs else {
+            return false;
+        };
+        binary.op == crate::hir::HirBinaryOpKind::Eq
+            && matches!(
+                binary.rhs,
+                HirExpr::Nil
+                    | HirExpr::Boolean(_)
+                    | HirExpr::Integer(_)
+                    | HirExpr::Number(_)
+                    | HirExpr::String(_)
+            )
+            && facts.native_binary_layout(binary).is_some_and(|layout| {
+                layout.lhs == facts.trusted_local_home_slot(*local)
+                    && layout.lhs.is_some()
+                    && layout.rhs.is_none()
+            })
     }
-    let HirExpr::Binary(binary) = expr else {
+    check(expr, facts, &mut 32)
+}
+
+/// 真值 TEST 直接读取原绑定，不从当前 LocalRef 形状猜测被测槽。
+pub(super) fn direct_test(branch: &crate::hir::HirIf, facts: &ProtoPromotionFacts) -> bool {
+    if direct_condition(&branch.cond, facts) {
+        return true;
+    }
+    // 合并后的短路条件没有单个 predicate_source。这里只保留已有控制树：
+    // 所有叶都是具有稳定 home 的当前 binding，synthetic NOT 只交换分支，
+    // 因而发射 TEST 不分配 scratch；声明的实际栈位置仍由整批 prefix 核对。
+    if matches!(
+        branch.cond,
+        HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_) | HirExpr::Unary(_)
+    ) && predicate_reads_below(&branch.cond, facts, usize::MAX)
+    {
+        return true;
+    }
+    let HirExpr::LocalRef(local) = &branch.cond else {
         return false;
     };
-    let (HirExpr::LocalRef(local), HirExpr::Nil) = (&binary.lhs, &binary.rhs) else {
-        return false;
-    };
-    binary.op == crate::hir::HirBinaryOpKind::Eq
-        && facts.native_binary_layout(binary).is_some_and(|layout| {
-            layout.lhs == facts.trusted_local_home_slot(*local)
-                && layout.lhs.is_some()
-                && layout.rhs.is_none()
+    branch
+        .predicate_source
+        .and_then(|source| facts.original_truthy_input(source))
+        .is_some_and(|(value, home)| {
+            facts.promoted_local_for_temp(value) == Some(*local)
+                && facts.trusted_local_home_slot(*local) == Some(home)
         })
+}
+
+/// 原 ADD/ADDK 对现有 local 原位更新，没有额外输入或结果准备槽。
+pub(super) fn direct_increment(
+    assign: &crate::hir::HirAssign,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    let ([HirLValue::Local(local)], [HirExpr::Binary(binary)], None) = (
+        assign.targets.as_slice(),
+        assign.values.fixed.as_slice(),
+        &assign.values.tail,
+    ) else {
+        return false;
+    };
+    let Some(home) = facts.trusted_local_home_slot(*local) else {
+        return false;
+    };
+    !assign.is_phi_transfer
+        && assign.initializer_merge_transaction.is_none()
+        && binary.op == crate::hir::HirBinaryOpKind::Add
+        && binary.lhs == HirExpr::LocalRef(*local)
+        && facts.native_binary_layout(binary).is_some_and(|layout| {
+            layout.lhs == Some(home)
+                && facts.direct_binary_operand_home(binary, 0) == Some(home)
+                && match binary.rhs {
+                    HirExpr::Integer(_) | HirExpr::Number(_) => layout.rhs.is_none(),
+                    HirExpr::LocalRef(local) => {
+                        facts.trusted_local_home_slot(local).is_some_and(|rhs| {
+                            layout.rhs == Some(rhs)
+                                && facts.direct_binary_operand_home(binary, 1) == Some(rhs)
+                        })
+                    }
+                    _ => false,
+                }
+        })
+        && binary
+            .source_site
+            .and_then(|source| facts.operation_writeback(source))
+            // 原结果可能只进入后继 phi，因而没有独立 promoted local；
+            // 当前原位目标与已验证输入同一 binding，仍须写回原 home。
+            .is_some_and(|(_, written)| written == home)
+}
+
+/// 原比较只读低槽/RK，Boolean 叶仍写已有结果 home；不引入或退休准备槽。
+pub(super) fn direct_boolean_write(
+    assign: &crate::hir::HirAssign,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    let ([HirLValue::Local(local)], [value], None) = (
+        assign.targets.as_slice(),
+        assign.values.fixed.as_slice(),
+        &assign.values.tail,
+    ) else {
+        return false;
+    };
+    if assign.is_phi_transfer || assign.initializer_merge_transaction.is_some() {
+        return false;
+    }
+    direct_boolean_result(*local, value, facts)
+}
+
+pub(super) fn direct_boolean_result(
+    local: LocalId,
+    value: &HirExpr,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    if !direct_condition(value, facts) {
+        return false;
+    }
+    let HirExpr::Binary(binary) = synthetic_not_subject(value).0 else {
+        return false;
+    };
+    let Some(result) = facts.comparison_result_temp(binary) else {
+        return false;
+    };
+    let Some(home) = facts.trusted_local_home_slot(local) else {
+        return false;
+    };
+    facts.promoted_local_for_temp(result) == Some(local)
+        && facts.trusted_temp_home_slot(result) == Some(home)
+        && facts
+            .complete_temp_definition_write_homes(result)
+            .iter()
+            .copied()
+            .eq([home])
 }
 
 pub(super) fn loops_unchanged(proto: &HirProto, leaves: &[bool]) -> bool {

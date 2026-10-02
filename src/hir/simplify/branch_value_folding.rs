@@ -241,6 +241,7 @@ fn fold_nil_fallback_decision_locals_in_block(
         stmts.insert(
             index + 1,
             HirStmt::If(Box::new(HirIf {
+                predicate_source: None,
                 preserves_empty_test: false,
                 preserves_arm_order: false,
                 cond: nil_check_for_local(rewrite.target),
@@ -707,6 +708,7 @@ fn fold_nil_fallback_alias_locals_in_block(
             generic_for_initializer_producer: None,
         }));
         stmts[index + 1] = HirStmt::If(Box::new(HirIf {
+            predicate_source: None,
             preserves_empty_test: false,
             preserves_arm_order: false,
             cond: nil_check_for_local(rewrite.target),

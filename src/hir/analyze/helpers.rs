@@ -53,6 +53,7 @@ pub(super) fn branch_stmt(
     else_block: Option<HirBlock>,
 ) -> HirStmt {
     HirStmt::If(Box::new(HirIf {
+        predicate_source: None,
         cond,
         preserves_empty_test: false,
         preserves_arm_order: false,

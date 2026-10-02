@@ -1,7 +1,7 @@
 //! 分配 for/phi 状态绑定并保留其物理覆盖终点；依赖最终 loop value plan 与 Dataflow
 //! 覆盖关系，不负责捕获槽位。例如循环后的 `state = nil` 仍写回 carried 身份，
 //! 不会成为独立死 temp 而丢失原 VM 清根行为。
-//! 循环 owner 与唯一入口值直接消费 PhiPlan 的已证明输入，不在 binding 分配中重建处置。
+//! 循环 owner 与入口边直接消费 PhiPlan 的冻结事实，不在 binding 分配中重建处置。
 
 use super::*;
 
@@ -100,8 +100,8 @@ pub(super) fn preserve_loop_state_overwrites(
 /// 嵌套 loop 只在最终 value plan 明确证明“沿用祖先 carried 槽位”时复用 HIR temp。
 ///
 /// phi arena identity 与 incoming owner 保持不变；这里只收敛 lowering binding，避免
-/// 每层 loop 为同一源码状态制造一组机械 handoff local。capture 或混合 owner 会让
-/// 提前写回变得可观察，因此保守保留独立 temp。
+/// 每层 loop 为同一源码状态制造一组机械 handoff local。capture 身份或不能归于共同
+/// 祖先的入口仍保留独立 temp，不把不同值快照合并为可变状态。
 pub(super) fn coalesce_nested_loop_carried_temps(
     plan: &StructurePlan,
     cfg: &Cfg,
@@ -110,8 +110,7 @@ pub(super) fn coalesce_nested_loop_carried_temps(
     debug_hints: &[Option<DebugBindingHint<'_>>],
     phi_temps: &mut [TempId],
 ) -> Vec<Option<PhiId>> {
-    let mut parents = vec![None; plan.phis().len()];
-
+    let mut inputs = vec![Vec::new(); plan.phis().len()];
     for phi in plan.phis() {
         if dataflow.reg_is_captured(phi.reg) {
             continue;
@@ -119,77 +118,131 @@ pub(super) fn coalesce_nested_loop_carried_temps(
         let Some(binding) = phi.loop_carried() else {
             continue;
         };
-        let source = match binding.input {
-            Some(SsaValue::Phi(source)) => source,
-            Some(SsaValue::Def(def)) => {
-                // 内层入口也可能是祖先状态在原槽中的一次更新。只消费 Dataflow
-                // 的直接覆盖事实；COPY 的 canonical 源和跨 epoch/debug 身份不能
-                // 据此共址，原更新仍在原定义点求值。
-                let definition = &dataflow.defs[def.index()];
-                let Some(SsaValue::Phi(source)) = dataflow.def_overwritten_value(def) else {
-                    continue;
+        let sources = phi
+            .incomings
+            .iter()
+            .filter_map(|incoming| {
+                (incoming.disposition == PhiIncomingDisposition::RegionInput(binding.owner))
+                    .then_some(incoming.value)
+            })
+            .map(|input| {
+                let source = match input {
+                    SsaValue::Phi(source) => source,
+                    SsaValue::Def(def) => {
+                        // 内层入口也可能是祖先状态在原槽中的一次更新。只消费 Dataflow
+                        // 的直接覆盖事实；COPY 的 canonical 源和跨 epoch/debug 身份不能
+                        // 据此共址，原更新仍在原定义点求值。
+                        let definition = &dataflow.defs[def.index()];
+                        let Some(SsaValue::Phi(source)) = dataflow.def_overwritten_value(def)
+                        else {
+                            return None;
+                        };
+                        let source_plan = plan.phi_plan(source)?;
+                        let epoch =
+                            epochs.epoch_at(phi.reg, cfg.blocks[phi.block.index()].instrs.start);
+                        if definition.reg != phi.reg
+                            || dataflow.canonical_move_value(SsaValue::Def(def))
+                                != Some(SsaValue::Def(def))
+                            || epochs.epoch_at(phi.reg, definition.instr) != epoch
+                            || epochs.epoch_at(
+                                source_plan.reg,
+                                cfg.blocks[source_plan.block.index()].instrs.start,
+                            ) != epoch
+                            || debug_hints[phi.phi.index()].is_some()
+                            || debug_hints[source.index()].is_some()
+                        {
+                            // ProofIncomplete：同槽覆盖尚不能证明跨身份的可观察绑定一致。
+                            return None;
+                        }
+                        source
+                    }
+                    _ => return None,
                 };
-                let Some(source_plan) = plan.phi_plan(source) else {
-                    continue;
-                };
-                let epoch = epochs.epoch_at(phi.reg, cfg.blocks[phi.block.index()].instrs.start);
-                if definition.reg != phi.reg
-                    || dataflow.canonical_move_value(SsaValue::Def(def)) != Some(SsaValue::Def(def))
-                    || epochs.epoch_at(phi.reg, definition.instr) != epoch
-                    || epochs.epoch_at(
-                        source_plan.reg,
-                        cfg.blocks[source_plan.block.index()].instrs.start,
-                    ) != epoch
-                    || debug_hints[phi.phi.index()].is_some()
-                    || debug_hints[source.index()].is_some()
-                {
-                    // ProofIncomplete：同槽覆盖尚不能证明跨身份的可观察绑定一致。
-                    continue;
-                }
-                source
+                let source_plan = plan.phi_plan(source)?;
+                source_plan.loop_carried()?;
+                (source_plan.reg == phi.reg).then_some(source)
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(sources) = sources {
+            inputs[phi.phi.index()] = sources;
+        }
+    }
+
+    // 原入口值可以来自刚结束的兄弟循环，也可以由多个路径写入同一祖先状态。
+    // 先解析来源身份再消费它；每条入口边只入队一次，不反复扫描所有 phi 求不动点。
+    let mut dependents = vec![Vec::new(); inputs.len()];
+    let mut remaining = inputs.iter().map(Vec::len).collect::<Vec<_>>();
+    let mut ready = Vec::new();
+    for (phi, sources) in inputs.iter().enumerate() {
+        if sources.is_empty() {
+            ready.push(PhiId(phi));
+        }
+        for source in sources {
+            dependents[source.index()].push(PhiId(phi));
+        }
+    }
+    let mut roots = vec![None; inputs.len()];
+    let mut parents = vec![None; inputs.len()];
+    let mut cursor = 0;
+    while let Some(&id) = ready.get(cursor) {
+        cursor += 1;
+        let parent = (|| {
+            let sources = &inputs[id.index()];
+            let &first = sources.first()?;
+            let root = roots[first.index()]?;
+            if sources
+                .iter()
+                .any(|source| roots[source.index()] != Some(root))
+            {
+                // ProofIncomplete：值相等或同槽不能代替共同 carried 身份。
+                return None;
             }
-            _ => continue,
-        };
-        let Some(source_plan) = plan.phi_plan(source) else {
-            continue;
-        };
-        let Some(source_binding) = source_plan.loop_carried() else {
-            continue;
-        };
-        if source_plan.reg == phi.reg
-            && source_binding.owner != binding.owner
-            && plan.region_contains(source_binding.owner, binding.owner)
-        {
-            parents[phi.phi.index()] = Some(source);
+            let phi = plan.phi_plan(id)?;
+            let binding = phi.loop_carried()?;
+            let owner = binding.owner;
+            let root_plan = plan.phi_plan(root)?;
+            let root_owner = root_plan.loop_carried()?.owner;
+            if root_plan.reg != phi.reg
+                || root_owner == owner
+                || !plan.region_contains(root_owner, owner)
+            {
+                return None;
+            }
+            let source_owner = plan.phi_plan(first)?.loop_carried()?.owner;
+            if binding.input.is_none()
+                || source_owner == owner
+                || !plan.region_contains(source_owner, owner)
+            {
+                // 单一祖先入口沿用原 owner 证明；跨兄弟或多入口的共址额外要求
+                // 全部来源及共同祖先没有 debug 身份，且属于同一未关闭区间。
+                let epoch = epochs.epoch_at(phi.reg, cfg.blocks[phi.block.index()].instrs.start);
+                if std::iter::once(id)
+                    .chain(std::iter::once(root))
+                    .chain(sources.iter().copied())
+                    .any(|source| {
+                        let source = plan.phi_plan(source).expect("validated loop input");
+                        debug_hints[source.phi.index()].is_some()
+                            || epochs
+                                .epoch_at(source.reg, cfg.blocks[source.block.index()].instrs.start)
+                                != epoch
+                    })
+                {
+                    return None;
+                }
+            }
+            Some(root)
+        })();
+        parents[id.index()] = parent;
+        roots[id.index()] = Some(parent.unwrap_or(id));
+        for dependent in &dependents[id.index()] {
+            remaining[dependent.index()] -= 1;
+            if remaining[dependent.index()] == 0 {
+                ready.push(*dependent);
+            }
         }
     }
 
-    let mut roots = vec![None; parents.len()];
-    let mut seen_at = vec![usize::MAX; parents.len()];
-    for start in 0..parents.len() {
-        if roots[start].is_some() {
-            continue;
-        }
-        let mut path = Vec::new();
-        let mut current = start;
-        while roots[current].is_none() && seen_at[current] != start {
-            seen_at[current] = start;
-            path.push(current);
-            let Some(parent) = parents[current] else {
-                break;
-            };
-            current = parent.index();
-        }
-        let root = if seen_at[current] == start && parents[current].is_some() {
-            None
-        } else {
-            Some(roots[current].unwrap_or(PhiId(current)))
-        };
-        for phi in path {
-            roots[phi] = root.or(Some(PhiId(phi)));
-        }
-    }
-
+    // 无法闭合的入口依赖环保留各自 temp，不凭部分解析的身份合并。
     for (phi, root) in roots.iter().copied().enumerate() {
         let Some(root_temp) = root.and_then(|root| phi_temps.get(root.index()).copied()) else {
             continue;
@@ -233,7 +286,12 @@ impl<T: Copy + Eq> BindingCandidate<T> {
 /// 协议时才共址；nested carried target 的结果消费者必须已证明共址，独立 snapshot
 /// 仅接纳直接正常出口的唯一读取，避免其它 edge copy 延后读取已覆盖状态。候选从 carried target 出发一次构建，
 /// 避免 result × owner 的重复扫描。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "原指令的 debug 身份与循环值、槽位及合并屏障共同约束状态归属"
+)]
 pub(super) fn coalesce_loop_state_temps(
+    proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
@@ -563,6 +621,54 @@ pub(super) fn coalesce_loop_state_temps(
         }
     }
 
+    // 归一化的 RETURN 出口不再执行 alias block；它读取的 carried 值须与共同出口的
+    // 原入口定义共用状态身份，否则共同 RETURN 会继续读取循环前的不可变快照。
+    for (loop_id, loop_) in plan.loops() {
+        let Some(owner) = plan.loop_region(loop_id) else {
+            continue;
+        };
+        for alias in &loop_.normalized_exit_aliases {
+            let source_site = cfg.blocks[alias.block.index()].instrs.start;
+            let target_site = cfg.blocks[alias.continuation.index()].instrs.start;
+            for (reg, value) in dataflow.use_values_at(source_site).iter() {
+                let SsaValue::Phi(source) = value else {
+                    continue;
+                };
+                let Some(phi) = plan.phi_plan(source) else {
+                    continue;
+                };
+                let Some(carried) = phi.loop_carried() else {
+                    continue;
+                };
+                let SsaValue::Def(initial) = dataflow.use_value(target_site, reg) else {
+                    continue;
+                };
+                let definition = &dataflow.defs[initial.index()];
+                let epoch = epochs.epoch_at(reg, definition.instr);
+                if carried.owner != owner
+                    || carried.input != Some(SsaValue::Def(initial))
+                    || phi.reg != reg
+                    || definition.reg != reg
+                    || numeric_binding_phis[source.index()]
+                    || phi_debug_hints[source.index()].is_some()
+                    || debug_local_hint_for_reg_at_instr(proto, reg, definition.instr).is_some()
+                    || dataflow.reg_is_captured(reg)
+                    || [
+                        source_site,
+                        target_site,
+                        cfg.blocks[phi.block.index()].instrs.start,
+                    ]
+                    .iter()
+                    .any(|&site| epochs.epoch_at(reg, site) != epoch)
+                {
+                    // 候选拒绝[ProofIncomplete:BindingIdentity]：只统一已冻结同槽出口所连接的
+                    // 循环状态和唯一原入口值；debug、捕获与跨 epoch 的身份由各自 owner 保留。
+                    continue;
+                }
+                def_candidates[initial.index()].add(phi_temps[source.index()]);
+            }
+        }
+    }
     for (temp, candidate) in fixed_temps.iter_mut().zip(def_candidates) {
         if let Some(target) = candidate.resolved() {
             *temp = target;

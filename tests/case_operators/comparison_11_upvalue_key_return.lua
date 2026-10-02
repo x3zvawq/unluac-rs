@@ -3,6 +3,7 @@
 -- unluac: expect-ast-count [[if]] [[0]]
 -- unluac: expect-ast-count [[function]] [[6]]
 -- unluac: expect-ast-max [[local-binding]] [[8]]
+-- unluac: expect-contains [[names.present, names.missing = nil, nil]] [[@dialect=luajit]] [[@debug=retained]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
@@ -74,3 +75,10 @@ trace = {}
 assert(select("#", named_check(names)) == 1)
 assert(table.concat(trace, ",") == "present,missing")
 assert(select("#", observe("present", nil, true, "present")) == 0)
+
+-- 复用索引观察器记录 nil 字段写；各方言的原写入次序由运行输出比较固定。
+setmetatable(names, {__newindex = getmetatable(names).__index})
+trace = {}
+names.first, names.second = nil, nil
+assert(#trace == 2)
+print("nil-pair-write-order", table.concat(trace, ","))

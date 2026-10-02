@@ -149,6 +149,10 @@ pub(super) fn prepare_body(
         proto,
         rk_literals: None,
         expanded_callees: None,
+        compared_choices: None,
+        value_expressions: None,
+        calling_values: None,
+        seeded_predicates: None,
         retired_roots: None,
         root_seed_sources: None,
         barred: &restrictions.barred,
@@ -436,26 +440,8 @@ pub(super) fn plans(context: NativeFrameContext<'_>, facts: &ProtoPromotionFacts
                 tail: Some(HirPackTail::exact(invocation, 2)),
             };
             plan.result_locals.push(second);
-            // 对已有低槽的两项写回属于同一个返回包，不能留下临时接收声明抬高后缀。
-            if let (Some(HirStmt::Assign(left)), Some(HirStmt::Assign(right))) =
-                (stmts.get(sink + 1), stmts.get(sink + 2))
-                && left.values.fixed.as_slice() == [HirExpr::LocalRef(first)]
-                && left.values.tail.is_none()
-                && right.values.fixed.as_slice() == [HirExpr::LocalRef(second)]
-                && right.values.tail.is_none()
-                && let ([HirLValue::Local(a)], [HirLValue::Local(b)]) =
-                    (left.targets.as_slice(), right.targets.as_slice())
-                && a != b
-                && [a, b].iter().all(|local| {
-                    facts
-                        .trusted_local_home_slot(**local)
-                        .is_some_and(|home| home.slot() < base.slot())
-                })
-            {
-                plan.result_locals.clear();
-                plan.assignment_targets = vec![HirLValue::Local(*a), HirLValue::Local(*b)];
-                plan.sink = sink + 2;
-                plan.removed = (start..plan.sink).collect();
+            if let (Some(left), Some(right)) = (stmts.get(sink + 1), stmts.get(sink + 2)) {
+                factories::pair_writeback(&mut plan, [left, right], facts);
             }
             Some(plan)
         })();

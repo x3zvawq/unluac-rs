@@ -2,6 +2,353 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_operators/boolean_41_inlined_ordered_condition_suffix.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "共享调用之间保留有序比较及布尔写回；原准备 Def 约束前缀，后续独立循环复用同槽不使前一只读参数视图失效。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_40_inlined_shared_result_comparison.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "动态共享调用的返回 Phi 直接参与比较；原消费位置和当前值版本共同恢复完整调用，保持急切读取、单值返回及后续槽复用。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_39_inlined_nil_result_comparison.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "内联调用的 nil 结果以原 SSA Def 直接参与比较；完整恢复调用和外层断言，保持急切读取次数及单值返回。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_38_inlined_sequential_read_frames.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "连续调用复用旧断言结果槽；原返回 COPY 与比较参数共同恢复，保持标签读取顺序、匿名闭包创建及急切读取计数。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_37_inlined_anonymous_shared_read.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "匿名读取参数保持原闭包创建、标签断言和捕获更新；动态 guard 前急切读取一次，整帧恢复调用并退休参数及断言中转。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_36_inlined_labeled_reads.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "标签 a、b 的两次捕获读取保持顺序；外层短路、嵌套选值和 EdgeCopy 结果共同恢复完整单返回调用。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_35_inlined_shared_read_guard.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "动态 guard 前急切读取一次，原共享 item 参与选值和最终比较；恢复完整单返回调用并退休中转及同批多余根。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_34_inlined_unused_shared_read.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "nil 返回仍执行急切读取；保留两臂无读写入的身份和副作用，恢复参数及局部声明中的完整单返回调用。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_33_inlined_nil_guard_copy.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "nil guard 消去读取体后，原未读取参数 COPY 与固定单返回仍由完整帧重发；观察返回数量、nil 值和捕获计数。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_32_inlined_reader_folded_pair.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "常量选择参数折叠比较后，原真值谓词、捕获读取和双返回 COPY 仍作为完整调用恢复。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_31_inlined_reader_pair.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "急切读取闭包的两层展开保留捕获更新、固定双返回及原参数 COPY，比较结果和原读取值共同恢复。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_30_inlined_captured_reader.lua",
+        &[
+            "short-circuit",
+            "capture",
+            "evaluation-order",
+            "call-frame",
+            "recompile",
+        ],
+        "函数参数的嵌套展开保留捕获计数器、按条件读取及原参数 COPY，完整观察调用无结果中转。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_29_inlined_value_expression.lua",
+        &[
+            "short-circuit",
+            "comparison",
+            "return-frame",
+            "recompile",
+            "loop",
+        ],
+        "完整表达式展开保留提前求值的参数、只读循环绑定、返回 COPY 与内部分支，验证三轮源码收敛。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_operators/boolean_27_shared_terminal_operand.lua",
         &["short-circuit", "value-operand", "evaluation-order"],
         "内部 Boolean phi 经共享终边成为比较操作数时，保留逐路径值及单次读取。",
@@ -49,6 +396,31 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/boolean_42_inlined_seeded_predicate.lua",
+        &[
+            "short-circuit",
+            "initialization",
+            "evaluation-order",
+            "readability",
+        ],
+        "已内联字段谓词恢复独立调用和中间实参，保留字段轨迹与 Boolean 共同返回槽，验证三轮收敛。",
+        &[
             LuaCaseConfiguration::new(LUAU_ONLY)
                 .with_options(LuaCaseOptions {
                     recompile_rounds: Some(3),

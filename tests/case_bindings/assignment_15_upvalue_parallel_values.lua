@@ -1,6 +1,8 @@
 -- 并列上值写回等待全部 RHS 完成，失败的后项不能提前发布前项结果。
 -- 三个子函数的逆序编号仍使 assign_pair 在所有方言中对应 proto#2。
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
+-- 三项常量重置应整体恢复，不为首项留下独立的高槽中转变量。
+-- unluac: expect-ast-max [[local-binding]] [[12]] [[@proto=0]]
 -- unluac: expect-contains [[first, second = value("L"), value("R")]] [[@debug=retained]]
 local first, second = 0, 0
 local trace, fail = "", true

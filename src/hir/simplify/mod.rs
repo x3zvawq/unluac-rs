@@ -623,7 +623,8 @@ fn apply_temp_inline_pass(
     // a one-use closure is substantial enough to keep as a named callee. Unknown/backward refs
     // stay conservative (`true`) instead of being inlined on incomplete body evidence.
     let mut substantial_closure_bodies = vec![true; module.protos.len()];
-    let mut changed = false;
+    let mut changed = dialect == DecompileDialect::Luau
+        && call_frames::preserve_seeded_predicate_outputs(module, promotion_facts);
     for proto_index in (0..module.protos.len()).rev() {
         let proto_id = module.protos[proto_index].id.index();
         let facts = promotion_facts.get(proto_id).unwrap_or(empty_facts);

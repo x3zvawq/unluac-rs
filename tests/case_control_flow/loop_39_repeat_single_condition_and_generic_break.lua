@@ -3,12 +3,18 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[break]]
--- unluac: expect-contains [[continue]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[in function()]]
+-- 两个内联 probe 返回的常量仍有原 TEST，不能在回编译时与其条件分支一起删除。
+-- unluac: expect-instruction-count [[branch]] [[4]] [[@proto=4]] [[@variant=O2]]
+-- 恢复的 probe 调用必须重新内联消失，仅保持运行结果与分支数还不足以证明这一点。
+-- unluac: expect-instruction-count [[call]] [[0]] [[@proto=4]] [[@variant=O2]]
+-- unluac: expect-contains [[--!optimize 2]] [[@variant=O2]]
+-- 内联函数返回的常量仍经原 EQ 检查，不能在回编译时把根函数中的检查折叠掉。
+-- unluac: expect-instruction-count [[branch]] [[11]] [[@proto=0]] [[@variant=O2]]
 local function repeat_single_condition(a, xs)
     repeat
         if a then
@@ -85,22 +91,19 @@ end
 -- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=4]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]
+-- continue guard 与嵌套/合并条件都可自然表达；固定原来的三次谓词检查。
+-- unluac: expect-instruction-count [[branch]] [[3]] [[@proto=1]]
 -- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=2]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=2]]
 -- unluac: expect-ast-count [[break]] [[1]] [[@proto=2]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]]
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]] [[@variant=O0]]
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]] [[@variant=O1]]
--- unluac: expect-ast-count [[local-binding]] [[13]] [[@proto=0]] [[@variant=O2]]
+-- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
 
 -- 未展开的完整调用链保留所有观察调用，不留下 callee/result 重赋值。
--- unluac: expect-ast-count [[call]] [[21]] [[@proto=0]] [[@variant=O0]]
--- unluac: expect-ast-count [[call]] [[21]] [[@proto=0]] [[@variant=O1]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]] [[@variant=O0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]] [[@variant=O1]]
+-- unluac: expect-ast-count [[call]] [[21]] [[@proto=0]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
 
 -- 捕获状态沿各出口使用同一 cell，不生成重复的空暂存声明。
 -- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=4]]

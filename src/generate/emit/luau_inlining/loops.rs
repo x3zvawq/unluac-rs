@@ -8,7 +8,7 @@ pub(super) fn unchanged(
     loop_: &AstNumericFor,
     callees: &BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
 ) -> bool {
-    if !plain_block(&loop_.body, callees) {
+    if !PlainExpressions::new(callees).block(&loop_.body) {
         return false;
     }
     let (AstExpr::Integer(start), AstExpr::Integer(limit), AstExpr::Integer(step)) =
@@ -92,7 +92,8 @@ fn cost(
                 let AstExpr::Var(AstNameRef::Global(name)) = &call.callee else { return None; };
                 if !matches!(name.text.as_str(), "assert" | "print")
                     || !call.args.iter().all(|arg| *arg == AstExpr::Var(index.to_name_ref()) || no_index(arg, index)) { return None; }
-                if name.text == "assert" { 2 } else { 3 }
+                // print 是普通全局 CALL；GETIMPORT 与各实参至少一次求值/COPY 也计入下界。
+                if name.text == "assert" { 2 } else { 4 + call.args.len() }
             }
             AstStmt::If(branch) => {
                 let mut condition = &branch.cond;

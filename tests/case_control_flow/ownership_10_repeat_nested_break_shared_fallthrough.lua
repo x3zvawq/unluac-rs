@@ -36,7 +36,7 @@ assert(run("", 0) == 1 and tail_count == 2)
 assert(run(nil, "") == 3 and tail_count == 3 and tail_value == 2)
 print = saved_print
 -- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[5]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
 -- unluac: expect-ast-count [[break]] [[1]]

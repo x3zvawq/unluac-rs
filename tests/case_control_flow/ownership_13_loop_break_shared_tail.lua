@@ -3,6 +3,7 @@
 -- unluac: expect-ast-count [[repeat]] [[1]]
 -- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=0]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[assign]] [[3]]
 -- 末尾 if a then break 可与 until 合成短路条件，但不能根据 while a 消掉检查。
 -- unluac: expect-ast-count [[break]] [[1]]
 -- unluac: expect-contains [[until p1_0 or p1_3]] [[@dialect=lua5.1]]

@@ -364,6 +364,9 @@ pub(crate) struct CaseBaseline {
 enum InstructionOperation {
     Not,
     Call,
+    Branch,
+    Add,
+    Sub,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -42,7 +42,7 @@ pub use naming::{
     FunctionNameMap, NameInfo, NameMap, NameSource, NamingError, NamingEvidence, NamingMode,
     NamingOptions, assign_name_map, assign_names_with_evidence, collect_naming_evidence,
 };
-pub(crate) use visit::written_locals;
+pub(crate) use visit::{written_locals, written_names};
 
 pub(crate) fn analyze_ast_stage(
     state: &mut crate::decompile::DecompileState,

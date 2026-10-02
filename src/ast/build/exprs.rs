@@ -154,6 +154,7 @@ impl<'a> AstLowerer<'a> {
             }
         }
         Ok(AstFunctionExpr {
+            source_site: closure.source_site,
             creation: closure.creation,
             function: closure.proto,
             params: child.params.clone(),

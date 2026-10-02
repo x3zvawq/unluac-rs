@@ -79,6 +79,7 @@ pub(super) fn materialize_control(if_stmt: &HirIf) -> Option<Vec<HirStmt>> {
         }
         blocks[node.id.index()] = Some(HirBlock {
             stmts: vec![HirStmt::If(Box::new(HirIf {
+                predicate_source: None,
                 cond,
                 // 原测试可以改变极性和嵌套形状，但不能因两条控制叶相同而消失。
                 preserves_empty_test: true,

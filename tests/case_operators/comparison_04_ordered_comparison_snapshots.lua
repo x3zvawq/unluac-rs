@@ -2,6 +2,7 @@
 -- unluac: expect-ast-count [[function]] [[9]]
 -- unluac: expect-ast-count [[if]] [[3]]
 -- unluac: expect-ast-max [[local-binding]] [[15]]
+-- unluac: expect-contains [[numeric_left, numeric_right = 1, 0 / 0]] [[@debug=retained]]
 local events = {}
 local old = getmetatable(_G)
 local nan_mode = false

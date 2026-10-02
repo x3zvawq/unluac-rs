@@ -51,7 +51,7 @@ pub(super) fn prune_empty_assign_stmts(block: &mut HirBlock) -> bool {
 pub(super) fn prune_redundant_copy_stmts(
     block: &mut HirBlock,
     preserved_bindings: &BTreeSet<CarryBinding>,
-    call_preparations: &BTreeSet<(CarryBinding, CarryBinding)>,
+    frame_preparations: &BTreeSet<(CarryBinding, CarryBinding)>,
     reference_captured: &BTreeSet<CarryBinding>,
 ) -> bool {
     let mut previous_copy = None;
@@ -82,9 +82,9 @@ pub(super) fn prune_redundant_copy_stmts(
                         && first_target == source
                         && first_source == target
                         && !preserved_bindings.contains(&target)
-                        // 候选拒绝[LayerBoundary]：前次 CALL 写回后的反向 COPY 仍是下次
-                        // callee/SELF 的原准备事件，由完整调用帧消费，不能仅据同值裁剪。
-                        && !call_preparations.contains(&(target, source))
+                        // 候选拒绝[LayerBoundary]：写回后的反向 COPY 仍是后继 CALL/RETURN
+                        // 的原准备事件，由完整帧消费，不能仅据同值裁剪。
+                        && !frame_preparations.contains(&(target, source))
                         // 捕获 cell 的回读可开启新的赋值快照；同值不授权把它并回
                         // 前一次 CALL 结果，否则后续帧失去独立消费这两个版本的边界。
                         && !reference_captured.contains(&source)
