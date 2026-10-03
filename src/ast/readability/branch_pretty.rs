@@ -667,7 +667,6 @@ fn normalize_terminal_guard_polarity(block: &mut AstBlock) -> bool {
     };
     if if_stmt.preserves_arm_order
         || if_stmt.else_block.is_some()
-        || !matches!(&if_stmt.cond, AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not)
         || !matches!(if_stmt.then_block.stmts.as_slice(), [stmt] if is_direct_exit(stmt))
         || !is_direct_exit(tail)
     {
@@ -677,20 +676,24 @@ fn normalize_terminal_guard_polarity(block: &mut AstBlock) -> bool {
     if matches!(
         (&if_stmt.then_block.stmts[0], &*tail),
         (AstStmt::Return(_), AstStmt::Return(_))
-    ) {
-        // 候选拒绝[LayerBoundary]：双 return 的空出口 guard 由
+    ) && (is_empty_return_stmt(&if_stmt.then_block.stmts[0]) || is_empty_return_stmt(tail))
+    {
+        // 候选拒绝[LayerBoundary]：空出口 guard 由
         // fold_terminal_guard_return 规范化；反转其方向会在同一 pass 内反复恢复旧形。
+        return false;
+    }
+    let (positive, negative, _) = guard_condition_not_costs(&if_stmt.cond);
+    if negative >= positive {
         return false;
     }
 
     // 候选接受：两条直接终止语句是互斥的完整两臂，没有声明、label 或额外求值
     // 需要越过作用域；return 的值包与 break/continue 的最近循环 owner 均保持不变。
     // 与显式 else 的否定整理保持同一方向，避免回编译把隐含另一臂反复翻转。
-    let AstExpr::Unary(unary) = std::mem::replace(&mut if_stmt.cond, AstExpr::Boolean(false))
-    else {
-        unreachable!("validated terminal guard condition must remain a unary not");
-    };
-    if_stmt.cond = unary.expr;
+    if_stmt.cond = negate_guard_condition(std::mem::replace(
+        &mut if_stmt.cond,
+        AstExpr::Boolean(false),
+    ));
     std::mem::swap(&mut if_stmt.then_block.stmts[0], tail);
     true
 }
@@ -1007,9 +1010,37 @@ fn stmt_requires_scope_barrier(stmt: &AstStmt) -> bool {
     )
 }
 
+/// 当前树与 negate_guard_condition 实际反形的合成 NOT 数，以及左脊是否可消去。
+/// 只遍历一次条件骨架；在 HIR 值式归约完成后比较最终形状，避免两层极性成本不同而振荡。
+fn guard_condition_not_costs(expr: &AstExpr) -> (usize, usize, bool) {
+    match expr {
+        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not && !unary.original_operation => {
+            let (inner, _, _) = guard_condition_not_costs(&unary.expr);
+            (inner + 1, inner, true)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical)
+            if !logical.preserves_boolean_prewrite =>
+        {
+            let (left, inverted_left, leading) = guard_condition_not_costs(&logical.lhs);
+            let (right, inverted_right, _) = guard_condition_not_costs(&logical.rhs);
+            let positive = left + right;
+            let negative = if leading {
+                inverted_left + inverted_right
+            } else {
+                positive + 1
+            };
+            (positive, negative, leading)
+        }
+        // 原 NOT 和预写值帧作为完整叶保留；反形只能在外部增加条件否定。
+        _ => (0, 1, false),
+    }
+}
+
 fn negate_guard_condition(expr: AstExpr) -> AstExpr {
     let mut leading = &expr;
-    while let AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) = leading {
+    while let AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) = leading
+        && !logical.preserves_boolean_prewrite
+    {
         leading = &logical.lhs;
     }
     if matches!(leading, AstExpr::Unary(unary)
@@ -1036,7 +1067,9 @@ fn negate_guard_condition(expr: AstExpr) -> AstExpr {
         return invert_left(expr);
     }
     match expr {
-        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => unary.expr,
+        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not && !unary.original_operation => {
+            unary.expr
+        }
         // Lua 的 `<`/`<=` 可能走元方法，number 还可能遇到 NaN；`not (a < b)`
         // 不能安全改写成 `b <= a`，所以这里只消除显式双重否定。
         other => AstExpr::Unary(Box::new(AstUnaryExpr {

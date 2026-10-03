@@ -536,6 +536,13 @@ impl<'a> AstLowerer<'a> {
         proto_index: usize,
         global_decl: &HirGlobalDecl,
     ) -> Result<AstGlobalDecl, AstLowerError> {
+        if global_decl.pending_target_preparations {
+            // 候选拒绝[ProofIncomplete]：协议已配对不代表宽目标快照已完成源码帧证明。
+            return Err(AstLowerError::ResidualHir {
+                proto: proto_index,
+                kind: "global-target-preparation",
+            });
+        }
         if !self.target.caps.global_decl {
             return Err(AstLowerError::UnsupportedFeature {
                 dialect: self.target.version,

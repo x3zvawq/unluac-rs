@@ -29,6 +29,7 @@ mod residuals;
 mod root_lifetimes;
 mod source_frames;
 mod stmt_plan;
+mod syntax_budget;
 mod table_constructors;
 mod temp_inline;
 mod temp_touch;

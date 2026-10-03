@@ -4,7 +4,11 @@
 -- unluac: expect-contains [[p6_0 and r6_0() or p6_0 and r6_1()]]
 -- unluac: expect-contains [[return p9_0 and {} or p9_0 and]]
 -- unluac: expect-contains [[("unexpected", "fallback")]]
--- unluac: expect-contains [[if not ((p11_0 or]]
+-- 条件可交换返回方向；短路调用与共享分配必须保留。
+-- unluac: expect-contains [[(p11_0 or r0_10()) and {}]]
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=11]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=11]]
+-- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=11]]
 -- unluac: expect-contains [[return p12_0 and p12_1 or {}]]
 -- unluac: expect-contains [[return p16_0 and p16_1 and p16_2 or {}]]
 -- unluac: expect-ast-count [[function]] [[16]]

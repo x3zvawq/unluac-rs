@@ -1,6 +1,8 @@
 -- 连续条件的入口 phi 是本区域输入；逐次状态和调用顺序必须保留。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[if]] [[512]]
+-- unluac: expect-ast-max [[local-binding]] [[4]]
+-- unluac: expect-ast-count [[assign]] [[1025]]
 local function run(f, x)
     if x % 2 == 0 then x = f(x) else x = x + 1 end
     if x % 2 == 0 then x = f(x) else x = x + 1 end

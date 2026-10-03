@@ -1,4 +1,4 @@
-//! 保存 PUC/LuaJIT 并行赋值中查表与标量准备、末项直接写低槽及逆序写回的原 Def。
+//! 保存 PUC/LuaJIT 并行赋值中查表、标量及末项 CONCAT 的准备与逆序写回 Def。
 //! 这里只识别无额外左值准备的固定键读取；源码声明和后继 scratch 复用由完整帧验证。
 
 use super::*;
@@ -23,6 +23,10 @@ pub(in crate::hir) struct LookupFrame {
     pub(in crate::hir) reads: Vec<LookupRead>,
     /// 与前面的 scratch 读取同序；原指令按逆序执行这些写。
     pub(in crate::hir) writes: Vec<LookupWrite>,
+    /// 末项 CONCAT 的输入准备长度；输入 Def 与缓冲合同仍归 CONCAT owner。
+    pub(in crate::hir) concat_inputs: Option<usize>,
+    /// PUC 5.4+ 的 CONCAT 先写输入首槽，再用原 COPY 提交末项目标。
+    pub(in crate::hir) tail_write: Option<LookupWrite>,
 }
 
 pub(in crate::hir::promotion) fn collect(
@@ -45,6 +49,8 @@ pub(in crate::hir::promotion) fn collect(
         let mut inputs = BTreeSet::new();
         let frame = (|| {
             let mut at = start;
+            let mut concat_inputs = None;
+            let mut tail_write = None;
             loop {
                 let (dst, literal) = match proto.instrs.get(at)? {
                     LowInstr::GetTable(read) => {
@@ -59,6 +65,38 @@ pub(in crate::hir::promotion) fn collect(
                         }
                         inputs.insert(table);
                         (read.dst, None)
+                    }
+                    LowInstr::Move(_) => {
+                        let operand_start = base + reads.len();
+                        let mut prepared = 0;
+                        loop {
+                            if cfg.instr_to_block.get(at) != Some(&block) {
+                                return None;
+                            }
+                            let instr = proto.instrs.get(at)?;
+                            if let LowInstr::Concat(concat) = instr {
+                                if prepared < 2
+                                    || concat.src.start.index() != operand_start
+                                    || concat.src.len != prepared
+                                    || (concat.dst.index() >= base
+                                        && concat.dst.index() != operand_start)
+                                {
+                                    return None;
+                                }
+                                concat_inputs = Some(prepared);
+                                break (concat.dst, None);
+                            }
+                            let dst = match instr {
+                                LowInstr::Move(copy) if copy.src.index() < base => copy.dst,
+                                instr => scalar_literal(proto, instr)?.0,
+                            };
+                            if dst.index() != operand_start + prepared {
+                                return None;
+                            }
+                            prepared += 1;
+                            at += 1;
+                            index = at;
+                        }
                     }
                     instr => {
                         let (dst, value) = scalar_literal(proto, instr)?;
@@ -80,7 +118,29 @@ pub(in crate::hir::promotion) fn collect(
                 });
                 at += 1;
                 index = at;
-                if dst.index() < base {
+                if concat_inputs.is_some() && dst.index() >= base {
+                    let site = InstrRef(at);
+                    let LowInstr::Move(copy) = proto.instrs.get(at)? else {
+                        return None;
+                    };
+                    if cfg.instr_to_block[at] != block
+                        || copy.src != dst
+                        || copy.dst.index() >= base
+                        || dataflow.use_value(site, dst) != SsaValue::Def(def)
+                    {
+                        return None;
+                    }
+                    let target = dataflow.instr_def_for_reg(site, copy.dst)?;
+                    tail_write = Some(LookupWrite {
+                        site,
+                        target: Some((
+                            TempId(target.index()),
+                            HomeSlotKey::new(copy.dst.index(), epochs.epoch_at(copy.dst, site)),
+                        )),
+                    });
+                    at += 1;
+                }
+                if dst.index() < base || concat_inputs.is_some() {
                     break;
                 }
             }
@@ -88,7 +148,11 @@ pub(in crate::hir::promotion) fn collect(
             if count == 0 {
                 return None;
             }
-            let mut targets = BTreeSet::from([Reg(reads.last()?.home.slot())]);
+            let tail_home = tail_write
+                .as_ref()
+                .and_then(|write| write.target)
+                .map_or(reads.last()?.home, |(_, home)| home);
+            let mut targets = BTreeSet::from([Reg(tail_home.slot())]);
             let mut writes = Vec::with_capacity(count);
             for read in reads[..count].iter().rev() {
                 let site = InstrRef(at);
@@ -150,6 +214,8 @@ pub(in crate::hir::promotion) fn collect(
             Some(LookupFrame {
                 reads: std::mem::take(&mut reads),
                 writes,
+                concat_inputs,
+                tail_write,
             })
         })();
         if let Some(frame) = frame {

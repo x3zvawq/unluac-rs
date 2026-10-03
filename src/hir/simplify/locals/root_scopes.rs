@@ -71,26 +71,29 @@ impl HirRewritePass for ScopePass<'_> {
         {
             return false;
         }
-        if block.stmts.iter().any(|stmt| {
-            !scope_statement(stmt)
-                && !matches!(
-                    stmt,
-                    HirStmt::Block(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_)
-                )
-        }) {
-            // MissingFact：SETLIST 和未支持的控制结构可能仍属于跨语句协议。
-            // 不能把未知节点当成可切分边界，截断在其两侧继续构造的表达式帧。
-            return false;
-        }
+        let scan_end = block
+            .stmts
+            .iter()
+            .position(|stmt| {
+                !scope_statement(stmt)
+                    && !matches!(
+                        stmt,
+                        HirStmt::Block(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_)
+                    )
+            })
+            .unwrap_or(block.stmts.len());
+        // 未闭合协议阻止扫描其自身及后缀，但不阻止之前已由原覆盖端点闭合的窗口。
+        // 全 proto 读取索引仍拒绝任何逃逸到后缀的定义；不在未知节点之后重新起窗。
+        let stmts = &block.stmts[..scan_end];
         let mut windows = BTreeMap::new();
         let mut start = 0;
-        for end in 0..=block.stmts.len() {
-            if end < block.stmts.len() && scope_statement(&block.stmts[end]) {
+        for end in 0..=stmts.len() {
+            if end < stmts.len() && scope_statement(&stmts[end]) {
                 continue;
             }
             if start < end {
                 windows.extend(
-                    self.scope_windows(&block.stmts[start..end])
+                    self.scope_windows(&stmts[start..end])
                         .into_iter()
                         .map(|(first, last)| (start + first, start + last)),
                 );
@@ -120,7 +123,7 @@ impl HirRewritePass for ScopePass<'_> {
 }
 
 /// 已闭合的表写/Boolean 分支和直线循环可留在扫描区；候选窗口另行核对身份与写域。
-/// 已闭合词法子块及显式资源激活/关闭分隔候选区，未支持结构保留整个块；每条语句至多在自身及父区各索引一次。
+/// 已闭合词法子块及显式资源激活/关闭分隔候选区，未支持结构截断后缀；每条语句至多在自身及父区各索引一次。
 fn scope_statement(stmt: &HirStmt) -> bool {
     match stmt {
         // 已有声明留在扫描区，候选窗口仍拒绝包含它；不把声明当分隔符切断跨语句协议。
@@ -142,6 +145,10 @@ fn scope_loop_body(body: &HirBlock) -> bool {
     body.stmts
         .iter()
         .all(|stmt| matches!(stmt, HirStmt::Assign(_) | HirStmt::CallStmt(_))
+            // 空循环没有内部声明或跨语句准备；条件读取及调用仍由窗口索引核对，
+            // 循环整体留在原位置，不改变其零次执行或不终止的行为。
+            || matches!(stmt, HirStmt::While(inner) if inner.body.stmts.is_empty())
+            || matches!(stmt, HirStmt::Repeat(inner) if inner.body.stmts.is_empty())
             || matches!(stmt, HirStmt::If(branch)
                 if branch.else_block.is_none() && matches!(branch.then_block.stmts.as_slice(), [HirStmt::Break])))
 }

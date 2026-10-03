@@ -4,7 +4,8 @@
 -- unluac: expect-ast-count [[numeric-for]] [[4]] [[@variant=O2]]
 -- unluac: expect-ast-count [[if]] [[0]] [[@variant=O2]]
 -- unluac: expect-ast-max [[local-binding]] [[8]] [[@variant=O2]]
--- unluac: expect-contains [[local result = shared(enabled == 1, value, function(key)]] [[@variant=O2]] [[@debug=retained]]
+-- 匿名实参可换行，仍须在调用处出现，不能成为调用前的独立闭包声明。
+-- unluac: expect-order [[local result = shared(enabled == 1, value,]] [[function(key)]] [[@variant=O2]] [[@debug=retained]]
 -- unluac: expect-not-contains [[unluac error]]
 local function shared(enabled, value, read)
     local item = read("shared")

@@ -1,0 +1,36 @@
+-- 通用 FASTCALL 的固定参数区覆盖空参数与四个有序求值的参数；fallback 保留原 callee 读取时点。
+-- unluac: expect-ast-count [[local-binding]] [[0]]
+-- unluac: expect-ast-count [[assign]] [[0]]
+-- unluac: expect-ast-count [[call]] [[8]]
+-- unluac: expect-instruction-count [[call]] [[8]]
+-- unluac-runtime: local run = ...
+-- unluac-runtime: local trace = ""
+-- unluac-runtime: local bits = {
+-- unluac-runtime:     band = function(...)
+-- unluac-runtime:         assert(select("#", ...) == 0)
+-- unluac-runtime:         trace = trace .. "B"
+-- unluac-runtime:         return bit32.band()
+-- unluac-runtime:     end,
+-- unluac-runtime: }
+-- unluac-runtime: local maximum = function(...)
+-- unluac-runtime:     assert(select("#", ...) == 4)
+-- unluac-runtime:     local a, b, c, d = ...
+-- unluac-runtime:     assert(a == 1 and b == 4 and c == 2 and d == 3)
+-- unluac-runtime:     trace = trace .. "C"
+-- unluac-runtime:     return math.max(...)
+-- unluac-runtime: end
+-- unluac-runtime: local library = setmetatable({}, { __index = function(_, key)
+-- unluac-runtime:     assert(key == "max")
+-- unluac-runtime:     trace = trace .. "M"
+-- unluac-runtime:     return maximum
+-- unluac-runtime: end })
+-- unluac-runtime: local function event(value)
+-- unluac-runtime:     trace = trace .. value
+-- unluac-runtime:     return tonumber(value), -100
+-- unluac-runtime: end
+-- unluac-runtime: setfenv(run, setmetatable({ bit32 = bits, math = library, tonumber = event }, { __index = getfenv() }))
+-- unluac-runtime: run()
+-- unluac-runtime: assert(trace == "BM1423C" or trace == "B1423MC")
+-- unluac-runtime: print("fastcall-fixed-all", trace)
+assert(bit32.band() == 4294967295)
+assert(math.max(tonumber("1"), tonumber("4"), tonumber("2"), (tonumber("3"))) == 4)

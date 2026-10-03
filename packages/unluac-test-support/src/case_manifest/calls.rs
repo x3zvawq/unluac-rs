@@ -2,6 +2,51 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_calls/fastcall_12_parameter_writeback.lua",
+        &["fastcall", "copy", "parameter", "call-frame"],
+        "连续两次参数更新保留 CALL 低槽写回，下一 FASTCALL 的参数 COPY 不反挂到前一结果定义。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/fastcall_11_fixed_all_arguments.lua",
+        &[
+            "fastcall",
+            "lookup-order",
+            "fixed-arguments",
+            "runtime-observer",
+        ],
+        "通用 FASTCALL 固定空参数和四参数帧保持求值顺序、单结果调整与 fallback callee 读取时点。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_calls/fastcall_10_dynamic_lookup_message.lua",
         &[
             "fastcall",

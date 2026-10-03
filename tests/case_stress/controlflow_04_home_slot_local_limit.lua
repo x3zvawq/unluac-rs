@@ -1,5 +1,7 @@
 -- regress_264_phi_home_slot_local_limit#1: 顺序 branch phi 复用状态 binding，不逐条件累积 scratch。
--- 最后一次 TEST 的原槽没有后续覆盖，可以保留到出口；不能用源码形状断言抹掉这份根事实。
+-- 两种真值交替执行全部更新/跳过路径，状态始终只需一个绑定；显式 +0 操作不能被折掉。
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[assign]] [[200]] [[@proto=1]]
 -- unluac: expect-contains [[if p1_0[2] then]]
 -- unluac: expect-contains [[if p1_0[199] then]]
 -- unluac: expect-not-contains [[    r1_1 = p1_0]]
@@ -58,16 +60,18 @@ local function run(flags)
     return value
 end
 
-local reads = {}
-local flags = setmetatable({}, {
-    __index = function(_, key)
-        reads[#reads + 1] = key
-        return false
-    end,
-})
-local result = run(flags)
-assert(result == 0 and #reads == 200 and reads[1] == 1 and reads[200] == 200)
-for key = 1, 200 do
-    assert(reads[key] == key)
+for parity = 0, 1 do
+    local reads = {}
+    local flags = setmetatable({}, {
+        __index = function(_, key)
+            reads[#reads + 1] = key
+            return key % 2 == parity
+        end,
+    })
+    local result = run(flags)
+    assert(result == 0 and #reads == 200 and reads[1] == 1 and reads[200] == 200)
+    for key = 1, 200 do
+        assert(reads[key] == key)
+    end
+    print("regress_264_phi_home_slot_local_limit#1", parity, result, #reads)
 end
-print("regress_264_phi_home_slot_local_limit#1", result, #reads)

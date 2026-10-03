@@ -6,6 +6,7 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=1]]
 local function run(a, b, c, xs)
     local x = 0
     repeat
@@ -65,3 +66,19 @@ print(
     "regress_114_luau_repeat_shared_nested_loop_tail#1",
     run(true, true, true, { [0] = true })
 )
+
+-- 分别进入共享尾部的两个前驱；索引观察器在原无界 while 前退出，核对迭代和累加顺序。
+for mode = 1, 2 do
+    local reads = {}
+    local xs = setmetatable({ [99] = true }, {
+        __index = function(_, key)
+            reads[#reads + 1] = key
+            if key == 0 then return false end
+            error("shared-tail:" .. key, 0)
+        end,
+    })
+    local ok, message = pcall(run, mode == 1, true, true, xs)
+    assert(not ok and message == "shared-tail:4", message)
+    assert(table.concat(reads, ",") == (mode == 1 and "0,4" or "4"))
+    print("shared-tail-path", mode, table.concat(reads, ","))
+end

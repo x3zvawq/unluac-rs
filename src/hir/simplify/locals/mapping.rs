@@ -1,7 +1,7 @@
 //! 维护 locals 提升的词法映射和全部 SSA 版本的 home 摘要。
 //! 词法映射在子块退出时回滚；计划索引增量记录标量与子域输出的绑定和最后需求。
 
-use super::{BTreeMap, HomeSlotKey, LocalId, PromotionCtx, TempId};
+use super::{BTreeMap, BTreeSet, HomeSlotKey, LocalId, PromotionCtx, TempId};
 
 #[derive(Default)]
 pub(super) struct LocalMapping {
@@ -169,6 +169,8 @@ pub(super) struct PlannedLocalUses {
     pub(super) bindings: BTreeMap<TempId, LocalId>,
     pub(super) homes: BTreeMap<TempId, Option<HomeSlotKey>>,
     pub(super) last_touches: BTreeMap<LocalId, usize>,
+    /// 本轮提升已绑定 capture/debug 身份的 local；后续同槽写不能再借用它。
+    pub(super) protected_locals: BTreeSet<LocalId>,
 }
 
 impl PlannedLocalUses {
@@ -199,6 +201,7 @@ impl PlannedLocalUses {
                 .iter()
                 .all(|temp| !ctx.identity_sensitive_temps.contains(temp));
         if !anonymous {
+            self.protected_locals.insert(plan.local);
             self.last_touches.remove(&plan.local);
             return;
         }

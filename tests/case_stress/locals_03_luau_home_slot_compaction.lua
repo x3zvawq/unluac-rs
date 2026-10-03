@@ -3,6 +3,62 @@
 -- unluac: expect-not-contains [[do]]
 -- unluac: expect-contains [[return nil, nil]]
 -- unluac: expect-not-contains [[= nil, nil]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[assign]] [[64]] [[@proto=2]]
+-- 正常 bit32 的整条线性链最终归零；外部 fallback 另覆盖非零返回，并核对每轮快照与开放尾。
+-- unluac-runtime: local run = ...
+-- unluac-runtime: local original = bit32
+-- unluac-runtime: for mode = 0, 1 do
+-- unluac-runtime:     local step, phase, expected = 1, 1, 12345
+-- unluac-runtime:     local left, right
+-- unluac-runtime:     local checks, outputs, extras = 0, 0, 0
+-- unluac-runtime:     local library = {
+-- unluac-runtime:         lrotate = function(value, distance, ...)
+-- unluac-runtime:             assert(phase == 1 and select("#", ...) == 0 and value == expected)
+-- unluac-runtime:             assert(distance == (step - 1) % 31 + 1)
+-- unluac-runtime:             left = original.lrotate(value, distance)
+-- unluac-runtime:             phase = 2
+-- unluac-runtime:             return left
+-- unluac-runtime:         end,
+-- unluac-runtime:         rrotate = function(value, distance, ...)
+-- unluac-runtime:             assert(phase == 2 and select("#", ...) == 0 and value == expected)
+-- unluac-runtime:             assert(distance == (step - 1) * 7 % 31 + 1)
+-- unluac-runtime:             right = original.rrotate(value, distance)
+-- unluac-runtime:             phase = 3
+-- unluac-runtime:             return right, 0
+-- unluac-runtime:         end,
+-- unluac-runtime:         bxor = function(a, b, ...)
+-- unluac-runtime:             assert(phase == 3 and a == left and b == right)
+-- unluac-runtime:             local width = select("#", ...)
+-- unluac-runtime:             assert(width == 0 or (width == 1 and (...) == 0))
+-- unluac-runtime:             extras = extras + width
+-- unluac-runtime:             expected = original.bxor(a, b)
+-- unluac-runtime:             if mode == 1 and step == 64 then expected = 1 end
+-- unluac-runtime:             step = step + 1
+-- unluac-runtime:             phase = 1
+-- unluac-runtime:             return expected
+-- unluac-runtime:         end,
+-- unluac-runtime:     }
+-- unluac-runtime:     local function check(condition, ...)
+-- unluac-runtime:         checks = checks + 1
+-- unluac-runtime:         assert(select("#", ...) == 0 and condition == (mode == 0))
+-- unluac-runtime:     end
+-- unluac-runtime:     local function output(tag, ...)
+-- unluac-runtime:         outputs = outputs + 1
+-- unluac-runtime:         assert(tag == "regress_206_luau_home_slot_compaction#1" and select("#", ...) == 3)
+-- unluac-runtime:         local value, marker, tail = ...
+-- unluac-runtime:         if mode == 0 then
+-- unluac-runtime:             assert(value == nil and marker == nil and tail == "tail")
+-- unluac-runtime:         else
+-- unluac-runtime:             assert(value == 1 and marker == 1 and tail == nil)
+-- unluac-runtime:         end
+-- unluac-runtime:     end
+-- unluac-runtime:     setfenv(run, setmetatable({ bit32 = library, assert = check, print = output }, { __index = getfenv() }))
+-- unluac-runtime:     run()
+-- unluac-runtime:     assert(step == 65 and phase == 1 and checks == 1 and outputs == 1)
+-- unluac-runtime:     assert(extras == 0 or extras == 64)
+-- unluac-runtime:     print("home-slot-fallback", mode, step - 1, extras)
+-- unluac-runtime: end
 local function tail()
     return "tail"
 end

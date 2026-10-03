@@ -19,6 +19,7 @@ mod captured;
 mod captured_predicates;
 mod conditional_methods;
 mod constant_control;
+pub(in crate::hir::simplify::call_frames) use constant_control::Frames as ConstantControlFrames;
 mod control;
 mod counter_repeat;
 mod counter_while;
@@ -325,12 +326,11 @@ pub(in crate::hir::simplify) fn restore(
                     })
                 })
                 .or_else(|| {
-                    constant_controls[proto.id.index()].as_ref().map(|body| {
+                    constant_controls[proto.id.index()].as_ref().map(|_| {
                         (
                             HirLuauInliningBody::ConstantControl {
                                 template: proto.id.index(),
                                 parameters: proto.params.len(),
-                                truth_mask: body.truth_mask,
                             },
                             "".into(),
                         )
@@ -549,6 +549,7 @@ pub(in crate::hir::simplify) fn restore(
         }
         let compared_choices = literal_choices::compared_callees(&callees, facts);
         let expression_frames = value_expressions::frames(proto, &callees, facts);
+        let control_frames = constant_control::frames(&callees, facts, &constant_controls);
         let calling_frames = calling_draft.as_ref().map(|draft| draft.frames(facts));
         let restrictions = frame_restrictions(proto, facts);
         let context = NativeFrameContext {
@@ -556,6 +557,7 @@ pub(in crate::hir::simplify) fn restore(
             expanded_callees: Some(&callees),
             compared_choices: Some(&compared_choices),
             value_expressions: Some(&expression_frames),
+            constant_controls: Some(&control_frames),
             calling_values: calling_frames.as_ref(),
             seeded_predicates: seeded_frames.as_ref(),
             retired_roots: None,
@@ -634,7 +636,7 @@ pub(in crate::hir::simplify) fn restore(
         expanded.extend(repeat_lookup::plans(context, facts));
         expanded.extend(counter_repeat::plans(context, facts));
         expanded.extend(reset_counter::plans(context, facts, &reset_counters));
-        expanded.extend(constant_control::plans(context, facts, &constant_controls));
+        expanded.extend(constant_control::plans(context, facts));
         let numeric_recovery = numeric_repeat::plans(context, facts, &numeric_repeats);
         expanded.extend(numeric_recovery.plans);
         let guarded_recovery = guarded_counter::plans(context, facts, &guarded_counters);
@@ -878,6 +880,15 @@ pub(in crate::hir::simplify) fn restore(
                                         )
                                     {
                                         home.slot()
+                                    } else if matches!(
+                                        callee.body,
+                                        HirLuauInliningBody::ConstantControl { .. }
+                                    ) {
+                                        facts
+                                            .operation_result_home(site)
+                                            .expect("validated constant-control allocation")
+                                            .slot()
+                                            - 1
                                     } else if matches!(
                                         callee.body,
                                         HirLuauInliningBody::GenericCounter { .. }
@@ -1337,7 +1348,7 @@ fn standalone_initializer_frame(
         HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)
             if matches!(stmt, HirStmt::LocalDecl(_))
                 && frame_builder(context, &[], facts, DecompileDialect::Luau, base.slot())
-                    .and_then(|mut builder| builder.luau_logical_value(value, 0, base))
+                    .and_then(|mut builder| builder.luau_logical_value(value, 0, base, None))
                     .is_some_and(|rebuilt| rebuilt == *value) => {}
         HirExpr::Binary(_) | HirExpr::Unary(_)
             if matches!(stmt, HirStmt::LocalDecl(_))

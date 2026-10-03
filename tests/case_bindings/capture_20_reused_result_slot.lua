@@ -2,7 +2,7 @@
 -- unluac: expect-ast-count [[do-block]] [[1]]
 -- unluac: expect-ast-count [[local-binding]] [[12]]
 -- unluac: expect-ast-count [[assign]] [[4]]
--- unluac: expect-contains [[= setmetatable({}, {]]
+-- unluac: expect-contains [[= setmetatable({},]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 do
     local first, second, captured = 0, 1, 2

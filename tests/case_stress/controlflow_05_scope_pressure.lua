@@ -1,5 +1,6 @@
 -- 独立不可规约区域不得让所有 SSA carrier 的空声明累积到函数入口。
 -- 33 段足以让旧生成结果超过 Lua 的 200 个活跃 local 上限；原源码只复用少数槽。
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=1]]
 local function run(entry, cycle)
     local total = 0
     do local n = 0; if entry then goto second1 end; ::first1:: total = total + 1; ::second1:: total = total + 10; n = n + 1; if cycle and n < 2 then goto first1 end end
@@ -39,4 +40,6 @@ local function run(entry, cycle)
 end
 assert(run(true, false) == 330)
 assert(run(false, true) == 726)
-print("regress_476_irreducible_scope_pressure", run(true, false), run(false, true))
+assert(run(false, false) == 363)
+assert(run(true, true) == 693)
+print("regress_476_irreducible_scope_pressure", run(true, false), run(false, true), run(false, false), run(true, true))

@@ -1695,4 +1695,30 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             }),
         ],
     ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/comparison_18_conditional_upvalue_leaf.lua",
+        &[
+            "comparison",
+            "short-circuit",
+            "upvalue",
+            "metamethod",
+            "fastcall",
+        ],
+        "比较内取值phi保留GETUPVAL身份；元方法更新cell后值叶重新读取，覆盖nil/false、真值身份、短路和抛错。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
 ];

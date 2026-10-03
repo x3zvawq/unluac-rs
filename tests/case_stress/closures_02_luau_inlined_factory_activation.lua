@@ -2,6 +2,12 @@
 -- NaN snapshot 抬高前缀后，第二次调用会跨 Luau 的寄存器压力上限。
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- identity 的完整实参帧不应因合成 NaN 快照永久占槽而拆成中转变量。
+-- unluac: expect-contains [[print("identity",]]
+-- unluac: expect-ast-max [[local-binding]] [[129]] [[@proto=0]]
+-- observe 的原 Boolean 预写属于完整 OR；写回既有局部值不能留下独立常量作用域。
+-- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=5]]
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=5]]
 function make() return 1 end
 function consume(x) total = total + x end
 function barrier() end
@@ -57,3 +63,14 @@ consume(keep104); consume(keep105); consume(keep106); consume(keep107); consume(
 consume(keep112); consume(keep113); consume(keep114); consume(keep115); consume(keep116); consume(keep117); consume(keep118); consume(keep119)
 consume(keep120); consume(keep121); consume(keep122)
 print("total", total)
+
+-- 同一个 protected caller 先观察 count 不匹配，再观察末项 vararg 不匹配。
+-- observe 即使断言失败也须先写回实际帧信息，下一次相同调用才能重新匹配。
+function verify_observe()
+    first_count = -1
+    assert(not pcall(observe, "activation-frame", "count-mismatch"))
+    first_vararg = not first_vararg
+    assert(not pcall(observe, "activation-frame", "vararg-mismatch"))
+    assert(pcall(observe, "activation-frame", "matched"))
+end
+verify_observe()

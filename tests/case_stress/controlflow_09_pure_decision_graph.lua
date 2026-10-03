@@ -1,6 +1,9 @@
 -- 纯 Decision 的共享尾在图内归约，不能先生成指数表达式再提取共同式。
 -- unluac: expect-not-contains [[p1_1 and (not p1_3]]
 -- unluac: expect-not-contains [[b and (not d]]
+-- unluac: expect-max-count [[ and ]] [[22]]
+-- unluac: expect-ast-max [[local-binding]] [[16]]
+-- unluac: expect-ast-max [[if]] [[4]]
 local function choose(a, b, c, d)
     return a and (b or c) and not d or (a or d) and b and c
 end
@@ -35,10 +38,19 @@ for encoded = 0, 2400 do
     local b = values[math.floor(encoded / 7) % 7 + 1]
     local c = values[math.floor(encoded / 49) % 7 + 1]
     local d = values[math.floor(encoded / 343) % 7 + 1]
-    assert(rawequal(choose(a,b,c,d), expected(a,b,c,d)))
+    local want = expected(a,b,c,d)
+    assert(rawequal(choose(a,b,c,d), want))
+    -- 逐组排除先前分支；非末组的假值继续流向末尾 false，末组保留 nil/false 身份。
+    assert(rawequal(wide(a,b,c,d,false,false,false,false,false,false,false,false,false,false,false,false), want or false))
+    assert(rawequal(wide(false,false,false,false,a,b,c,d,false,false,false,false,false,false,false,false), want or false))
+    assert(rawequal(wide(false,false,false,false,false,false,false,false,a,b,c,d,false,false,false,false), want or false))
+    assert(rawequal(wide(false,false,false,false,false,false,false,false,false,false,false,false,a,b,c,d), want))
 end
 assert(unexpected == 0)
 assert(wide() == nil)
 assert(wide(false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false) == false)
 assert(rawequal(wide(false,false,false,false,false,false,false,false,false,false,false,false,true,true,other,true), other))
+assert(rawequal(wide(true,true,object,true,true,true,other,true), object))
+assert(rawequal(wide(false,false,false,false,true,true,object,true,true,true,other,true), object))
+assert(rawequal(wide(false,false,false,false,false,false,false,false,true,true,object,true,true,true,other,true), object))
 print("regress_564_pure_decision_graph", "OK")

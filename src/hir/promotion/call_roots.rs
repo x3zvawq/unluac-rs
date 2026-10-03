@@ -899,6 +899,8 @@ pub(super) struct ResultCopies {
     pub by_site: BTreeMap<InstrRef, ImmediateMoveWrite>,
     pub writes: Vec<ImmediateMoveWrite>,
     pub state_writes: BTreeMap<TempId, StateCopy>,
+    /// COPY 读取的确切数值字面量 Def；用于没有算术节点携带来源的常量返回。
+    pub literals: BTreeMap<TempId, (TempId, HirExpr)>,
 }
 
 /// COPY 保留原目标 Def 及其固定 binding 投影；source 是当前 carrier，producer 是独立原操作。
@@ -924,6 +926,7 @@ pub(super) fn value_result_copies(
     let mut by_site = BTreeMap::new();
     let mut writes = Vec::new();
     let mut state_writes = BTreeMap::new();
+    let mut literals = BTreeMap::new();
     for (index, block) in cfg.blocks.iter().enumerate() {
         if block.instrs.is_empty() || !cfg.reachable_blocks.contains(&BlockRef(index)) {
             continue;
@@ -991,6 +994,17 @@ pub(super) fn value_result_copies(
                 target_home: HomeSlotKey::new(copy.dst.index(), epochs.epoch_at(copy.dst, instr)),
             };
             writes.push(write);
+            if let SsaValue::Def(source) = value
+                && let Some((reg, literal)) = copy_assignments::scalar_literal(
+                    proto,
+                    &proto.instrs[dataflow.def_instr(source).index()],
+                )
+                && reg == copy.src
+                && matches!(literal, HirExpr::Integer(_) | HirExpr::Number(_))
+                && fixed_temps[source.index()] == TempId(source.index())
+            {
+                literals.insert(target, (result, literal));
+            }
             // 直线展开可在回编译后失去多余跳转；COPY 身份不依赖块入口。
             // 旧结果合流查询仍只消费入口 MOVE，不能扩大其唯一写回合同。
             if instr != block.instrs.start {
@@ -1017,6 +1031,7 @@ pub(super) fn value_result_copies(
         by_site,
         writes,
         state_writes,
+        literals,
     }
 }
 

@@ -345,18 +345,24 @@ impl FrameBuilder<'_> {
         self.native?;
         let facts = self.facts;
         let dialect = self.dialect;
-        let protocol @ crate::transformer::FastCallProtocol::Mask { .. } = call.fastcall? else {
-            return None;
-        };
+        let protocol = call.fastcall?;
         if dialect != DecompileDialect::Luau
             || call.method != HirMethodCall::None
-            || !(1..=3).contains(&call.args.fixed.len())
+            || matches!(protocol, crate::transformer::FastCallProtocol::Mask { .. })
+                && !(1..=3).contains(&call.args.fixed.len())
         {
             return None;
         }
         let frame = facts.native_fastcall_frame(call)?;
+        // 通用 FASTCALL 的 All 表示全部参数直接准备，不表示 CALL 必须有开放尾。
+        // 固定空参数区也保留原起点；callee 读取和结果帧仍由同一事务逐事件核对。
         let args = match (frame.args, &call.args.tail) {
-            (ValuePack::Fixed(args), None) if !protocol.tail_is_direct() => args,
+            (ValuePack::Fixed(args), None)
+                if matches!(protocol, crate::transformer::FastCallProtocol::All { .. })
+                    || !protocol.tail_is_direct() =>
+            {
+                args
+            }
             (ValuePack::Open(start), Some(tail))
                 if protocol.tail_is_direct()
                     && tail.exact_width().is_none()
@@ -494,11 +500,19 @@ impl FrameBuilder<'_> {
                     let table = !embedded
                         && matches!(&value, HirExpr::TableConstructor(table)
                         if facts.allocation_result_home(table).is_some_and(|home| home.slot() == slot));
-                    // mixed FASTCALL 的 direct Boolean 与全 direct 参数共用原比较结果协议；
-                    // message 的 fallback COPY 不改变这个参数先写入原槽的时点。
+                    // expr 已逐叶重发操作数；mixed 参数的 fallback COPY 不改变求值时点。
+                    // 预写参数由完整值帧提供身份并重发 and/or 包装，裸比较核对独立 LOADBOOL 结果；
+                    // 不再用只接受纯低槽值的形状查询拒绝已证明的条件操作数。
                     let comparison = !embedded
                         && matches!(&value, HirExpr::Binary(binary)
-                    if self.luau_boolean_comparison(binary, slot));
+                            if boolean_prewrite && matches!(binary.op,
+                                crate::hir::HirBinaryOpKind::Eq | crate::hir::HirBinaryOpKind::Lt
+                                | crate::hir::HirBinaryOpKind::Le | crate::hir::HirBinaryOpKind::Gt
+                                | crate::hir::HirBinaryOpKind::Ge)
+                            || facts.comparison_result_temp(binary).is_some_and(|result|
+                                facts.call_argument_value(call, index) == Some(result)
+                                    && facts.trusted_temp_home_slot(result)
+                                        .is_some_and(|home| home.slot() == slot)));
                     // direct 算术参数先在原参数槽求值，fallback 随后读取 callee；
                     // expr 已核对原操作数与准备顺序，这里再绑定原结果槽。
                     let arithmetic = !embedded

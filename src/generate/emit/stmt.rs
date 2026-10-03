@@ -387,7 +387,10 @@ impl<'a> Emitter<'a> {
     pub(super) fn emit_parenthesized_list(&self, items: Vec<Doc>) -> Doc {
         Doc::concat([
             Doc::text("("),
-            Doc::join(items, Doc::text(", ")),
+            Doc::indent(Doc::fill(
+                items,
+                Doc::concat([Doc::text(","), Doc::soft_line()]),
+            )),
             Doc::text(")"),
         ])
     }

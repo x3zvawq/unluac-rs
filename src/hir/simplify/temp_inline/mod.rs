@@ -39,6 +39,9 @@ use super::root_lifetimes::{
     materialize_generic_for_dispatch_root_releases, scope_end_copy_root_handoffs,
     scope_end_copy_roots_needing_materialization, stmt_has_argument_root_handoff,
 };
+use super::syntax_budget::{
+    inline_expansion_budget, inline_syntax_budget, spend_inline_syntax_budget,
+};
 use crate::hir::rewrite::{replace_temp_in_expr, replace_temp_in_stmt, replace_temps_in_stmt};
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
@@ -1900,44 +1903,6 @@ fn inline_pure_dependency_chain(
     context.commit(sink, &replacements);
     *callee_materialized_at = callee;
     true
-}
-
-// PUC 的语法递归上限约为 200；为外围调用、控制结构和源码投影留出余量。
-// 只约束一元链的拼接；左结合算术的长度不等于解析递归深度。
-// 节点预算保守覆盖一元嵌套，每次查询最多访问固定数量节点。
-const INLINE_SYNTAX_NODE_BUDGET: usize = 128;
-
-struct InlineSyntaxBudget(usize);
-
-impl HirVisitor<'_> for InlineSyntaxBudget {
-    fn is_complete(&self) -> bool {
-        self.0 == 0
-    }
-
-    fn visit_expr(&mut self, _expr: &HirExpr) {
-        self.0 -= 1;
-    }
-}
-
-fn inline_syntax_budget(sink: &HirStmt) -> usize {
-    let mut budget = InlineSyntaxBudget(INLINE_SYNTAX_NODE_BUDGET);
-    crate::hir::visit::visit_stmt_header(sink, &mut budget);
-    budget.0
-}
-
-fn spend_inline_syntax_budget(value: &HirExpr, remaining: usize) -> Option<usize> {
-    // 代换移除一个 TempRef 叶子；至少留一格，区分刚好到界与提前终止遍历。
-    let mut budget = InlineSyntaxBudget(remaining + 1);
-    visit_expr(value, &mut budget);
-    (budget.0 != 0).then_some(budget.0)
-}
-
-fn inline_expansion_budget(sink: &HirStmt, value: &HirExpr) -> Option<usize> {
-    if matches!(value, HirExpr::Unary(_)) {
-        spend_inline_syntax_budget(value, inline_syntax_budget(sink))
-    } else {
-        Some(INLINE_SYNTAX_NODE_BUDGET)
-    }
 }
 
 fn first_eager_condition_call(expr: &HirExpr) -> Option<&HirCallExpr> {

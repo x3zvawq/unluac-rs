@@ -183,7 +183,7 @@ fn validate_scope(
         .union(&numeric_bindings)
         .copied()
         .collect::<BTreeSet<_>>();
-    let Some(constant_controls) = constant_control::Models::new(&statements, &bodies) else {
+    let Some(constant_controls) = constant_control::Models::new(&statements, &bodies, hir) else {
         return false;
     };
     if bodies.values().any(|body| {
@@ -435,8 +435,8 @@ fn validate_scope(
                         } else if let HirLuauInliningBody::NumericForExit { template } = fields[&local].0 {
                             hir.protos.get(template).is_some_and(|proto|
                                 numeric_exit::body(&decl.func, proto, fields[&local].2))
-                        } else if let HirLuauInliningBody::ConstantControl { template, parameters, truth_mask } = fields[&local].0 {
-                            hir.protos.get(template).is_some_and(|proto| constant_control::body(&decl.func, proto, parameters, truth_mask))
+                        } else if let HirLuauInliningBody::ConstantControl { .. } = fields[&local].0 {
+                            constant_controls.declaration(local)
                         } else if let HirLuauInliningBody::ResetCounter { template } = fields[&local].0 {
                             hir.protos.get(template).is_some_and(|proto| reset_counter::body(&decl.func, proto))
                         } else if let HirLuauInliningBody::ArrayFold { template } = fields[&local].0 {
@@ -1028,13 +1028,8 @@ impl InvocationExpressions<'_> {
                         self.bodies[callee],
                         HirLuauInliningBody::GuardedCounter { .. }
                     ) || guarded_counter::arguments(&call.args))
-                    && (if let HirLuauInliningBody::ConstantControl {
-                        parameters,
-                        truth_mask,
-                        ..
-                    } = self.bodies[callee]
-                    {
-                        constant_control::arguments(&call.args, parameters, truth_mask)
+                    && (if let HirLuauInliningBody::ConstantControl { .. } = self.bodies[callee] {
+                        self.constant_controls.inlined(*callee, &call.args)
                     } else {
                         true
                     })

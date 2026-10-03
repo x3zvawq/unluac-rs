@@ -141,7 +141,6 @@ impl LuaCaseConfiguration {
 pub(crate) enum LuaCaseExpectation {
     Source,
     Lua53Float32,
-    GlobalDeclResidual,
     InvalidDebugStillRejected,
     LuaJitBuiltinTableRemove,
     LuaJitMethodProtocol,

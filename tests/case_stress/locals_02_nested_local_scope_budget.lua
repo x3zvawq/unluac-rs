@@ -1,5 +1,10 @@
 -- regress_199_nested_local_scope_budget#1: 嵌套 block 必须扣除外层仍活跃的 local 预算
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[assign]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[2]]
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[if]] [[2]]
+-- unluac: expect-ast-count [[call]] [[426]]
 local function nested_budget(flag)
     assert(bit32.band() == bit32.bnot(0))
     assert(bit32.band() == bit32.bnot(0))
@@ -76,6 +81,7 @@ local function nested_budget(flag)
 end
 
 nested_budget(true)
+nested_budget(false)
 print("regress_199_nested_local_scope_budget#1", "OK")
 
 
@@ -156,4 +162,5 @@ local function future_outer_budget(flag)
 end
 
 future_outer_budget(true)
+future_outer_budget(false)
 print("regress_199_nested_local_scope_budget#2", "OK")

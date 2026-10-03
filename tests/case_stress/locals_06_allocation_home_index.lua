@@ -1,5 +1,8 @@
 -- Copies share an allocation site; every physical home keeps its own release endpoint.
 -- unluac: expect-ast-min [[local-decl]] [[32]]
+-- unluac: expect-ast-max [[local-binding]] [[34]] [[@proto=1]]
+-- unluac: expect-ast-count [[table-constructor]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[call]] [[6]] [[@proto=1]]
 local weak = setmetatable({}, { __mode = "v" })
 local function run()
     local first = {}

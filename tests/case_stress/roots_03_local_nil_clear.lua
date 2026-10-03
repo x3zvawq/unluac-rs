@@ -1,6 +1,9 @@
 local weak = setmetatable({}, {__mode = "v"})
 -- unluac: expect-ast-min [[local-decl]] [[128]]
 -- unluac: expect-ast-min [[table-constructor]] [[128]]
+-- unluac: expect-ast-max [[local-binding]] [[129]] [[@proto=1]]
+-- unluac: expect-ast-count [[table-constructor]] [[128]] [[@proto=1]]
+-- unluac: expect-ast-count [[call]] [[133]] [[@proto=1]]
 local function run()
 local a0 = {}
 weak[1] = a0
@@ -259,6 +262,9 @@ weak[127] = a126
 local a127 = {}
 weak[128] = a127
 collectgarbage("collect")
+for i = 1, 128 do
+    assert(weak[i] ~= nil)
+end
 assert(a0 ~= a1)
 assert(a1 ~= a2)
 assert(a2 ~= a3)
@@ -516,6 +522,7 @@ a125 = nil
 a126 = nil
 a127 = nil
 collectgarbage("collect")
+assert(next(weak) == nil)
 end
 run()
 assert(next(weak) == nil)

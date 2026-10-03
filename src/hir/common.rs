@@ -120,7 +120,6 @@ pub(crate) enum HirLuauInliningBody {
     ConstantControl {
         template: usize,
         parameters: usize,
-        truth_mask: u8,
     },
     /// 数值循环内的条件 repeat；不同 occurrence 可保留索引循环或展开为原 ADD 序列。
     NumericRepeat {
@@ -1301,6 +1300,9 @@ pub struct HirLocalDecl {
 pub struct HirGlobalDecl {
     /// 完整协议首个 GET probe 的来源；RHS 改写不改变 probe/store 的原位置和准备边界。
     pub(crate) probe_source: HirSourceSite,
+    /// 宽目标准备跨 RHS 调用时，native-call-frames 必须连同原槽和当前常量宽度一起消费。
+    /// 协议识别只认领操作，未完成该事务的节点不得作为普通源码交给 AST。
+    pub(crate) pending_target_preparations: bool,
     pub names: Vec<LuaString>,
     pub values: HirValuePack,
 }

@@ -255,6 +255,8 @@ pub(super) struct IdentityCaptureInitializer {
 pub(super) struct SharedCaptureBarrier {
     pub(super) box_local: Option<LocalId>,
     pub(super) snapshots: Vec<Option<LocalId>>,
+    /// 单值屏障先占用 factory 的原 home，再复制到内部只读 capture，避免永久抬高外层前缀。
+    pub(super) scoped_factory: bool,
 }
 
 #[derive(Default)]
@@ -535,7 +537,7 @@ fn lower_proto_one(
     global_decls.record_preparations(dataflow, &bindings.fixed_temps, &mut promotion_facts);
     let lexical_environment_local =
         global_decls.bind_environment(&mut bindings, &mut promotion_facts)?;
-    let captured_shared_closures = CapturedSharedClosureLowering::new(
+    let mut captured_shared_closures = CapturedSharedClosureLowering::new(
         captured_shared_plan,
         composite_protos,
         proto,
@@ -1577,6 +1579,7 @@ impl<'a> CapturedSharedClosureLowering<'a> {
                 SharedCaptureBarrier {
                     box_local,
                     snapshots,
+                    scoped_factory: false,
                 }
             });
             capture_barriers.push(barrier);
@@ -1656,10 +1659,11 @@ impl<'a> CapturedSharedClosureLowering<'a> {
     }
 
     /// factory 独占替换原 owner 的一次写时，沿用该写的物理 home，不能传播原函数值身份。
-    /// 保留 owner 或 NaN capture 屏障会新增声明，不能把最后一个 factory 冒充原 dst；
-    /// 已打开引用的 dst 也属于现有 cell。最终源码声明顺序仍由 source_frames 核对。
+    /// 单值 NaN 屏障在原位置初始化 factory 槽，内部只读快照不占用外层前缀。
+    /// 保留 owner、多值屏障或已打开引用的 dst 仍不能冒充独立 home。
+    /// 最终源码声明顺序由 source_frames 核对。
     fn record_anchor_homes(
-        &self,
+        &mut self,
         proto: &LoweredProto,
         dataflow: &DataflowFacts,
         slot_epochs: &SlotEpochFacts,
@@ -1670,7 +1674,9 @@ impl<'a> CapturedSharedClosureLowering<'a> {
             let anchor = composite.anchor;
             if composite.preserve_owner_value
                 || self.plan.is_consumed(anchor)
-                || self.capture_barriers[index].is_some()
+                || self.capture_barriers[index]
+                    .as_ref()
+                    .is_some_and(|barrier| barrier.box_local.is_some())
                 || bindings
                     .capture_empty_local_decls
                     .get(&anchor.index())
@@ -1692,6 +1698,9 @@ impl<'a> CapturedSharedClosureLowering<'a> {
                 continue;
             }
             if let Some(home) = facts.trusted_temp_home_slot(temp) {
+                if let Some(barrier) = &mut self.capture_barriers[index] {
+                    barrier.scoped_factory = true;
+                }
                 facts.record_local_home_slot(self.factory_locals[index], home);
             }
         }

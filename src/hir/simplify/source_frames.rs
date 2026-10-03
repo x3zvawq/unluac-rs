@@ -334,10 +334,26 @@ pub(super) fn validate_prefixes(
         reads: BTreeSet<TempId>,
     }
     impl HirVisitor<'_> for GlobalKeys<'_> {
+        fn visit_call(&mut self, call: &crate::hir::common::HirCallExpr) {
+            for (name, store) in self.facts.global_call_targets(call) {
+                if let Some((temp, _)) = self.facts.global_call_target_key(name, *store) {
+                    self.keys.insert(temp, name.clone());
+                }
+            }
+        }
+
+        fn visit_lvalue(&mut self, target: &crate::hir::common::HirLValue) {
+            if let crate::hir::common::HirLValue::Global(global) = target
+                && let Some(temp) = self.facts.global_key_preparation(global)
+            {
+                self.keys.insert(temp, global.key.clone());
+            }
+        }
+
         fn visit_expr(&mut self, expr: &crate::hir::common::HirExpr) {
             match expr {
                 crate::hir::common::HirExpr::GlobalRef(global) => {
-                    if let Some(temp) = self.facts.global_read_key_preparation(global) {
+                    if let Some(temp) = self.facts.global_key_preparation(global) {
                         self.keys.insert(temp, global.key.clone());
                     }
                 }

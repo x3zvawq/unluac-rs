@@ -1,6 +1,6 @@
 -- 字段闭包在原空闲槽创建；安装回调与后续调用共享同一个可变捕获 cell。
 -- unluac: expect-ast-count [[local-function]] [[2]]
--- unluac: expect-contains [[= setmetatable({}, {]]
+-- unluac: expect-contains [[= setmetatable({},]]
 -- unluac: expect-not-contains [[ = assert]]
 -- unluac: expect-not-contains [[ = print]]
 local target

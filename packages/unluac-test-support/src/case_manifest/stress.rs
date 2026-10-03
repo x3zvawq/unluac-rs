@@ -57,8 +57,8 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     ),
     LuaCaseDefinition::new(
         "tests/case_stress/locals_03_luau_home_slot_compaction.lua",
-        &["bit32", "home-slot"],
-        "64次旋转异或链按home复用local，避免stripped源码槽膨胀。",
+        &["bit32", "home-slot", "fastcall", "runtime-observer"],
+        "64次旋转异或更新消除中转绑定，逐轮观察 fallback 参数快照、尾宽度和两条返回路径。",
         &[LuaCaseConfiguration::new(LUAU_ONLY).with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)],
     ),
     LuaCaseDefinition::new(
@@ -112,9 +112,8 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_stress/constants_04_lua55_wide_mixed_global_rhs.lua",
         &["environment", "global", "wide-constants"],
-        "以260个常量制造宽leading target，拒绝直接抽取tail_b/tail_c后缀。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua55])
-            .with_expectation(LuaCaseExpectation::GlobalDeclResidual)],
+        "以260个常量制造宽目标，完整恢复混合RHS并保留调用前后的环境身份。",
+        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua55])],
     ),
     LuaCaseDefinition::new(
         "tests/case_stress/locals_05_lua55_local_scope_crosses_global_decl.lua",
@@ -298,6 +297,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_stress/closures_02_luau_inlined_factory_activation.lua",
         &["activation", "inlining", "register-pressure"],
         "O2已内联factory effect属于caller，123个keep抬高frame后两次factory仍有相同debug.info activation。",
+        &[LuaCaseConfiguration::new(LUAU_ONLY).with_options(LUAU_OPTIMIZED_OPTIONS)],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_stress/closures_03_luau_compacted_value_capture.lua",
+        &["capture", "identity", "home-slot", "register-pressure"],
+        "本轮新提升的按值快照不参与后继槽压缩；两个返回闭包独立，捕获值在原槽复用后仍为NaN。",
         &[LuaCaseConfiguration::new(LUAU_ONLY).with_options(LUAU_OPTIMIZED_OPTIONS)],
     ),
     LuaCaseDefinition::new(

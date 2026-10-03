@@ -3,7 +3,7 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
 -- 相邻作用域的 scalar/CALL 前缀与未使用结果应完整恢复，不能让后段构造器退回逐槽交接。
--- unluac: expect-count [[= setmetatable({}, {]] [[2]]
+-- unluac: expect-count [[= setmetatable({},]] [[2]]
 -- 写回 captured cell 后，后继上值返回复用原 scratch，不另引入源码声明。
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
 -- 字段初始化只保留实际字段，模板占位不能与同键闭包一起输出。

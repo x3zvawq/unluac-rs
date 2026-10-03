@@ -2,7 +2,7 @@
 -- unluac: expect-ast-count [[do-block]] [[1]]
 -- unluac: expect-ast-count [[assign]] [[4]]
 -- unluac: expect-ast-count [[local-binding]] [[7]]
--- unluac: expect-contains [[= setmetatable({}, {]]
+-- unluac: expect-contains [[= setmetatable({},]]
 do
     local first, second, captured = 0, 1, 2
     local function advance()

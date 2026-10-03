@@ -1,6 +1,11 @@
 -- regress_510_return_lookup_value_dag: shared temp definitions must stay a DAG during root analysis.
 -- The same source runs with numbers and observable __add calls; each definition executes once.
 -- unluac: expect-ast-min [[local-decl]] [[25]]
+-- LuaJIT 反向排列同级 proto：1/4 是共享值链或索引观察器，2/3 是加法观察器或查表链。
+-- unluac: expect-ast-max [[local-binding]] [[24]] [[@proto=1]]
+-- unluac: expect-ast-max [[local-binding]] [[24]] [[@proto=4]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=2]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]]
 
 return_dag_source = 3
 
@@ -36,15 +41,26 @@ end
 assert(run() == 50331648)
 
 local additions = 0
+local stop_addition = 0
+local failure = {}
 local mt = {}
 mt.__add = function(left, right)
     additions = additions + 1
+    assert(rawequal(left, right) and left.value == 3 * 2 ^ (additions - 1))
+    return_dag_source = "changed"
+    if additions == stop_addition then error(failure, 0) end
     return setmetatable({ value = left.value + right.value }, mt)
 end
 return_dag_source = setmetatable({ value = 3 }, mt)
 assert(run().value == 50331648)
 assert(additions == 24, "shared definitions must execute once")
+assert(return_dag_source == "changed")
 print("regress_510_return_lookup_value_dag", additions)
+additions = 0
+stop_addition = 12
+return_dag_source = setmetatable({ value = 3 }, mt)
+local ok, problem = pcall(run)
+assert(not ok and rawequal(problem, failure) and additions == 12)
 
 -- 两个独立 seed 启用私有字段分析；未知访问链只查询一次，不能在值域兜底中指数重扫。
 -- unluac: expect-contains [[.child.child.child.child.child.child.child.child]]
@@ -55,9 +71,11 @@ local function lookup_chain(input)
     return first, second
 end
 local reads = 0
+local stop_read = 0
 local node = setmetatable({}, {__index = function(self, key)
     assert(key == "child")
     reads = reads + 1
+    if reads == stop_read then error(failure, 0) end
     return self
 end})
 local first, second = lookup_chain(node)
@@ -66,3 +84,8 @@ node.child = node
 first, second = lookup_chain(node)
 assert(first.value == node and next(second) == nil and reads == 32)
 print("private-field-chain", reads)
+node.child = nil
+reads = 0
+stop_read = 17
+ok, problem = pcall(lookup_chain, node)
+assert(not ok and rawequal(problem, failure) and reads == 17)

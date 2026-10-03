@@ -466,10 +466,10 @@ fn fixed_values_plan(
     let transaction = for_.initializer_transaction.as_ref()?;
     let width = frame.initializers.len();
     if for_.iterator.tail.is_some()
-        || for_.iterator.fixed.len() != width
+        || for_.iterator.fixed.len() > width
         || transaction.iterator_width != width
         || transaction.producers.is_empty()
-        || transaction.producers.len() > width
+        || transaction.producers.len() > for_.iterator.fixed.len()
     {
         return None;
     }
@@ -519,6 +519,7 @@ fn fixed_values_plan(
             ),
             _ => return None,
         };
+        // 同槽后续捕获不回溯到当前 producer；原定义的未别名事实仍须有效。
         if span.value_start != offset
             || span.value_count != 1
             || has_tail
@@ -528,7 +529,8 @@ fn fixed_values_plan(
             || facts.trusted_local_home_slot(local) != Some(home)
             || context.proto.local_debug_hints[local.index()].is_some()
             || context.proto.local_debug_scopes[local.index()].is_some()
-            || context.barred.contains(&home)
+            || (context.barred.contains(&home)
+                && !facts.local_definitions_reference_unaliased(local))
             || context.closed.contains(&home)
             || matches!(
                 value,
@@ -550,7 +552,10 @@ fn fixed_values_plan(
         }
     }
     // 原 iterator owner 已消费的固定后缀保持在循环头；不把未证明的交错 span 猜成准备区。
-    for (offset, value) in for_.iterator.fixed.iter().enumerate().skip(remaining) {
+    // iterator owner 会在保留 transaction 时省略尾部 nil；固定值包在原协议宽度内
+    // 的这些位置仍确定为 nil，不能把展示长度当作初始化帧的物理宽度。
+    for offset in remaining..width {
+        let value = for_.iterator.fixed.get(offset).unwrap_or(&HirExpr::Nil);
         if !matches!(
             value,
             HirExpr::Nil

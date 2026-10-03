@@ -22,8 +22,8 @@ pub(crate) struct Trace {
 }
 
 pub(crate) struct Template {
-    pub truth_mask: u8,
-    pub trace: Trace,
+    /// 相同操作轨迹只保留一个代表实参；不同轨迹属于同一个 callee。
+    pub traces: BTreeMap<Trace, u8>,
 }
 
 pub(crate) fn truth(expr: &HirExpr, parameters: usize, mask: u8) -> Option<bool> {
@@ -96,13 +96,14 @@ impl Evaluator {
                 }
                 HirStmt::Assign(assign)
                     if assign.values.tail.is_none()
-                        && !assign.is_phi_transfer
                         && assign.initializer_merge_transaction.is_none()
                         && assign.generic_for_initializer_producer.is_none()
                         && assign.root_release.is_none()
                         && assign.method_rewrite_transaction.is_none()
                         && assign.parallel_nil_frame.is_none() =>
                 {
+                    // 树化后原算术可直接写入 phi carrier；来源仍在 Binary 上。
+                    // 这里只解释显式同状态更新，不把无来源的 phi COPY 当作一次计算。
                     let ([HirLValue::Local(local)], [HirExpr::Binary(binary)]) =
                         (assign.targets.as_slice(), assign.values.fixed.as_slice())
                     else {
@@ -138,10 +139,40 @@ impl Evaluator {
                         Flow::Next
                     }
                 }
-                HirStmt::While(loop_)
-                    if truth(&loop_.cond, self.parameters, self.mask) == Some(false) =>
-                {
-                    Flow::Next
+                HirStmt::While(loop_) => {
+                    if !truth(&loop_.cond, self.parameters, self.mask)? {
+                        Flow::Next
+                    } else {
+                        // 条件只读取不可写的 Boolean 参数；首轮不退出就不是有限直线轨迹。
+                        match self.block(&loop_.body, false)? {
+                            Flow::Break => Flow::Next,
+                            Flow::Return => Flow::Return,
+                            _ => return None,
+                        }
+                    }
+                }
+                HirStmt::NumericFor(loop_) => {
+                    let count = crate::hir::luau_loop_cost::trips(
+                        small_integer(&loop_.start)?,
+                        small_integer(&loop_.limit)?,
+                        small_integer(&loop_.step)?,
+                    )?;
+                    // 候选拒绝[TargetConstraint]：pinned Luau 最多展开 25 轮；最终 AST 另核对成本。
+                    if count > 25 {
+                        return None;
+                    }
+                    let mut exit = Flow::Next;
+                    for _ in 0..count {
+                        match self.block(&loop_.body, false)? {
+                            Flow::Break => break,
+                            Flow::Return => {
+                                exit = Flow::Return;
+                                break;
+                            }
+                            Flow::Next | Flow::Continue => {}
+                        }
+                    }
+                    exit
                 }
                 HirStmt::Repeat(loop_) => match self.block(&loop_.body, false)? {
                     Flow::Return => Flow::Return,
@@ -195,14 +226,7 @@ pub(crate) fn trace(proto: &HirProto, mask: u8) -> Option<Trace> {
         remaining: 256,
     };
     let flow = evaluator.block(&proto.body, true)?;
-    (flow == Flow::Return
-        && !evaluator.trace.returned.is_empty()
-        && evaluator
-            .trace
-            .actions
-            .iter()
-            .any(|action| matches!(action, Action::Update { .. })))
-    .then_some(evaluator.trace)
+    (flow == Flow::Return && !evaluator.trace.returned.is_empty()).then_some(evaluator.trace)
 }
 
 pub(crate) fn template(proto: &HirProto) -> Option<Template> {
@@ -227,23 +251,12 @@ pub(crate) fn template(proto: &HirProto) -> Option<Template> {
     if writes.0 {
         return None;
     }
-    let mut selected: Option<Template> = None;
+    let mut traces = BTreeMap::new();
     for mask in 0..1u8 << (proto.params.len() - 1) {
         let Some(trace) = trace(proto, mask) else {
             continue;
         };
-        if let Some(known) = &selected {
-            // 候选拒绝[ProofIncomplete:Specialization]：当前 callee 合同只发布一个直线轨迹；
-            // 不同轨迹需由多模板 owner 区分，不能随意选择一个掩盖另一条路径。
-            if known.trace != trace {
-                return None;
-            }
-        } else {
-            selected = Some(Template {
-                truth_mask: mask,
-                trace,
-            });
-        }
+        traces.entry(trace).or_insert(mask);
     }
-    selected
+    (!traces.is_empty()).then_some(Template { traces })
 }

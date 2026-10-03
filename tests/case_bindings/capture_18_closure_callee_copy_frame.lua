@@ -4,7 +4,7 @@
 -- unluac: expect-ast-count [[local-binding]] [[7]] [[@dialect=luau]] [[@debug=stripped]]
 -- unluac: expect-ast-count [[assign]] [[2]]
 -- unluac: expect-ast-count [[do-block]] [[2]]
--- unluac: expect-contains [[= setmetatable({}, {]]
+-- unluac: expect-contains [[= setmetatable({},]]
 -- unluac: expect-contains [[local result = -get() and "yes" or "no"]] [[@debug=retained]]
 -- Luau 常量传播删掉 marker 比较，但保留比较前的 false 写；and true 重发该协议。
 -- unluac: expect-count [[and true]] [[1]] [[@dialect=luau]]

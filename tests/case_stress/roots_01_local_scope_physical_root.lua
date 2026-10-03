@@ -1,4 +1,7 @@
 -- regress_385_local_scope_physical_root: local 预算分段不能缩短 PhysicalRoot 的 GC 生命周期
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=1]]
+-- unluac: expect-ast-count [[function]] [[181]] [[@proto=1]]
+-- unluac: expect-ast-count [[call]] [[367]] [[@proto=1]]
 local function run()
     collectgarbage("stop")
     local weak = setmetatable({}, { __mode = "v" })

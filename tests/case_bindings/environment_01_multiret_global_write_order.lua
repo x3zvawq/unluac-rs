@@ -1,6 +1,6 @@
 -- regress_223_multiret_global_write_order#1: 连续全局写不能合并成逆序生效的多赋值
 -- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-count [[setmetatable({}, {]] [[2]]
+-- unluac: expect-count [[setmetatable({},]] [[2]]
 -- unluac: expect-ast-max [[local-decl]] [[2]] [[@proto=0]]
 -- unluac: expect-order [[first_global =]] [[second_global =]]
 -- unluac: expect-contains [[assert(meta.get_owner() == replacement and reads == 1)]] [[@debug=retained]]

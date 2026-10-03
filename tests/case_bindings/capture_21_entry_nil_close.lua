@@ -5,7 +5,7 @@
 -- unluac: expect-ast-count [[assign]] [[2]]
 -- unluac: expect-ast-count [[do-block]] [[3]] [[@debug=retained]]
 -- unluac: expect-ast-count [[do-block]] [[2]] [[@debug=stripped]]
--- unluac: expect-contains [[= setmetatable({}, {]]
+-- unluac: expect-contains [[= setmetatable({},]]
 -- unluac: expect-not-contains [[unresolved]]
 -- 入口 cell 可以没有初始化值；同槽后继多返回声明必须完整恢复，不能再拆空声明。
 -- unluac: expect-ast-max [[empty-local]] [[1]] [[@proto=0]]

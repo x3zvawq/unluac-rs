@@ -1,6 +1,9 @@
 -- Lookup values retain their future reads across many observing statements.
 -- N distinct lookup homes remain readable after N GC observations.
 -- unluac: expect-ast-min [[local-decl]] [[64]]
+-- unluac: expect-ast-max [[local-binding]] [[72]]
+-- unluac: expect-ast-count [[call]] [[74]]
+-- unluac: expect-ast-count [[assign]] [[5]]
 local function hold(t)
 local a1 = t[1]
 local a2 = t[2]
@@ -134,6 +137,21 @@ return a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 
 end
 local values = {}
 for i = 1, 64 do values[i] = i end
-assert(hold(values) == 2080)
-
-print("regress496", hold(values))
+local reads, observations, expected_reads = 0, 0, 64
+local proxy = setmetatable({}, { __index = function(_, key)
+    reads = reads + 1
+    assert(key == (reads - 1) % 64 + 1)
+    return values[key]
+end })
+local original_collectgarbage = collectgarbage
+collectgarbage = function(mode)
+    assert(mode == "count" and reads == expected_reads)
+    observations = observations + 1
+    return original_collectgarbage(mode)
+end
+assert(hold(proxy) == 2080)
+assert(reads == 64 and observations == 64)
+expected_reads = 128
+print("regress496", hold(proxy))
+assert(reads == 128 and observations == 128)
+collectgarbage = original_collectgarbage

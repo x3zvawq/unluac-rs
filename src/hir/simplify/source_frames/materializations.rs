@@ -529,9 +529,25 @@ pub(in crate::hir::simplify) fn restore_materializations(
         read: &'a mut BTreeSet<TempId>,
     }
     impl crate::hir::visit::HirVisitor<'_> for GlobalKeys<'_> {
+        fn visit_call(&mut self, call: &crate::hir::common::HirCallExpr) {
+            for (name, store) in self.facts.global_call_targets(call) {
+                if let Some((temp, _)) = self.facts.global_call_target_key(name, *store) {
+                    self.read.insert(temp);
+                }
+            }
+        }
+
+        fn visit_lvalue(&mut self, target: &HirLValue) {
+            if let HirLValue::Global(global) = target
+                && let Some(temp) = self.facts.global_key_preparation(global)
+            {
+                self.read.insert(temp);
+            }
+        }
+
         fn visit_expr(&mut self, expr: &HirExpr) {
             if let HirExpr::GlobalRef(global) = expr
-                && let Some(temp) = self.facts.global_read_key_preparation(global)
+                && let Some(temp) = self.facts.global_key_preparation(global)
             {
                 self.read.insert(temp);
             }
@@ -2286,9 +2302,11 @@ fn statement_frame(
                         | DecompileDialect::Lua53
                         | DecompileDialect::Lua54
                         | DecompileDialect::Lua55
+                        | DecompileDialect::Luau
                 )
             {
-                // 原 GETTABLE/GETTABUP 可直接写回已声明 local，不占 freereg；
+                // 原直接全局读取可写回已声明 local，不占 freereg；Luau 的
+                // 单目标赋值同样将 GETIMPORT/GETGLOBAL 发到原目标槽。
                 // CALL 即使目标相同仍有独立准备区，不能套用这项直接写回许可。
                 None
             } else {

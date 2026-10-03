@@ -51,19 +51,32 @@ impl HirVisitor<'_> for PendingFrameInputs<'_> {
 
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::GlobalRef(global) = expr
-            && let Some(temp) = self.facts.global_read_key_preparation(global)
+            && let Some(temp) = self.facts.global_key_preparation(global)
         {
             self.global_keys.insert(temp);
         }
     }
 
     fn visit_call(&mut self, call: &crate::hir::common::HirCallExpr) {
+        for (name, store) in self.facts.global_call_targets(call) {
+            if let Some((temp, _)) = self.facts.global_call_target_key(name, *store) {
+                self.global_keys.insert(temp);
+            }
+        }
         if self.stage == DeadTempStage::BeforeNativeFrames {
             self.temps.extend(
                 self.facts
                     .boolean_argument_prewrites(call)
                     .map(|write| write.initial),
             );
+        }
+    }
+
+    fn visit_lvalue(&mut self, target: &HirLValue) {
+        if let HirLValue::Global(global) = target
+            && let Some(temp) = self.facts.global_key_preparation(global)
+        {
+            self.global_keys.insert(temp);
         }
     }
 }

@@ -1,10 +1,17 @@
 -- regress_282_long_logical_ast_depth: 超长同类逻辑链不能让AST build递归耗尽进程栈
+-- unluac: expect-max-line-length [[120]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[call]] [[1280]] [[@proto=2]]
 local calls = 0
+local stop = 1280
+local selected = "tail"
+local failure = {}
 
 local function next_value()
     calls = calls + 1
-    if calls == 1280 then
-        return "tail"
+    if calls == stop then
+        if rawequal(selected, failure) then error(failure, 0) end
+        return selected
     end
     return false
 end
@@ -16,4 +23,24 @@ end
 
 local result = pick()
 assert(result == "tail" and calls == 1280)
+local stops = {1, 640, 1280}
+local values = {{}, 0, ""}
+for index = 1, 3 do
+    stop = stops[index]
+    selected = values[index]
+    calls = 0
+    assert(rawequal(pick(), selected) and calls == stop)
+end
+stop = 0
+calls = 0
+assert(pick() == nil and calls == 1280)
+stop = 1280
+selected = nil
+calls = 0
+assert(pick() == nil and calls == 1280)
+stop = 640
+selected = failure
+calls = 0
+local ok, problem = pcall(pick)
+assert(not ok and rawequal(problem, failure) and calls == 640)
 print("regress_282_long_logical_ast_depth", result)

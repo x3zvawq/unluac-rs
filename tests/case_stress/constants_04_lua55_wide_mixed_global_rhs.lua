@@ -1,7 +1,8 @@
--- regress_410_lua55_wide_mixed_global_rhs: wide leading target must reject the direct suffix
+-- regress_410_lua55_wide_mixed_global_rhs: wide target captures its environment before the RHS call
 -- unluac: expect-not-contains [[global tail_b, tail_c =]]
--- unluac: expect-min-count [[err-nnil]] [[1]]
--- unluac: expect-ast-min [[error]] [[1]] [[@proto=0]]
+-- unluac: expect-contains [[global new_wide, tail_b, tail_c =]]
+-- unluac: expect-ast-count [[error]] [[0]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=0]]
 
 global<const> print
 
@@ -286,3 +287,5 @@ emit(
     new_env.tail_b,
     new_env.tail_c
 )
+old_env.assert(old_env.new_wide == 262 and new_env.new_wide == nil
+    and new_env.tail_b == 2 and new_env.tail_c == 3)

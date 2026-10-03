@@ -30,7 +30,7 @@ impl FrameBuilder<'_> {
             return None;
         }
         *head = self.expr(head, before, home.slot(), None, false, true, Some(initial))?;
-        self.luau_logical_value(&rebuilt, before, home)
+        self.luau_logical_value(&rebuilt, before, home, None)
     }
 
     pub(super) fn scalar_selection_layout(
@@ -94,6 +94,7 @@ impl FrameBuilder<'_> {
         expr: &HirExpr,
         before: usize,
         result: HomeSlotKey,
+        producer: Option<crate::hir::TempId>,
     ) -> Option<HirExpr> {
         if let HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) = expr
             && let Some(layout) = self.scalar_selection_layout(
@@ -110,10 +111,22 @@ impl FrameBuilder<'_> {
                 layout,
             );
         }
+        let mut upvalues = producer.and_then(|producer| {
+            let (home, expected) = self.facts.value_upvalue_frame(producer)?;
+            (home == result).then_some(UpvalueFrameUse {
+                result: producer,
+                expected,
+                reads: BTreeSet::new(),
+            })
+        });
         let previous = self.boolean_frame.replace(result);
-        let value = self.luau_logical_tree(expr, before, result, LogicalUse::Value);
+        let value = self.luau_logical_tree(expr, before, result, LogicalUse::Value, &mut upvalues);
         self.boolean_frame = previous;
-        value
+        // 每个原值叶恰好重发一次；仅有同名上值不能授权省略或复制读取。
+        upvalues
+            .is_none_or(|frame| frame.reads.len() == frame.expected)
+            .then_some(value)
+            .flatten()
     }
 
     fn luau_logical_tree(
@@ -122,10 +135,67 @@ impl FrameBuilder<'_> {
         before: usize,
         result: HomeSlotKey,
         usage: LogicalUse,
+        upvalues: &mut Option<UpvalueFrameUse>,
     ) -> Option<HirExpr> {
         match expr {
             HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
                 let and = matches!(expr, HirExpr::LogicalAnd(_));
+                if and
+                    && matches!(usage, LogicalUse::Value)
+                    && !logical.preserves_boolean_prewrite
+                    && crate::hir::value_facts::value_facts(&logical.lhs).is_boolean()
+                    && let HirExpr::LogicalOr(tail) = &logical.rhs
+                    && !tail.preserves_boolean_prewrite
+                    && tail.rhs == HirExpr::Boolean(false)
+                    && let HirExpr::UpvalueRef(upvalue) = tail.lhs
+                    && let Some(frame) = upvalues.as_ref()
+                    && self.facts.boolean_value_prewrite(frame.result).is_none()
+                    && self
+                        .facts
+                        .value_upvalue_leaf(frame.result, upvalue)
+                        .is_some_and(|leaf| leaf.home == result && leaf.copy_and.is_none())
+                {
+                    // 结构值树可以把 false 尾臂结合进右子树，但 Luau 会将该形状编译为
+                    // 高槽 GETUPVAL + ORK。原叶直接写结果槽时，恢复外层 or 的条件取值
+                    // 形状；Boolean 谓词保证结合变化不会把原 nil 结果改成 false。
+                    let condition = LogicalUse::Condition {
+                        retain_value: true,
+                        truthy: false,
+                    };
+                    let lhs =
+                        self.luau_logical_tree(&logical.lhs, before, result, condition, upvalues)?;
+                    let checkpoint = (self.first_event, self.next_event);
+                    let rhs =
+                        self.luau_logical_tree(&tail.lhs, before, result, condition, upvalues)?;
+                    if checkpoint != (self.first_event, self.next_event) {
+                        return None;
+                    }
+                    return Some(HirExpr::LogicalOr(Box::new(
+                        crate::hir::common::HirLogicalExpr {
+                            preserves_boolean_prewrite: false,
+                            lhs: HirExpr::LogicalAnd(Box::new(
+                                crate::hir::common::HirLogicalExpr {
+                                    preserves_boolean_prewrite: false,
+                                    lhs,
+                                    rhs,
+                                },
+                            )),
+                            rhs: HirExpr::Boolean(false),
+                        },
+                    )));
+                }
+                if let HirExpr::UpvalueRef(upvalue) = logical.lhs
+                    && tables::literal_rk(&logical.rhs)
+                    && self.native?.constants_fit_rk
+                    && let Some(frame) = upvalues.as_mut()
+                    && let Some(leaf) = self.facts.value_upvalue_leaf(frame.result, upvalue)
+                    && leaf.copy_and == Some(and)
+                    && leaf.home.slot() == result.slot() + 1
+                {
+                    // Luau ANDK/ORK 先在高槽读取 cell，再选择 COPY/常量写入结果。
+                    // 原极性和两端 Def 已核对；不能把这个读改成结果槽上的直接 GETUPVAL。
+                    return frame.reads.insert(upvalue).then(|| expr.clone());
+                }
                 let (left_use, right_use) = match usage {
                     LogicalUse::Value => (
                         LogicalUse::Condition {
@@ -145,9 +215,11 @@ impl FrameBuilder<'_> {
                         usage,
                     ),
                 };
-                let lhs = self.luau_logical_tree(&logical.lhs, before, result, left_use)?;
+                let lhs =
+                    self.luau_logical_tree(&logical.lhs, before, result, left_use, upvalues)?;
                 let checkpoint = (self.first_event, self.next_event);
-                let rhs = self.luau_logical_tree(&logical.rhs, before, result, right_use)?;
+                let rhs =
+                    self.luau_logical_tree(&logical.rhs, before, result, right_use, upvalues)?;
                 // 右臂的准备必须原本就在条件路径中；不从前方吸收无条件定义。
                 if checkpoint != (self.first_event, self.next_event) {
                     return None;
@@ -215,6 +287,7 @@ impl FrameBuilder<'_> {
                         retain_value: false,
                         truthy: true,
                     },
+                    upvalues,
                 )?;
                 let mut inner = inner.as_ref().clone();
                 inner.expr = value;
@@ -329,6 +402,23 @@ impl FrameBuilder<'_> {
             | HirExpr::Integer(_)
             | HirExpr::Number(_)
             | HirExpr::String(_) => Some(expr.clone()),
+            HirExpr::UpvalueRef(upvalue)
+                if !matches!(
+                    usage,
+                    LogicalUse::Condition {
+                        retain_value: false,
+                        ..
+                    }
+                ) =>
+            {
+                let frame = upvalues.as_mut()?;
+                (self
+                    .facts
+                    .value_upvalue_leaf(frame.result, *upvalue)
+                    .is_some_and(|leaf| leaf.home == result && leaf.copy_and.is_none())
+                    && frame.reads.insert(*upvalue))
+                .then(|| expr.clone())
+            }
             HirExpr::LocalRef(_) | HirExpr::ParamRef(_)
                 if self
                     .direct_home(expr)

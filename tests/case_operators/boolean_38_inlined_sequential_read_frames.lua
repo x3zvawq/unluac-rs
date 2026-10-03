@@ -6,7 +6,7 @@
 -- unluac: expect-ast-max [[local-binding]] [[13]] [[@variant=O2]]
 -- unluac: expect-contains [[assert(nested(enabled == 1, value, a == 1, b == 1) == expected)]] [[@variant=O2]] [[@debug=retained]]
 -- unluac: expect-contains [[assert(observed(enabled == 1, value, read) == expected)]] [[@variant=O2]] [[@debug=retained]]
--- unluac: expect-contains [[local result = shared(enabled == 1, value, function(key)]] [[@variant=O2]] [[@debug=retained]]
+-- unluac: expect-order [[local result = shared(enabled == 1, value,]] [[function(key)]] [[@variant=O2]] [[@debug=retained]]
 -- unluac: expect-not-contains [[unluac error]]
 local function nested(enabled, value, a, b)
     return enabled and value == ((a and 1 or 2) == (b and 1 or 2) and 7 or 8)

@@ -113,3 +113,44 @@ literal_allocations()
 -- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=11]]
 -- unluac: expect-ast-count [[assign]] [[9]] [[@proto=11]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=12]]
+
+-- 查表先取快照，CONCAT 完成后才提交两个 cell；任一 RHS 抛错都不能留下半次赋值。
+local function lookup_concat(reads, tail, observe)
+    local first, last = "old", tail
+    observe(function() return first, last end)
+    first, last = reads.value, last .. "!"
+    return first, last
+end
+for stop = 0, 2 do
+    local snapshot
+    local events = {}
+    local failure = {}
+    local selected = {}
+    local tail = setmetatable({}, {__concat = function(lhs, rhs)
+        local first, last = snapshot()
+        assert(first == "old" and rawequal(last, lhs) and rhs == "!")
+        events[#events + 1] = "concat"
+        if stop == 1 then error(failure, 0) end
+        return "finished", "discarded"
+    end})
+    local reads = setmetatable({}, {__index = function(_, key)
+        local first, last = snapshot()
+        assert(first == "old" and rawequal(last, tail) and key == "value")
+        events[#events + 1] = "lookup"
+        if stop == 2 then error(failure, 0) end
+        return selected, "discarded"
+    end})
+    local ok, first, last = pcall(lookup_concat, reads, tail, function(read)
+        snapshot = read
+    end)
+    if stop == 0 then
+        assert(ok and rawequal(first, selected) and last == "finished")
+        local saved_first, saved_last = snapshot()
+        assert(rawequal(saved_first, selected) and saved_last == "finished")
+    else
+        assert(not ok and rawequal(first, failure))
+        local saved_first, saved_last = snapshot()
+        assert(saved_first == "old" and rawequal(saved_last, tail))
+    end
+    assert(table.concat(events, ",") == (stop == 2 and "lookup" or "lookup,concat"))
+end

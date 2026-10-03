@@ -1,5 +1,9 @@
 -- regress_229_long_short_circuit_chain#1: 超过 fixed-point 轮数的值/条件长链必须一次收敛
 -- unluac: expect-max-line-length [[120]]
+-- unluac: expect-max-count [[not ]] [[4]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
 local function pick(values)
     return
         values[1]
@@ -336,4 +340,47 @@ local tail = pick({ [160] = "tail" })
 local hit = guarded({ [160] = true })
 local miss = guarded({})
 assert(tail == "tail" and hit == "hit" and miss == "miss")
+local reads = 0
+local stop = 0
+local selected
+local throw_at = 0
+local failure = {}
+local proxy = setmetatable({}, {__index = function(_, index)
+    reads = reads + 1
+    assert(index == reads)
+    if index == throw_at then error(failure, 0) end
+    if index == stop then return selected end
+    if index % 2 == 0 then return false end
+    return nil
+end})
+local object = {}
+local truthy = {object, 0, ""}
+for position = 1, 160 do
+    stop = position
+    for index = 1, 3 do
+        selected = truthy[index]
+        reads = 0
+        assert(rawequal(pick(proxy), selected) and reads == position)
+        reads = 0
+        assert(guarded(proxy) == "hit" and reads == position)
+    end
+end
+stop = 0
+reads = 0
+assert(pick(proxy) == false and reads == 160)
+reads = 0
+assert(guarded(proxy) == "miss" and reads == 160)
+stop = 160
+selected = nil
+reads = 0
+assert(pick(proxy) == nil and reads == 160)
+reads = 0
+assert(guarded(proxy) == "miss" and reads == 160)
+throw_at = 80
+reads = 0
+local ok, problem = pcall(pick, proxy)
+assert(not ok and rawequal(problem, failure) and reads == 80)
+reads = 0
+ok, problem = pcall(guarded, proxy)
+assert(not ok and rawequal(problem, failure) and reads == 80)
 print("regress_229_long_short_circuit_chain#1", tail, hit, miss)

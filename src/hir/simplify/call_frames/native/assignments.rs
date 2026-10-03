@@ -161,7 +161,7 @@ fn prepared_local_plan(
     ))
 }
 
-/// PUC/LuaJIT 的末项查表或标量可直接写入最后一个 local；其余 RHS 先占连续 scratch，
+/// PUC/LuaJIT 的末项查表、标量或 CONCAT 写入最后一个 local；其余 RHS 先占连续 scratch，
 /// 随后逆序提交。全部原写同批重发，不能把某个捕获 cell 的更新提前到后续读取前。
 pub(super) fn lookup_pack(
     context: NativeFrameContext<'_>,
@@ -173,19 +173,86 @@ pub(super) fn lookup_pack(
 ) -> Option<(Plan, usize)> {
     let frame = facts.lookup_assignment_frame(first)?;
     let count = frame.writes.len();
-    let end = index + count * 2;
+    let tail = frame.reads.last()?;
+    let producer = if let Some(inputs) = frame.concat_inputs {
+        // 原输入准备与 CONCAT 属于一个不重叠的 LIR 帧；只查看其有界 HIR 准备区，
+        // 不从每个查表候选向函数末尾搜索，也不跨过已物化的控制流。
+        let mut producer = index + count;
+        loop {
+            let (_, value) = scalar_local(flat.get(producer)?.as_ref()?.stmt)?;
+            if matches!(value, HirExpr::Binary(binary)
+                if binary.op == crate::hir::common::HirBinaryOpKind::Concat
+                    && binary.source_site.is_some_and(|source| source.instr == tail.site))
+            {
+                break producer;
+            }
+            if producer == index + count + inputs {
+                return None;
+            }
+            producer += 1;
+        }
+    } else {
+        index + count
+    };
+    let separate_result = frame.concat_inputs.is_some()
+        && !matches!(flat.get(producer)?.as_ref()?.stmt, HirStmt::Assign(_));
+    let tail_assignment = producer + usize::from(separate_result);
+    let end = tail_assignment + count;
     let entries = flat
         .get(index..=end)?
         .iter()
         .copied()
         .collect::<Option<Vec<_>>>()?;
     let base = frame.reads[0].home;
-    if !context.constants_fit_rk || entries.iter().any(|entry| !plain_copy(entry.stmt)) {
+    if !context.constants_fit_rk
+        || entries.iter().enumerate().any(|(offset, entry)| {
+            if offset > tail_assignment - index
+                && let HirStmt::Assign(assign) = entry.stmt
+            {
+                // 分支 COPY 可同时承担 phi 交接；后面逐项核对原 Def、当前目标及
+                // 逆序写回后才消费，不能把 is_phi_transfer 本身当作不同操作。
+                !unclaimed_assignment(assign)
+            } else {
+                !plain_copy(entry.stmt)
+            }
+        })
+    {
         return None;
     }
     let mut values = Vec::with_capacity(count + 1);
     let mut targets = Vec::with_capacity(count + 1);
     for (offset, read) in frame.reads.iter().enumerate() {
+        if offset == count && frame.concat_inputs.is_some() {
+            let assignment = concat_assignment_source(
+                entries[tail_assignment - index].stmt,
+                separate_result.then_some(entries[producer - index].stmt),
+                facts,
+            )?;
+            let (target_temp, target_home) = frame
+                .tail_write
+                .as_ref()
+                .and_then(|write| write.target)
+                .unwrap_or((read.value, read.home));
+            let HirLValue::Local(target) = assignment.target else {
+                return None;
+            };
+            if facts.promoted_local_for_temp(target_temp) != Some(*target)
+                || assignment.target_home != target_home
+                || assignment.base.slot() != base.slot() + count
+                || facts.operation_result_temp(assignment.binary.source_site?) != Some(read.value)
+                || facts
+                    .complete_temp_definition_write_homes(read.value)
+                    .iter()
+                    .any(|home| *home != read.home && *home != target_home)
+            {
+                // 候选拒绝[ProofIncomplete:BindingIdentity]：CONCAT 结果与可选 COPY
+                // 必须仍指向原末项目标，不能借同槽的其它写回版本。
+                return None;
+            }
+            targets.push(assignment.target.clone());
+            values.push(HirExpr::Binary(Box::new(assignment.binary.clone())));
+            continue;
+        }
         let (local, value) = scalar_local(entries[offset].stmt)?;
         if facts.promoted_local_for_temp(read.value) != Some(local) {
             return None;
@@ -220,7 +287,7 @@ pub(super) fn lookup_pack(
             continue;
         }
         let write = &frame.writes[offset];
-        let HirStmt::Assign(assign) = entries[count * 2 - offset].stmt else {
+        let HirStmt::Assign(assign) = entries[end - index - offset].stmt else {
             return None;
         };
         let ([target], [HirExpr::LocalRef(source)], None) = (
@@ -235,7 +302,9 @@ pub(super) fn lookup_pack(
         }
         match (target, write.target) {
             (HirLValue::Local(target), Some((temp, home)))
-                if facts.promoted_local_for_temp(temp) == Some(*target)
+                if (facts.promoted_local_for_temp(temp) == Some(*target)
+                    || facts.promoted_binding_for_temp(temp).is_none()
+                        && assign.is_phi_transfer)
                     && facts.trusted_local_home_slot(*target) == Some(home) => {}
             (HirLValue::TableAccess(target), None)
                 if matches!(target.sources, crate::hir::common::HirOperationSources::Single(source) if source.instr == write.site)
@@ -251,10 +320,12 @@ pub(super) fn lookup_pack(
                         }) => {}
             _ => return None,
         }
+        // 未物化的原 MOVE 可由紧邻 phi 交接承担：上面已将 RHS 绑定到这次查表 Def，
+        // 当前 Assign 自身提供目标身份，原写回只核对其精确 home，不能改选同槽其它绑定。
         targets.push(target.clone());
         values.push(HirExpr::LocalRef(local));
     }
-    let run = entries[..count]
+    let run = entries[..producer - index]
         .iter()
         .map(|entry| entry.stmt)
         .collect::<Vec<_>>();
@@ -274,7 +345,7 @@ pub(super) fn lookup_pack(
         ));
         *value = builder.expr(
             value,
-            count,
+            run.len(),
             base.slot() + offset,
             None,
             false,
@@ -282,7 +353,14 @@ pub(super) fn lookup_pack(
             Some(frame.reads[offset].value),
         )?;
     }
-    if builder.first_event != Some(0) || builder.next_event != count {
+    if frame.concat_inputs.is_some() {
+        let HirExpr::Binary(binary) = values.last()? else {
+            return None;
+        };
+        let value = builder.concat_in_frame(binary, run.len(), base.slot() + count, tail.home)?;
+        *values.last_mut()? = value;
+    }
+    if builder.first_event != Some(0) || builder.next_event != run.len() {
         return None;
     }
     Some((
@@ -299,7 +377,7 @@ pub(super) fn lookup_pack(
             indexed_target: None,
             continuing_root: None,
             retained_copies: Vec::new(),
-            replayed_effects: entries[count..entries.len() - 1]
+            replayed_effects: entries[tail_assignment - index..entries.len() - 1]
                 .iter()
                 .map(|entry| entry.id)
                 .collect(),
@@ -442,16 +520,17 @@ pub(super) fn global_arithmetic(
 
 pub(super) fn plain_copy(stmt: &HirStmt) -> bool {
     match stmt {
-        HirStmt::Assign(assign) => {
-            !assign.is_phi_transfer
-                && assign.initializer_merge_transaction.is_none()
-                && assign.generic_for_initializer_producer.is_none()
-                && assign.root_release.is_none()
-                && assign.method_rewrite_transaction.is_none()
-        }
+        HirStmt::Assign(assign) => !assign.is_phi_transfer && unclaimed_assignment(assign),
         HirStmt::LocalDecl(decl) => decl.initializer_merge_transaction.is_none(),
         _ => false,
     }
+}
+
+fn unclaimed_assignment(assign: &crate::hir::common::HirAssign) -> bool {
+    assign.initializer_merge_transaction.is_none()
+        && assign.generic_for_initializer_producer.is_none()
+        && assign.root_release.is_none()
+        && assign.method_rewrite_transaction.is_none()
 }
 
 /// 从当前准备操作读取原定义身份，不按被复用的 Local 或物理槽选择结果帧。
@@ -541,7 +620,7 @@ pub(super) fn selection_writeback(
         return None;
     }
     let value = if dialect == DecompileDialect::Luau {
-        builder.luau_logical_value(&assign.values.fixed[0], run.len(), home)?
+        builder.luau_logical_value(&assign.values.fixed[0], run.len(), home, None)?
     } else {
         let input = builder.expr(
             &selected.lhs,
@@ -647,7 +726,7 @@ pub(super) fn copy_value_initializer(
         {
             return None;
         }
-        let value = builder.luau_logical_value(value, 0, home)?;
+        let value = builder.luau_logical_value(value, 0, home, None)?;
         builder.finish_event(0)?;
         value
     } else {

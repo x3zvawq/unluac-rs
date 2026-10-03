@@ -17,7 +17,7 @@ use super::helpers::{
 use super::lower::ProtoLowering;
 use super::shared_closures::CompositeFactoryRef;
 use crate::hir::common::{
-    HirCallExpr, HirCallStmt, HirClose, HirExpr, HirGlobalDecl, HirLValue, HirLocalDecl,
+    HirBlock, HirCallExpr, HirCallStmt, HirClose, HirExpr, HirGlobalDecl, HirLValue, HirLocalDecl,
     HirPackTail, HirSourceSite, HirStmt, HirTableAccess, HirTableConstructor, HirTableField,
     HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack, LocalId,
 };
@@ -331,18 +331,46 @@ fn lower_regular_instr_body(
                             vec![lower_closure_expr(lowering, block, instr_ref, closure)],
                         ));
                     }
-                    stmts.extend(lower_shared_capture_barrier(
-                        lowering, block, instr_ref, closure, factory,
-                    ));
-                    stmts.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
-                        bindings: vec![lowering.shared_factory_local(factory)],
-                        values: vec![lower_composite_factory_expr(
-                            lowering, block, instr_ref, closure, factory,
-                        )]
-                        .into(),
-                        initializer_merge_transaction: None,
-                        generic_for_initializer_producer: None,
-                    })));
+                    let mut barrier =
+                        lower_shared_capture_barrier(lowering, block, instr_ref, closure, factory);
+                    let factory_local = lowering.shared_factory_local(factory);
+                    let factory_expr =
+                        lower_composite_factory_expr(lowering, block, instr_ref, closure, factory);
+                    if lowering
+                        .captured_shared_closures
+                        .capture_barrier(factory)
+                        .is_some_and(|barrier| barrier.scoped_factory)
+                    {
+                        let [HirStmt::LocalDecl(snapshot)] = barrier.as_mut_slice() else {
+                            unreachable!("scoped factory requires one scalar capture barrier");
+                        };
+                        let capture = std::mem::replace(&mut snapshot.bindings[0], factory_local);
+                        // 屏障仍先写原槽，不能提前用 nil 清除未知旧根；复制出的 capture
+                        // 保持只读 BYVALUE，factory 的后续写入不会改变闭包缓存身份。
+                        stmts.extend(barrier);
+                        stmts.push(HirStmt::Block(Box::new(HirBlock {
+                            stmts: vec![
+                                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                                    bindings: vec![capture],
+                                    values: vec![HirExpr::LocalRef(factory_local)].into(),
+                                    initializer_merge_transaction: None,
+                                    generic_for_initializer_producer: None,
+                                })),
+                                assign_stmt(
+                                    vec![HirLValue::Local(factory_local)],
+                                    vec![factory_expr],
+                                ),
+                            ],
+                        })));
+                    } else {
+                        stmts.extend(barrier);
+                        stmts.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                            bindings: vec![factory_local],
+                            values: vec![factory_expr].into(),
+                            initializer_merge_transaction: None,
+                            generic_for_initializer_producer: None,
+                        })));
+                    }
                 }
                 None => stmts.extend(fixed_assign(
                     lowering,
@@ -692,7 +720,9 @@ pub(super) fn lower_global_decl_owner(
     protocol: &GlobalDeclProtocol,
 ) -> Option<HirStmt> {
     let values = match &protocol.values {
-        GlobalDeclValues::FixedCall { prefix, results } => {
+        GlobalDeclValues::FixedCall {
+            prefix, results, ..
+        } => {
             let LowInstr::Call(call) = lowering.proto.instrs.get(instr_ref.index())? else {
                 return None;
             };
@@ -719,6 +749,8 @@ pub(super) fn lower_global_decl_owner(
         ),
     };
     Some(HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
+        pending_target_preparations: matches!(&protocol.values,
+            GlobalDeclValues::FixedCall { wide_targets, .. } if !wide_targets.is_empty()),
         probe_source: HirSourceSite {
             proto: lowering.id,
             instr: protocol.probe,

@@ -317,7 +317,7 @@ fn boolean_return_plan(
     }
     let value = prepared_boolean_value(context, facts, select, target, home, original, result)?;
     let mut builder = frame_builder(context, &[], facts, DecompileDialect::Luau, home.slot())?;
-    let value = builder.luau_logical_value(&value, 0, home)?;
+    let value = builder.luau_logical_value(&value, 0, home, None)?;
     Some(value_plan(home, value))
 }
 
@@ -740,7 +740,7 @@ fn initializer_plan(
         let mut builder = frame_builder(context, &[], facts, DecompileDialect::Luau, base.slot())?;
         // 已树化 RHS 仍核对原 CALL/短路结果槽；不依据赋值外形猜测原初始化帧。
         if matches!(value, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
-            builder.luau_logical_value(value, 0, base)
+            builder.luau_logical_value(value, 0, base, None)
         } else {
             builder.expr(value, 0, base.slot(), None, false, true, None)
         }

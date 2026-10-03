@@ -1,5 +1,9 @@
 -- 共享 continuation 必须只消费一次，不能把串联菱形树化为指数个调用位置。
 -- unluac: expect-contains [[("diamond-six") or ]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=4]]
+-- unluac: expect-not-contains [[.a = ]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[local-binding]] [[21]] [[@proto=0]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
 local function choose(step)
     return (step("a") and (step("b") or step("c")) and step("d")) or step("e")
 end

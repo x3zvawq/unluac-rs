@@ -3,6 +3,7 @@ local current = function() return function() return function() return function()
 
 
 -- unluac: expect-ast-count [[function]] [[300]]
+-- unluac: expect-ast-max [[local-binding]] [[2]]
 -- 逐层执行，验证的不只是最外层 closure 创建成功。
 for depth = 1, 300 do
     assert(type(current) == "function")

@@ -1056,6 +1056,61 @@ impl FrameBuilder<'_> {
     }
 
     /// 新增帧内操作逐层核对原输入；旧的简单字段入口不承担嵌套准备证明。
+    /// 原同槽 NOT 链只在最内层准备输入；逐边核对原 Def，再从叶到根重建。
+    /// 不让长链逐层进入大型 expr 分派栈，也不复制每一层尚未处理的子树。
+    pub(super) fn inplace_not_chain(
+        &mut self,
+        expr: &HirExpr,
+        before: usize,
+        slot: usize,
+    ) -> Option<HirExpr> {
+        let mut chain = Vec::new();
+        let mut current = expr;
+        let (leaf, producer) = loop {
+            let HirExpr::Unary(unary) = current else {
+                unreachable!("native NOT chain retains its current operation");
+            };
+            let home = self.facts.unary_result_home(unary)?;
+            if home.slot() != slot || self.facts.unary_operand_home(unary) != Some(home) {
+                return None;
+            }
+            let input = match &unary.expr {
+                HirExpr::LocalRef(local) => {
+                    scalar_local(self.run[self.definition(*local, before)?])?.1
+                }
+                value => value,
+            };
+            let (producer, input_home) = self
+                .facts
+                .operation_input_preparation(unary.source_site?, input)?;
+            if input_home != home {
+                return None;
+            }
+            chain.push(unary);
+            if matches!(&unary.expr, HirExpr::Unary(inner)
+                if inner.op == crate::hir::common::HirUnaryOpKind::Not
+                    && self.facts.unary_result_home(inner) == Some(home)
+                    && self.facts.unary_operand_home(inner) == Some(home))
+            {
+                current = &unary.expr;
+            } else {
+                // 链的首运算可以从既有低槽读取，或使用不同输入布局；只迭代同槽段，
+                // 首叶继续交给原表达式 owner 核对，不把其合法读取强改为同槽准备。
+                break (&unary.expr, producer);
+            }
+        };
+        let mut value = self.expr(leaf, before, slot, None, false, true, Some(producer))?;
+        for unary in chain.into_iter().rev() {
+            value = HirExpr::Unary(Box::new(crate::hir::common::HirUnaryExpr {
+                source_site: unary.source_site,
+                op: unary.op,
+                expr: value,
+            }));
+        }
+        // ResourceLimit：不能在完整帧内撤销临时值阶段为目标解析器保留的长链分段。
+        crate::hir::simplify::syntax_budget::unary_frame_fits(&value).then_some(value)
+    }
+
     pub(super) fn register_operand(
         &mut self,
         value: &HirExpr,
@@ -1160,13 +1215,14 @@ impl FrameBuilder<'_> {
         let rhs_low = direct(&binary.rhs, layout.rhs);
         if matches!(
             self.dialect,
-            DecompileDialect::Lua54 | DecompileDialect::Lua55
+            DecompileDialect::Lua54 | DecompileDialect::Lua55 | DecompileDialect::Luajit
         ) && result == input
             && constant(&binary.lhs)
             && layout.rhs == Some(input)
             && layout.lhs.is_some_and(|home| home.slot() == slot + 1)
         {
-            // PUC 5.4+ 的非 RK 左常量在右值完成后才载入相邻槽，例如 1/f()。
+            // 非 RK 左常量在右值完成后才载入相邻槽，例如 PUC 5.4+ 的 1/f()
+            // 或 LuaJIT 的 2^f()。常量没有自身事件，但其准备槽不能提前覆盖。
             // 原两个输入的 use→Def 与准备次序共同签证，保留运算方向和回调看到的覆盖时点。
             let right_value = match &binary.rhs {
                 HirExpr::LocalRef(local) => self

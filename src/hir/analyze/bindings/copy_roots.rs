@@ -218,7 +218,7 @@ pub(in crate::hir::analyze) fn bind_allocation_copy_scopes(
         facts.record_temp_to_local_merge(temp, local);
         scoped.insert(temp);
     }
-    facts.record_allocation_copy_scopes(scoped);
+    facts.record_scoped_copy_roots(scoped);
 }
 
 /// 分配后的原低槽 MOVE 与原参数快照属于同一 binding；在表达式内联前保留这个身份，
@@ -534,6 +534,170 @@ pub(in crate::hir::analyze) fn bind_copy_root_holders(
     holders.into_values().collect()
 }
 
+/// 两块循环的字面量 header 与 COPY 正文复用完整同槽前缀。
+/// 回边到下一次覆盖之间没有观察；保留原声明和 COPY，而非依赖输入参数仍持有同值。
+fn bind_loop_copy_scopes(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    structure: &ReadyStructureFacts,
+    emission: &HirEmissionFacts<'_>,
+    bindings: &mut ProtoBindings,
+    facts: &mut ProtoPromotionFacts,
+) {
+    let releases = facts.single_copy_root_before_releases();
+    if releases.is_empty() {
+        return;
+    }
+    let base = usize::from(proto.signature.num_params);
+    let mut candidates = Vec::new();
+    for (index, block) in cfg.blocks.iter().enumerate() {
+        let body = BlockRef(index);
+        let Some(last) = block.instrs.last() else {
+            continue;
+        };
+        if !matches!(proto.instrs[last.index()], LowInstr::Jump(_)) {
+            continue;
+        }
+        let successors = cfg.reachable_successors(body);
+        let [header] = successors.as_slice() else {
+            continue;
+        };
+        if *header == body || cfg.reachable_predecessors(body).as_slice() != [*header] {
+            continue;
+        }
+        let Some(initializers) = emission.regular_prefix(*header) else {
+            continue;
+        };
+        let Some(copies) = emission.regular_prefix(body) else {
+            continue;
+        };
+        let successors = cfg.reachable_successors(*header);
+        if successors.len() != 2
+            || !successors.contains(&body)
+            || successors.contains(header)
+            || initializers.is_empty()
+            || initializers.end > copies.start
+            || emission.prefix_is_hoisted(*header)
+            || emission.prefix_is_hoisted(body)
+            || copies.end != last.index()
+        {
+            continue;
+        }
+        let count = initializers.end - initializers.start;
+        if copies.start + count > copies.end {
+            continue;
+        }
+        let mut roots = Vec::with_capacity(count);
+        let valid = (0..count).all(|offset| {
+            let initial = initializers.start + offset;
+            let copied = copies.start + offset;
+            let ([seed], [root]) = (
+                dataflow.instr_defs[initial].as_slice(),
+                dataflow.instr_defs[copied].as_slice(),
+            ) else {
+                return false;
+            };
+            let temp = TempId(root.index());
+            let home = HomeSlotKey::new(base + offset, 0);
+            let LowInstr::Move(copy) = proto.instrs[copied] else {
+                return false;
+            };
+            for (def, end) in [(*seed, initializers.end), (*root, copies.end)] {
+                if let Some(scope) = bindings.temp_debug_scopes[def.index()] {
+                    let Some(fact) = structure.debug_bindings().for_scope(scope) else {
+                        return false;
+                    };
+                    if fact.value.ssa() != Some(SsaValue::Def(def))
+                        || fact
+                            .end_instr
+                            .and_then(|end| emission.source_scope_prefix_end(cfg, end.index()))
+                            != Some(end)
+                    {
+                        return false;
+                    }
+                }
+            }
+            // 候选拒绝[ProofIncomplete:Frame]：必须是完整连续的原前缀；
+            // 不越过观察、捕获、已有独立绑定或仍活出的 header 初始化。
+            if !matches!(
+                proto.instrs[initial],
+                LowInstr::LoadBool(_)
+                    | LowInstr::LoadConst(_)
+                    | LowInstr::LoadInteger(_)
+                    | LowInstr::LoadNumber(_)
+            ) || dataflow.effect_summaries[initial].may_observe_gc_roots()
+                || releases.get(&temp) != Some(&InstrRef(initial))
+                || copy.dst.index() != home.slot()
+                || copy.src.index() >= base
+                || facts.trusted_temp_home_slot(temp) != Some(home)
+                || facts.trusted_temp_home_slot(TempId(seed.index())) != Some(home)
+                || bindings.fixed_temps[root.index()] != temp
+                || !dataflow.def_uses[seed.index()].is_empty()
+                || !dataflow.def_phi_uses[seed.index()].is_empty()
+                || dataflow.reg_is_reference_captured(copy.dst)
+                || bindings.bound_temp_targets.contains_key(&temp)
+                || bindings.captured_temp_targets.contains_key(&temp)
+                || bindings.temp_decl_locals.contains_key(&temp)
+                || dataflow.def_uses[root.index()]
+                    .iter()
+                    .any(|use_| cfg.instr_to_block[use_.instr.index()] != body)
+            {
+                return false;
+            }
+            roots.push((temp, home));
+            true
+        });
+        if valid {
+            candidates.push((initializers, copies, roots));
+        }
+    }
+    let retained = lexical_windows::retain_non_crossing(
+        bindings
+            .lexical_scopes
+            .iter()
+            .cloned()
+            .chain(
+                candidates
+                    .iter()
+                    .flat_map(|(initial, copy, _)| [initial.clone().into(), copy.clone().into()]),
+            )
+            .collect(),
+    )
+    .into_iter()
+    .map(|scope| (scope.start, scope.end))
+    .collect::<BTreeSet<_>>();
+    let mut scoped = BTreeSet::new();
+    for (initializers, copies, roots) in candidates {
+        if ![&initializers, &copies]
+            .iter()
+            .all(|range| retained.contains(&(range.start, range.end)))
+        {
+            continue;
+        }
+        bindings.lexical_scopes.push(initializers.into());
+        bindings.lexical_scopes.push(copies.into());
+        for (temp, home) in roots {
+            let local = LocalId(bindings.local_count);
+            bindings.local_count += 1;
+            bindings
+                .local_debug_hints
+                .push(bindings.temp_debug_locals[temp.index()].clone());
+            bindings
+                .local_debug_scopes
+                .push(bindings.temp_debug_scopes[temp.index()]);
+            bindings
+                .bound_temp_targets
+                .insert(temp, BoundSlotTarget::Local(local));
+            bindings.temp_decl_locals.insert(temp, local);
+            facts.record_local_home_slot(local, home);
+            facts.record_temp_to_local_merge(temp, local);
+            scoped.insert(temp);
+        }
+    }
+    facts.record_scoped_copy_roots(scoped);
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "身份交接借用同一 lowering 的发射与生命周期事实"
@@ -550,6 +714,7 @@ pub(in crate::hir::analyze) fn bind_copy_root_scopes(
     bindings: &mut ProtoBindings,
     facts: &mut ProtoPromotionFacts,
 ) -> Result<(), HirLowerError> {
+    bind_loop_copy_scopes(proto, cfg, dataflow, structure, emission, bindings, facts);
     if facts.copy_root_temps().is_empty() {
         return Ok(());
     }

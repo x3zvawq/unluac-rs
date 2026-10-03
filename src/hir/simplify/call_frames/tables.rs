@@ -1775,10 +1775,18 @@ impl FrameBuilder<'_> {
                 return None;
             };
             let scratch = slot + 1 + usize::from(prepared_key);
-            if layout.value != Some(HomeSlotKey::new(scratch, 0)) {
+            if layout.value.is_none_or(|home| home.slot() != scratch) {
                 return None;
             }
-            let value = self.expr(value, *index, scratch, None, false, true, None)?;
+            // scratch 是编译位置，原 TSET 输入的完整 home 仍由共享字段操作数证明；
+            // 循环 CLOSE 形成的新 epoch 不能重置为零，也不能借同槽其它版本。
+            let (value, _) = self.record_operand_impl(
+                value,
+                layout.value,
+                *index,
+                scratch,
+                Some((&access.sources, true)),
+            )?;
             // 保持 TDUP 之后的动态写；常量不能借此提前移入模板初值。
             if crate::value_semantics::table::table_constant_kind(&value).is_some() {
                 return None;

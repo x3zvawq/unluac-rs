@@ -47,6 +47,10 @@ pub(super) struct TablePreparation {
 }
 
 impl OperandPreparation {
+    pub(super) fn is_upvalue_read(&self) -> bool {
+        matches!(self.value, PreparedValue::Upvalue(_))
+    }
+
     pub(super) fn is_nil_batch_member(&self) -> bool {
         matches!(self.value, PreparedValue::NilBatch)
     }

@@ -352,12 +352,12 @@ struct FrameBuilder<'a> {
     /// 外层已核对的完整值结果身份；比较叶复用它，不能重新假定 epoch 为零。
     boolean_frame: Option<HomeSlotKey>,
     /// 确切布尔结果帧内的原上值读取，每个来源只消费一次。
-    boolean_condition: Option<BooleanConditionUse>,
+    boolean_condition: Option<UpvalueFrameUse>,
     /// 当前参数准备 COPY 的原输入绑定；嵌套表达式只可用确切目标 Def 消费这次读取。
     parameter_copy: Option<(crate::hir::TempId, crate::hir::ParamId, HomeSlotKey)>,
 }
 
-struct BooleanConditionUse {
+struct UpvalueFrameUse {
     result: crate::hir::TempId,
     expected: usize,
     reads: BTreeSet<crate::hir::UpvalueId>,
@@ -374,6 +374,7 @@ struct NativeFrameContext<'a> {
     expanded_callees: Option<&'a native::expanded::Callees>,
     compared_choices: Option<&'a native::expanded::ComparedCallees<'a>>,
     value_expressions: Option<&'a native::expanded::ValueExpressionFrames<'a>>,
+    constant_controls: Option<&'a native::expanded::ConstantControlFrames<'a>>,
     calling_values: Option<&'a native::expanded::CallingValueFrames<'a>>,
     seeded_predicates: Option<&'a native::expanded::SeededPredicateFrames>,
     /// 同一连续区内，前序计划已消费的值版本；只供本批 release 交接。
@@ -745,6 +746,24 @@ impl FrameBuilder<'_> {
         argument_home: bool,
         original_producer: Option<crate::hir::common::TempId>,
     ) -> Option<HirExpr> {
+        if self.native.is_some()
+            && self.dialect != DecompileDialect::Luau
+            && let HirExpr::Unary(unary) = expr
+            && unary.op == crate::hir::common::HirUnaryOpKind::Not
+            && self.facts.unary_result_home(unary).is_some_and(|home| {
+                home.slot() == slot && self.facts.unary_operand_home(unary) == Some(home)
+            })
+        {
+            return self.inplace_not_chain(expr, before, slot);
+        }
+        if matches!(
+            expr,
+            HirExpr::Binary(_) | HirExpr::Integer(_) | HirExpr::Number(_)
+        ) && let Some(result) = original_producer
+            && self.has_constant_control(result)
+        {
+            return self.expanded_constant_control(expr, before, slot, result);
+        }
         if matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
             && let Some(result) = original_producer
             && self.has_value_expression(result)
@@ -1003,7 +1022,7 @@ impl FrameBuilder<'_> {
                         .and_then(|result| {
                             let (home, expected) = self.facts.boolean_condition_frame(result)?;
                             (home.slot() == slot && crate::hir::value_facts::value_facts(value).is_boolean())
-                                .then_some(BooleanConditionUse { result, expected, reads: BTreeSet::new() })
+                                .then_some(UpvalueFrameUse { result, expected, reads: BTreeSet::new() })
                         });
                     let has_condition = condition.is_some();
                     let previous_condition = if has_condition {
@@ -1163,7 +1182,7 @@ impl FrameBuilder<'_> {
                             }
                             // 原内部 phi 已固定结果槽；只作真假测试的 CALL 使用其
                             // 上一槽，不能把 predicate 与真正的值叶都按结果槽重放。
-                            self.luau_logical_value(value, before, home)?
+                            self.luau_logical_value(value, before, home, Some(producer))?
                             }
                         } else {
                             self.expr(value, before, home.slot(), None, false, true, Some(producer))?
@@ -1620,7 +1639,9 @@ impl FrameBuilder<'_> {
                     let producer = self.facts.binary_phi_operand(binary, 1)?;
                     self.expr(&binary.rhs, before, rhs_slot, None, false, true, Some(producer))?
                 } else if self.dialect != DecompileDialect::Luau
-                    && matches!(binary.rhs, HirExpr::LocalRef(_) | HirExpr::TableAccess(_))
+                    && (matches!(binary.rhs, HirExpr::LocalRef(_) | HirExpr::TableAccess(_))
+                        || matches!(&binary.rhs, HirExpr::Binary(rhs)
+                            if is_scalar_binary_operation(rhs.op)))
                 {
                     // 已由比较布局签证的 RHS 是原寄存器操作数；读取须在 lhs 后原位重发。
                     self.register_operand(&binary.rhs, before, rhs_slot)?
@@ -1639,19 +1660,16 @@ impl FrameBuilder<'_> {
             HirExpr::Unary(unary)
                 if self.native.is_some()
                     && self.dialect != DecompileDialect::Luau
-                    && matches!(unary.op, crate::hir::common::HirUnaryOpKind::Not | crate::hir::common::HirUnaryOpKind::Neg)
+                    && unary.op == crate::hir::common::HirUnaryOpKind::Neg
                     && self.facts.unary_result_home(unary) == Some(HomeSlotKey::new(slot, 0))
                     && self.facts.unary_operand_home(unary) == Some(HomeSlotKey::new(slot, 0))
                     && (matches!(unary.expr, HirExpr::Call(_))
-                        || unary.op == crate::hir::common::HirUnaryOpKind::Not
-                            && matches!(&unary.expr, HirExpr::Unary(inner)
-                                if inner.op == crate::hir::common::HirUnaryOpKind::Not)
                         || matches!(unary.expr, HirExpr::LocalRef(local)
                             if self.definition(local, before)
                                 .and_then(|index| scalar_local(self.run[index]))
                                 .is_some_and(|(_, value)| matches!(value, HirExpr::Call(_))))) =>
             {
-                // CALL 或内层 NOT 的结果仍在原槽执行一元操作；输入 Def 必须属于
+                // CALL 的结果仍在原槽执行一元操作；输入 Def 必须属于
                 // 当前运算，不能仅凭同槽把其它版本或 synthetic 极性包装收进帧。
                 let input = match &unary.expr {
                     HirExpr::LocalRef(local) => scalar_local(self.run[self.definition(*local, before)?])?.1,
@@ -1883,7 +1901,7 @@ impl FrameBuilder<'_> {
                 let result = self.boolean_frame
                     .filter(|home| home.slot() == slot)
                     .unwrap_or_else(|| HomeSlotKey::new(slot, 0));
-                self.luau_logical_value(expr, before, result)
+                self.luau_logical_value(expr, before, result, original_producer)
             }
             HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)
                 if self.native.is_some() && self.pure_conditional_value(expr) =>
@@ -2065,16 +2083,25 @@ impl FrameBuilder<'_> {
                 if self.register_operand
                     && self.facts.global_read_frame(global, self.dialect).is_none_or(|home| home.slot() != slot)
                 { return None; }
-                if let Some(temp) = self.facts.global_read_key_preparation(global)
-                    && let Some(&index) = self.temp_definitions.get(&temp)
+                if let Some(temp) = self.facts.global_key_preparation(global)
+                    && let Some((index, key_expr)) = self.temp_definitions.get(&temp)
+                        .map(|&index| (index, HirExpr::TempRef(temp)))
+                        .or_else(|| {
+                            let local = self.facts.promoted_local_for_temp(temp)?;
+                            Some((self.definition(local, before)?, HirExpr::LocalRef(local)))
+                        })
                 {
                     // GlobalRef 发射仍包含宽常量键 LOADK；按原 key Def 消费这次
                     // 隐式准备事件，不能留下一个独立 Temp 阻断外层构造帧。
-                    if index >= before || self.facts.trusted_temp_home_slot(temp).is_none_or(|home| home.slot() != slot) {
+                    let key_home = self.facts.trusted_temp_home_slot(temp)?;
+                    let adjacent_key = key_home.slot() == slot + 1
+                        && self.facts.global_read_frame(global, self.dialect).is_some_and(|home| home.slot() == slot)
+                        && self.literal_uses_rk(&HirExpr::String(global.key.clone()), None) == Some(false);
+                    if index >= before || (key_home.slot() != slot && !adjacent_key) {
                         return None;
                     }
                     let previous = std::mem::replace(&mut self.register_operand, false);
-                    let key = self.expr(&HirExpr::TempRef(temp), before, slot, None, false, true, Some(temp));
+                    let key = self.expr(&key_expr, before, key_home.slot(), None, false, true, Some(temp));
                     self.register_operand = previous;
                     if key != Some(HirExpr::String(global.key.clone())) { return None; }
                 }
@@ -2581,12 +2608,15 @@ impl FrameBuilder<'_> {
                         });
             }
         }
-        if let HirExpr::Binary(concat) = value
-            && concat.op == crate::hir::common::HirBinaryOpKind::Concat
+        if let HirExpr::Binary(operation) = value
+            && (operation.op == crate::hir::common::HirBinaryOpKind::Concat
+                || is_scalar_binary_operation(operation.op))
             && self.dialect != DecompileDialect::Luau
         {
             let home = HomeSlotKey::new(slot, 0);
-            return concat
+            // 算术与 CONCAT 都可在已保留的左操作数之后完成 RHS；原结果 home
+            // 必须是比较读取的相邻槽。内部读取、常量准备及运算顺序仍由各自 owner 重放。
+            return operation
                 .source_site
                 .and_then(|source| self.facts.operation_result_home(source))
                 == Some(home)
@@ -3786,6 +3816,9 @@ impl FrameBuilder<'_> {
                             HirExpr::Int64(_) | HirExpr::UInt64(_) | HirExpr::Complex { .. } => {
                                 self.facts.call_argument_preparation(call, index, arg)
                                     .is_some_and(|home| self.facts.trusted_temp_home_slot(*producer) == Some(home))
+                            }
+                            HirExpr::Binary(_) | HirExpr::Integer(_) | HirExpr::Number(_) => {
+                                self.has_constant_control(*producer)
                             }
                             _ => false,
                         }),

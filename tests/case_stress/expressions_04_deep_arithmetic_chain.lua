@@ -1,5 +1,7 @@
 -- 长左结合运算链应通过完整管线；不能靠重新结合或截断绕过递归深度。
 -- unluac: expect-max-line-length [[120]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
 local function sum(a)
     return
         a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a +

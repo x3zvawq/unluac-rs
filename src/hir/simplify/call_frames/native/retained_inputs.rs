@@ -179,6 +179,7 @@ fn closure_initializers(proto: &HirProto, facts: &ProtoPromotionFacts) -> BTreeM
         expanded_callees: None,
         compared_choices: None,
         value_expressions: None,
+        constant_controls: None,
         calling_values: None,
         seeded_predicates: None,
         retired_roots: None,

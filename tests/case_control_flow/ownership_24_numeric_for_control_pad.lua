@@ -26,6 +26,10 @@
 -- unluac: expect-count [[ or ]] [[2]] [[@variant=O0]]
 -- unluac: expect-count [[ or ]] [[2]] [[@variant=O1]]
 -- unluac: expect-count [[ or ]] [[4]] [[@variant=O2]]
+-- 尾 nil 与原位全局写回均不阻断完整帧；旧表声明结束后，断言及调用准备不再接棒。
+-- unluac: expect-ast-max [[assign]] [[5]] [[@proto=0]] [[@variant=O2]]
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=0]] [[@variant=O2]]
+-- unluac: expect-max-count [[ = assert]] [[0]] [[@variant=O2]]
 local function run(a, b, c, xs)
     for _ in xs do
         print("regress_82_numeric_for_control_pad#1 body")

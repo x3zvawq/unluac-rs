@@ -2199,6 +2199,12 @@ fn collect_plans(
                         .then(|| home_slot.and_then(|slot| current_slot_locals.get(&slot).copied()))
                         .flatten()
                         .filter(|local| !unavailable_for_compaction.contains(local))
+                        // 候选拒绝[SemanticBarrier:Capture]：本轮新提升的 BYVALUE 快照
+                        // 也有源码身份，不能等下一轮 CaptureCollector 才禁止寄存器复用。
+                        .filter(|local| {
+                            !planned.protected_locals.contains(local)
+                                && !ctx.identity_sensitive_locals.contains(local)
+                        })
                 })
         };
 
@@ -2686,6 +2692,10 @@ fn collect_plans(
                                     .then(|| current_slot_locals.get(&slot).copied())
                                     .flatten()
                                     .filter(|local| !unavailable_for_compaction.contains(local))
+                                    .filter(|local| {
+                                        !planned.protected_locals.contains(local)
+                                            && !ctx.identity_sensitive_locals.contains(local)
+                                    })
                             })
                         })
                     })

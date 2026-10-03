@@ -1,8 +1,13 @@
 -- 连续 debug 生命周期复用寄存器，并覆盖同起点多局部、嵌套遮蔽与闭包捕获。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-ast-count [[local-binding]] [[42]]
+-- unluac: expect-ast-count [[do-block]] [[34]]
 local total = 0
+local calls = 0
 local function consume(value)
+    calls = calls + 1
+    assert(value == (calls <= 32 and calls or 16))
     total = total + value
 end
 do local value = 1; consume(value) end
@@ -49,5 +54,5 @@ do
 end
 local first, second = read()
 assert(first == 4 and second == 9)
-assert(total == 544)
+assert(total == 544 and calls == 33)
 print("regress494", total, first, second)

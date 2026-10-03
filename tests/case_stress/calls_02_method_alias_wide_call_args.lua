@@ -1,9 +1,15 @@
 -- unluac: expect-contains [[.m70(]]
 -- unluac: expect-not-contains [[:m70()]]
+-- 宽参数列表仍保留完整点号调用，但不能把七十项挤进一条物理行。
+-- unluac: expect-max-line-length [[120]]
 local object = {}
+local calls = 0
 
 for i = 1, 70 do
     object["m" .. i] = function(self)
+        assert(self == object)
+        calls = calls + 1
+        assert(calls == i)
         return i
     end
 end
@@ -41,4 +47,5 @@ end
 
 local total = run()
 assert(total == 2485)
+assert(calls == 70)
 print("regress_54_method_alias_wide_call_args", total)

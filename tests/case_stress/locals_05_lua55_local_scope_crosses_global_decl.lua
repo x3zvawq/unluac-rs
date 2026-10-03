@@ -5,6 +5,9 @@
 -- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=1]]
 -- unluac: expect-contains [[global slot_001]]
 -- unluac: expect-contains [[global function exported_function]]
+-- unluac: expect-ast-max [[local-binding]] [[40]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=2]]
 
 global marker = 0
 global<const> boundary

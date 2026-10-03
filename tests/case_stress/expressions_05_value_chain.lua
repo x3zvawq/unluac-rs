@@ -1,6 +1,27 @@
 -- 静态展开保留连续 NOT 指令，检查内联后仍能被官方解析器重新编译。
 -- unluac: expect-min-count [[not ]] [[256]]
 -- unluac: expect-max-line-length [[600]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]] [[@dialect=lua5.1]]
+-- unluac: expect-instruction-count [[not]] [[256]] [[@proto=1]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]] [[@dialect=lua5.2]]
+-- unluac: expect-instruction-count [[not]] [[256]] [[@proto=1]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]] [[@dialect=lua5.3]]
+-- unluac: expect-instruction-count [[not]] [[256]] [[@proto=1]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]] [[@dialect=lua5.4]]
+-- unluac: expect-instruction-count [[not]] [[256]] [[@proto=1]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]] [[@dialect=lua5.5]]
+-- unluac: expect-instruction-count [[not]] [[256]] [[@proto=1]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]] [[@dialect=luau]]
+-- unluac: expect-instruction-count [[not]] [[256]] [[@proto=1]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=7]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=8]] [[@dialect=luajit]]
+-- unluac: expect-instruction-count [[not]] [[256]] [[@proto=12]] [[@dialect=luajit]]
 local function coerce(value)
     local result = value
     result = not result; result = not result; result = not result; result = not result; result = not result; result = not result; result = not result; result = not result

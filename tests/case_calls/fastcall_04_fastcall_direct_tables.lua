@@ -57,7 +57,7 @@ print("fastcall-direct-tables", weak[1].value, inherited.value, maximum, frozen.
 -- unluac: expect-contains [[assert(select_table({ value = chosen }) == chosen and table.isfrozen(chosen))]] [[@debug=retained]]
 -- unluac: expect-contains [[local false_result = select_table({ value = false })]] [[@debug=retained]]
 -- unluac: expect-contains [[local nil_result = select_table({})]] [[@debug=retained]]
--- unluac: expect-contains [[local proxy = setmetatable({}, {]] [[@debug=retained]]
+-- unluac: expect-contains [[local proxy = setmetatable({},]] [[@debug=retained]]
 -- unluac: expect-contains [[--!optimize 2]] [[@variant=O2]]
 local function select_table(source)
     return table.pack(table.freeze(source.value or {}))[1]

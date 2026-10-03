@@ -1,6 +1,8 @@
 -- regress_164_lua55_wide_global_decl#1: 宽常量环境访问仍须与 ERRNNIL 配对恢复 global 声明
 -- unluac: expect-contains [[global boundary_name = 1]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 常量表之外没有独立的全局键准备绑定。
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=0]]
 -- unluac: expect-contains [["k000", "k001", "k002"]]
 -- unluac: expect-max-line-length [[120]]
 local values = {

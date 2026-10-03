@@ -33,6 +33,8 @@ pub(super) enum GlobalDeclValues {
     FixedCall {
         prefix: Vec<GlobalDeclValueUse>,
         results: RegRange,
+        /// 目标 base/key 在 RHS 之前准备；逆序 probe 的准备则属于协议本体。
+        wide_targets: Vec<(crate::LuaString, InstrRef)>,
     },
     ValueUses(Vec<GlobalDeclValueUse>),
 }
@@ -63,7 +65,12 @@ impl GlobalDeclProtocols {
             {
                 facts.record_global_initializer_write(protocol.probe, value.instr);
             }
-            let GlobalDeclValues::FixedCall { prefix, .. } = &protocol.values else {
+            let GlobalDeclValues::FixedCall {
+                prefix,
+                wide_targets,
+                ..
+            } = &protocol.values
+            else {
                 continue;
             };
             if prefix.is_empty() {
@@ -78,7 +85,7 @@ impl GlobalDeclProtocols {
                     fixed_temps[def.index()]
                 })
                 .collect();
-            facts.record_global_call_prefix(protocol.owner, inputs);
+            facts.record_global_call_prefix(protocol.owner, inputs, wide_targets.clone());
         }
     }
 
@@ -262,11 +269,14 @@ fn recognize_call_protocol(
     }
 
     let mut prefix = Vec::new();
+    let mut wide_targets = Vec::new();
     while end
         .checked_add(3)
         .is_some_and(|item_end| item_end <= block_end)
     {
-        let Some(item) = recognize_item(proto, dataflow, local_environment, InstrRef(end)) else {
+        let Some((item, item_end, wide)) =
+            recognize_prefix_item(proto, dataflow, local_environment, end, block_end)
+        else {
             break;
         };
         let expected = results.start.index().checked_sub(prefix.len() + 1);
@@ -291,12 +301,15 @@ fn recognize_call_protocol(
                 ),
             };
         }
+        if wide {
+            wide_targets.push((item.name.clone(), item.set_ref));
+        }
         names.push(item.name);
         prefix.push(GlobalDeclValueUse {
             instr: item.set_ref,
             reg: item.value_reg,
         });
-        end += 3;
+        end = item_end;
     }
     // 候选拒绝[SemanticBarrier:EvalOrder]: wide target descriptors can be prepared before the tail call, so
     // the leading item is not necessarily adjacent to the direct suffix. A later ERRNNIL/SET
@@ -312,14 +325,113 @@ fn recognize_call_protocol(
     }
     names.reverse();
     prefix.reverse();
+    wide_targets.reverse();
+    let first_value = prefix
+        .iter()
+        .filter_map(|value| match dataflow.use_value(value.instr, value.reg) {
+            SsaValue::Def(def) => Some(dataflow.def_instr(def)),
+            _ => None,
+        })
+        .min()
+        .unwrap_or(call_ref);
+    let mut previous_target_end = block.start;
+    for (_, store_ref) in &wide_targets {
+        let LowInstr::SetTable(store) = &proto.instrs[store_ref.index()] else {
+            unreachable!()
+        };
+        let (AccessBase::Reg(base), AccessKey::Reg(key)) = (store.base, store.key) else {
+            unreachable!()
+        };
+        let (SsaValue::Def(base), SsaValue::Def(key)) = (
+            dataflow.use_value(*store_ref, base),
+            dataflow.use_value(*store_ref, key),
+        ) else {
+            unreachable!()
+        };
+        let base = dataflow.def_instr(base);
+        let key = dataflow.def_instr(key);
+        // 候选拒绝[ProofIncomplete:EvalOrder]：目标快照必须按声明顺序在本块所有 RHS
+        // 之前完成；不能把后取得的环境快照提前越过可能改写 _ENV 的前缀表达式。
+        if base < previous_target_end || key >= first_value {
+            return CallProtocolMatch::Blocked { resume_at: end };
+        }
+        previous_target_end = InstrRef(key.index() + 1);
+    }
 
     CallProtocolMatch::Claimed(GlobalDeclProtocol {
         owner: call_ref,
         probe: InstrRef(call_ref.index() + 1),
         end,
         names,
-        values: GlobalDeclValues::FixedCall { prefix, results },
+        values: GlobalDeclValues::FixedCall {
+            prefix,
+            results,
+            wide_targets,
+        },
     })
+}
+
+/// 宽 probe 的环境和名字准备是协议的一部分，不能把它们当作下一条声明的边界。
+fn recognize_prefix_item(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    local_environment: Option<DefId>,
+    start: usize,
+    block_end: usize,
+) -> Option<(GlobalDeclItem, usize, bool)> {
+    if let Some(item) = recognize_item(proto, dataflow, local_environment, InstrRef(start)) {
+        return Some((item, start + 3, false));
+    }
+    let end = start.checked_add(5)?;
+    if end > block_end || local_environment.is_some() {
+        return None;
+    }
+    let item = recognize_item(proto, dataflow, local_environment, InstrRef(start + 2))?;
+    let LowInstr::GetTable(probe) = &proto.instrs[start + 2] else {
+        return None;
+    };
+    let LowInstr::SetTable(store) = &proto.instrs[item.set_ref.index()] else {
+        return None;
+    };
+    for (site, base, key, at_probe) in [
+        (InstrRef(start + 2), probe.base, probe.key, true),
+        (item.set_ref, store.base, store.key, false),
+    ] {
+        let (AccessBase::Reg(base), AccessKey::Reg(key)) = (base, key) else {
+            return None;
+        };
+        let (SsaValue::Def(base_def), SsaValue::Def(key_def)) = (
+            dataflow.use_value(site, base),
+            dataflow.use_value(site, key),
+        ) else {
+            return None;
+        };
+        let base_read = dataflow.def_instr(base_def);
+        let key_read = dataflow.def_instr(key_def);
+        // 候选拒绝[ProofIncomplete]：只认领独占、相邻的原环境/字符串准备；
+        // MOVE、共享快照和其它表达式不能因最终名字相同而失去自己的执行位置。
+        if key.index() != base.index() + 1
+            || key_read.index() != base_read.index() + 1
+            || !def_has_only_direct_use(dataflow, base_def, site, base)
+            || !def_has_only_direct_use(dataflow, key_def, site, key)
+            || !matches!(&proto.instrs[base_read.index()], LowInstr::GetUpvalue(get)
+                if matches!(get.src, crate::transformer::UpvalueOperand::Env(_)))
+            || !matches!(&proto.instrs[key_read.index()], LowInstr::LoadConst(load)
+                if const_string(proto, load.value).as_ref() == Some(&item.name))
+            || (at_probe && (base_read.index() != start || probe.dst != base))
+        {
+            return None;
+        }
+        if !at_probe {
+            let SsaValue::Def(value) = dataflow.use_value(site, item.value_reg) else {
+                return None;
+            };
+            if key_read >= dataflow.def_instr(value) {
+                return None;
+            }
+        }
+    }
+    Some((item, end, true))
 }
 
 /// 按候选 owner 的物理位置冻结可阻断 item 的最远末端。直接 Def 只从下一条指令起

@@ -1,5 +1,5 @@
 -- 低槽标量仍承担 CALL 声明前缀，局部内联不能阻塞相邻作用域和构造器的完整恢复。
--- unluac: expect-count [[= setmetatable({}, {]] [[2]]
+-- unluac: expect-count [[= setmetatable({},]] [[2]]
 -- unluac: expect-not-contains [[and 1 == 1]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 -- 一元结果跨 print 保活，但必须在后继 assert 复用原槽前离域。

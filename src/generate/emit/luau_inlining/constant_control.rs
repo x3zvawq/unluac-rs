@@ -112,10 +112,42 @@ impl TraceBuilder<'_> {
                         Flow::Next
                     }
                 }
-                AstStmt::While(loop_)
-                    if truth(&loop_.cond, self.function, Some(self.mask)) == Some(false) =>
-                {
-                    Flow::Next
+                AstStmt::While(loop_) => {
+                    if !truth(&loop_.cond, self.function, Some(self.mask))? {
+                        Flow::Next
+                    } else {
+                        match self.block(&loop_.body, false)? {
+                            Flow::Break => Flow::Next,
+                            Flow::Return => Flow::Return,
+                            _ => return None,
+                        }
+                    }
+                }
+                AstStmt::NumericFor(loop_) => {
+                    let start = counter_repeat::integer(&loop_.start)?;
+                    let limit = counter_repeat::integer(&loop_.limit)?;
+                    let step = counter_repeat::integer(&loop_.step)?;
+                    let count = trips(start, limit, step)?;
+                    // 候选拒绝[TargetConstraint]：轨迹相等不足以让原数值循环消失；
+                    // 最终源码的专化循环体还必须满足 pinned Luau 展开阈值。
+                    if count > 25
+                        || block_cost(self.function, &loop_.body, Some(self.mask))?
+                            .blocks_unroll(start, limit, step)
+                    {
+                        return None;
+                    }
+                    let mut exit = Flow::Next;
+                    for _ in 0..count {
+                        match self.block(&loop_.body, false)? {
+                            Flow::Break => break,
+                            Flow::Return => {
+                                exit = Flow::Return;
+                                break;
+                            }
+                            Flow::Next | Flow::Continue => {}
+                        }
+                    }
+                    exit
                 }
                 AstStmt::Repeat(loop_) => match self.block(&loop_.body, false)? {
                     Flow::Return => Flow::Return,
@@ -503,7 +535,7 @@ pub(super) fn runtime_summary(func: &AstFunctionExpr) -> Option<(Cost, BTreeSet<
     Some((cost, model.stable_loops))
 }
 
-pub(super) fn body(
+fn trace_matches(
     func: &AstFunctionExpr,
     proto: &crate::hir::HirProto,
     parameters: usize,
@@ -532,26 +564,29 @@ pub(super) fn body(
         },
         budget: 256,
     };
-    builder.block(&func.body, true) == Some(Flow::Return)
-        && builder.trace == expected
-        && cost(func, Some(mask))
-            .zip(cost(func, None))
-            .is_some_and(|(specialized, baseline)| specialized.permits_inline(baseline))
+    builder.block(&func.body, true) == Some(Flow::Return) && builder.trace == expected
 }
 
-pub(super) fn arguments(args: &[AstExpr], parameters: usize, mask: u8) -> bool {
-    args.len() == parameters
-        && args[..parameters - 1]
-            .iter()
-            .enumerate()
-            .all(|(bit, value)| *value == AstExpr::Boolean(mask & (1 << bit) != 0))
-        && matches!(args.last(), Some(AstExpr::TableConstructor(table)) if table.fields.is_empty())
+fn argument_mask(args: &[AstExpr], parameters: usize) -> Option<u8> {
+    if args.len() != parameters {
+        return None;
+    }
+    args[..parameters - 1]
+        .iter()
+        .enumerate()
+        .try_fold(0, |mask, (bit, arg)| {
+            let AstExpr::Boolean(value) = arg else {
+                return None;
+            };
+            Some(mask | (u8::from(*value) << bit))
+        })
 }
 
 struct FunctionCosts {
     parameters: usize,
     baseline: Cost,
     profiles: Vec<Option<Cost>>,
+    inlined: Vec<bool>,
 }
 
 pub(super) struct Models(BTreeMap<crate::hir::LocalId, FunctionCosts>);
@@ -560,6 +595,7 @@ impl Models {
     pub(super) fn new(
         statements: &[&AstStmt],
         bodies: &BTreeMap<crate::hir::LocalId, HirLuauInliningBody>,
+        hir: &crate::hir::HirModule,
     ) -> Option<Self> {
         let mut models = BTreeMap::new();
         for stmt in statements {
@@ -569,7 +605,10 @@ impl Models {
             let AstBindingRef::Local(local) = decl.name else {
                 continue;
             };
-            let Some(&HirLuauInliningBody::ConstantControl { parameters, .. }) = bodies.get(&local)
+            let Some(&HirLuauInliningBody::ConstantControl {
+                template,
+                parameters,
+            }) = bodies.get(&local)
             else {
                 continue;
             };
@@ -577,8 +616,17 @@ impl Models {
                 return None;
             }
             let baseline = cost(&decl.func, None)?;
-            let profiles = (0..1u8 << (parameters - 1))
+            let profiles: Vec<_> = (0..1u8 << (parameters - 1))
                 .map(|mask| cost(&decl.func, Some(mask)))
+                .collect();
+            let proto = hir.protos.get(template)?;
+            let inlined = profiles
+                .iter()
+                .enumerate()
+                .map(|(mask, cost)| {
+                    cost.is_some_and(|cost| cost.permits_inline(baseline))
+                        && trace_matches(&decl.func, proto, parameters, mask as u8)
+                })
                 .collect();
             models.insert(
                 local,
@@ -586,10 +634,25 @@ impl Models {
                     parameters,
                     baseline,
                     profiles,
+                    inlined,
                 },
             );
         }
         Some(Self(models))
+    }
+
+    pub(super) fn declaration(&self, local: crate::hir::LocalId) -> bool {
+        self.0
+            .get(&local)
+            .is_some_and(|model| model.inlined.iter().any(|valid| *valid))
+    }
+
+    pub(super) fn inlined(&self, local: crate::hir::LocalId, args: &[AstExpr]) -> bool {
+        let Some(model) = self.0.get(&local) else {
+            return false;
+        };
+        argument_mask(args, model.parameters).is_some_and(|mask| model.inlined[usize::from(mask)])
+            && matches!(args.last(), Some(AstExpr::TableConstructor(table)) if table.fields.is_empty())
     }
 
     pub(super) fn retained(
@@ -605,15 +668,7 @@ impl Models {
             return false;
         }
         let controls = &args[..args.len() - 1];
-        let profile = controls
-            .iter()
-            .enumerate()
-            .try_fold(0u8, |mask, (bit, arg)| {
-                let AstExpr::Boolean(value) = arg else {
-                    return None;
-                };
-                Some(mask | (u8::from(*value) << bit))
-            });
+        let profile = argument_mask(args, model.parameters);
         if let Some(mask) = profile {
             return model.profiles[usize::from(mask)]
                 .is_some_and(|cost| !cost.permits_inline(model.baseline));

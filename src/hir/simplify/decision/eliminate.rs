@@ -155,6 +155,7 @@ fn eliminate_stmt(
                 extract_value_pack(global_decl.values, state, safety);
             prefix.push(HirStmt::GlobalDecl(Box::new(crate::hir::HirGlobalDecl {
                 probe_source: global_decl.probe_source,
+                pending_target_preparations: global_decl.pending_target_preparations,
                 names: global_decl.names,
                 values,
             })));

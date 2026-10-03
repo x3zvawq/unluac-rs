@@ -1,6 +1,7 @@
 -- 宽逻辑链应保持表达式，不因决策自然化预算退化为大量条件语句。
 -- unluac: expect-ast-max [[if]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-max [[goto]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[function]] [[1]] [[@proto=0]]
 local function wide_boolean_chain(
     a01, a02, a03, a04, a05, a06, a07, a08, a09, a10,

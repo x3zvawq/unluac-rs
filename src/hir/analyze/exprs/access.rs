@@ -446,11 +446,17 @@ fn reg_use_is_env(
     let LowInstr::GetUpvalue(get_upvalue) = &lowering.proto.instrs[def_instr.index()] else {
         return false;
     };
+    let declaration = access_is_global_decl(lowering, instr_ref, key);
+    // 多处读取说明这是需要保留的环境快照；把其中一次访问改成隐式 _ENV 会
+    // 丢失原低槽 base，宽常量键的完整写帧也会因此错位。global 声明仍由协议配对。
     matches!(get_upvalue.src, UpvalueOperand::Env(_))
+        && (declaration
+            || (lowering.dataflow.def_uses[def.index()].len() == 1
+                && lowering.dataflow.def_phi_uses[def.index()].is_empty()))
         && def_instr.index() < instr_ref.index()
         && (((def_instr.index() + 1)..instr_ref.index())
             .all(|index| !lowering.dataflow.effect_summaries[index].has_effect_tags())
-            || access_is_global_decl(lowering, instr_ref, key))
+            || declaration)
 }
 
 fn access_is_global_decl(
