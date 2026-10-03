@@ -1,5 +1,8 @@
 -- 同一 VM 临时槽的 224 个顺序快照必须复用额外身份，不能耗尽 Lua 的 200 个 local。
 -- 必须展开源码，Lua 循环只产生一个静态定义，无法覆盖身份数量随源码增长的问题。
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[assign]] [[224]] [[@proto=2]]
+-- unluac: expect-ast-count [[call]] [[224]] [[@proto=2]]
 local calls = 0
 snapshot_pressure_missing = function() calls = calls + 1 end
 local function run(owner)
@@ -32,8 +35,10 @@ local function run(owner)
     owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing();
     owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing();
     owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing(); owner, iteration = owner, 0; snapshot_pressure_missing();
-    return iteration
+    return iteration, owner
 end
-assert(run({}) == 0 and calls == 224)
+local original_owner = {}
+local iteration, retained = run(original_owner)
+assert(iteration == 0 and retained == original_owner and calls == 224)
 snapshot_pressure_missing = nil
 print("regress_543_snapshot_holder_reuse", "OK")

@@ -2,6 +2,22 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_protocol/varargs_07_fixed_result_declaration.lua",
+        &["vararg", "fixed-width", "local-declaration", "return-frame"],
+        "固定变参原槽恢复一组声明，后续高槽返回 COPY 保留独立写域；观察缺失值、nil、false、身份及固定返回宽度。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_protocol/compatibility_01_lua51_legacy_arg_table.lua",
         &["arg-table", "nested-function", "vararg"],
         "恢复 Lua 5.1 隐式 arg 表，并区分嵌套 consumed 使用 ... 后不再填充外层 arg 表的行为。",

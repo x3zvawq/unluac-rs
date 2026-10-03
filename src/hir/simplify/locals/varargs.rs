@@ -7,6 +7,28 @@ use crate::hir::simplify::mention::{BindingReadCollector, BindingWriteCollector}
 use crate::hir::simplify::source_frames::{PrefixRequest, coordinates, validate_prefixes};
 use crate::hir::visit::visit_stmt_header;
 
+/// 固定 VARARG 原结果留在声明区，高槽 COPY 是后续准备；保留全部写域供消费者验证。
+pub(super) fn has_upward_preparation_copies(
+    facts: &ProtoPromotionFacts,
+    temp: TempId,
+    home: HomeSlotKey,
+    end: usize,
+) -> bool {
+    facts
+        .complete_temp_non_move_write_homes(temp)
+        .iter()
+        .copied()
+        .eq([home])
+        && facts.trusted_immediate_moves(temp).is_some_and(|copies| {
+            !copies.is_empty()
+                && copies.iter().all(|copy| {
+                    copy.source == Some(temp)
+                        && copy.source_home == home
+                        && copy.target_home.slot() >= end
+                })
+        })
+}
+
 #[derive(Default)]
 struct Touches {
     reads: Vec<usize>,

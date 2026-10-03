@@ -764,7 +764,48 @@ pub(super) struct ScalarPair<'a> {
     pub(super) base: HomeSlotKey,
     pub(super) literal_input: Option<&'a HirExpr>,
     pub(super) tail: crate::hir::promotion::ScalarPairTail,
-    pub(super) tail_result: TempId,
+    /// 只有运算尾项需要逐 Def 核对来源；直接值的合同由值与绑定本身给出。
+    pub(super) tail_result: Option<TempId>,
+}
+
+impl ScalarPair<'_> {
+    pub(super) fn same_contract(&self, other: &Self) -> bool {
+        self.left == other.left
+            && self.right == other.right
+            && self.copied_input == other.copied_input
+            && self.base == other.base
+            && self.tail_result == other.tail_result
+            && match (self.literal_input, other.literal_input) {
+                (None, None) => true,
+                (Some(left), Some(right)) => scalar_value_matches(left, right),
+                _ => false,
+            }
+            && match (&self.tail, &other.tail) {
+                (
+                    crate::hir::promotion::ScalarPairTail::Value(left),
+                    crate::hir::promotion::ScalarPairTail::Value(right),
+                ) => scalar_value_matches(left, right),
+                (
+                    crate::hir::promotion::ScalarPairTail::Binary {
+                        instruction: left,
+                        input: left_home,
+                    },
+                    crate::hir::promotion::ScalarPairTail::Binary {
+                        instruction: right,
+                        input: right_home,
+                    },
+                ) => left == right && left_home == right_home,
+                _ => false,
+            }
+    }
+}
+
+// 写回证书比较原标量表示；数值相等不能把 -0.0 的写入替换为 +0.0。
+fn scalar_value_matches(left: &HirExpr, right: &HirExpr) -> bool {
+    match (left, right) {
+        (HirExpr::Number(left), HirExpr::Number(right)) => left.to_bits() == right.to_bits(),
+        _ => left == right,
+    }
 }
 
 /// 标量尾项的并列赋值仍在原高槽准备首项，再写第二项和首项；完整前缀不得移动。
@@ -797,7 +838,9 @@ pub(super) fn scalar_pair(
             )
             && dialect != DecompileDialect::Luajit)
         || match (copied_input, value) {
-            (None, value) => literal_input != Some(value),
+            (None, value) => {
+                literal_input.is_none_or(|literal| !scalar_value_matches(literal, value))
+            }
             (Some(input), value) => HirBinding::from_expr(value) != Some(input),
         }
     {
@@ -835,14 +878,18 @@ pub(super) fn scalar_pair(
         return None;
     };
     let tail = match tail {
-        crate::hir::promotion::ScalarPairTail::Value(tail) if current_tail == tail => tail.clone(),
+        crate::hir::promotion::ScalarPairTail::Value(tail)
+            if scalar_value_matches(current_tail, tail) =>
+        {
+            tail.clone()
+        }
         crate::hir::promotion::ScalarPairTail::Binary { instruction, input } => {
             let HirExpr::Binary(binary) = current_tail else {
                 return None;
             };
             let source = binary.source_site?;
             if source.instr != *instruction
-                || facts.operation_result_temp(source) != Some(frame.tail_result)
+                || facts.operation_result_temp(source) != frame.tail_result
                 || ![&binary.lhs, &binary.rhs]
                     .into_iter()
                     .all(|value| matches!(value, HirExpr::Integer(_) | HirExpr::Number(_)))

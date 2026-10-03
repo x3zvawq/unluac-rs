@@ -2,6 +2,146 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_syntax/interpolation_01_loop_return_frame.lua",
+        &["interpolation", "generic-for", "return-frame", "method"],
+        "插值的高槽 format 和低返回 COPY 在完整事务恢复，循环控制槽的旧身份不制造接棒声明。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_syntax/interpolation_02_shared_initializer.lua",
+        &["interpolation", "local-declaration", "capture", "method"],
+        "插值共享结果保留原声明与捕获身份，消费高槽模板、实参和结果 COPY，保持求值次数及顺序。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_syntax/interpolation_03_conditional_initializer.lua",
+        &[
+            "interpolation",
+            "local-declaration",
+            "condition",
+            "metamethod",
+        ],
+        "条件准备退休后，插值写回在原 COPY home 恢复新声明，保持取模与格式化的求值顺序。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_syntax/interpolation_04_prior_selection.lua",
+        &[
+            "interpolation",
+            "local-declaration",
+            "condition",
+            "metamethod",
+        ],
+        "首个无准备的完整选择不占用后继选择恢复，比较常量不得成为插值接棒变量。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_syntax/interpolation_05_captured_return.lua",
+        &[
+            "interpolation",
+            "local-declaration",
+            "condition",
+            "metamethod",
+        ],
+        "已吸收的结果 COPY 仍授权完整插值返回帧，格式化前读取全部上值并保留 cell 更新后的快照。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_syntax/interpolation_06_branch_receivers.lua",
+        &[
+            "interpolation",
+            "local-declaration",
+            "condition",
+            "metamethod",
+        ],
+        "循环内两臂方法 receiver 保留各自准备 Def，完整帧恢复不丢失重入格式化前的计数器快照。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_syntax/globals_01_keyword_table_access.lua",
         &["env", "keyword", "table-index"],
         "确保环境表中的关键字 key `end` 始终以索引访问生成，不变成非法裸 global。",
@@ -138,7 +278,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_syntax/functions_03_vararg.lua",
         &["closure", "multi-return", "named-vararg"],
         "六个命名变参函数覆盖pack索引/n字段、capture改写、global安装、直接返回和正负偏移索引。",
-        &[LuaCaseConfiguration::new(PUC_LUA_GE_55)],
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_GE_55).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_GE_55).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_syntax/attributes_02_luau_typed_control_flow_matrix.lua",

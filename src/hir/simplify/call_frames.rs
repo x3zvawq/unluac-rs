@@ -3,6 +3,7 @@
 //! 消费 Promotion 的定义、参数、结果及方法协议，并与源码声明前缀 owner 协作提交。
 
 mod fastcalls;
+mod interpolation;
 mod logical;
 mod lookups;
 mod native;
@@ -860,6 +861,10 @@ impl FrameBuilder<'_> {
                 Some(value)
             }
             HirExpr::LocalRef(local) => {
+                if self.interpolation_source(*local, before).is_some_and(|(_, _, _, target)|
+                    self.facts.trusted_temp_home_slot(target).is_some_and(|home| home.slot() == slot)) {
+                    return self.interpolation_local(*local, before, slot, original_producer, false);
+                }
                 if self.scalar_copy_source(*local, before).is_some_and(|(call, _, _)| {
                     self.expanded_scalar_home(call) == Some(HomeSlotKey::new(slot, 0))
                 }) {
@@ -973,6 +978,9 @@ impl FrameBuilder<'_> {
                                             | HirExpr::LocalRef(_)
                                             | HirExpr::ParamRef(_)
                                             | HirExpr::Closure(_)
+                                            // 原 LOADK 的字符串 receiver 在此同槽重发；
+                                            // 该 Local 先前作为循环根不冻结后来的常量版本。
+                                            | HirExpr::String(_)
                                             // 完整 callee 链的每个 CALL 在下方核对同槽固定单结果，
                                             // 不把原结果作为独立快照删掉，也不改变下一次调用时点。
                                             | HirExpr::Call(_)
@@ -1091,6 +1099,10 @@ impl FrameBuilder<'_> {
                 Some(HirExpr::VarArg)
             }
             HirExpr::Call(call) => {
+                if call.interpolation.is_some()
+                    || self.is_interpolation_copy(call, before, slot, original_producer) {
+                    return self.interpolation_call(call, before, slot).map(|call| HirExpr::Call(Box::new(call)));
+                }
                 // 外层寄存器操作只限定 CALL 的结果槽；callee/参数由调用自己的
                 // 原帧验证，不能把外层 RK 读取限制泄漏到 GETUPVAL 等调用准备。
                 let previous = std::mem::replace(&mut self.register_operand, false);
@@ -3471,9 +3483,12 @@ impl FrameBuilder<'_> {
             _ => None,
         }
         .or_else(|| {
-            protocol.receiver_temp.filter(|temp| {
-                matches!(access.base, HirExpr::LocalRef(local)
-                if self.facts.promoted_local_for_temp(*temp) == Some(local))
+            protocol.receiver_temp.filter(|temp| match access.base {
+                HirExpr::LocalRef(local) => {
+                    self.facts.promoted_local_for_temp(*temp) == Some(local)
+                }
+                HirExpr::TempRef(receiver) => receiver == *temp,
+                _ => false,
             })
         })
         .or_else(|| self.facts.call_argument_value(call, 0));
@@ -3898,6 +3913,7 @@ impl FrameBuilder<'_> {
             method_key: call.method_key.clone(),
             callee_root_handoff: call.callee_root_handoff,
             method_rewrite_transaction: transaction,
+            interpolation: call.interpolation.clone(),
             plain_method_syntax: false,
             boolean_prewrite_arguments,
         })

@@ -263,6 +263,7 @@ fn lower_regular_instr_body(
                 method_key: None,
                 callee_root_handoff: None,
                 method_rewrite_transaction: None,
+                interpolation: None,
                 plain_method_syntax: false,
                 boolean_prewrite_arguments: Vec::new(),
             };
@@ -416,8 +417,14 @@ fn lower_regular_instr_body(
         .promotion_facts
         .copy_root_before_releases(instr_ref);
     if !roots.is_empty() {
-        // 异槽 NOT 在读完输入后写 Boolean；它不调用元方法，也不需要先清除目标根。
-        let boolean_overwrite = (matches!(instr, LowInstr::LoadBool(_))
+        // 原单槽 nil、数值/Boolean 写无观察事件；异槽 NOT 也在读完输入后直接覆盖目标根。
+        // 已有 binding/home 时不先发 nil；匿名绑定尚未归并时仍保留端点供 Locals 消费。
+        let inert_overwrite = (matches!(instr,
+                LowInstr::LoadBool(_) | LowInstr::LoadInteger(_) | LowInstr::LoadNumber(_))
+            || matches!(instr, LowInstr::LoadNil(load) if load.dst.len == 1)
+            || matches!(instr, LowInstr::LoadConst(load)
+                if matches!(lowering.proto.constants.get(load.value.index()),
+                    Some(crate::parser::RawLiteralConst::Integer(_) | crate::parser::RawLiteralConst::Number(_))))
             || matches!(instr, LowInstr::UnaryOp(unary)
                 if unary.op == crate::transformer::UnaryOpKind::Not && unary.src != unary.dst))
         .then(|| {
@@ -444,9 +451,8 @@ fn lower_regular_instr_body(
             Default::default()
         };
         let roots = roots.iter().copied()
-            // 原 Boolean 写已更新同一 binding/home，且没有 RHS 观察事件；
-            // 不提前发 nil 清除，也不能让其后无读取的 Boolean Def 被误删。
-            .filter(|temp| boolean_overwrite.as_ref().is_none_or(|(target, home)| {
+            // 原无观察写已更新同一 binding/home，不提前发 nil 清除。
+            .filter(|temp| inert_overwrite.as_ref().is_none_or(|(target, home)| {
                 lowering.bindings.lvalue_for_temp(*temp) != *target
                     || lowering.promotion_facts.trusted_temp_home_slot(*temp) != Some(*home)
             }))
@@ -572,6 +578,7 @@ pub(super) fn lower_terminal_instr(
                         // 尾调用保留 SELF 双端身份，原 owner 不为它签发 post-call 根。
                         callee_root_handoff: lower_call_root_handoff(lowering, instr_ref),
                         method_rewrite_transaction: None,
+                        interpolation: None,
                         plain_method_syntax: false,
                         boolean_prewrite_arguments: Vec::new(),
                     }))),
@@ -655,6 +662,7 @@ fn generic_for_iterator_call(
         method_key: None,
         callee_root_handoff: None,
         method_rewrite_transaction: None,
+        interpolation: None,
         plain_method_syntax: false,
         boolean_prewrite_arguments: Vec::new(),
     }))
@@ -708,6 +716,7 @@ fn lower_call_expr(
         method_key,
         callee_root_handoff: lower_call_root_handoff(lowering, instr_ref),
         method_rewrite_transaction: None,
+        interpolation: None,
         plain_method_syntax: false,
         boolean_prewrite_arguments: Vec::new(),
     }
@@ -821,6 +830,7 @@ pub(in crate::hir::analyze) fn lower_literal_initializer(
             method_key: None,
             callee_root_handoff: None,
             method_rewrite_transaction: None,
+            interpolation: None,
             plain_method_syntax: false,
             boolean_prewrite_arguments: Vec::new(),
         }));

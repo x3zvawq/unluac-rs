@@ -1,10 +1,13 @@
 -- regress_411_lua55_global_function_assignment: assignments to declared globals stay assignments
 -- unluac: expect-contains [[function direct_target()]]
--- unluac: expect-contains [[function forwarded_target()]] [[@debug=stripped]]
+-- 发布后的低槽局部仍属于后续调用前缀，保留它才能自然恢复两个直接调用。
+-- unluac: expect-contains [[forwarded_target = r0_1]] [[@debug=stripped]]
 -- unluac: expect-contains [[local function forwarded()]] [[@debug=retained]]
 -- unluac: expect-contains [[forwarded_target = forwarded]] [[@debug=retained]]
 -- unluac: expect-not-contains [[global function direct_target()]]
 -- unluac: expect-not-contains [[global function forwarded_target()]]
+-- unluac: expect-not-contains [[= assert]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=0]]
 
 global<const> assert, print
 

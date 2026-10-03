@@ -207,6 +207,12 @@ pub(super) fn format_string_literal(value: &LuaString, quote_style: QuoteStyle) 
     rendered
 }
 
+pub(super) fn format_interpolation_fragment(value: &LuaString) -> String {
+    let mut rendered = String::new();
+    push_quoted_string_body(&mut rendered, value, '`');
+    rendered.replace('{', "\\{").replace('}', "\\}")
+}
+
 fn push_quoted_string_body(rendered: &mut String, value: &LuaString, quote: char) {
     if let Some(text) = value.as_utf8() {
         push_utf8_string_body(rendered, text, quote);

@@ -60,6 +60,7 @@ pub(super) fn try_chain_local_method_call_stmt(
     Some((
         AstStmt::CallStmt(Box::new(crate::ast::common::AstCallStmt {
             call: AstCallKind::MethodCall(Box::new(crate::ast::common::AstMethodCallExpr {
+                interpolation: None,
                 receiver: AstExpr::MethodCall(Box::new(first_call.clone())),
                 method: second_call.method.clone(),
                 args: second_call.args.clone(),

@@ -1,9 +1,7 @@
--- unluac: expect-not-contains [[xmin, ymin, xmax, ymax =]]
 -- unluac: expect-not-contains [[local r1_0 = p1_0]]
--- x/y/radius 的写入保持原参数身份；多结果 CALL 仍一次初始化四个低槽副本。
--- unluac: expect-contains [[local r1_0, r1_1, r1_2, r1_3 = p1_0:getAdjustedRect()]]
--- unluac: expect-contains [[ymax = r1_3]]
--- unluac: expect-contains [[xmin = r1_0]]
+-- x/y/radius 保持原参数身份；固定结果按原顺序直接写全局，不保留四个中转副本。
+-- unluac: expect-contains [[xmin, ymin, xmax, ymax = p1_0:getAdjustedRect()]]
+-- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=1]]
 -- unluac: expect-contains [[return p1_1, p1_2, p1_3]]
 -- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
 -- CALL 初始化以当前事务的左值归属为准，不因后续 owner 合并退回空声明。

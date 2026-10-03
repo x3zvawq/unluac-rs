@@ -1,6 +1,9 @@
 -- A one-use `<close>` tail is a declaration-merge candidate, not an inline-exprs candidate.
 -- The literal-only substring keeps this shape contract independent of generated binding names.
 -- unluac: expect-contains [[<close> = 37, nil]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[close-binding]] [[1]] [[@proto=1]]
 
 local function close_tail()
     local repeated = 37

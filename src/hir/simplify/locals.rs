@@ -211,7 +211,19 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             facts.record_home_free_local(LocalId(first_new_local + offset));
         }
     }
+    let mut result_writebacks = BTreeMap::new();
     for (temp, local) in promoted_bindings.iter().copied() {
+        if let Some(home) = facts.trusted_local_home_slot(local)
+            && matches!(facts.trusted_immediate_moves(temp), Some([copy])
+                if copy.source == Some(temp)
+                    && facts.trusted_temp_home_slot(temp) == Some(copy.source_home)
+                    && facts.trusted_temp_home_slot(copy.target) == Some(home)
+                    && copy.target_home == home && copy.source_home.slot() > home.slot())
+        {
+            // 原高槽结果已通过紧邻 COPY 接回现存声明；scratch 不成为声明的新 home。
+            result_writebacks.insert(temp, home);
+            continue;
+        }
         if let Some(home_slot) = facts.home_slot(temp) {
             facts.record_local_home_slot(local, home_slot);
         }
@@ -253,7 +265,20 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         _ => binding,
     });
     for (temp, local) in promoted_bindings {
-        facts.record_temp_to_local_merge(temp, local);
+        if result_writebacks.get(&temp).copied() == facts.trusted_local_home_slot(local)
+            && result_writebacks.contains_key(&temp)
+        {
+            // 保留全部原写域；后续帧仍须共同证明高槽求值及低槽 COPY，不借身份登记折叠 RHS。
+            facts.merge_local_definition_write_homes(
+                local,
+                facts
+                    .complete_temp_definition_write_homes(temp)
+                    .into_owned(),
+            );
+            facts.record_temp_local_binding(temp, local);
+        } else {
+            facts.record_temp_to_local_merge(temp, local);
+        }
     }
     proto.physical_root_locals.extend(physical_root_locals);
     let coalesced_releases_changed =
@@ -1477,11 +1502,14 @@ fn collect_plans(
                         || temp_debug_scopes
                             .get(temp.index())
                             .is_some_and(Option::is_some)))
-                        || !facts
+                        || !(facts
                             .complete_temp_definition_write_homes(*temp)
                             .iter()
                             .copied()
                             .eq([home])
+                            || vararg_initializer && varargs::has_upward_preparation_copies(
+                                facts, *temp, home, base + assign.targets.len(),
+                            ))
                     {
                         return None;
                     }
@@ -1844,6 +1872,13 @@ fn collect_plans(
             // 根（regress_342）；这里不重建字段、原始参数协议或内联求值顺序。
             continue;
         }
+        let numeric_for_preparation = touching_stmt_indices.len() == 1
+            && touching_stmt_indices.first().is_some_and(|index| {
+                matches!(block.stmts[*index], HirStmt::NumericFor(_))
+                    && event_block
+                        .stmt(*index)
+                        .consumes_only_control_head(&block.stmts[*index], &group)
+            });
         let reusable_local = if release_local.is_some() {
             None
         } else if recursive_initializers.contains(&root_temp) {
@@ -1873,13 +1908,7 @@ fn collect_plans(
                     inherited_mapping.entry_nil_owner(home, ctx)
                 })
                 .or_else(|| {
-                    if touching_stmt_indices.len() == 1
-                        && let Some(index) = touching_stmt_indices.first()
-                        && matches!(block.stmts[*index], HirStmt::NumericFor(_))
-                        && event_block
-                            .stmt(*index)
-                            .consumes_only_control_head(&block.stmts[*index], &group)
-                    {
+                    if numeric_for_preparation {
                         // 候选拒绝[LayerBoundary]：仅供数值 for 头使用的常量仍由完整循环头帧消费；
                         // 接到已退休参数声明会保留旧准备变量，阻止 header alias 恢复。
                         return None;
@@ -1947,13 +1976,12 @@ fn collect_plans(
                 })
                 .or_else(|| {
                     let home = home_slot?;
-                    let predecessor = facts.copy_overwrite_predecessor(root_temp)?;
                     if let Some(release) =
                         decl_index.checked_sub(1).map(|index| &block.stmts[index])
-                        && let Some(local) =
+                        && let Some((local, released)) =
                             super::root_lifetimes::copy_release_local(release, root_temp, facts)
-                        && facts.promoted_local_for_temp(predecessor) == Some(local)
-                        && !has_label_flow
+                        && facts.temp_definition_reference_unaliased(root_temp)
+                        && decl_index < linear_prefix_end
                         && !ctx.identity_sensitive_locals.contains(&local)
                         && ctx.local_debug_hints[local.index()].is_none()
                         && ctx.local_debug_scopes[local.index()].is_none()
@@ -1963,13 +1991,19 @@ fn collect_plans(
                             .iter()
                             .all(|temp| !ctx.identity_sensitive_temps.contains(temp))
                         && !event_block.has_local_read_from(local, decl_index)
-                        && !event_block.has_read_from(predecessor, decl_index)
+                        && released
+                            .iter()
+                            .all(|temp| !event_block.has_read_from(*temp, decl_index))
                     {
-                        // 原 COPY 的退休来源已指向紧邻的可见旧身份；保持原位覆盖，
+                        // 原覆盖端点已签发全部退休根及可见旧身份；常量写不需借用 MOVE 前驱。
+                        // 相邻写仍在首个 label/goto 之前，整组已通过上方的支配验证；
+                        // 后缀的局部跳转不妨碍此处沿用原根身份。
+                        // 各旧版本均已结束显式读取，保持原位覆盖，
                         // 后续 root owner 在确认无观察 RHS 后一并撤销合成 nil。
                         // 不依赖前轮声明是否还存在于本轮计划，也不按槽号猜测前驱。
                         return Some(local);
                     }
+                    let predecessor = facts.copy_overwrite_predecessor(root_temp)?;
                     if let Some(&local) = planned.bindings.get(&predecessor)
                         && (facts.is_swap_write(root_temp)
                             || facts.is_parallel_target_seed(predecessor))
@@ -2037,14 +2071,25 @@ fn collect_plans(
                 })
                 .or_else(|| {
                     let home = home_slot?;
-                    let HirExpr::Call(call) = stmt.scalar_temp_assignment()?.1 else {
-                        return None;
-                    };
-                    let predecessor = facts.same_slot_call_predecessor(call, root_temp)?;
+                    let predecessor = match stmt.scalar_temp_assignment()?.1 {
+                        HirExpr::Call(call) => facts
+                            .same_slot_call_predecessor(call, root_temp)
+                            .or_else(|| {
+                                // 初值、上界和步长的 COPY 属于完整循环头，不能接回
+                                // 已退休的外层声明后截断该准备区。
+                                (!numeric_for_preparation)
+                                    .then(|| facts.call_writeback_predecessor(call, root_temp))
+                                    .flatten()
+                            }),
+                        HirExpr::TableAccess(access) => {
+                            facts.same_slot_lookup_predecessor(access, root_temp)
+                        }
+                        _ => None,
+                    }?;
                     let local = *planned.bindings.get(&predecessor)?;
-                    // 已知词法 closure 的 COPY 不需要额外 GC root，仍有真实的原 CALL 覆盖。
-                    // 只连接已物化的匿名 callee 与原结果，所有旧版本需求在此结束；完整调用
-                    // 的 freereg/准备事件仍交给 native frame owner，不能由这里授权折叠 RHS。
+                    // 原 callee、查表 base 或低槽 COPY 的覆盖前驱可接回现存声明。
+                    // 低槽 COPY 仍在 CALL 完成后写入；同槽操作另须证明旧值惰性。
+                    // 完整求值的准备事件仍由 native frame owner 验证。
                     (current_slot_locals.get(&home) == Some(&local)
                         && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
                         && group

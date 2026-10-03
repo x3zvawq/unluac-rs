@@ -93,6 +93,7 @@ pub(super) fn lower_closure_expr(
             method_key: None,
             callee_root_handoff: None,
             method_rewrite_transaction: None,
+            interpolation: None,
             plain_method_syntax: false,
             boolean_prewrite_arguments: Vec::new(),
         }));
@@ -324,6 +325,7 @@ fn pack_tail_for_open_def(
                 method_key,
                 callee_root_handoff: lower_call_root_handoff(lowering, open_def.instr),
                 method_rewrite_transaction: None,
+                interpolation: None,
                 plain_method_syntax: false,
                 boolean_prewrite_arguments: Vec::new(),
             }))))

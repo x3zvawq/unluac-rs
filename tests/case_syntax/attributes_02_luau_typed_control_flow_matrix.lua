@@ -1,4 +1,11 @@
 -- luau_01#1: continue与复合运算管线
+-- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=2]]
+-- unluac: expect-ast-max [[assign]] [[3]] [[@proto=5]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=7]]
+-- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=9]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=15]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=20]]
+-- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=25]]
 local function test_continue_compound()
     local function build_report(seed: number, items: { number }): string
         local acc: number = seed
@@ -19,6 +26,8 @@ local function test_continue_compound()
     end
 
     print("luau_01#1", build_report(5, { 4, 6, 9, 7, 12, 15, 3, 11 }))
+    assert(build_report(10, { 0, 1, 2, 4 }) == "seed=10 acc=13 marks=#2:12,#3:13,#4:13")
+    assert(build_report(0, {}) == "seed=0 acc=0 marks=")
 end
 
 -- luau_01#2: if表达式路由
@@ -44,6 +53,9 @@ local function test_if_expression()
     print("luau_01#2", run_a("alpha", { 2, 5, 1, 4 }))
 
     print("luau_01#2", run_b(nil, { 3, 1, 2 }))
+    assert(run_a(nil, { 0 }) == "router anon zero 0")
+    assert(run_a(nil, {}) == "router anon zero 0")
+    assert(run_b("negative", { -2 }) == "router negative neg -10")
 
 end
 
@@ -181,7 +193,14 @@ local function test_optional_closure()
     end
 
     local dispatch = make_dispatch("luau")
-    print("luau_01#8", dispatch({ 4, -2, 7, 3, -1, 5 }))
+    local named = dispatch({ 4, -2, 7, 3, -1, 5 })
+    assert(named == "luau-1:4|luau-3:13|luau-4:16|luau-6:22")
+    local anonymous = make_dispatch(nil)
+    local plain = anonymous({ 4, -2, 7, 3, -1, 5 })
+    assert(plain == "slot-1:4|slot-3:13|slot-4:16|slot-6:22")
+    assert(anonymous({ 1, -3, 2 }) == "slot-1:23|slot-3:28")
+    assert(anonymous({}) == "" and anonymous({ 0 }) == "slot-1:28")
+    print("luau_01#8", named, plain)
 
 end
 

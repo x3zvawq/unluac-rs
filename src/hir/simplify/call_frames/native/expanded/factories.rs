@@ -543,6 +543,7 @@ pub(super) fn factory_call(
         frame_root_ends: Vec::new(),
         callee_root_handoff: None,
         method_rewrite_transaction: None,
+        interpolation: None,
         plain_method_syntax: false,
         boolean_prewrite_arguments: Vec::new(),
     }))

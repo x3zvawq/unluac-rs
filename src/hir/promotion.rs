@@ -632,6 +632,8 @@ pub(super) struct ProtoPromotionFacts {
     /// 字段发布后不再退休的闭包声明；完整字段帧也不能消费这个前缀身份。
     published_closure_declarations: BTreeSet<TempId>,
     value_operand_prefix_calls: BTreeSet<TempId>,
+    /// 已恢复结果声明仍为指定后继 CALL 提供前缀；定义退休即失效。
+    source_result_prefixes: BTreeMap<TempId, crate::hir::common::HirSourceSite>,
     comparison_result_writes: BTreeMap<TempId, InstrRef>,
     boolean_condition_frames: BTreeMap<TempId, boolean_frames::BooleanConditionFrame>,
     value_upvalue_frames: BTreeMap<TempId, boolean_frames::ValueUpvalueFrame>,
@@ -1097,10 +1099,38 @@ impl ProtoPromotionFacts {
         self.published_closure_declarations.contains(&temp)
     }
 
-    /// 原调用在内嵌取值控制之前完成，结果到其消费谓词仍须持有独立身份。
-    pub(super) fn call_result_precedes_value_operand(&self, temp: TempId) -> bool {
+    /// 原调用在后继取值或索引帧之前完成，其结果仍承担独立声明前缀。
+    pub(super) fn call_result_requires_prefix(&self, temp: TempId) -> bool {
         self.trusted_temp_home_slot(temp).is_some()
-            && self.value_operand_prefix_calls.contains(&temp)
+            && (self.value_operand_prefix_calls.contains(&temp)
+                || self.source_result_prefixes.contains_key(&temp))
+    }
+
+    pub(super) fn has_source_result_prefix(&self, temp: TempId) -> bool {
+        self.trusted_temp_home_slot(temp).is_some()
+            && self.source_result_prefixes.contains_key(&temp)
+    }
+
+    /// 当前 HIR 恢复出的原结果声明与独立消费调用共享同一前缀义务。
+    pub(super) fn record_result_prefix(
+        &mut self,
+        temp: TempId,
+        consumer: crate::hir::common::HirSourceSite,
+    ) {
+        self.source_result_prefixes.insert(temp, consumer);
+    }
+
+    pub(super) fn source_result_prefixes(
+        &self,
+    ) -> impl Iterator<Item = (LocalId, crate::hir::common::HirSourceSite, HomeSlotKey)> + '_ {
+        self.source_result_prefixes
+            .iter()
+            .filter_map(|(&result, &consumer)| {
+                let home = self.trusted_temp_home_slot(result)?;
+                let local = self.promoted_local_for_temp(result)?;
+                (self.trusted_local_home_slot(local) == Some(home))
+                    .then_some((local, consumer, home))
+            })
     }
 
     /// 原 callee/receiver 与 RETURN COPY 是完整帧的准备事件；即使两槽此时同值，
@@ -1712,20 +1742,109 @@ impl ProtoPromotionFacts {
     }
 
     /// 固定单结果原 CALL 在返回时覆盖自己的 callee 槽；这是身份连续性，不是帧内联许可。
-    /// 当前 callee 必须仍是原 Def，结果也必须保留原操作身份，不能把后续 MOVE 当作 CALL 写。
+    /// 当前 callee 必须仍是原 Def；已树化的 global callee 可接回其明确覆盖的惰性旧值。
+    /// 结果仍须保留原操作身份，不能把后续 MOVE 当作 CALL 写。
     pub(super) fn same_slot_call_predecessor(
         &self,
         call: &crate::hir::common::HirCallExpr,
         result: TempId,
     ) -> Option<TempId> {
-        let frame = self.native_call_frame(call)?;
-        (!call.is_method()
-            && call.callee == crate::hir::common::HirExpr::TempRef(frame.callee)
-            && self.operation_result_temp(call.source_site?) == Some(result)
+        let frame = self
+            .native_call_frame(call)
+            .or_else(|| self.native_fastcall_frame(call))?;
+        if call.is_method()
+            || self.operation_result_temp(call.source_site?) != Some(result)
+            || self.trusted_temp_home_slot(result) != Some(frame.home)
+            || !matches!(frame.results, Some(ResultPack::Fixed(pack)) if pack.len == 1)
+            || !self.operation_result_reference_unaliased(call.source_site?)
+        {
+            return None;
+        }
+        if call.fastcall.is_none() && call.callee == HirExpr::TempRef(frame.callee) {
+            return Some(frame.callee);
+        }
+        let HirExpr::GlobalRef(global) = &call.callee else {
+            return None;
+        };
+        let crate::hir::common::HirOperationSources::Single(source) = global.sources else {
+            return None;
+        };
+        let InertHomeOverwrite::DefinedScalar(Some(previous)) =
+            *self.inert_home_overwrites.get(&frame.callee)?
+        else {
+            return None;
+        };
+        // 原 callee 准备已覆盖旧数值；赋值 RHS 保留该惰性旧值到 CALL 返回不会延长 GC 根。
+        // 只沿原覆盖 Def 连接声明，不把同 home 的其它历史版本认作前驱。
+        (self.operation_result_temp(source) == Some(frame.callee)
+            && self.trusted_temp_home_slot(frame.callee) == Some(frame.home)
+            && self.trusted_temp_home_slot(previous) == Some(frame.home)
+            && self.temp_definition_reference_unaliased(frame.callee)
+            && self.temp_definition_reference_unaliased(previous))
+        .then_some(previous)
+    }
+
+    /// 已树化的单结果 CALL 仍在原低槽 COPY 处覆盖旧值，目标声明可沿该前驱接续。
+    /// 这里只恢复绑定身份；高槽求值及低槽写回仍由完整帧证明。
+    pub(super) fn call_writeback_predecessor(
+        &self,
+        call: &crate::hir::common::HirCallExpr,
+        target: TempId,
+    ) -> Option<TempId> {
+        let result = self.fixed_call_result(call, 0)?;
+        let frame = self
+            .native_call_frame(call)
+            .or_else(|| self.native_fastcall_frame(call))?;
+        let copy = self.trusted_immediate_moves(result)?.first()?;
+        let previous = self.copy_overwrite_predecessor(target)?;
+        (matches!(frame.results, Some(ResultPack::Fixed(pack)) if pack.len == 1)
+            && copy.source == Some(result)
+            && copy.target == target
+            && copy.source_home == frame.home
             && self.trusted_temp_home_slot(result) == Some(frame.home)
-            && matches!(frame.results, Some(ResultPack::Fixed(pack)) if pack.len == 1)
-            && self.operation_result_reference_unaliased(call.source_site?))
-        .then_some(frame.callee)
+            && copy.target_home.slot() < frame.home.slot()
+            && self.trusted_temp_home_slot(target) == Some(copy.target_home)
+            && self.temp_definition_reference_unaliased(previous))
+        .then_some(previous)
+    }
+
+    /// GETTABLE 同槽覆盖已证明的非资源 base；原 base 写仍独立保留，不跨 lookup 释放旧资源。
+    pub(super) fn same_slot_lookup_predecessor(
+        &self,
+        access: &crate::hir::common::HirTableAccess,
+        result: TempId,
+    ) -> Option<TempId> {
+        let crate::hir::common::HirOperationSources::Single(source) = access.sources else {
+            return None;
+        };
+        let InertHomeOverwrite::DefinedScalar(Some(previous)) =
+            *self.inert_home_overwrites.get(&result)?
+        else {
+            return None;
+        };
+        let layout = self.native_table_read_layout(access)?;
+        let home = self.trusted_temp_home_slot(result)?;
+        let reads_previous = match access.base {
+            HirExpr::TempRef(temp) => temp == previous,
+            HirExpr::LocalRef(local) => {
+                self.promoted_local_for_temp(previous) == Some(local)
+                    && self.trusted_local_home_slot(local) == Some(home)
+            }
+            _ => false,
+        };
+        (self.operation_result_temp(source) == Some(result)
+            && self.table_read_base_value(access) == Some(previous)
+            && self.trusted_temp_home_slot(previous) == Some(home)
+            && layout.base == home
+            && layout.key.is_none()
+            && matches!(
+                access.key,
+                HirExpr::String(_) | HirExpr::Integer(_) | HirExpr::Number(_)
+            )
+            && reads_previous
+            && self.temp_definition_reference_unaliased(previous)
+            && self.temp_definition_reference_unaliased(result))
+        .then_some(previous)
     }
 
     /// 单次比较之后的两个 LOADBOOL 共同写原结果槽；没有比较前的 Boolean 预写。
@@ -4223,6 +4342,16 @@ impl ProtoPromotionFacts {
                     if param.index() < usize::from(proto.signature.num_params)))
             .then_some(temp)
         }));
+        let copy_result_prefixes = if source == crate::decompile::DecompileDialect::Luau {
+            call_roots::copy_result_prefixes(proto, cfg, graph, dataflow, &calls, fixed_temps)
+        } else {
+            BTreeMap::new()
+        };
+        source_frame_temps.extend(
+            copy_result_prefixes
+                .iter()
+                .flat_map(|(&result, &copy)| [result, copy]),
+        );
         let immediate_move_writes = collect_immediate_move_writes(
             proto,
             dataflow,
@@ -5094,15 +5223,13 @@ impl ProtoPromotionFacts {
                 source_frame_temps.extend(writes.steps.iter().map(|step| step.target));
             }
         }
-        // 无返回值调用的具名闭包由 statement owner 恢复；原低槽 CLOSURE 是 caller
-        // 前缀中的独立分配，不能把其定义身份换成高槽 callee COPY。
+        // 普通调用的原低槽 CLOSURE 是 caller 前缀中的独立分配，不因结果是否被使用
+        // 而改变声明归属；不能把其定义身份换成高槽 callee COPY。
         // 保留这个 canonical 定义，让 locals 按原 home 声明；完整调用帧再消费 COPY。
         // 否则闭包移进 COPY 后只剩目标槽，既使后缀前缀证明拒绝，也会跨过原覆盖点
         // 保留此前无读取的根。每个 CALL 只查缓存的 MOVE 源，不回扫指令或闭包子树。
         source_frame_temps.extend(calls.values().filter_map(|call| {
-            if call.layout.results != Some(ResultPack::Ignore) {
-                return None;
-            }
+            call.layout.results?;
             let callee = call.callee?;
             if callee.index() >= dataflow.defs.len() {
                 return None;
@@ -5145,13 +5272,17 @@ impl ProtoPromotionFacts {
                     || dataflow
                         .first_must_write_in_range(def.reg, start..end)
                         .is_some()
-                    || dataflow.first_close_in_range(def.reg, start..end).is_some()
+                    || dataflow
+                        .first_close_in_range(def.reg, start..end)
+                        .is_some_and(|close| !dataflow.has_unobserved_forward_exit_after(close))
                 {
                     // ProofIncomplete：后续退休也可能属于构造器 scratch 或尚未写完的
                     // 控制区，比较的 callee 也可能到合流块才覆盖；只读当前块不足以
                     // 证明声明。仅有保守 root 下界而没有原 CALL 也不签发声明身份。
                     return None;
                 }
+                // 退出清理不撤销此前的低槽保活义务；Close 后无观察地退出时，
+                // 声明保留到原 frame exit。中途关闭仍需独立词法区间证明。
                 dataflow
                     .minimum_rooted_prefix(start..end)
                     .is_some_and(|prefix| def.reg.index() < prefix)
@@ -5388,7 +5519,11 @@ impl ProtoPromotionFacts {
                 dataflow,
                 plan,
                 fixed_temps,
-            ),
+            )
+            .into_iter()
+            .chain(copy_result_prefixes.keys().copied())
+            .collect(),
+            source_result_prefixes: BTreeMap::new(),
             closed_capture_temps: BTreeSet::new(),
             uncaptured_definition_temps: BTreeSet::new(),
             comparison_result_writes,
@@ -6252,8 +6387,14 @@ impl ProtoPromotionFacts {
         });
         self.conditional_root_endpoints
             .retain(|endpoint, input| !temps.contains(endpoint) && !temps.contains(input));
-        self.inert_home_overwrites
-            .retain(|temp, _| !temps.contains(temp));
+        self.inert_home_overwrites.retain(|temp, value| {
+            if let InertHomeOverwrite::DefinedScalar(previous) = value
+                && previous.is_some_and(|previous| temps.contains(&previous))
+            {
+                *previous = None;
+            }
+            !temps.contains(temp)
+        });
         self.scalar_load_predecessors
             .retain(|result, (previous, _)| !temps.contains(result) && !temps.contains(previous));
         self.entry_nil_phi_temps
@@ -6271,6 +6412,9 @@ impl ProtoPromotionFacts {
         self.argument_root_producers
             .retain(|temp| !temps.contains(temp));
         self.source_frame_temps.retain(|temp| !temps.contains(temp));
+        self.scalar_copy_temps.retain(|temp| !temps.contains(temp));
+        self.source_result_prefixes
+            .retain(|temp, _| !temps.contains(temp));
         self.value_operand_prefix_calls
             .retain(|temp| !temps.contains(temp));
         self.unobserved_result_ends.retain(|producer, ends| {
@@ -6286,6 +6430,17 @@ impl ProtoPromotionFacts {
     /// 回边携带的前一轮写入不能冒充入口值；当前 HIR 的重入与 home 合并仍由消费者检查。
     pub(super) fn overwrites_entry_nil(&self, temp: TempId) -> bool {
         self.inert_home_overwrites.get(&temp) == Some(&InertHomeOverwrite::EntryNil)
+    }
+
+    /// 原操作的 canonical 结果由 SSA 数值/标量传播证明不持有 GC 根。
+    /// 改写后仍须携带同一操作来源；槽身份失效或定义退休即撤销此查询。
+    pub(super) fn operation_result_is_gc_inert(
+        &self,
+        source: crate::hir::common::HirSourceSite,
+    ) -> bool {
+        self.operation_result_temp(source).is_some_and(|temp| {
+            !self.temp_home_was_invalidated(temp) && self.scalar_copy_temps.contains(&temp)
+        })
     }
 
     /// 前层证明当前定义覆盖非资源旧值，后续 RHS 内联删除旧写时仍保留该事实。
@@ -8046,7 +8201,8 @@ fn collect_immediate_move_writes(
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum InertHomeOverwrite {
     EntryNil,
-    DefinedScalar,
+    /// 原覆盖的 canonical Def；phi/入口旧值仍只提供惰性值证明，不猜测具体身份。
+    DefinedScalar(Option<TempId>),
 }
 
 /// COPY 的旧槽责任沿同寄存器 phi 传给 region result，不能仅保留 canonical Def。
@@ -8205,14 +8361,21 @@ fn collect_inert_home_overwrites(
                 .def_overwritten_value(def.id)
                 .is_some_and(|value| dataflow.value_is_gc_inert(value))
         {
-            overwrites.insert(direct, InertHomeOverwrite::DefinedScalar);
+            let previous = match dataflow.def_overwritten_value(def.id) {
+                Some(SsaValue::Def(previous)) => fixed_temps.get(previous.index()).copied(),
+                _ => None,
+            };
+            overwrites.insert(direct, InertHomeOverwrite::DefinedScalar(previous));
             continue;
         }
         match dataflow.def_overwritten_value(def.id) {
             Some(SsaValue::Def(previous))
                 if !ssa_value_may_hold_gc_root(proto, dataflow, SsaValue::Def(previous)) =>
             {
-                overwrites.insert(direct, InertHomeOverwrite::DefinedScalar);
+                overwrites.insert(
+                    direct,
+                    InertHomeOverwrite::DefinedScalar(fixed_temps.get(previous.index()).copied()),
+                );
             }
             Some(SsaValue::Entry(reg))
                 if reg.index() >= param_count && Some(reg.index()) != vararg_param_reg =>

@@ -626,6 +626,7 @@ impl<'a> AstLowerer<'a> {
             if call.method == crate::hir::HirMethodCall::Implicit {
                 let (receiver, _) = call.method_receiver().expect("validated method receiver");
                 return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                    interpolation: call.interpolation.clone(),
                     receiver: self.lower_expr(proto_index, receiver)?,
                     method: method_name,
                     args,
@@ -639,6 +640,7 @@ impl<'a> AstLowerer<'a> {
             }
             let receiver = args.remove(0);
             return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                interpolation: call.interpolation.clone(),
                 receiver,
                 method: method_name,
                 args,
@@ -661,6 +663,7 @@ impl<'a> AstLowerer<'a> {
                 };
                 args.remove(0);
                 return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                    interpolation: call.interpolation.clone(),
                     receiver: access.base,
                     method: access.field,
                     args,

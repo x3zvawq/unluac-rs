@@ -229,6 +229,7 @@ impl FrameBuilder<'_> {
             method_key: call.method_key.clone(),
             callee_root_handoff: call.callee_root_handoff,
             method_rewrite_transaction: call.method_rewrite_transaction,
+            interpolation: None,
             plain_method_syntax: call.plain_method_syntax,
             boolean_prewrite_arguments: call.boolean_prewrite_arguments.clone(),
         };
@@ -622,6 +623,7 @@ impl FrameBuilder<'_> {
             method_key: call.method_key.clone(),
             callee_root_handoff: call.callee_root_handoff,
             method_rewrite_transaction: call.method_rewrite_transaction,
+            interpolation: None,
             plain_method_syntax: false,
             boolean_prewrite_arguments,
             frame_root_ends: call.frame_root_ends.clone(),

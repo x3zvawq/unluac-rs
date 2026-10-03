@@ -3,7 +3,7 @@
 //! 消费构造器步骤与 Promotion 原槽事实，由共享 FrameBuilder 核对写入和事件顺序。
 
 use super::*;
-use crate::hir::common::{HirBinding, HirRecordField};
+use crate::hir::common::{HirBinding, HirRecordField, HirTableAccess};
 use crate::hir::simplify::table_constructors::{ConstructorWrite, TableBinding, constructor_write};
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
@@ -2266,6 +2266,21 @@ impl FrameBuilder<'_> {
             }
         }
         Some(())
+    }
+
+    /// Lua 5.5 命名变参的直接索引总是准备寄存器键；捕获后的上值仍用普通表规则。
+    pub(super) fn table_key_uses_rk(&self, access: &HirTableAccess, key: &HirExpr) -> Option<bool> {
+        if self.dialect == DecompileDialect::Lua55
+            && self.native.is_some_and(|context| {
+                context
+                    .proto
+                    .vararg_param_local
+                    .is_some_and(|local| access.base == HirExpr::LocalRef(local))
+            })
+        {
+            return Some(false);
+        }
+        self.literal_uses_rk(key, Some((&access.sources, false)))
     }
 
     pub(super) fn literal_uses_rk(

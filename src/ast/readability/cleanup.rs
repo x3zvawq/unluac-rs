@@ -512,6 +512,10 @@ fn split_overwritten_call_result(
             unwrapped = inner;
         }
         match unwrapped {
+            AstExpr::MethodCall(call) if call.interpolation.is_some() => {
+                // 候选拒绝[TargetConstraint]：插值是单值表达式，不能作为独立调用语句。
+                return None;
+            }
             AstExpr::Call(_) | AstExpr::MethodCall(_) if call_index.is_none() => {
                 call_index = Some(index);
             }
@@ -884,7 +888,9 @@ fn collect_live_empty_bindings(
 fn into_call_kind(expr: AstExpr) -> Result<AstCallKind, AstExpr> {
     match expr {
         AstExpr::Call(call) => Ok(AstCallKind::Call(call)),
-        AstExpr::MethodCall(call) => Ok(AstCallKind::MethodCall(call)),
+        AstExpr::MethodCall(call) if call.interpolation.is_none() => {
+            Ok(AstCallKind::MethodCall(call))
+        }
         AstExpr::SingleValue(inner) => {
             into_call_kind(*inner).map_err(|inner| AstExpr::SingleValue(Box::new(inner)))
         }

@@ -6,6 +6,123 @@ use super::*;
 use crate::hir::common::HirCallArgumentRoot;
 use crate::transformer::ValuePack;
 
+/// 高槽单结果写回低槽后，后继比较或索引写仍从该结果之上的独立帧开始。
+/// 相邻 CALL 区间互不重叠；保留未覆盖的结果与 COPY，供完整源码帧消费。
+pub(super) fn copy_result_prefixes(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    dataflow: &DataflowFacts,
+    calls: &BTreeMap<InstrRef, NativeCallFacts>,
+    fixed: &[TempId],
+) -> BTreeMap<TempId, TempId> {
+    let mut prefixes = BTreeMap::new();
+    for ((&site, call), (&next_site, next)) in calls.iter().zip(calls.iter().skip(1)) {
+        let candidate = (|| {
+            let [result] = call.fixed_results.as_deref()? else {
+                return None;
+            };
+            let result_def = dataflow.defs.get(result.index())?;
+            if result_def.instr != site
+                || fixed[result.index()] != *result
+                || !graph.dominates(
+                    cfg.instr_to_block[site.index()],
+                    cfg.instr_to_block[next_site.index()],
+                )
+            {
+                return None;
+            }
+            let mut predicate = InstrRef(site.index() + 1);
+            let input;
+            let copied = if let Some(LowInstr::Move(copy)) = proto.instrs.get(predicate.index()) {
+                let [copy_id] = dataflow.instr_defs[predicate.index()].as_slice() else {
+                    return None;
+                };
+                let copy_def = &dataflow.defs[copy_id.index()];
+                let copied = TempId(copy_id.index());
+                if fixed[copied.index()] != copied
+                    || copy_def.reg.index() >= call.layout.home.slot()
+                    || copy_def.block != result_def.block
+                    || copy.src != result_def.reg
+                    || copy.dst != copy_def.reg
+                    || dataflow.use_value(copy_def.instr, copy.src) != SsaValue::Def(result_def.id)
+                {
+                    return None;
+                }
+                input = *copy_id;
+                predicate = InstrRef(predicate.index() + 1);
+                copied
+            } else {
+                return None;
+            };
+            let comparison = predicate < next_site
+                && next.layout.home.slot() == call.layout.home.slot() + 1
+                && matches!(proto.instrs.get(predicate.index()), Some(LowInstr::Branch(branch))
+                    if matches!(branch.cond.subject, crate::transformer::BranchSubject::Compare { .. }))
+                && dataflow.use_values[predicate.index()]
+                    .fixed
+                    .values()
+                    .any(|value| value == SsaValue::Def(input));
+            // SETTABLE 的 key 定义与 RHS 调用确定共同准备区；仅有后继高槽 CALL
+            // 不足以划分独立帧，它也可能消费前一个结果作为嵌套参数。
+            let indexed_key = (|| {
+                use crate::transformer::{AccessBase, AccessKey, ValueOperand};
+                let write_site = InstrRef(next_site.index() + 1);
+                let LowInstr::SetTable(write) = proto.instrs.get(write_site.index())? else {
+                    return None;
+                };
+                let (AccessBase::Reg(base), AccessKey::Reg(key), ValueOperand::Reg(value)) =
+                    (write.base, write.key, write.value)
+                else {
+                    return None;
+                };
+                let [rhs] = next.fixed_results.as_deref()? else {
+                    return None;
+                };
+                let rhs_definition = dataflow.defs.get(rhs.index())?;
+                let SsaValue::Def(key_def) = dataflow.use_value(write_site, key) else {
+                    return None;
+                };
+                let key_definition = &dataflow.defs[key_def.index()];
+                (base.index() < call.layout.home.slot()
+                    && key.index() == call.layout.home.slot() + 1
+                    && value.index() == key.index() + 1
+                    && next.layout.home.slot() == value.index()
+                    && rhs_definition.instr == next_site
+                    && rhs_definition.reg == value
+                    && fixed[rhs.index()] == *rhs
+                    && dataflow.use_value(write_site, value) == SsaValue::Def(rhs_definition.id)
+                    && key_definition.instr >= predicate
+                    && key_definition.instr < next_site
+                    && key_definition.block == cfg.instr_to_block[next_site.index()]
+                    && matches!(
+                        proto.instrs[key_definition.instr.index()],
+                        LowInstr::UnaryOp(_) | LowInstr::BinaryOp(_)
+                    ))
+                .then_some(())
+            })()
+            .is_some();
+            if !comparison && !indexed_key
+                || (site.index() + 1..next_site.index()).any(|index| {
+                    dataflow.instr_defs[index]
+                        .iter()
+                        .any(|def| dataflow.def_reg(*def) == result_def.reg)
+                        || dataflow.instr_effects[index]
+                            .open_must_def
+                            .is_some_and(|start| start <= result_def.reg)
+                })
+            {
+                return None;
+            }
+            Some((*result, copied))
+        })();
+        if let Some((result, copy)) = candidate {
+            prefixes.insert(result, copy);
+        }
+    }
+    prefixes
+}
+
 /// 冻结 operand 控制之前已求值、随后在消费谓词读取的 CALL 结果。
 /// 只查询原 Def 与计划节点，不从后层合成的条件声明或语句距离猜测边界。
 pub(super) fn value_operand_prefix_calls(

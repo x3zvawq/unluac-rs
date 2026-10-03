@@ -135,6 +135,7 @@ fn proven_direct_method_call(call: &AstCallExpr) -> Option<AstMethodCallExpr> {
         return None;
     }
     Some(AstMethodCallExpr {
+        interpolation: None,
         receiver: access.base.clone(),
         method: access.field.clone(),
         args: args.to_vec(),
@@ -207,6 +208,7 @@ pub(super) fn try_recover_certified_method_setup(
     Some((
         AstStmt::CallStmt(Box::new(AstCallStmt {
             call: AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                interpolation: None,
                 receiver: access.base.clone(),
                 method: access.field.clone(),
                 args: args.to_vec(),

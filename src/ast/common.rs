@@ -660,6 +660,8 @@ pub struct AstCallExpr {
 /// 方法调用。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstMethodCallExpr {
+    /// HIR 已证明的 Luau 插值片段；receiver 为原 format 模板，参数仍按顺序求值。
+    pub(crate) interpolation: Option<Vec<LuaString>>,
     pub receiver: AstExpr,
     pub method: String,
     pub args: Vec<AstExpr>,

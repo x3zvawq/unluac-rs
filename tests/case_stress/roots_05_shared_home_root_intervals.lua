@@ -1,4 +1,7 @@
 -- 多个独立物理根共享长运算后缀，跨回边后分别在原 home 的常量覆盖处退休。
+-- unluac: expect-ast-max [[local-binding]] [[16]] [[@proto=1]]
+-- unluac: expect-ast-count [[assign]] [[98]] [[@proto=1]]
+-- unluac: expect-instruction-count [[not]] [[64]] [[@proto=1]]
 local function run(a, done)
  local copy0
  local copy1

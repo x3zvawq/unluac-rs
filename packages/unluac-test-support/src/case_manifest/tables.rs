@@ -53,6 +53,32 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_tables/indexing_15_luau_key_writeback_frame.lua",
+        &[
+            "dynamic-key",
+            "call-frame",
+            "local-declaration",
+            "eval-order",
+            "convergence",
+        ],
+        "低槽索引写回消费原高槽长度输入；保留跨更高声明的后继覆盖身份，避免回编译增加中转变量。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/indexing_14_nested_dynamic_return.lua",
         &[
             "return",

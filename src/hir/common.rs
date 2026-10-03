@@ -988,6 +988,9 @@ pub(crate) struct HirSourceSite {
 /// 调用表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirCallExpr {
+    /// 完整 Luau 插值帧已证明模板、固定参数和结果 COPY；片段数比显式参数多一。
+    /// 仍按原 format 调用分析求值，AST/Generate 只消费已签发的插值语法。
+    pub(crate) interpolation: Option<Vec<LuaString>>,
     pub(crate) source_site: Option<HirSourceSite>,
     /// 恢复的调用必须重新内联；身份来自原展开帧内的操作，不冒充原 CALL。
     pub(crate) required_luau_inlining: Option<HirSourceSite>,

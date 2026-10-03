@@ -84,12 +84,12 @@ pub(super) fn remove_inert_value_releases(
     block(&mut proto.body, &inert)
 }
 
-/// 查询合成退休端点所归属的原覆盖及已物化身份；只接受完整 home 一致的单个旧根。
-pub(super) fn copy_release_local(
-    stmt: &HirStmt,
+/// 查询合成退休端点的原覆盖、可见身份及全部旧值版本；各版本须保持同一完整 home。
+pub(super) fn copy_release_local<'a>(
+    stmt: &'a HirStmt,
     overwrite: TempId,
     facts: &ProtoPromotionFacts,
-) -> Option<LocalId> {
+) -> Option<(LocalId, &'a [TempId])> {
     let HirStmt::Assign(release) = stmt else {
         return None;
     };
@@ -116,7 +116,7 @@ pub(super) fn copy_release_local(
             facts.promoted_local_for_temp(*temp) == Some(*local)
                 && facts.trusted_temp_home_slot(*temp) == Some(home)
         }))
-    .then_some(*local)
+    .then_some((*local, released))
 }
 
 /// Locals 已把旧根和无观察覆盖归到同一身份时，由原写承担退休。
@@ -164,6 +164,9 @@ pub(super) fn remove_coalesced_root_releases(
                 }
                 let reason = match write.values.fixed.as_slice() {
                     [HirExpr::Boolean(_)] => HirInlineRetentionReason::BooleanValueContext,
+                    [HirExpr::Integer(_) | HirExpr::Number(_)] => {
+                        HirInlineRetentionReason::RootOverwrite
+                    }
                     [HirExpr::LocalRef(input)] if input != local => {
                         HirInlineRetentionReason::RootOverwrite
                     }
@@ -173,10 +176,12 @@ pub(super) fn remove_coalesced_root_releases(
                 };
                 // 候选拒绝[ProofIncomplete]：展示身份相同不足以证明原覆盖；旧根、新 Def
                 // 和当前 Local 都须保有同一完整 home，且没有独立释放对象。
-                if copy_release_local(&pair[0], *overwrite, self.facts) != Some(*local) {
+                if copy_release_local(&pair[0], *overwrite, self.facts)
+                    .is_none_or(|(owner, _)| owner != *local)
+                {
                     continue;
                 }
-                // Boolean 或独立绑定读取不观察 GC；相邻、同身份的原写直接结束旧根。
+                // Boolean、数值或独立绑定读取不观察 GC；相邻、同身份的原写直接结束旧根。
                 // 两个真实写没有 release 来源，仍保留各自操作，不能当作重复 nil 清理。
                 removed[index] = true;
                 self.retained.push((*overwrite, *local, reason));
@@ -2013,7 +2018,18 @@ pub(super) fn collect_scalar_gc_root_lifetimes(
                     .unwrap_or_else(|| values.new_value(index, None)),
             ),
             HirExpr::TableAccess(_) => Some(values.new_value(index, None)),
-            HirExpr::Unary(_) | HirExpr::Binary(_) if !safety.result_is_gc_inert(value) => {
+            HirExpr::Unary(_) | HirExpr::Binary(_)
+                if !safety.result_is_gc_inert(value)
+                    && !match value {
+                        HirExpr::Unary(unary) => unary.source_site,
+                        HirExpr::Binary(binary) => binary.source_site,
+                        _ => unreachable!(),
+                    }
+                    .is_some_and(|source| {
+                        facts.operation_result_temp(source) == Some(temp)
+                            && facts.operation_result_is_gc_inert(source)
+                    }) =>
+            {
                 // 元方法可返回任意对象；独立结果槽在最后一次读取后仍可能是 GC root。
                 // 与 lookup 共用 identity/home 生命周期，不能把算术外形当作数值证明。
                 Some(values.new_value(index, None))

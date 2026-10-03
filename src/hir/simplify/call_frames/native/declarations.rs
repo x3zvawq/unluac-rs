@@ -6,6 +6,85 @@
 use super::*;
 use crate::hir::simplify::table_constructors::{ConstructorWrite, constructor_write};
 
+/// 每次插值重新在 callee 槽载入模板；该槽随后被 CALL 覆盖，不重扫前面的准备区。
+pub(super) fn interpolation_preparations(
+    flat: &[Option<FlatStmt<'_>>],
+    facts: &ProtoPromotionFacts,
+) -> BTreeMap<usize, usize> {
+    let mut literals = BTreeMap::new();
+    let mut starts = BTreeMap::new();
+    for (index, entry) in flat.iter().enumerate() {
+        let Some(entry) = entry else {
+            literals.clear();
+            continue;
+        };
+        if let Some((_, HirExpr::Call(call))) = scalar_local(entry.stmt)
+            && let Some(HirCallRootHandoff::MethodCallee(protocol)) = call.callee_root_handoff
+            && let Some(receiver) = facts
+                .method_setup_protocol(protocol)
+                .and_then(|setup| setup.receiver_temp)
+            && let Some(frame) = facts.native_call_frame(call)
+            && facts.trusted_temp_home_slot(receiver) == Some(frame.home)
+            && let Some((expression, key)) = call.method_receiver()
+            && key.as_bytes() == b"format"
+            && let Some(binding) = HirBinding::from_expr(expression)
+            && (facts.promoted_binding_for_temp(receiver) == Some(binding)
+                || binding == HirBinding::Temp(receiver))
+            && let Some(&start) = literals.get(&binding)
+        {
+            starts.insert(index, start);
+        }
+        crate::hir::visit::visit_stmt_header(
+            entry.stmt,
+            &mut BindingWriteCollector(|binding| {
+                literals.remove(&binding);
+            }),
+        );
+        if let Some((binding, HirExpr::String(_))) = scalar_binding(entry.stmt) {
+            literals.insert(binding, index);
+        }
+    }
+    starts
+}
+
+/// 插值的 CALL 与低槽 COPY 初始化同一源码声明；仅退休准备，保留声明身份及后续读取。
+pub(super) fn interpolation_initializer(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    run: &[&HirStmt],
+) -> Option<Plan> {
+    let HirStmt::LocalDecl(decl) = *run.last()? else {
+        return None;
+    };
+    let [target] = decl.bindings.as_slice() else {
+        return None;
+    };
+    let home = facts.trusted_local_home_slot(*target)?;
+    let mut builder = frame_builder(context, run, facts, DecompileDialect::Luau, home.slot())?;
+    let (_, _, _, original) = builder.interpolation_source(*target, run.len())?;
+    let value =
+        builder.interpolation_local(*target, run.len(), home.slot(), Some(original), true)?;
+    let start = builder.first_event?;
+    if builder.next_event != run.len() {
+        return None;
+    }
+    Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
+        start,
+        sink: run.len() - 1,
+        base: home,
+        values: vec![value].into(),
+        result_locals: vec![*target],
+        assignment_targets: Vec::new(),
+        luau_compound_global: false,
+        indexed_target: None,
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        replayed_effects: Vec::new(),
+        removed: Vec::new(),
+    })
+}
 /// 共同的 debug 生效边界证明这些声明属于同一 initializer，而非相邻的独立语句。
 pub(super) fn collect_debug_groups(
     context: NativeFrameContext<'_>,

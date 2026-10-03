@@ -68,6 +68,7 @@ impl<'a> MethodSinkPlan<'a> {
 
     pub(super) fn apply(self) -> AstStmt {
         let method = Box::new(AstMethodCallExpr {
+            interpolation: None,
             receiver: self.replacement.receiver.clone(),
             method: self.replacement.method.to_owned(),
             args: self.replacement.args.to_vec(),

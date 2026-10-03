@@ -86,6 +86,34 @@ impl<'a> Emitter<'a> {
         call: &AstMethodCallExpr,
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
+        if let Some(segments) = &call.interpolation {
+            if self.target.version != DecompileDialect::Luau {
+                return Err(GenerateError::UnsupportedFeature {
+                    dialect: self.target.version,
+                    feature: "string interpolation",
+                });
+            }
+            if segments.len() != call.args.len() + 1 {
+                return Err(GenerateError::UnprovenLuauInterpolation);
+            }
+            let mut parts = vec![Doc::text("`")];
+            for (index, segment) in segments.iter().enumerate() {
+                parts.push(Doc::text(super::syntax::format_interpolation_fragment(
+                    segment,
+                )));
+                if let Some(arg) = call.args.get(index) {
+                    parts.push(Doc::text("{"));
+                    if matches!(arg, AstExpr::TableConstructor(_)) {
+                        // 相邻 {{ 被 Luau lexer 视为损坏的插值分隔符。
+                        parts.push(Doc::text(" "));
+                    }
+                    parts.push(self.emit_expr(arg, function, 0, ExprSide::Standalone)?);
+                    parts.push(Doc::text("}"));
+                }
+            }
+            parts.push(Doc::text("`"));
+            return Ok(Doc::concat(parts));
+        }
         let receiver = self.emit_expr(&call.receiver, function, PREC_PREFIX, ExprSide::Left)?;
         let args = call
             .args
@@ -225,7 +253,11 @@ impl<'a> Emitter<'a> {
             }
             AstExpr::MethodCall(call) => (
                 self.emit_method_call_expr(call, function)?,
-                PREC_PREFIX,
+                if call.interpolation.is_some() {
+                    PREC_LITERAL
+                } else {
+                    PREC_PREFIX
+                },
                 Assoc::Left,
             ),
             AstExpr::SingleValue(expr) => (

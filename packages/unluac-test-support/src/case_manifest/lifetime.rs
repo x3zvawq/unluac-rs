@@ -2,6 +2,22 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_lifetime/copy_21_numeric_root_overwrite.lua",
+        &["gc", "copy", "numeric-overwrite", "loop", "physical-root"],
+        "两个旧根分别在整数与浮点覆盖处退休，跨回边观察首次覆盖后存活、第二次覆盖后释放。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_GE_52).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_GE_52).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_lifetime/scope_12_repeat_tail_root.lua",
         &["repeat", "scope", "gc", "branch", "metamethod"],
         "提前退出分支的落入路径保留对象根直到尾部表写入，内联条件准备不能提前结束原声明。",

@@ -11,6 +11,8 @@ use crate::hir::HirProtoRef;
 /// Generate 可能失败的原因。
 #[derive(Debug, Error)]
 pub enum GenerateError {
+    #[error("proven Luau interpolation lost its fixed argument shape")]
+    UnprovenLuauInterpolation,
     #[error("required Luau compound assignment has lost its proven shape")]
     UnprovenCompoundAssignment,
     #[error("required Luau inline frame cannot be emitted without its compiler contract")]

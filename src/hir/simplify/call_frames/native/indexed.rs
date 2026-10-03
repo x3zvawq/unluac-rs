@@ -586,28 +586,26 @@ pub(super) fn prepared_key(
             } else {
                 base
             });
-    let prepared_upvalue = if let HirExpr::LocalRef(local) = access.key {
+    let prepared = if let HirExpr::LocalRef(local) = access.key {
         builder
             .definition(local, builder.run.len())
-            .is_some_and(|index| {
-                matches!(
-                    scalar_local(builder.run[index]),
-                    Some((_, HirExpr::UpvalueRef(_)))
-                )
-            })
+            .and_then(|index| scalar_local(builder.run[index]).map(|(_, value)| value))
+            .unwrap_or(&access.key)
     } else {
-        false
+        &access.key
     };
-    let producer =
-        if prepared_upvalue || matches!(access.key, HirExpr::UpvalueRef(_) | HirExpr::TempRef(_)) {
-            let (producer, original) = builder.facts.table_key_value_preparation(access)?;
-            if original != home {
-                return None;
-            }
-            Some(producer)
-        } else {
-            None
-        };
+    let prepared_register = matches!(prepared, HirExpr::UpvalueRef(_))
+        || (tables::literal_rk(prepared)
+            && builder.table_key_uses_rk(access, prepared) == Some(false));
+    let producer = if prepared_register || matches!(access.key, HirExpr::TempRef(_)) {
+        let (producer, original) = builder.facts.table_key_value_preparation(access)?;
+        if original != home {
+            return None;
+        }
+        Some(producer)
+    } else {
+        None
+    };
     let previous_register_operand =
         std::mem::replace(&mut builder.register_operand, producer.is_none());
     let key = builder.expr(
@@ -631,6 +629,7 @@ pub(super) fn plan(
     dialect: DecompileDialect,
     assign: &HirAssign,
     rhs_live_after: bool,
+    retain_key_prefix: bool,
 ) -> Option<Plan> {
     let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
         return None;
@@ -701,7 +700,7 @@ pub(super) fn plan(
             return None;
         }
     }
-    // 候选拒绝[SemanticBarrier:BindingIdentity]：待退休的 RHS 值版本仍被后缀读取。
+    // 候选拒绝[SemanticBarrier:BindingIdentity]：RHS 仍被后缀读取，或其声明仍承接后继覆盖。
     // 现成低槽 RHS 不在本事务删除范围内；不能因此阻止其独立 key/base 准备。
     if result_binding.is_some() && rhs_live_after {
         return None;
@@ -829,8 +828,38 @@ pub(super) fn plan(
             result_binding,
         );
     }
-    // 先证明包含 key 准备的完整帧；若先把较低的 key 当成已有变量，
-    // 会把 #out + 1 等原准备永久冻结为声明。
+    let existing_key_frame = key_home.is_some_and(|key| {
+        facts.direct_table_write_input_home(access, 1) == Some(key)
+            && value_home.is_some_and(|value| key.slot() < value.slot())
+    });
+    let existing_key = || {
+        // key 也可以是循环变量等已有低槽输入，此时只准备 RHS。
+        // 仍由原 SETTABLE 输入身份及 scalar_rhs 的完整事件/前缀证明约束。
+        existing_key_frame
+            .then(|| {
+                scalar_rhs(
+                    context,
+                    run,
+                    facts,
+                    dialect,
+                    access,
+                    value,
+                    rhs,
+                    result_binding,
+                )
+            })
+            .flatten()
+    };
+    if retain_key_prefix && existing_key_frame {
+        // 已消费的高槽 RHS 仍可能依赖 key 的声明位置；没有新事件时不能删除它。
+        // 字面量准备不产生独立结果根，仍可由完整 key/RHS 事务共同恢复。
+        let plan = existing_key();
+        if plan.is_some() || prepared_literal.is_none() {
+            return plan;
+        }
+    }
+    // 没有后继声明依赖时，优先证明包含 key 准备的完整帧；
+    // 否则会把 #out + 1 等原准备永久冻结为声明。
     let prepared_key = (|| {
         let result = if literal_rhs || direct_rhs_home.is_some() {
             None
@@ -1096,28 +1125,7 @@ pub(super) fn plan(
             removed: Vec::new(),
         })
     })();
-    prepared_key.or_else(|| {
-        // key 也可以是循环变量等已有低槽输入，此时只准备 RHS。
-        // 仍由原 SETTABLE 输入身份及 scalar_rhs 的完整事件/前缀证明约束。
-        key_home
-            .is_some_and(|key| {
-                facts.direct_table_write_input_home(access, 1) == Some(key)
-                    && value_home.is_some_and(|value| key.slot() < value.slot())
-            })
-            .then(|| {
-                scalar_rhs(
-                    context,
-                    run,
-                    facts,
-                    dialect,
-                    access,
-                    value,
-                    rhs,
-                    result_binding,
-                )
-            })
-            .flatten()
-    })
+    prepared_key.or_else(existing_key)
 }
 
 /// Luau 的具名字段函数先创建闭包，再读取全局目标；这是声明帧，不能重发为普通赋值。

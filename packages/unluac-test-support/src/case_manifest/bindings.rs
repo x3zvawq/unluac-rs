@@ -2,6 +2,42 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_bindings/scalar_01_luau_length_frame.lua",
+        &["scalar", "length", "call-frame", "runtime-observer"],
+        "长度及数值运算不建立伪 GC 根，后继同槽字段读取与格式化帧保持声明数量及重编译收敛。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_bindings/assignment_16_reused_scalar_pair_proofs.lua",
+        &["parallel-assignment", "snapshot", "reuse"],
+        "重复值版本共享等价标量写回证书，保留低槽对象身份、标量值及每次调用的观察时点。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_bindings/scope_19_inlined_debug_result_scope.lua",
         &["scope", "debug", "inline", "capture", "runtime-observer"],
         "内联结果的首次写回必须处于 debug local 声明域内，不得泄漏为全局写入。",

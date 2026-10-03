@@ -123,6 +123,7 @@ pub(crate) fn lower_raw_table_set_call(
         method_key: None,
         callee_root_handoff: None,
         method_rewrite_transaction: None,
+        interpolation: None,
         plain_method_syntax: false,
         boolean_prewrite_arguments: Vec::new(),
     }
@@ -313,6 +314,7 @@ fn raw_table_get_expr(base: HirExpr, key: HirExpr) -> HirExpr {
         method_key: None,
         callee_root_handoff: None,
         method_rewrite_transaction: None,
+        interpolation: None,
         plain_method_syntax: false,
         boolean_prewrite_arguments: Vec::new(),
     }))

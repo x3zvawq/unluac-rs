@@ -943,12 +943,11 @@ impl FrameBuilder<'_> {
                     };
                     prepared.is_some_and(|value| {
                         tables::literal_rk(value)
-                            && self.literal_uses_rk(value, Some((&access.sources, false)))
-                                == Some(false)
+                            && self.table_key_uses_rk(access, value) == Some(false)
                     })
                 }
             {
-                // 池满后的 key 仍在原高槽 LOADK/LOADBOOL；沿唯一 use→Def
+                // 池满或命名变参的 key 仍在原高槽 LOADK/LOADBOOL；沿唯一 use→Def
                 // 消费尚未树化的准备 local，不把它误判成应保留的普通 COPY。
                 self.expr(
                     &access.key,
@@ -963,7 +962,7 @@ impl FrameBuilder<'_> {
                 self.register_operand(&access.key, before, key_slot)?
             }
         } else {
-            if self.literal_uses_rk(&access.key, Some((&access.sources, false))) != Some(true)
+            if self.table_key_uses_rk(access, &access.key) != Some(true)
                 || !matches!(
                     access.key,
                     HirExpr::String(_) | HirExpr::Integer(_) | HirExpr::Number(_)

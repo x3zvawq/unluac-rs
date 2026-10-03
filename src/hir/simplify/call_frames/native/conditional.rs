@@ -8,6 +8,481 @@ use crate::hir::common::{
 };
 use crate::hir::visit::for_each_nested_block;
 
+/// 比较写回低槽后，紧随的独立调用仍从方法结果槽之上开始。
+/// 把相邻 callee 声明改为同槽结果声明，保留两次调用之间的原结果根。
+pub(super) fn restore_comparison_call_results(
+    proto: &mut HirProto,
+    facts: &mut ProtoPromotionFacts,
+    dialect: DecompileDialect,
+) -> bool {
+    if dialect != DecompileDialect::Luau {
+        return false;
+    }
+    let mut reads = BTreeMap::<LocalId, usize>::new();
+    visit_stmts(
+        &proto.body.stmts,
+        &mut BindingReadCollector(|binding| {
+            if let HirBinding::Local(local) = binding {
+                *reads.entry(local).or_default() += 1;
+            }
+        }),
+    );
+    let mut flat = Vec::new();
+    flatten_scope(&proto.body, &mut 0, &mut flat);
+    let mut rewrites = BTreeMap::new();
+    let mut results = Vec::new();
+    for index in 0..flat.len() {
+        let candidate = (|| {
+            let entry = flat[index]?;
+            let next = flat.get(index + 1).copied().flatten()?;
+            let HirStmt::LocalDecl(decl) = entry.stmt else {
+                return None;
+            };
+            let ([local], [initializer], None) = (
+                decl.bindings.as_slice(),
+                decl.values.fixed.as_slice(),
+                &decl.values.tail,
+            ) else {
+                return None;
+            };
+            let HirStmt::Assign(assign) = next.stmt else {
+                return None;
+            };
+            let (target, value) = scalar_local(next.stmt)?;
+            let (HirExpr::Binary(binary), depth) = synthetic_not_subject(value) else {
+                return None;
+            };
+            let (call, lookup) = match (initializer, &binary.lhs) {
+                (HirExpr::TableAccess(access), HirExpr::Call(call))
+                    if call.callee == HirExpr::LocalRef(*local)
+                        && crate::hir::simplify::method_protocol::match_method_setup_pair(
+                            access,
+                            &call.callee,
+                            call,
+                        )
+                        .is_some()
+                        && reads.get(local) == Some(&1)
+                        && proto.local_debug_hints[local.index()].is_none()
+                        && proto.local_debug_scopes[local.index()].is_none()
+                        && decl.initializer_merge_transaction.is_none()
+                        && decl.generic_for_initializer_producer.is_none() =>
+                {
+                    (call, Some(access))
+                }
+                (HirExpr::Call(call), HirExpr::LocalRef(input)) if input == local => (call, None),
+                _ => return None,
+            };
+            let frame = facts.native_call_frame(call)?;
+            let result = facts.fixed_call_result(call, 0)?;
+            if lookup.is_none() && facts.call_result_requires_prefix(result) {
+                return None;
+            }
+            let comparison = facts.comparison_result_temp(binary)?;
+            let low = facts.trusted_temp_home_slot(comparison)?;
+            if !matches!(frame.results, Some(crate::transformer::ResultPack::Fixed(pack)) if pack.len == 1)
+                || lookup.is_some() && facts.promoted_local_for_temp(frame.callee) != Some(*local)
+                || facts.trusted_local_home_slot(*local) != Some(frame.home)
+                || facts
+                    .promoted_local_for_temp(result)
+                    .is_some_and(|known| known != *local)
+                || facts.trusted_temp_home_slot(result) != Some(frame.home)
+                || !facts.temp_definition_reference_unaliased(result)
+                || facts.promoted_local_for_temp(comparison) != Some(target)
+                || facts.trusted_local_home_slot(target) != Some(low)
+                || low.slot() >= frame.home.slot()
+            {
+                return None;
+            }
+            let consumer = following_written_argument_call(
+                &flat,
+                index + 2,
+                target,
+                comparison,
+                low,
+                frame.home,
+                facts,
+            )?;
+            let Some(access) = lookup else {
+                return Some((entry.id, next.id, *local, result, consumer, None));
+            };
+            let mut call = call.as_ref().clone();
+            call.callee = HirExpr::TableAccess(access.clone());
+            let mut declaration = decl.as_ref().clone();
+            declaration.values = vec![HirExpr::Call(Box::new(call))].into();
+            let mut assignment = assign.as_ref().clone();
+            let mut condition = &mut assignment.values.fixed[0];
+            for _ in 0..depth {
+                let HirExpr::Unary(unary) = condition else {
+                    unreachable!()
+                };
+                condition = &mut unary.expr;
+            }
+            let HirExpr::Binary(binary) = condition else {
+                unreachable!()
+            };
+            binary.lhs = HirExpr::LocalRef(*local);
+            Some((
+                entry.id,
+                next.id,
+                *local,
+                result,
+                consumer,
+                Some((declaration, assignment)),
+            ))
+        })();
+        if let Some((first, second, local, result, consumer, replacement)) = candidate {
+            if let Some((declaration, assignment)) = replacement {
+                rewrites.insert(first, HirStmt::LocalDecl(Box::new(declaration)));
+                rewrites.insert(second, HirStmt::Assign(Box::new(assignment)));
+            }
+            results.push((result, local, consumer));
+        }
+    }
+    if results.is_empty() {
+        return false;
+    }
+    visit_scope_mut(&mut proto.body, &mut 0, &mut |index, _, stmt| {
+        if let Some(replacement) = rewrites.remove(&index) {
+            *stmt = replacement;
+        }
+        Some(())
+    });
+    for (result, local, consumer) in results {
+        facts.record_temp_to_local_merge(result, local);
+        facts.record_result_prefix(result, consumer);
+        proto
+            .inline_dispositions
+            .promote_temp_to_local(result, local);
+    }
+    true
+}
+
+/// 已证明的高槽 Boolean initializer 若仍是后继调用前缀，恢复其声明及独立低槽 COPY。
+/// 使用现成计划的完整 RHS 证明；两个相邻语句原子改写，不另建表达式证明或扫描准备区。
+pub(super) fn restore_boolean_result_prefixes(
+    proto: &mut HirProto,
+    facts: &mut ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    plans: &[Plan],
+) -> bool {
+    if dialect != DecompileDialect::Luau {
+        return false;
+    }
+    let mut by_target = BTreeMap::new();
+    for (initial, result, home, value) in facts.boolean_value_prewrites() {
+        let Some(copy) = facts.value_result_copy(result) else {
+            continue;
+        };
+        let Some(target) = facts.promoted_local_for_temp(copy.target) else {
+            continue;
+        };
+        by_target
+            .entry(target)
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some((
+                initial,
+                result,
+                home,
+                value,
+                copy.target,
+                copy.target_home,
+            )));
+    }
+    if by_target.is_empty() {
+        return false;
+    }
+    let mut flat = Vec::new();
+    flatten_scope(&proto.body, &mut 0, &mut flat);
+    let positions = flat
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| entry.map(|entry| (entry.id, index)))
+        .collect::<BTreeMap<_, _>>();
+    let mut rewrites = BTreeMap::new();
+    let mut results = Vec::new();
+    for plan in plans {
+        let candidate = (|| {
+            let [HirLValue::Local(target)] = plan.assignment_targets.as_slice() else {
+                return None;
+            };
+            let (initial, result, home, initial_value, copied, low) =
+                by_target.get(target).copied().flatten()?;
+            let &position = positions.get(&plan.start)?;
+            let first = flat[position]?;
+            let sink = flat.get(position + 1).copied().flatten()?;
+            if sink.id != plan.sink
+                || plan.base != home
+                || plan.removed != [first.id]
+                || !plan.result_locals.is_empty()
+                || plan.values.tail.is_some()
+                || !matches!(
+                    plan.values.fixed.as_slice(),
+                    [HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)]
+                )
+                || low.slot() >= home.slot()
+            {
+                return None;
+            }
+            let consumer = following_written_argument_call(
+                &flat,
+                position + 2,
+                *target,
+                copied,
+                low,
+                home,
+                facts,
+            )?;
+            let HirStmt::LocalDecl(decl) = first.stmt else {
+                return None;
+            };
+            let ([local], [HirExpr::Boolean(value)], None) = (
+                decl.bindings.as_slice(),
+                decl.values.fixed.as_slice(),
+                &decl.values.tail,
+            ) else {
+                return None;
+            };
+            if *value != initial_value
+                || facts.promoted_local_for_temp(initial) != Some(*local)
+                || facts.trusted_local_home_slot(*local) != Some(home)
+                || proto.local_debug_hints[local.index()].is_some()
+                || proto.local_debug_scopes[local.index()].is_some()
+                || decl.initializer_merge_transaction.is_some()
+                || decl.generic_for_initializer_producer.is_some()
+            {
+                return None;
+            }
+            let HirStmt::Assign(assign) = sink.stmt else {
+                return None;
+            };
+            let mut declaration = decl.as_ref().clone();
+            declaration.values = plan.values.clone();
+            let mut assignment = assign.as_ref().clone();
+            assignment.values = vec![HirExpr::LocalRef(*local)].into();
+            Some((
+                first.id,
+                sink.id,
+                *local,
+                result,
+                consumer,
+                declaration,
+                assignment,
+            ))
+        })();
+        if let Some((first, second, local, result, consumer, declaration, assignment)) = candidate {
+            rewrites.insert(first, HirStmt::LocalDecl(Box::new(declaration)));
+            rewrites.insert(second, HirStmt::Assign(Box::new(assignment)));
+            results.push((result, local, consumer));
+        }
+    }
+    if rewrites.is_empty() {
+        return false;
+    }
+    visit_scope_mut(&mut proto.body, &mut 0, &mut |index, _, stmt| {
+        if let Some(replacement) = rewrites.remove(&index) {
+            *stmt = replacement;
+        }
+        Some(())
+    });
+    for (result, local, consumer) in results {
+        facts.record_temp_to_local_merge(result, local);
+        facts.record_result_prefix(result, consumer);
+        proto
+            .inline_dispositions
+            .promote_temp_to_local(result, local);
+        proto
+            .inline_dispositions
+            .preserve_local(local, HirInlineRetentionReason::PhysicalFramePrefix);
+    }
+    true
+}
+
+/// 删除结果声明必须由同一完整事务消费其指定调用；其它事务不能只留下低槽 COPY。
+/// 索引计划涉及的声明和调用一次，按 owner 比较依赖，不展开声明到全部后缀调用的边。
+pub(super) fn retain_prefix_producers(
+    proto: &HirProto,
+    facts: &ProtoPromotionFacts,
+    plans: &mut Vec<Plan>,
+    count: usize,
+) {
+    if plans.is_empty() {
+        return;
+    }
+    let mut declarations = vec![None; count];
+    let mut calls = vec![None; count];
+    let mut live = BTreeSet::new();
+    prefix::coordinates::visit(&proto.body, &mut 0, &mut |index, kind, stmt| {
+        if kind != PointKind::Statement {
+            return;
+        }
+        if let HirStmt::LocalDecl(decl) = stmt {
+            declarations[index] = Some(decl.bindings.as_slice());
+        }
+        if let HirStmt::CallStmt(call) = stmt {
+            calls[index] = call.call.source_site;
+            live.extend(call.call.source_site);
+        }
+    });
+    let requirements = facts
+        .source_result_prefixes()
+        .filter(|(_, consumer, _)| live.contains(consumer))
+        .collect::<Vec<_>>();
+    if requirements.is_empty() {
+        return;
+    }
+    let mut removers = BTreeMap::new();
+    let mut consumers = BTreeMap::new();
+    let owner = |map: &mut BTreeMap<_, Option<usize>>, key, start| {
+        map.entry(key)
+            .and_modify(|prior| {
+                if *prior != Some(start) {
+                    *prior = None;
+                }
+            })
+            .or_insert(Some(start));
+    };
+    for plan in plans.iter() {
+        let retained = plan.result_locals.iter().copied().collect::<BTreeSet<_>>();
+        for index in plan.removed.iter().copied().chain([plan.sink]) {
+            if let Some(source) = calls[index] {
+                consumers
+                    .entry(source)
+                    .and_modify(|prior| {
+                        if *prior != Some(plan.start) {
+                            *prior = None;
+                        }
+                    })
+                    .or_insert(Some(plan.start));
+            }
+        }
+        for &index in &plan.removed {
+            for &local in declarations[index].into_iter().flatten() {
+                if !retained.contains(&local) {
+                    owner(&mut removers, local, plan.start);
+                }
+            }
+        }
+    }
+    let rejected = requirements
+        .into_iter()
+        .filter_map(|(local, consumer, _)| {
+            let remover = removers.get(&local)?;
+            (remover.is_none() || consumers.get(&consumer) != Some(remover)).then_some(local)
+        })
+        .collect::<BTreeSet<_>>();
+    plans.retain(|plan| {
+        let retained = plan.result_locals.iter().copied().collect::<BTreeSet<_>>();
+        !plan.removed.iter().any(|&index| {
+            declarations[index].is_some_and(|locals| {
+                locals
+                    .iter()
+                    .any(|local| rejected.contains(local) && !retained.contains(local))
+            })
+        })
+    });
+}
+
+pub(super) fn require_result_prefixes(
+    proto: &HirProto,
+    removed: &[bool],
+    facts: &ProtoPromotionFacts,
+    candidates: &mut BTreeMap<usize, prefix::PrefixRequest>,
+) {
+    let mut live = BTreeSet::new();
+    prefix::coordinates::visit(&proto.body, &mut 0, &mut |index, kind, stmt| {
+        if kind == PointKind::Statement
+            && !removed[index]
+            && let HirStmt::CallStmt(call) = stmt
+        {
+            live.extend(call.call.source_site);
+        }
+    });
+    let required = facts
+        .source_result_prefixes()
+        .filter(|(_, consumer, _)| live.contains(consumer))
+        .map(|(local, _, home)| (local, home))
+        .collect::<BTreeMap<_, _>>();
+    if required.is_empty() {
+        return;
+    }
+    prefix::coordinates::visit(&proto.body, &mut 0, &mut |index, kind, stmt| {
+        if kind != PointKind::Statement || removed[index] {
+            return;
+        }
+        if let HirStmt::LocalDecl(decl) = stmt
+            && let [local] = decl.bindings.as_slice()
+            && let Some(&home) = required.get(local)
+        {
+            candidates.entry(index).or_insert(prefix::PrefixRequest {
+                home,
+                required: BTreeSet::new(),
+            });
+        }
+    });
+}
+
+fn following_written_argument_call(
+    flat: &[Option<FlatStmt<'_>>],
+    mut index: usize,
+    target: LocalId,
+    written: TempId,
+    low: HomeSlotKey,
+    result_home: HomeSlotKey,
+    facts: &ProtoPromotionFacts,
+) -> Option<crate::hir::common::HirSourceSite> {
+    let next = flat.get(index).copied().flatten()?;
+    let argument = if let Some((copied, HirExpr::LocalRef(source))) = scalar_local(next.stmt)
+        && *source == target
+    {
+        index += 1;
+        copied
+    } else {
+        target
+    };
+    let next = flat.get(index).copied().flatten()?;
+    let preparation = if let Some((local, HirExpr::GlobalRef(global))) = scalar_local(next.stmt)
+        && let crate::hir::common::HirOperationSources::Single(source) = global.sources
+    {
+        index += 1;
+        Some((local, source))
+    } else {
+        None
+    };
+    let HirStmt::CallStmt(caller) = flat.get(index).copied().flatten()?.stmt else {
+        return None;
+    };
+    let frame = facts
+        .native_call_frame(&caller.call)
+        .or_else(|| facts.native_fastcall_frame(&caller.call))?;
+    if frame.home.slot() != result_home.slot() + 1
+        || preparation.is_some_and(|(local, source)| {
+            caller.call.callee != HirExpr::LocalRef(local)
+                || facts.promoted_local_for_temp(frame.callee) != Some(local)
+                || facts.operation_result_temp(source) != Some(frame.callee)
+                || facts.trusted_local_home_slot(local) != Some(frame.home)
+        })
+    {
+        return None;
+    }
+    caller
+        .call
+        .args
+        .fixed
+        .iter()
+        .enumerate()
+        .any(|(index, value)| {
+            *value == HirExpr::LocalRef(argument)
+                && facts
+                    .call_argument_copy(&caller.call, index)
+                    .is_some_and(|copy| {
+                        copy.source == written
+                            && copy.source_home == low
+                            && copy.target_home.slot() > frame.home.slot()
+                    })
+        })
+        .then_some(caller.call.source_site?)
+}
+
 /// 仅在原结果槽内重发整棵值图，不把“允许控制极性恢复”误作单个旧根已结束。
 pub(super) fn lookup_value_plans(
     context: NativeFrameContext<'_>,

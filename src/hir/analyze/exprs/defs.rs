@@ -354,6 +354,7 @@ fn expr_for_fixed_call(
         method_key,
         callee_root_handoff: lower_call_root_handoff(lowering, instr_ref),
         method_rewrite_transaction: None,
+        interpolation: None,
         plain_method_syntax: false,
         boolean_prewrite_arguments: Vec::new(),
     })))

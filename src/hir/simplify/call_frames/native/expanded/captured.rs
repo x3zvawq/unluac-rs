@@ -462,6 +462,7 @@ fn captured_sum_call(
         method_key: None,
         callee_root_handoff: None,
         method_rewrite_transaction: None,
+        interpolation: None,
         plain_method_syntax: false,
         boolean_prewrite_arguments: Vec::new(),
     }))

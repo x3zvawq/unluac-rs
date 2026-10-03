@@ -2,6 +2,43 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_calls/results_13_writeback_before_callable.lua",
+        &["call-frame", "writeback", "closure", "captured-cell"],
+        "捕获 cell 的 CALL 写回不吞并后继低槽闭包声明；普通调用读取其返回值，观察 cell 改写、快照身份和两条结果路径。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/results_12_global_writeback.lua",
+        &[
+            "fixed-width",
+            "global-metamethod",
+            "eval-order",
+            "call-frame",
+        ],
+        "固定 CALL 结果按原逆序直接写回环境；观察对象身份、nil/false、额外返回值、异常中断及后继表写时点。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_calls/fastcall_12_parameter_writeback.lua",
         &["fastcall", "copy", "parameter", "call-frame"],
         "连续两次参数更新保留 CALL 低槽写回，下一 FASTCALL 的参数 COPY 不反挂到前一结果定义。",

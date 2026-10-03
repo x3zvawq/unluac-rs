@@ -2,6 +2,22 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_closures/scope_08_forwarded_global_root.lua",
+        &["closure", "global-write", "gc-root", "call-frame"],
+        "局部闭包转交全局后仍占低槽；后续调用清空全局并强制 GC 时，原局部根继续保活。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_closures/flow_05_terminal_capture_fallthrough.lua",
         &["branch", "capture", "return", "cell-identity", "recompile"],
         "已终止分支的引用捕获不污染另一条返回路径，保留各次调用的独立可写 cell。",

@@ -1361,6 +1361,20 @@ impl HirVisitor<'_> for ProtocolHomes<'_> {
                     .native_fastcall_frame(call)
                     .map(|frame| frame.home)
             });
+        if let Some(crate::hir::common::HirCallRootHandoff::MethodCallee(protocol)) =
+            call.callee_root_handoff
+            && let Some(receiver) = self
+                .facts
+                .method_setup_protocol(protocol)
+                .and_then(|setup| setup.receiver_temp)
+            && let Some((HirExpr::TempRef(current), _)) = call.method_receiver()
+            && *current == receiver
+            && self.facts.trusted_temp_home_slot(receiver) == frame_home
+        {
+            // 候选拒绝[LayerBoundary]：尚未消费的 SELF receiver 是调用准备，不是循环状态。
+            // 同槽分支模板各有独立 Def；先交给完整调用帧，不能合并后只留下旧协议身份。
+            self.frame_inputs.insert(receiver);
+        }
         if let Some(frame) = self.facts.native_call_frame(call)
             && let HirExpr::LocalRef(local) = call.callee
             && self.facts.promoted_local_for_temp(frame.callee) == Some(local)

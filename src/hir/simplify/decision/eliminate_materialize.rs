@@ -74,6 +74,7 @@ pub(super) fn extract_call_expr(
         method_key,
         callee_root_handoff,
         method_rewrite_transaction,
+        interpolation,
         plain_method_syntax,
         boolean_prewrite_arguments,
     } = call;
@@ -96,6 +97,7 @@ pub(super) fn extract_call_expr(
             method_key,
             callee_root_handoff,
             method_rewrite_transaction,
+            interpolation,
             plain_method_syntax,
             boolean_prewrite_arguments,
         },
@@ -883,6 +885,7 @@ fn collapse_call_to_pure(call: HirCallExpr, safety: HirExprSafety) -> Option<Hir
         method_key: call.method_key,
         callee_root_handoff: call.callee_root_handoff,
         method_rewrite_transaction: call.method_rewrite_transaction,
+        interpolation: call.interpolation,
         plain_method_syntax: false,
         boolean_prewrite_arguments: call.boolean_prewrite_arguments,
     })
