@@ -359,16 +359,8 @@ fn simplify_logical_or(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> O
                 .is_repeatable_in_single_value_context(lhs)
                 .then(|| lhs.clone())
         }
-        (HirExpr::LogicalAnd(inner), rhs) if rhs == &inner.rhs => {
-            // 候选拒绝[SemanticBarrier:EvalCount]：`(mark() and y) or y` 吸收成 `y` 会删除必达的 `mark()` 求值。
-            if !safety.is_discard_safe(&inner.lhs) {
-                return None;
-            }
-            // 候选拒绝[SemanticBarrier:EvalCount]：`(true and f()) or f()` 在首个 `f()` falsy 时调用两次，吸收后只调用一次。
-            safety
-                .is_repeatable_in_single_value_context(rhs)
-                .then(|| rhs.clone())
-        }
+        // PolicyBoundary：即使两侧读取同一稳定值，(guard and value) or value
+        // 仍包含原 guard 和 value 测试；值等价不授权把整个选择吸收为 value。
         _ => None,
     }
 }

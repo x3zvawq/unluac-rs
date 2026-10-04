@@ -617,7 +617,15 @@ fn collapse_shared_falsy_term(
 
     loop {
         let child = decision.nodes.get(child_ref.index())?;
-        if child.falsy != fallback {
+        // CurrentValue 的终端身份属于 child；同一 binding 与共同回退读取相同，
+        // 仍应保留 parent/child 两次原测试，不能先把 child 折成值再做等值消除。
+        let current_fallback = matches!(child.falsy, HirDecisionTarget::CurrentValue)
+            && matches!(
+                child.test,
+                HirExpr::TempRef(_) | HirExpr::LocalRef(_) | HirExpr::ParamRef(_)
+            )
+            && matches!(&fallback, HirDecisionTarget::Expr(expr) if *expr == child.test);
+        if child.falsy != fallback && !current_fallback {
             return None;
         }
         guard = logical_and(guard, child.test.clone());

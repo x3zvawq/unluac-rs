@@ -1,4 +1,6 @@
 -- Assignment-to-method syntax is retained as plain field syntax without explicit provenance.
+-- 保留构造声明前缀，尾调用不新增 callee 与参数接棒。
+-- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=13]]
 -- unluac: expect-contains [[.capture_root(p]]
 -- receiver 的独立根不能因缩写调用而删除；源码本身也是普通点调用。
 -- unluac: expect-contains [[.effectful_relaxed(]]

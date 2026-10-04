@@ -18,19 +18,6 @@ pub(super) fn parallel_preparations(
     if !matches!(dialect, DecompileDialect::Lua51 | DecompileDialect::Luajit) {
         return None;
     }
-    let group = nil_argument_group(entries.get(preparation_end)?.as_ref()?.stmt, facts);
-    let direct_targets = dialect == DecompileDialect::Luajit;
-    if direct_targets && group.is_none() {
-        return None;
-    }
-    let first_write = preparation_end + usize::from(group.is_some());
-    let width = group.as_ref().map_or(2, |group| group.len());
-    let end = first_write + width - 1;
-    let writes = entries
-        .get(first_write..=end)?
-        .iter()
-        .copied()
-        .collect::<Option<Vec<_>>>()?;
     fn parse(stmt: &HirStmt) -> Option<(&HirTableAccess, &HirExpr)> {
         let HirStmt::Assign(assign) = stmt else {
             return None;
@@ -44,11 +31,46 @@ pub(super) fn parallel_preparations(
         };
         assignments::plain_copy(stmt).then_some((access.as_ref(), value))
     }
+    let preparation = entries.get(preparation_end)?.as_ref()?.stmt;
+    let group = nil_argument_group(preparation, facts);
+    let local_group = local_nil_argument_group(preparation);
+    let group_width = group
+        .map(<[_]>::len)
+        .or_else(|| local_group.as_ref().map(|group| group.len()));
+    let first_write = preparation_end + usize::from(group_width.is_some());
+    // PUC 的最后一个 nil 可直接使用 RK；其余成员仍必须消费完整 LOADNIL。
+    // 这条常量写不占准备槽，不能把它算进批次的 home 连续性检查。
+    let rk_tail = dialect == DecompileDialect::Lua51
+        && group_width.is_some()
+        && entries
+            .get(first_write)
+            .and_then(Option::as_ref)
+            .and_then(|entry| parse(entry.stmt))
+            .is_some_and(|(access, value)| {
+                matches!(value, HirExpr::Nil)
+                    && facts
+                        .native_table_write_layout(access)
+                        .is_some_and(|layout| layout.value.is_none())
+                    && context.literal_uses_rk(value, Some((&access.sources, true)), dialect)
+                        == Some(true)
+            });
+    let direct_targets = dialect == DecompileDialect::Luajit || rk_tail;
+    if direct_targets && group_width.is_none() {
+        return None;
+    }
+    let prepared_width = group_width.unwrap_or(2);
+    let width = prepared_width + usize::from(rk_tail);
+    let end = first_write + width - 1;
+    let writes = entries
+        .get(first_write..=end)?
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()?;
     let (first, first_value) = parse(writes.last()?.stmt)?;
-    let (last, last_value) = parse(writes.first()?.stmt)?;
+    let (last, last_value) = parse(writes[usize::from(rk_tail)].stmt)?;
     if HirBinding::from_expr(first_value).is_none()
         || HirBinding::from_expr(last_value).is_none()
-        || facts.native_table_write_layout(first)?.value?.slot() + width - 1
+        || facts.native_table_write_layout(first)?.value?.slot() + prepared_width - 1
             != facts.native_table_write_layout(last)?.value?.slot()
     {
         return None;
@@ -60,7 +82,7 @@ pub(super) fn parallel_preparations(
         first_layout.base
     };
     // 先排除普通字段写；只有相邻写回确实属于同一并列帧时才索引准备区。
-    // JIT 直接左值没有前置准备；只索引这一条 nil 批次，拒绝时也不重扫增长前缀。
+    // 直接低槽左值不需要前置准备；只索引 nil 批次，拒绝时也不重扫增长前缀。
     let run_start = if direct_targets { preparation_end } else { 0 };
     let run = entries[run_start..first_write]
         .iter()
@@ -73,31 +95,41 @@ pub(super) fn parallel_preparations(
     for (offset, write) in writes.iter().rev().enumerate() {
         let (access, value) = parse(write.stmt)?;
         let layout = facts.native_table_write_layout(access)?;
-        let (producer, home) = if let Some(group) = &group {
-            let temp = group[offset];
-            if *value != HirExpr::TempRef(temp) {
+        if offset < prepared_width {
+            let (producer, home) = if group_width.is_some() {
+                let binding = group
+                    .and_then(|group| group.get(offset))
+                    .map(|temp| HirBinding::Temp(*temp))
+                    .or_else(|| {
+                        local_group
+                            .as_ref()
+                            .and_then(|group| group.get(offset))
+                            .map(|local| HirBinding::Local(*local))
+                    })?;
+                if HirBinding::from_expr(value) != Some(binding) {
+                    return None;
+                }
+                facts.table_nil_batch_preparation(access)?
+            } else {
+                let prepared = match HirBinding::from_expr(value) {
+                    Some(binding) => run
+                        .iter()
+                        .rev()
+                        .find_map(|stmt| {
+                            scalar_binding(stmt).filter(|(written, _)| *written == binding)
+                        })
+                        .map(|(_, value)| value)?,
+                    None => value,
+                };
+                facts.table_write_value_preparation(access, prepared)?
+            };
+            if layout.value != Some(home) || !direct_targets && layout.base.slot() != next {
                 return None;
             }
-            facts.table_nil_batch_preparation(access)?
-        } else {
-            let prepared = match HirBinding::from_expr(value) {
-                Some(binding) => run
-                    .iter()
-                    .rev()
-                    .find_map(|stmt| {
-                        scalar_binding(stmt).filter(|(written, _)| *written == binding)
-                    })
-                    .map(|(_, value)| value)?,
-                None => value,
-            };
-            facts.table_write_value_preparation(access, prepared)?
-        };
-        if layout.value != Some(home) || !direct_targets && layout.base.slot() != next {
-            return None;
+            rhs.push((value, producer, home));
         }
-        rhs.push((value, producer, home));
         if direct_targets {
-            // JIT 固定字段直接读取原低槽表，不额外制造左值快照。各次 SETTABLE
+            // 固定字段直接读取原低槽表，不额外制造左值快照。各次 SETTABLE
             // 仍按原逆序发布；整组 nil 由后面的 builder 一次消费并核对后缀。
             if layout.base.slot() >= base.slot()
                 || facts.direct_table_write_input_home(access, 0) != Some(layout.base)
@@ -176,6 +208,9 @@ pub(super) fn parallel_preparations(
             true,
             Some(producer),
         )?);
+    }
+    if rk_tail {
+        values.push(HirExpr::Nil);
     }
     let start = run_start + builder.first_event?;
     if builder.next_event != run.len() {
@@ -1388,12 +1423,12 @@ fn scalar_rhs(
     {
         return None;
     }
-    if matches!(rhs, HirExpr::Closure(_))
+    if matches!(rhs, HirExpr::Closure(_) | HirExpr::TableConstructor(_))
         && source
             .and_then(|source| facts.operation_result_temp(source))
-            .is_some_and(|temp| facts.temp_is_published_closure_declaration(temp))
+            .is_some_and(|temp| facts.temp_is_published_allocation_declaration(temp))
     {
-        // SemanticBarrier:PhysicalFramePrefix：原闭包槽在字段发布后仍被后续
+        // SemanticBarrier:PhysicalFramePrefix：原分配槽在字段发布后仍被后续
         // 观察保活；字段写不承担它的退休责任，须保留原声明作为低槽前缀。
         return None;
     }

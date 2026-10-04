@@ -2,6 +2,13 @@
 -- unluac: expect-ast-count [[goto]] [[0]]
 -- unluac: expect-ast-count [[label]] [[0]]
 -- unluac: expect-ast-count [[table-list-field]] [[3]] [[@proto=0]]
+-- 调用参数的混合短路不引入分支中转；后续构造器仍使用原声明前缀。
+-- unluac: expect-not-contains [[ = assert]]
+-- unluac: expect-contains [[assert(pair[1].disposed and not pair[2].disposed and Store[point] == pair)]] [[@debug=retained]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=8]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=18]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=26]]
+-- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=34]]
 -- An initializer may contain nil holes and be captured after its SETLIST.
 VALUES = { first = 7, third = 9 }
 local t = { VALUES.first, VALUES.missing, VALUES.third }

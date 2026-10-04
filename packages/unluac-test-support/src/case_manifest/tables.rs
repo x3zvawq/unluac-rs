@@ -2,6 +2,50 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_tables/constructor_17_low_key_prefix.lua",
+        &[
+            "constructor",
+            "key",
+            "source-prefix",
+            "debug-write",
+            "recompile",
+        ],
+        "低槽键声明保留原表位置，回调通过 debug.setlocal 写回同一个表绑定。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_16_published_root.lua",
+        &[
+            "constructor",
+            "gc-root",
+            "call-frame",
+            "publication",
+            "recompile",
+        ],
+        "字段发布后调用清空外部引用，保留原低槽表根、构造顺序及直接调用帧。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/constructor_15_reused_nil_initializer.lua",
         &["constructor", "nil", "identity", "recompile"],
         "嵌套构造器槽随后复用为 nil 声明时，由原初始化承接匿名占位，避免重编译增加声明。",
@@ -277,7 +321,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/fields_01_global_table_install_readability.lua",
         &["callbacks", "inline-alias", "table-constructor"],
         "把全局表字段安装恢复为直接构造器与函数字段，同时内联 make_level 的三个参数别名。",
-        &[LuaCaseConfiguration::new(PUC_LUA_51)],
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/order_01_table_checkpoint_new_pending_rollback.lua",
@@ -289,7 +338,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/indexing_01_generic_for_break_tail_binding.lua",
         &["binding", "break", "generic-for"],
         "break tail保持index/field binding作用域并正确增删forceFields。",
-        &[LuaCaseConfiguration::new(PUC_LUA_51)],
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/multireturn_01_discarded_table_open_tail.lua",
@@ -342,7 +396,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             "table-constructor",
         ],
         "用四种 producer/field 组合证明移入构造器的值仍只求值一次且遵守原求值顺序。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/order_03_table_constructor_pending_alias.lua",
@@ -376,7 +440,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             "table-lvalue",
         ],
         "保证条件调用先改变 holder.target，再求值所选 arm 的 table 地址。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/setlist_02_deferred_open_setlist.lua",
@@ -408,7 +477,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/constructor_02_table_candidate.lua",
         &["constructor", "early-stop", "nested-block"],
         "保证 block 早停后仍遍历并恢复后序嵌套表构造候选。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/order_05_lvalue_key_deferred_base.lua",
@@ -471,13 +545,23 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/capture_01_constructor_call_capture.lua",
         &["call", "closure", "constructor"],
         "保证constructor-call folding保留由field closure捕获的local。",
-        &[LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/fields_03_constructor_fields_other_return.lua",
         &["constructor", "field", "identity"],
         "保证折叠constructor fields不删除或改写无关return。",
-        &[LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/multireturn_02_constructor_value_arity.lua",
@@ -501,13 +585,23 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/constructor_03_constructor_nil_local_prefix.lua",
         &["constructor", "dependency", "nil-local", "ordering"],
         "区分独立nil local与被字段读取的nil local对empty-table字段折叠的阻断能力。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54])],
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54]).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/constructor_04_constructor_eventless_assignment_prefix.lua",
         &["assignment", "captured-local", "constructor", "ordering"],
         "区分eventless captured-local写与字段真实读取该local时的constructor折叠边界。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54])],
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54]).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/setlist_10_open_constructor_multiple_setlists.lua",
@@ -519,7 +613,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/capacity_01_indexed_array_capacity.lua",
         &["nil-hole", "tdup", "tnew"],
         "枚举 a/b/c 的8种 nil/false/value 组合，覆盖纯数组1–3项、混合0键/record、显式整数键与模板 nil 前缀，固定 TNEW/TDUP 数组布局穿过 LowInstr→HIR→constructor commit。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Luajit])],
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Luajit]).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/multireturn_03_call_root_handoff.lua",
@@ -543,7 +642,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/capacity_02_template_hash_keys.lua",
         &["hash-capacity", "sparse-key", "string-dump"],
         "区分模板原始键集合与构造后字段写入，覆盖稀疏5/8键、record键、静态nil marker、运行时name键和0槽，防止把新 key 静态化后提前改变 hash/array 扩容。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Luajit])],
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Luajit]).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/multireturn_04_table_result_nil_shape.lua",
@@ -568,7 +672,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/capacity_03_luau_table_preallocation.lua",
         &["capacity", "multiret", "newtable"],
         "覆盖NEWTABLE string key命名化、function sugar扩展、numeric/sparse容量，以及call/vararg开放尾字段在enabled两态的长度与值。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Luau])],
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Luau]).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/indexing_03_pending_integer_key_shadow.lua",
@@ -580,16 +689,25 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/constructor_05_constructor_nil_prefix.lua",
         &["call-barrier", "capture", "initializer", "nil-decl"],
         "八槽nil声明随后赋值并写入result，要求捕获get cell保留更新；另证明可调用initializer阻断更早nil事实，value最终为final。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/constructor_06_constructor_run_boundaries.lua",
         &["callee", "constructor", "method", "multi-return"],
         "8个带read闭包的返回值构造run不可跨非call return或后续callee起点错误合并。",
         &[
-            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -599,9 +717,13 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["callee", "capture", "constructor", "function-field"],
         "8个表交替用assignment/function sugar安装read，并以captured a/b相互引用，要求同一constructor call正确消费字段target。",
         &[
-            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -610,16 +732,25 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/constructor_07_closure_table_results.lua",
         &["constructor", "local-function", "normalization", "vararg"],
         "递归自捕获恢复local function，同时覆盖嵌套constructor、整数键、vararg/多返回及无序表摘要归一化。",
-        &[LuaCaseConfiguration::new(PUC_LUA_ALL)],
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/fields_05_constructor_roots.lua",
         &["constructor", "escape", "gc", "metamethod"],
         "区分可折叠私有子表、持外部resource及已escape owner；另观察index/len顺序。",
         &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -627,17 +758,26 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_tables/fields_06_luajit_field_observer.lua",
         &["cdata", "field-key", "metamethod"],
-        "cdata __eq把key从left改right，前后字段lookup必须使用各自快照。",
-        &[LuaCaseConfiguration::new(LUAJIT_ONLY)],
+        "cdata __eq把key从left改right，前后字段lookup必须使用各自快照，普通比较也完整恢复字段值。",
+        &[
+            LuaCaseConfiguration::new(LUAJIT_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/fields_07_table_fields.lua",
         &["constructor", "escape", "parallel-write", "weak-key"],
         "深层私有字段折叠与escaped/inserted/weak/callback/neighbor/captured拒绝路径完整对照。",
         &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -657,11 +797,15 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_tables/calls_02_constructor_call_frames.lua",
         &["call-frame", "constructor", "gc", "order"],
-        "覆盖open宽度、嵌套record求值序、callee snapshot、dispatch roots、previous activation、record scratch、callable number及branch may-union。",
+        "覆盖open宽度、嵌套record求值序、callee snapshot、dispatch roots、previous activation、record scratch、callable number、branch may-union及混合LOADNIL/RK并列字段写。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_51),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -671,9 +815,13 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["callee", "constructor", "gc", "phi"],
         "callee与tag都经phi时constructor仍属于receive参数区，形参清空但call未返回的窗口可观察。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL),
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -831,9 +979,13 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
         "前一CALL用过的槽立即成为混合表声明目标，list、record及动态表key的同槽复用不得拆散initializer。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL),
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -842,16 +994,25 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_tables/constructor_10_tables.lua",
         &["closure", "constructor", "dynamic-key", "nested-index"],
         "九组表基础覆盖混合构造器、元表、深层读写、动态key、嵌套调用和构造器闭包。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/constructor_11_nested_table_before_compaction.lua",
         &["constructor", "nested-table", "local-pressure"],
         "大型嵌套构造器在物理槽复用前保留完整 producer 身份及所有数组元素。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_51),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -861,9 +1022,13 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["capture", "nil-hole", "setlist"],
         "原全局安装与后续同槽表初始化保留分配及捕获时序，nil batch 的内容和长度保持一致。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_51),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],

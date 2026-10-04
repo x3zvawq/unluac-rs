@@ -348,7 +348,8 @@ pub(super) fn collapse_written_back_if_results(
                 && exit.get(&result).and_then(ExitValue::exact_binding) == Some(state)
         });
         if outer_bindings.contains(&result)
-            || promotion_facts.compacts_home_slots()
+            || result.was_compacted(promotion_facts)
+            || state.was_compacted(promotion_facts)
             || !bindings_share_exact_home_slot(result, state, promotion_facts)
             || !identity_facts.binding_merge_preserves_identity(result, state, promotion_facts)
         {

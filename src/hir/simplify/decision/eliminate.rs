@@ -2,7 +2,9 @@
 //!
 //! 将表达式抽取与值物化委托给专属子模块，输出可进入 AST 的普通 HIR 语句。
 
-use std::{collections::BTreeSet, mem};
+use std::mem;
+
+use super::super::call_frames::DeferredLookupDecisions;
 
 use crate::hir::common::{
     HirBlock, HirCallStmt, HirErrNil, HirExpr, HirLValue, HirLocalDecl, HirProto, HirReturn,
@@ -26,7 +28,7 @@ pub(crate) fn eliminate_remaining_decisions_in_proto(
     proto: &mut HirProto,
     promotion_facts: &mut ProtoPromotionFacts,
     safety: HirExprSafety,
-    deferred: &BTreeSet<LocalId>,
+    deferred: &DeferredLookupDecisions,
 ) -> bool {
     let first_new_local = proto.local_count;
     let mut captures = CaptureCollector::new(crate::hir::common::HirCaptureMode::ByReference);
@@ -53,7 +55,7 @@ fn eliminate_block(
     promotion_facts: &ProtoPromotionFacts,
     reference_captures: &ReferenceCapturedBindings,
     safety: HirExprSafety,
-    deferred: &BTreeSet<LocalId>,
+    deferred: &DeferredLookupDecisions,
 ) -> bool {
     let mut changed = false;
     let mut rewritten = Vec::with_capacity(block.stmts.len());
@@ -78,12 +80,20 @@ fn eliminate_stmt(
     stmt: HirStmt,
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
-    deferred: &BTreeSet<LocalId>,
+    deferred: &DeferredLookupDecisions,
 ) -> (Vec<HirStmt>, bool) {
     match stmt {
         // 完整值帧的操作证明已由 owner 核对；Final 在稳定前缀上重验并消费。
         HirStmt::LocalDecl(ref decl)
-            if decl.bindings.len() == 1 && deferred.contains(&decl.bindings[0]) =>
+            if decl.bindings.len() == 1 && deferred.locals.contains(&decl.bindings[0]) =>
+        {
+            (vec![stmt], false)
+        }
+        HirStmt::CallStmt(ref call)
+            if call
+                .call
+                .source_site
+                .is_some_and(|source| deferred.calls.contains(&source)) =>
         {
             (vec![stmt], false)
         }
@@ -479,7 +489,7 @@ fn eliminate_nested_blocks_in_stmt(
     stmt: &mut HirStmt,
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
-    deferred: &BTreeSet<LocalId>,
+    deferred: &DeferredLookupDecisions,
 ) -> bool {
     rewrite_nested_blocks_in_stmt(stmt, &mut |block| {
         eliminate_block(

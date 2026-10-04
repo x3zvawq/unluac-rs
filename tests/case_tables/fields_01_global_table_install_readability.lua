@@ -1,8 +1,9 @@
 -- regress_08_global_table_install_readability#1: inline recovered aliases in table field installs
 -- unluac: expect-contains [[return { objectName = p1_0, eggName = p1_1, hidden = p1_2 == true }]]
 -- unluac: expect-not-contains [[r1_0.objectName]]
--- unluac: expect-ast-min [[table-constructor]] [[3]]
--- unluac: expect-ast-min [[function]] [[3]]
+-- unluac: expect-ast-count [[table-constructor]] [[3]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[local-binding]] [[0]]
 g_level_scripts = {}
 
 function make_level(object_name, egg_name, hidden)
@@ -31,3 +32,6 @@ g_level_scripts.LevelP4_426.onBeforeLevelEnding()
 print("regress_08_global_table_install_readability#1", g_level_scripts.LevelP4_440.objectName)
 assert(g_level_scripts.LevelP4_440.objectName == "ExtraGoldenEgg_1")
 assert(g_level_scripts.LevelP4_444.hidden == true)
+
+assert(g_level_scripts.LevelP4_440.eggName == "LevelGE_9" and g_level_scripts.LevelP4_440.hidden == false)
+assert(g_level_scripts.LevelP4_444.objectName == "ExtraRubberDuck_1" and g_level_scripts.LevelP4_444.eggName == "LevelGE_10")

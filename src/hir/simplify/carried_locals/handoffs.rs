@@ -390,7 +390,8 @@ fn temp_handoff_preserves_storage(
     safety: &HandoffSafety<'_>,
 ) -> bool {
     let source = CarryBinding::Temp(temp);
-    !safety.promotion_facts.compacts_home_slots()
+    !source.was_compacted(safety.promotion_facts)
+        && !target.was_compacted(safety.promotion_facts)
         && bindings_share_exact_home_slot(source, target, safety.promotion_facts)
         && safety.identity_facts.binding_merge_preserves_identity(
             source,

@@ -1,4 +1,6 @@
 -- common_10_tables#1: 表构造器与索引
+-- unluac: expect-ast-count [[function]] [[20]]
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=0]]
 -- unluac: expect-not-contains [[local r1_1 = 1]]
 local function test_ctor_index()
     local t = {
@@ -28,6 +30,9 @@ local function test_metatable()
 end
 
 -- common_10_tables#3: 深层嵌套构造器
+-- 写表的左值快照、RHS 查表和算术应整体恢复，不留下构造器复用槽的接棒变量。
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=4]] [[@dialect=luau]]
+-- unluac: expect-ast-max [[assign]] [[1]] [[@proto=4]] [[@dialect=luau]]
 local function test_deep_ctor()
     local t = {
         root = {
@@ -54,6 +59,8 @@ local function test_deep_ctor()
 end
 
 -- common_10_tables#4: 深层查找与覆写
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=5]] [[@dialect=luau]]
+-- unluac: expect-ast-max [[assign]] [[2]] [[@proto=5]] [[@dialect=luau]]
 local function test_deep_lookup()
     local keys = { "left", "right" }
     local t = {
@@ -75,6 +82,8 @@ local function test_deep_lookup()
 end
 
 -- common_10_tables#5: 表压力测试
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=7]] [[@dialect=luau]]
+-- unluac: expect-ast-max [[assign]] [[1]] [[@proto=7]] [[@dialect=luau]]
 local function test_stress()
     local function table_stress()
         local t = {
@@ -122,6 +131,10 @@ local function test_crazy_init()
 end
 
 -- common_10_tables#7: 嵌套表调用索引
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=8]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[assign]] [[0]] [[@proto=8]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=12]] [[@dialect=luau]]
+-- unluac: expect-ast-max [[assign]] [[0]] [[@proto=12]] [[@dialect=luau]]
 local function test_nested_call()
     local function build(seed)
         return {
@@ -138,11 +151,16 @@ local function test_nested_call()
 
     local obj = build(4)
     local fn = obj:pick(4)
+    local other = build(9)
+    assert(other:pick(9)(1) == 10)
+    assert(obj.branch[4] == fn and obj.branch[9] == nil)
 
     print("common_10_tables#7", fn(8), obj.branch[4](2))
 end
 
 -- common_10_tables#8: 动态深层覆写
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=6]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[assign]] [[2]] [[@proto=6]] [[@dialect=luajit]]
 local function test_dynamic_overwrite()
     local suffix = "tail"
     local key = "slot_" .. suffix
@@ -165,6 +183,8 @@ local function test_dynamic_overwrite()
 end
 
 -- common_10_tables#9: 构造器与函数混合
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=17]] [[@dialect=luau]]
+-- unluac: expect-ast-max [[assign]] [[0]] [[@proto=17]] [[@dialect=luau]]
 local function test_ctor_function_mix()
     local function build(seed)
         return {

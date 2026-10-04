@@ -2,6 +2,10 @@
 -- unluac: expect-ast-count [[table-constructor]] [[4]]
 -- unluac: expect-ast-count [[table-list-field]] [[3]]
 -- unluac: expect-ast-count [[table-record-field]] [[3]]
+-- 整个 initializer 保持同一声明，不拆出 record/key 准备变量或字段写。
+-- unluac: expect-ast-max [[local-binding]] [[4]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-max [[assign]] [[1]]
 print("regress_646")
 local rows = { { 1 }, key = { value = 3 }, [{ 2 }] = 3 }
 assert(rows[1][1] == 1 and rows.key.value == 3)

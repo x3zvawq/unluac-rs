@@ -1,4 +1,12 @@
 -- NEWTABLE preserves capacity even when string keys can be printed as named fields.
+-- unluac: expect-ast-count [[table-constructor]] [[7]]
+-- 容量要求的后续字段写保持清晰，两个开放尾直接留在构造器中。
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=7]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=8]]
+-- unluac: expect-ast-count [[table-list-field]] [[2]] [[@proto=7]]
+-- unluac: expect-ast-count [[table-list-field]] [[2]] [[@proto=8]]
 local function grow(value)
     local result = { ["a"] = 1, ["b"] = nil, ["c"] = value, ["d"] = 4 }
     result.e = 5

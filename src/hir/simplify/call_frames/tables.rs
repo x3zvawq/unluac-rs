@@ -37,6 +37,17 @@ impl<'a> ConstructorShape<'a> {
             ConstructorWrite::Record { access, .. } => {
                 let key = access.key.table_key();
                 let allowed = match &self.table.allocation {
+                    // 零容量分配已完成空构造器；动态 key 也属于之后的普通字段写，
+                    // 不能认领其 CALL 准备，否则 indexed owner 永远无法恢复完整左值。
+                    HirTableAllocation::Indexed {
+                        array_capacity: 0,
+                        hash_bits: 0,
+                    } => false,
+                    HirTableAllocation::Luau(allocation)
+                        if allocation.array_capacity == 0 && allocation.hash_capacity == 0 =>
+                    {
+                        false
+                    }
                     // TNEW 未预留 hash 时，固定字符串字段不可能属于原初始化形状。
                     // 后续普通字段写会动态扩容，不能因此独占它的 CALL 准备区。
                     HirTableAllocation::Indexed { hash_bits: 0, .. }
@@ -71,12 +82,25 @@ impl<'a> ConstructorShape<'a> {
                 || self.records > allocation.hash_capacity as usize)
     }
 
-    /// 原批量分配形状已填满的肯定证明；其它分配协议不能借此认领独立求值边界。
-    pub(super) fn batched_complete(&self) -> bool {
+    /// 批量字段已填满，或原零容量空表已完成；不把分段构造的中间分配当作边界。
+    pub(super) fn has_complete_allocation(&self) -> bool {
         self.table
             .allocation
             .batched_capacity_matches(self.arrays, self.records)
             == Some(true)
+            || self.arrays == 0
+                && self.records == 0
+                && self.table.trailing_multivalue.is_none()
+                && match &self.table.allocation {
+                    HirTableAllocation::Luau(allocation) => {
+                        allocation.array_capacity == 0 && allocation.hash_capacity == 0
+                    }
+                    HirTableAllocation::Indexed {
+                        array_capacity,
+                        hash_bits,
+                    } => *array_capacity == 0 && *hash_bits == 0,
+                    _ => false,
+                }
     }
 
     pub(super) fn complete(&self) -> bool {
@@ -306,7 +330,25 @@ pub(super) fn nested_initializers<'a>(
                             })
                             .is_some_and(|home| facts.trusted_local_home_slot(key) == Some(home))
                     {
-                        indexed_keys.insert(*definition);
+                        let base_allocated_later = match &access.base {
+                            HirExpr::LocalRef(base) => definitions.get(base).is_some_and(|seed| {
+                                *seed > *definition
+                                    && preparations[*seed].is_some_and(|value| {
+                                        let HirExpr::TableConstructor(table) = value else {
+                                            return false;
+                                        };
+                                        matches!(table.sources, crate::hir::common::HirOperationSources::Single(source)
+                                            if facts.operation_result_temp(source).is_some_and(|result|
+                                                facts.table_write_base_value(access) == Some(result)))
+                                    })
+                            }),
+                            _ => false,
+                        };
+                        // 键在目标表分配前已完成，是构造器的低槽输入；不能把它
+                        // 预留为分配之后的左值准备，阻止原 CALL 独立初始化。
+                        if !base_allocated_later {
+                            indexed_keys.insert(*definition);
+                        }
                     }
                 }
             }
@@ -1670,14 +1712,26 @@ impl FrameBuilder<'_> {
                     access.key != HirExpr::Integer(i64::try_from(offset + 1).ok()?)
                 } else {
                     !matches!(access.key, HirExpr::Integer(_))
+                        && !self
+                            .facts
+                            .direct_table_write_input_home(access, 1)
+                            .is_some_and(|key| {
+                                key.slot() < self.base && self.direct_home(&access.key) == Some(key)
+                            })
                 }
             {
                 return None;
             }
             // 常量数字键在值之后准备；超出 TSETB 的键占用紧随值的 scratch。
-            // 动态键采用另一求值顺序，不由这个常量键构造器候选接管。
-            let (value, value_scratch) =
-                self.record_operand(value, layout.value, index, slot + 1)?;
+            // 已有低槽动态键不生成准备事件，仍在原 SETTABLE 读取；
+            // 需要计算的动态键采用另一求值顺序，不由这个候选接管。
+            let (value, value_scratch) = self.record_operand_impl(
+                value,
+                layout.value,
+                index,
+                slot + 1,
+                Some((&access.sources, true)),
+            )?;
             let (key, _) = self.record_operand_impl(
                 &access.key,
                 layout.key,
@@ -1685,14 +1739,14 @@ impl FrameBuilder<'_> {
                 slot + 1 + usize::from(value_scratch),
                 Some((&access.sources, false)),
             )?;
-            // 字面量字段会被 JIT 编译为模板；动态字段必须保留原 TNEW/逐项写入方式。
-            if crate::value_semantics::table::table_constant_kind(&value).is_some() {
+            // 键和值共同决定 JIT 是否使用模板；动态键的字面量值仍保持 TNEW/逐项写入。
+            if crate::value_semantics::table::initializes_template(&key, &value) {
                 return None;
             }
             if array_fields {
                 rebuilt.fields.push(HirTableField::Array(value));
             } else {
-                // 原数字 record 保留自身预分配，不能改成数组或从空表开始逐项扩容。
+                // record 保留自身预分配，不能改成数组或从空表开始逐项扩容。
                 rebuilt.fields.push(HirTableField::Record(HirRecordField {
                     write_sources: access.sources.clone(),
                     key,
@@ -1949,6 +2003,7 @@ impl FrameBuilder<'_> {
                         || self.completed_luau_template_layout(table, layout.value?.slot())
                         || self.luau_array_frame_matches(table, layout.value?.slot())
                         || self.luau_record_frame_matches(table, layout.value?.slot())
+                        || self.completed_constructor_layout(table, layout.value?).is_some()
                         // 已合并的内层模板由 expr/complete_constructor 逐字段核对，
                         // 不能要求它退回仅含常量的模板；其中仍可保留完整数组分配。
                         || matches!(table.allocation, HirTableAllocation::LuauTemplate { .. })
@@ -2203,10 +2258,7 @@ impl FrameBuilder<'_> {
                 .iter()
                 .all(|field| matches!(field, HirTableField::Record(_)))
         {
-            if table
-                .allocation
-                .batched_capacity_matches(0, table.fields.len())
-                != Some(true)
+            if !table.matches_allocation_capacity(0)
                 || !table.fields.iter().all(|field| {
                     matches!(field, HirTableField::Record(record)
                     if self.completed_record_field(record, home))
@@ -2288,6 +2340,14 @@ impl FrameBuilder<'_> {
         expr: &HirExpr,
         operand: Option<(&crate::hir::common::HirOperationSources, bool)>,
     ) -> Option<bool> {
+        if self.dialect == DecompileDialect::Luajit
+            && let Some((sources, true)) = operand
+            && self.facts.native_record_write_layout(sources).is_some()
+        {
+            // TSETV/TSETS/TSETB 的 value 都是寄存器；常量池可容纳该值
+            // 不等于字段写可省去原 LOAD。模板初值没有独立写来源，不经过此分支。
+            return Some(false);
+        }
         if matches!(
             self.dialect,
             DecompileDialect::Lua54 | DecompileDialect::Lua55 | DecompileDialect::Luajit
@@ -2418,7 +2478,12 @@ impl FrameBuilder<'_> {
                 // 已证明需寄存器的字面量仍重发原 LOAD，不能按普通 RK 字段拒绝其准备声明。
                 || (literal_rk(prepared) && self.literal_uses_rk(prepared, operand) == Some(false))
                 || matches!(prepared, HirExpr::Binary(binary)
-                    if binary.op == crate::hir::HirBinaryOpKind::Concat),
+                    if binary.op == crate::hir::HirBinaryOpKind::Concat
+                        // 比较字段同样物化 Boolean 值；原 phi 必须写入这次 TSET 的
+                        // scratch，操作数及事件顺序仍由共享比较帧逐项证明。
+                        || self.dialect == DecompileDialect::Luajit
+                            && self.facts.comparison_result_temp(binary).is_some_and(|result|
+                                self.facts.trusted_temp_home_slot(result) == Some(home))),
             producer,
         )?;
 

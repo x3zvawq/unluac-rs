@@ -1,3 +1,8 @@
+-- unluac: expect-ast-count [[generic-for]] [[3]]
+-- unluac: expect-ast-count [[break]] [[2]]
+-- unluac: expect-ast-count [[function]] [[3]]
+-- unluac: expect-ast-count [[table-constructor]] [[16]]
+-- unluac: expect-ast-max [[local-binding]] [[16]]
 -- regress_19_generic_for_break_tail_binding#1: generic-for break tail keeps loop bindings in scope
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[table.remove]]
@@ -138,3 +143,38 @@ print(
     removed_index,
     registry.forceFieldtarget == nil
 )
+
+-- 尾部删除必须继续使用命中项的 index；旧列表别名也应观察同一次修改。
+local fields = objects.world.target.forceFields
+assert(fields[2].point and fields[2].force == 3)
+assert(fields[2].uniformForceFieldType == "pull" and fields[2].forceX == 4 and fields[2].forceY == 5)
+update_field("new", "target", false)
+assert(removed_index == 2 and #fields == 1 and fields[1].forceFieldName == "source")
+update_field("source", "target", false)
+assert(#fields == 0 and objects.world.target.forceFields == nil)
+assert(field_names(objects.world.target.forceFields) == "nil")
+
+-- 列表不存在时分别建立 field/point；无匹配删除和重复添加不得破坏注册闭包。
+update_field("source", "target", true)
+fields = objects.world.target.forceFields
+assert(#fields == 1 and fields[1].forceFieldName == "source" and fields[1].field)
+assert(fields[1].uniformForceFieldType == "wind" and fields[1].forceX == 1 and fields[1].forceY == 2)
+assert(registry.forceFieldtarget() == "target")
+update_field("old", "target", false)
+update_field("source", "target", true)
+assert(#fields == 1 and registry.forceFieldtarget() == "target")
+update_field("source", "target", false)
+assert(objects.world.target.forceFields == nil and registry.forceFieldtarget == nil)
+update_field("new", "target", true)
+fields = objects.world.target.forceFields
+assert(#fields == 1 and fields[1].forceFieldName == "new" and fields[1].point)
+assert(fields[1].force == 3 and fields[1].forceX == 4 and fields[1].forceY == 5)
+assert(fields[1].uniformForceFieldType == "pull" and registry.forceFieldtarget() == "target")
+update_field("source", "target", true)
+assert(#fields == 2 and fields[2].forceFieldName == "source" and fields[2].field)
+assert(fields[2].uniformForceFieldType == "wind" and fields[2].forceX == 1 and fields[2].forceY == 2)
+update_field("source", "target", false)
+assert(#fields == 1 and removed_index == 2)
+update_field("new", "target", false)
+update_field("source", "target", false)
+assert(objects.world.target.forceFields == nil and registry.forceFieldtarget == nil and removed_index == 1)

@@ -327,7 +327,8 @@ pub(super) fn collect_captured_slot_targets(
             let initializer = debug_initializer
                 .or_else(|| restored_initializers.get(&start_instr).copied())
                 .or_else(|| {
-                    let initial = dataflow.def_instr(*entry_initializers.get(&reg)?).index();
+                    let initial_def = *entry_initializers.get(&reg)?;
+                    let initial = dataflow.def_instr(initial_def).index();
                     let capture_block = cfg.instr_to_block[instr_index];
                     if graph.block_is_cyclic(capture_block) {
                         // 入口初始化不参与回边，且捕获仍处于同一 CLOSE epoch，才证明是
@@ -340,11 +341,16 @@ pub(super) fn collect_captured_slot_targets(
                         {
                             return None;
                         }
-                    } else if !matches!(
-                        dataflow.use_value(InstrRef(instr_index), reg),
-                        SsaValue::Phi(_)
-                    ) {
-                        return None;
+                    } else {
+                        let reaching = dataflow.use_value(InstrRef(instr_index), reg);
+                        // 直线重赋值也可接收原入口初始化；必须由 SSA 证明它直接覆盖
+                        // 未读的首写，不能仅按同槽把不同声明或中间版本接到捕获 cell。
+                        let overwrites_initial = matches!(reaching, SsaValue::Def(def)
+                            if dataflow.defs[def.index()].block == cfg.entry_block
+                                && dataflow.def_overwritten_value(def) == Some(SsaValue::Def(initial_def)));
+                        if !matches!(reaching, SsaValue::Phi(_)) && !overwrites_initial {
+                            return None;
+                        }
                     }
                     (initial < start_instr
                         && epochs.epoch_at(reg, InstrRef(initial))

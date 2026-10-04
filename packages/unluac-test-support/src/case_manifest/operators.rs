@@ -2,6 +2,22 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_operators/boolean_43_mixed_lookup_decision.lua",
+        &["short-circuit", "lookup", "call-frame", "metamethod", "gc"],
+        "嵌套查表、反向谓词及动态键比较恢复为直接短路返回和调用参数，保留 nil/false、元方法次序与原结果根替换。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_operators/boolean_41_inlined_ordered_condition_suffix.lua",
         &[
             "short-circuit",

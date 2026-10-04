@@ -17,6 +17,10 @@ pub(in crate::hir::simplify) enum CarryBinding {
 }
 
 impl CarryBinding {
+    pub(super) fn was_compacted(self, facts: &ProtoPromotionFacts) -> bool {
+        facts.binding_was_compacted(carry_capture_binding(self))
+    }
+
     pub(in crate::hir::simplify) const fn local(self) -> Option<LocalId> {
         match self {
             Self::Local(local) => Some(local),
@@ -243,6 +247,8 @@ pub(super) fn record_binding_merge(
     if source == target {
         return;
     }
+    promotion_facts
+        .propagate_binding_compaction(carry_capture_binding(source), carry_capture_binding(target));
     let source_definition_write_homes = match source {
         CarryBinding::Param(param) => {
             promotion_facts.supplemental_param_definition_write_homes(param)

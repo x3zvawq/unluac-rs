@@ -1,7 +1,22 @@
-//! 恢复准备值到上值与表字段的完整赋值帧，支持单目标及同批写回。
+//! 恢复准备值到局部、上值与表字段的完整赋值帧，支持单目标及同批写回。
 //! 原操作提供输入版本和槽位；共享 builder 验证左值、RHS 准备及目标方言的写回顺序。
 
 use super::*;
+
+type LocalCopies<'a> =
+    BTreeMap<(LocalId, LocalId), Option<&'a crate::hir::promotion::ImmediateMoveWrite>>;
+
+fn local_copy<'a>(
+    assign: &crate::hir::common::HirAssign,
+    copies: &LocalCopies<'a>,
+) -> Option<&'a crate::hir::promotion::ImmediateMoveWrite> {
+    let ([HirLValue::Local(target)], [HirExpr::LocalRef(source)]) =
+        (assign.targets.as_slice(), assign.values.fixed.as_slice())
+    else {
+        return None;
+    };
+    *copies.get(&(*source, *target))?
+}
 
 fn write(stmt: &HirStmt) -> Option<&crate::hir::common::HirAssign> {
     let HirStmt::Assign(assign) = stmt else {
@@ -10,7 +25,7 @@ fn write(stmt: &HirStmt) -> Option<&crate::hir::common::HirAssign> {
     (plain_copy(stmt)
         && matches!(
             assign.targets.as_slice(),
-            [HirLValue::Upvalue(_) | HirLValue::TableAccess(_)]
+            [HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::TableAccess(_)]
         )
         && assign.values.fixed.len() == 1
         && assign.values.tail.is_none())
@@ -20,8 +35,10 @@ fn write(stmt: &HirStmt) -> Option<&crate::hir::common::HirAssign> {
 fn input_home(
     assign: &crate::hir::common::HirAssign,
     facts: &ProtoPromotionFacts,
+    copies: &LocalCopies<'_>,
 ) -> Option<HomeSlotKey> {
     match &assign.targets[0] {
+        HirLValue::Local(_) => Some(local_copy(assign, copies)?.source_home),
         HirLValue::Upvalue(_) => Some(facts.upvalue_write_value(assign)?.1),
         HirLValue::TableAccess(access) => facts
             .native_table_write_layout(access)
@@ -78,7 +95,27 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
     flat: &[Option<FlatStmt<'_>>],
+    following: &[FollowingFrameFloor],
 ) -> BTreeMap<usize, (Plan, usize)> {
+    // 每轮只投影一次原 COPY 身份；同一绑定对存在多个版本时不按名称选择旧写回。
+    let copies = facts
+        .result_copy_frames()
+        .filter_map(|copy| {
+            Some((
+                (
+                    facts.promoted_local_for_temp(copy.source?)?,
+                    facts.promoted_local_for_temp(copy.target)?,
+                ),
+                copy,
+            ))
+        })
+        .fold(BTreeMap::new(), |mut copies, (key, copy)| {
+            copies
+                .entry(key)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(copy));
+            copies
+        });
     let mut result = BTreeMap::new();
     let mut index = 0;
     while index < flat.len() {
@@ -109,7 +146,7 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
                 index += 1;
                 continue;
             }
-            let Some(home) = input_home(assign, facts) else {
+            let Some(home) = input_home(assign, facts, &copies) else {
                 break;
             };
             if let Some(previous) = previous_home {
@@ -139,7 +176,15 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
             .iter()
             .map(|entry| entry.unwrap())
             .collect::<Vec<_>>();
-        if let Some((plan, first)) = candidate(context, facts, dialect, &definitions, &writes) {
+        if let Some((plan, first)) = candidate(
+            context,
+            facts,
+            dialect,
+            &definitions,
+            &writes,
+            &copies,
+            following[index - 1].all,
+        ) {
             result.insert(start + first, (plan, index - 1));
         }
     }
@@ -152,13 +197,15 @@ fn candidate(
     dialect: DecompileDialect,
     definitions: &[FlatStmt<'_>],
     writes: &[FlatStmt<'_>],
+    copies: &LocalCopies<'_>,
+    following_floor: Option<usize>,
 ) -> Option<(Plan, usize)> {
     let mut ordered = writes.to_vec();
     if dialect != DecompileDialect::Luau {
         ordered.reverse();
     }
     let first = write(ordered.first()?.stmt)?;
-    let rhs_base = input_home(first, facts)?;
+    let rhs_base = input_home(first, facts, copies)?;
     let run = definitions
         .iter()
         .map(|entry| entry.stmt)
@@ -168,6 +215,12 @@ fn candidate(
         .iter()
         .map(|entry| write(entry.stmt).map(|assign| assign.targets[0].clone()))
         .collect::<Option<Vec<_>>>()?;
+    if targets
+        .iter()
+        .all(|target| matches!(target, HirLValue::Local(_)))
+    {
+        return None;
+    }
     if targets.len() == 1 && matches!(targets[0], HirLValue::TableAccess(_)) {
         // 候选拒绝[ProofIncomplete]：单字段写可能仍属于尚未完成的构造器。
         // 其构造器根与后继字段由 indexed/tables owner 一起消费；这里只扩展并列写回。
@@ -199,6 +252,14 @@ fn candidate(
         {
             let (_, home) = facts
                 .table_write_base_preparation(access, prepared_value(&builder, &access.base))?;
+            // 后继准备区之前的低槽表仍是声明前缀，不能把 initializer 拖进左值。
+            // 下界包含中途的原重声明；被新 a0/a1 接替的目标快照不能只凭更晚 CALL 保留。
+            // 此处只选择候选身份，最终声明栈仍由 preview 验证。
+            if following_floor.is_some_and(|floor| home.slot() < floor)
+                && facts.direct_table_write_input_home(access, 0) == Some(home)
+            {
+                continue;
+            }
             if home.slot() < base.slot() {
                 base = home;
             }
@@ -289,11 +350,12 @@ fn candidate(
     for (offset, entry) in ordered.iter().enumerate() {
         let assign = write(entry.stmt)?;
         let value = &assign.values.fixed[0];
+        builder.result_move = None;
         if offset + 1 == ordered.len() && literal_write(context, facts, dialect, assign) {
             values.push(value.clone());
             continue;
         }
-        let home = input_home(assign, facts)?;
+        let home = input_home(assign, facts, copies)?;
         // 末项现成低槽没有准备指令，不能先向标量 producer 查询再判断是否直读。
         if home.slot() < rhs_base.slot() {
             if dialect == DecompileDialect::Luau
@@ -306,6 +368,26 @@ fn candidate(
             continue;
         }
         let (producer, prepared_home) = match &assign.targets[0] {
+            HirLValue::Local(target) => {
+                let copy = local_copy(assign, copies)?;
+                let source = copy.source?;
+                let source_local = facts.promoted_local_for_temp(source)?;
+                if facts.trusted_local_home_slot(*target) != Some(copy.target_home)
+                    || copy.target_home.slot() >= base.slot()
+                    || context.barred.contains(&copy.source_home)
+                    || context.closed.contains(&copy.source_home)
+                    || context.closed.contains(&copy.target_home)
+                {
+                    // ProofIncomplete:BindingIdentity：只消费已有低槽的原写回，不接走后继准备或跨关闭身份。
+                    return None;
+                }
+                builder.result_move = Some((
+                    source_local,
+                    builder.definition(source_local, run.len())?,
+                    BTreeSet::from([copy.target_home]),
+                ));
+                (Some(source), copy.source_home)
+            }
             HirLValue::Upvalue(_) => facts.upvalue_write_value(assign)?,
             HirLValue::TableAccess(access) => {
                 let prepared = prepared_value(&builder, value);

@@ -1,6 +1,8 @@
 -- callee 与后续参数各自经过 phi，不会改变原构造器属于接收 CALL 参数区的事实。
 -- 必须观察接收函数已经清空形参、但调用尚未返回的窗口；仅检查后面的槽覆盖会漏报。
 -- unluac: expect-not-contains [[unluac error]]
+-- 条件 callee 与参数保留完整表达式，最多保留原 answer 声明。
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=6]]
 local weak = setmetatable({}, {__mode = "v"})
 local function resource()
     return {}

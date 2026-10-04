@@ -118,3 +118,25 @@ write_dynamic_keys("left", "right")
 assert(key_evaluations == 2 and #dynamic_writes == 2)
 assert(string.match(dynamic_writes[1], ":2:right$") and string.match(dynamic_writes[2], ":1:left$"))
 print("parallel_dynamic_targets", table.concat(dynamic_writes, ","))
+
+-- 字段回调先观察并改写旧 cell，随后原低槽 MOVE 才安装 CALL 结果。
+-- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=13]]
+local function write_mixed_targets()
+    local object
+    local calls = 0
+    local function produce()
+        assert(object == nil)
+        calls = calls + 1
+        return {tag = "fresh"}
+    end
+    local target = setmetatable({}, {__newindex = function(_, key, value)
+        assert(object == nil and calls == 1)
+        assert(key == "value" and value == false)
+        object = {tag = "callback"}
+    end})
+    object, target.value = produce(), false
+    assert(object.tag == "fresh" and calls == 1)
+    return object.tag
+end
+assert(write_mixed_targets() == "fresh")
+print("parallel_mixed_targets", "OK")

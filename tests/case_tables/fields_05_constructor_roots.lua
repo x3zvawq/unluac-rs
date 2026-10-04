@@ -1,4 +1,10 @@
 -- 未暴露的新建子表可合并，持有外部资源或已经暴露的 owner 则不能借此删除独立根。
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=4]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[local-binding]] [[18]]
+-- unluac: expect-ast-count [[table-constructor]] [[15]]
+-- unluac: expect-ast-count [[function]] [[10]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
+-- unluac: expect-ast-max [[if]] [[3]]
 local weak = setmetatable({}, {__mode = "v"})
 local function watch(label)
     return setmetatable({}, {

@@ -185,15 +185,17 @@ impl Restore<'_> {
                 .is_some_and(|home| self.facts.trusted_local_home_slot(*local) == Some(home))
     }
 
-    fn restore_single_pass_initializers(&self, block: &mut HirBlock) -> bool {
+    fn restore_adjacent_initializers(&self, block: &mut HirBlock) -> bool {
         let mut declarations = Vec::new();
         let mut bindings = Vec::new();
         let mut changed = false;
+        let mut removed = BTreeSet::new();
         for index in 0..block.stmts.len() {
             match &mut block.stmts[index] {
                 HirStmt::LocalDecl(decl)
                     if decl.values.is_empty()
                         && decl.initializer_merge_transaction.is_none()
+                        && decl.generic_for_initializer_producer.is_none()
                         && decl
                             .bindings
                             .iter()
@@ -202,6 +204,42 @@ impl Restore<'_> {
                     declarations.push(index);
                     bindings.extend(decl.bindings.iter().copied());
                     continue;
+                }
+                HirStmt::Assign(assign)
+                    if !bindings.is_empty()
+                        && self.nil_groups.contains(&bindings)
+                        && assign.initializer_merge_transaction.is_none()
+                        && assign.generic_for_initializer_producer.is_none()
+                        && assign.root_release.is_none()
+                        && assign.method_rewrite_transaction.is_none()
+                        && assign.parallel_nil_frame.is_none()
+                        && !assign.is_phi_transfer
+                        && assign.targets.len() == bindings.len()
+                        && assign
+                            .targets
+                            .iter()
+                            .zip(&bindings)
+                            .all(|(target, local)| *target == HirLValue::Local(*local))
+                        && assign.values.tail.is_none()
+                        && assign.values.fixed.len() == bindings.len()
+                        && assign
+                            .values
+                            .fixed
+                            .iter()
+                            .all(|value| matches!(value, HirExpr::Nil)) =>
+                {
+                    // 构造器退休后恢复的空声明仍属于原 LOADNIL 批次；相邻空声明
+                    // 没有求值，整批原位归还初始化，避免 AST 再拆成逐槽 nil 赋值。
+                    let values = std::mem::take(&mut assign.values);
+                    block.stmts[declarations[0]] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                        bindings: std::mem::take(&mut bindings),
+                        values,
+                        initializer_merge_transaction: None,
+                        generic_for_initializer_producer: None,
+                    }));
+                    removed.extend(declarations.iter().skip(1).copied());
+                    removed.insert(index);
+                    changed = true;
                 }
                 HirStmt::Repeat(repeat)
                     if !repeat.preserves_condition
@@ -252,13 +290,19 @@ impl Restore<'_> {
             declarations.clear();
             bindings.clear();
         }
+        let mut index = 0;
+        block.stmts.retain(|_| {
+            let keep = !removed.contains(&index);
+            index += 1;
+            keep
+        });
         changed
     }
 }
 
 impl HirRewritePass for Restore<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        let initializers_changed = self.restore_single_pass_initializers(block);
+        let initializers_changed = self.restore_adjacent_initializers(block);
         let mut seeds = BTreeMap::new();
         let mut replacements = Vec::new();
         let mut removed = BTreeSet::new();

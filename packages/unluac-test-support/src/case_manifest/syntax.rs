@@ -169,7 +169,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_syntax/separators_01_parenthesized_call_separator.lua",
         &["parenthesized-call", "semicolon"],
         "生成源码必须用分号隔开前一赋值与下一行括号开头IIFE，避免粘成调用链。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_syntax/methods_06_keyword_method_name.lua",
@@ -198,7 +203,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_syntax/methods_03_function_sugar_relax.lua",
         &["evaluation", "gc", "method", "receiver", "root"],
         "覆盖普通点调用缩写及receiver根、写目标；用后继GC观察固定数值终端闭包的原槽覆盖责任。",
-        &[LuaCaseConfiguration::new(PUC_LUA_54)],
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_54).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_syntax/methods_04_function_sugar_nested_local_ids.lua",
@@ -217,7 +227,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             "nested-function",
         ],
         "验证child写入身份独立；点调用lookup期间保留额外实参的旧根，SELF预写不得提前清除。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54])],
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54]).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_syntax/functions_01_upvalue_function_decl.lua",
@@ -245,7 +260,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_syntax/tables_01_constructor_field_name_sugar.lua",
         &["byte-key", "constructor", "identifier", "keyword"],
         "保证constructor字符串key仅在合法标识符时转field-name糖。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54])],
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54]).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_syntax/attributes_01_statement_merge_attr_handoff.lua",

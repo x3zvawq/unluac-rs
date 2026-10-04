@@ -628,7 +628,7 @@ pub(in crate::hir::simplify) fn restore(
             start = sink + 1;
         }
 
-        let (mut plans, count) = collect_native_plans(context, facts, dialect);
+        let (mut plans, count) = collect_native_plans(context, facts, dialect, false);
         expanded.extend(factories::plans(context, facts));
         expanded.extend(returned_calls::plans(context, facts));
         expanded.extend(conditional_methods::plans(context, facts));

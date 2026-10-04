@@ -23,6 +23,13 @@ pub(super) use tables::{RkLiterals, constants_fit_rk, rk_prefix_end};
 use crate::transformer::{ResultPack, ValuePack};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// 仅延后已有完整操作帧证明的候选；Final 重新验证当前声明前缀。
+#[derive(Default)]
+pub(in crate::hir) struct DeferredLookupDecisions {
+    pub(super) locals: BTreeSet<LocalId>,
+    pub(super) calls: BTreeSet<crate::hir::common::HirSourceSite>,
+}
+
 use super::mention::{CaptureCollector, ProtectedLocalCollector, ToBeClosedHomeCollector};
 use super::source_frames as prefix;
 use crate::decompile::DecompileDialect;
@@ -804,6 +811,9 @@ impl FrameBuilder<'_> {
             return Some(restored);
         }
         match expr {
+            HirExpr::Decision(decision) if self.native.is_some() && argument_home => {
+                self.lookup_decision_value(decision, before, slot)
+            }
             HirExpr::TempRef(temp)
                 if self.native.is_some()
                     && self.facts.is_phi_carrier_temp(*temp)
@@ -1165,6 +1175,28 @@ impl FrameBuilder<'_> {
             {
                 // 已嵌入的比较按原 operand 和 Boolean scratch 求值，不另提升声明。
                 Some(expr.clone())
+            }
+            HirExpr::Binary(binary)
+                if self.native.is_some()
+                    && (argument_home || self.boolean_frame.is_some_and(|home| home.slot() == slot))
+                    && let Some(preparations) = self.jit_cdata_comparison_preparations(binary, before, slot) =>
+            {
+                let mut scratch = slot;
+                let mut values = [binary.lhs.clone(), binary.rhs.clone()];
+                for (value, producer) in values.iter_mut().zip(preparations) {
+                    if let Some(producer) = producer {
+                        let previous = std::mem::replace(&mut self.register_operand, false);
+                        let rebuilt = self.expr(value, before, scratch, None, false, true, Some(producer));
+                        self.register_operand = previous;
+                        scratch += 1;
+                        *value = rebuilt?;
+                    }
+                }
+                // 比较仍在两侧准备完成后执行，可能调用元方法；不提前缓存后续字段读取。
+                let [lhs, rhs] = values;
+                Some(HirExpr::Binary(Box::new(crate::hir::common::HirBinaryExpr {
+                    lhs, rhs, ..binary.as_ref().clone()
+                })))
             }
             HirExpr::Binary(binary)
                 if self.native.is_some()
@@ -3740,6 +3772,11 @@ impl FrameBuilder<'_> {
                             // 已处于参数表达式中的表没有待删除的 binding；完整 CALL 恢复
                             // 原参数槽时仍在此语境求值，不能要求不存在的 Local 身份。
                             HirExpr::TableConstructor(_) | HirExpr::Closure(_) => true,
+                            HirExpr::Decision(_) => self
+                                .facts
+                                .call_argument_value(call, index)
+                                .and_then(|producer| self.facts.trusted_temp_home_slot(producer))
+                                .is_some_and(|home| home.slot() == args_start + index),
                             HirExpr::Call(nested) if nested.required_luau_inlining.is_some() => {
                                 self.expanded_call_result(nested).is_some_and(|result| {
                                     self.facts.call_argument_value(call, index) == Some(result)

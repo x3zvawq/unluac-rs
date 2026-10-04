@@ -12,6 +12,73 @@ enum LogicalUse {
 }
 
 impl FrameBuilder<'_> {
+    /// 查表与比较的决策图在共同结果槽重发；调用参数和独立声明共用此证明。
+    pub(super) fn lookup_decision_value(
+        &mut self,
+        decision: &crate::hir::common::HirDecisionExpr,
+        before: usize,
+        slot: usize,
+    ) -> Option<HirExpr> {
+        use crate::hir::common::HirDecisionTarget;
+        let context = self.native?;
+        let home = HomeSlotKey::new(slot, 0);
+        if decision.emit_as_luau_if
+            || matches!(
+                self.dialect,
+                DecompileDialect::Luau | DecompileDialect::Luajit
+            )
+            || !context.constants_fit_rk
+            || context.closed.contains(&home)
+        {
+            // 候选拒绝[TargetConstraint]：这里只重发 PUC 的原 RK 帧，资源槽不借普通值帧改写。
+            return None;
+        }
+        let valid_value = |builder: &mut Self, value: &HirExpr| match value {
+            HirExpr::Boolean(_) => true,
+            HirExpr::TableAccess(access) => {
+                // 所有读取在原结果槽写回；共享读取帧逐层证明嵌套 base、动态 key
+                // 和输入 Def，不在下一次 GETTABLE 的回调前清除旧根。
+                builder.facts.table_read_result_home(access) == Some(home)
+                    && builder.register_lookup(access, before, slot).is_some()
+            }
+            HirExpr::Binary(binary) => {
+                // 末端比较的 Boolean 写回也须属于此槽，完整输入仍按原布局准备。
+                // 捕获状态绑定此次定义，后来的同槽 cell 不回溯到当前结果。
+                builder
+                    .facts
+                    .comparison_result_temp(binary)
+                    .is_some_and(|result| {
+                        builder.facts.trusted_temp_home_slot(result) == Some(home)
+                            && (!context.barred.contains(&home)
+                                || builder.facts.temp_definition_reference_unaliased(result))
+                    })
+                    && builder.comparison_tree(value, before, slot, true).is_some()
+            }
+            _ => false,
+        };
+        let checkpoint = (self.first_event, self.next_event);
+        if !decision.nodes.iter().all(|node| {
+            matches!(node.test, HirExpr::TableAccess(_) | HirExpr::Binary(_))
+                && valid_value(self, &node.test)
+                && [&node.truthy, &node.falsy]
+                    .iter()
+                    .all(|target| match target {
+                        HirDecisionTarget::Expr(value) => valid_value(self, value),
+                        HirDecisionTarget::CurrentValue | HirDecisionTarget::Node(_) => true,
+                    })
+        }) || checkpoint != (self.first_event, self.next_event)
+        {
+            // 候选拒绝[ProofIncomplete]：各臂须已带完整原操作，不把无条件 producer
+            // 吞入惰性分支；其它结果类型仍交回原决策 owner。
+            return None;
+        }
+        super::super::decision::collapse_value_decision_expr(
+            &crate::hir::decision::analyze_decision(decision),
+            crate::hir::expr_safety::HirExprSafety::for_dialect(self.dialect),
+            |_| true,
+        )
+    }
+
     /// 原入口 COPY 是这棵值树的初值；按 Def 与 home 消费，不能沿展示 local 猜来源。
     pub(super) fn luau_copy_value(
         &mut self,

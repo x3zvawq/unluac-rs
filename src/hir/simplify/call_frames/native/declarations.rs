@@ -6,6 +6,58 @@
 use super::*;
 use crate::hir::simplify::table_constructors::{ConstructorWrite, constructor_write};
 
+/// 同一绑定的后续 nil 准备不必持有最初的空声明；只有全部显式 nil 写都被本批
+/// 原帧重发时才解除保护。未知或仍留在 HIR 中的 nil 初始化继续保留原 owner。
+pub(super) fn unconsumed_nil_owners(
+    flat: &[Option<FlatStmt<'_>>],
+    facts: &ProtoPromotionFacts,
+    plans: &[Plan],
+) -> BTreeSet<LocalId> {
+    let mut owners = facts
+        .nil_write_groups()
+        .flat_map(|group| {
+            group
+                .iter()
+                .filter_map(|temp| facts.promoted_local_for_temp(*temp))
+        })
+        .collect::<BTreeSet<_>>();
+    let consumed = plans
+        .iter()
+        .filter(|plan| !plan.only_preserves_call_prefix())
+        .flat_map(|plan| plan.removed.iter().copied().chain([plan.sink]))
+        .collect::<BTreeSet<_>>();
+    let mut replayed = BTreeSet::new();
+    let mut remaining = BTreeSet::new();
+    for entry in flat.iter().flatten() {
+        let mut record = |local: LocalId, value: &HirExpr| {
+            if owners.contains(&local) && matches!(value, HirExpr::Nil) {
+                if consumed.contains(&entry.id) {
+                    replayed.insert(local);
+                } else {
+                    remaining.insert(local);
+                }
+            }
+        };
+        match entry.stmt {
+            HirStmt::LocalDecl(decl) => {
+                for (&local, value) in decl.bindings.iter().zip(&decl.values.fixed) {
+                    record(local, value);
+                }
+            }
+            HirStmt::Assign(assign) => {
+                for (target, value) in assign.targets.iter().zip(&assign.values.fixed) {
+                    if let HirLValue::Local(local) = target {
+                        record(*local, value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    owners.retain(|local| !replayed.contains(local) || remaining.contains(local));
+    owners
+}
+
 /// 每次插值重新在 callee 槽载入模板；该槽随后被 CALL 覆盖，不重扫前面的准备区。
 pub(super) fn interpolation_preparations(
     flat: &[Option<FlatStmt<'_>>],

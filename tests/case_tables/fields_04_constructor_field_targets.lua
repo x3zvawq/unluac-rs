@@ -1,9 +1,17 @@
 -- Several field targets share one constructor call; both field syntaxes matter.
--- unluac: expect-ast-min [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[table-constructor]] [[10]]
+-- unluac: expect-ast-count [[function]] [[13]]
+-- unluac: expect-ast-max [[local-binding]] [[18]]
+-- unluac: expect-ast-max [[if]] [[2]]
 function __reg555_collect(...)
+    local width = select("#", ...)
+    assert(width == 8 or width == 2)
     local total = 0
-    for i = 1, select("#", ...) do
-        total = total + select(i, ...).read()
+    for i = 1, width do
+        local value = select(i, ...).read()
+        assert(value == (width == 8 and i or i * 2))
+        total = total + value
     end
     return total
 end

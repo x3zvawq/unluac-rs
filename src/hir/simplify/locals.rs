@@ -87,14 +87,9 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         super::root_lifetimes::remove_inert_value_releases(proto, safety, dialect);
     let seed_split_changed = super::walk::rewrite_proto(proto, &mut MixedCarrierSeeds { facts });
     let entry_initializers_changed = initializers::restore_single_pass_entries(proto, facts);
-    // 定义数和根块实际绑定压力须同时超限；单纯 SSA 版本多不证明源码局部槽不足。
-    // 无 debug 身份时才允许同 home/epoch 复用，避免把源码声明压成同一绑定。
-    let compact_home_slots = hir_block_local_pressure(&proto.body) > crate::SOURCE_LOCAL_LIMIT
-        && facts.home_slot_definition_count() > crate::SOURCE_LOCAL_LIMIT
+    // 无 debug 身份且原定义数超限时，才允许在确有词法压力的块中复用 home。
+    let allow_home_slot_compaction = facts.home_slot_definition_count() > crate::SOURCE_LOCAL_LIMIT
         && proto.temp_debug_locals.iter().all(Option::is_none);
-    if compact_home_slots {
-        facts.enable_home_slot_compaction();
-    }
     let mut physical_root_locals = BTreeSet::new();
     let mut source_initializer_locals = BTreeSet::new();
     let mut promoted_bindings = Vec::new();
@@ -157,7 +152,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         });
     }
     vararg_prefix_temps.retain(|temp| literal_temps.contains(temp));
-    let result = {
+    let (result, compacted_locals) = {
         let mut ctx = PromotionCtx {
             stage,
             dialect,
@@ -183,18 +178,26 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             to_be_closed_temps: &to_be_closed_temps,
             label_refs: &label_refs,
             debug_scope_locals: &mut debug_scope_locals,
-            compact_home_slots,
+            allow_home_slot_compaction,
+            compact_home_slots: false,
+            compacted_locals: BTreeSet::new(),
+            implicit_local_count: proto.params.len()
+                + usize::from(proto.vararg_param_local.is_some()),
         };
         let mut empty_mapping = LocalMapping::default();
-        promote_block(
+        let result = promote_block(
             &mut ctx,
             &mut proto.body,
             event_index.root(),
             &mut empty_mapping,
             &BTreeMap::new(),
             &|_| false,
-        )
+        );
+        (result, ctx.compacted_locals)
     };
+    for local in compacted_locals {
+        facts.record_compacted_binding(HirBinding::Local(local));
+    }
     // 新身份尚无旧 local 来源。只有全部提升输入都明确 home-free，才能沿用
     // 合成 temp 的事实；已有 local 或含未知/物理输入的合并仍保留原边界。
     let mut home_free_promotions = vec![None; proto.local_count - first_new_local];
@@ -484,7 +487,10 @@ struct PromotionCtx<'a> {
     to_be_closed_temps: &'a BTreeSet<TempId>,
     label_refs: &'a BTreeMap<crate::hir::common::HirLabelId, usize>,
     debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
+    allow_home_slot_compaction: bool,
     compact_home_slots: bool,
+    compacted_locals: BTreeSet<LocalId>,
+    implicit_local_count: usize,
     vararg_prefix_temps: &'a BTreeSet<TempId>,
 }
 
@@ -626,6 +632,14 @@ fn promote_block_with_protection(
     outer_uses_temp: &dyn Fn(TempId) -> bool,
     protection: BlockProtection<'_>,
 ) -> PromotionResult {
+    // 压缩资格属于当前词法块。父块的大构造器已复用槽位后，不能让低压力子块
+    // 继续合并独立 callee/比较结果。前缀身份增量维护，不逐子块重扫祖先声明。
+    let parent_compaction = ctx.compact_home_slots;
+    ctx.compact_home_slots = ctx.allow_home_slot_compaction
+        && mapping.visible_local_count()
+            + ctx.implicit_local_count
+            + hir_block_local_pressure(block)
+            > crate::SOURCE_LOCAL_LIMIT;
     ctx.physical_root_locals
         .extend(collect_call_result_local_roots(
             &block.stmts,
@@ -652,6 +666,11 @@ fn promote_block_with_protection(
         &block_uses_outer_temp,
         &trailing_reads,
     );
+    if ctx.compact_home_slots {
+        ctx.compacted_locals.extend(plans.iter().filter_map(|plan| {
+            matches!(plan.action, PromotionAction::ReuseExistingLocal).then_some(plan.local)
+        }));
+    }
     let plan_by_decl = plans.iter().fold(
         BTreeMap::<usize, Vec<&PromotionPlan>>::new(),
         |mut grouped, plan| {
@@ -826,6 +845,7 @@ fn promote_block_with_protection(
         changed |= rewrite::expr(condition, mapping.bindings());
     }
     mapping.rollback(checkpoint);
+    ctx.compact_home_slots = parent_compaction;
     PromotionResult { changed }
 }
 
@@ -2084,10 +2104,13 @@ fn collect_plans(
                         HirExpr::TableAccess(access) => {
                             facts.same_slot_lookup_predecessor(access, root_temp)
                         }
+                        HirExpr::TableConstructor(table) => {
+                            facts.same_slot_table_nil_predecessor(table, root_temp)
+                        }
                         _ => None,
                     }?;
                     let local = *planned.bindings.get(&predecessor)?;
-                    // 原 callee、查表 base 或低槽 COPY 的覆盖前驱可接回现存声明。
+                    // 原 callee、查表、分配或低槽 COPY 的覆盖前驱可接回现存声明。
                     // 低槽 COPY 仍在 CALL 完成后写入；同槽操作另须证明旧值惰性。
                     // 完整求值的准备事件仍由 native frame owner 验证。
                     (current_slot_locals.get(&home) == Some(&local)
@@ -3570,6 +3593,8 @@ fn rewrite_stmt(
             let start_changed = rewrite::expr(&mut numeric_for.start, mapping.bindings());
             let limit_changed = rewrite::expr(&mut numeric_for.limit, mapping.bindings());
             let step_changed = rewrite::expr(&mut numeric_for.step, mapping.bindings());
+            // 数值 for 的控制三元组与循环变量在 body 期间占据局部前缀。
+            ctx.implicit_local_count += 4;
             let body_changed = promote_block(
                 ctx,
                 &mut numeric_for.body,
@@ -3579,6 +3604,7 @@ fn rewrite_stmt(
                 outer_uses_temp,
             )
             .changed;
+            ctx.implicit_local_count -= 4;
             start_changed || limit_changed || step_changed || body_changed
         }
         HirStmt::GenericFor(generic_for) => {
@@ -3586,6 +3612,14 @@ fn rewrite_stmt(
             // 纯身份提升不撤销 occurrence。普通表达式改写仍走 rewrite_iterator。
             let iterator_changed =
                 rewrite::value_pack(&mut generic_for.iterator, mapping.bindings());
+            let implicit_count = generic_for.bindings.len()
+                + 3
+                + usize::from(matches!(
+                    ctx.dialect,
+                    crate::decompile::DecompileDialect::Lua54
+                        | crate::decompile::DecompileDialect::Lua55
+                ));
+            ctx.implicit_local_count += implicit_count;
             let body_changed = promote_block(
                 ctx,
                 &mut generic_for.body,
@@ -3595,6 +3629,7 @@ fn rewrite_stmt(
                 outer_uses_temp,
             )
             .changed;
+            ctx.implicit_local_count -= implicit_count;
             iterator_changed || body_changed
         }
         HirStmt::Block(block) => {

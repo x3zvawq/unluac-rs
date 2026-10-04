@@ -354,7 +354,8 @@ pub(super) fn bindings_share_home_slot(
     seed: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
-    !promotion_facts.compacts_home_slots()
+    !result.was_compacted(promotion_facts)
+        && !seed.was_compacted(promotion_facts)
         && binding_home_slot(result, promotion_facts)
             .zip(binding_home_slot(seed, promotion_facts))
             .is_some_and(|(result, seed)| result == seed)

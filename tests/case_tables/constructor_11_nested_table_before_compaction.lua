@@ -1,6 +1,9 @@
 -- Original regression by ItsLucas <itslucas@itslucas.me>, PR #35.
 -- unluac: expect-ast-count [[goto]] [[0]]
 -- unluac: expect-ast-count [[label]] [[0]]
+-- unluac: expect-ast-count [[if]] [[0]]
+-- unluac: expect-ast-max [[local-binding]] [[2]]
+-- unluac: expect-ast-count [[table-constructor]] [[241]]
 -- Nested constructor producers must be folded before physical slots are reused.
 local t = {
     [0] = {{0, 22560, 1}},

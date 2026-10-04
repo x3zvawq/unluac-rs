@@ -495,6 +495,31 @@ pub(super) fn lookup_value_plans(
         if kind != PointKind::Statement {
             return;
         }
+        if let HirStmt::CallStmt(call_stmt) = stmt {
+            let call = &call_stmt.call;
+            let has_decision = call
+                .args
+                .fixed
+                .iter()
+                .chain(call.args.tail.iter().map(HirPackTail::as_expr))
+                .any(|value| {
+                    crate::hir::visit::any_expr(value, &mut |expr| {
+                        matches!(expr, HirExpr::Decision(_))
+                    })
+                });
+            if has_decision
+                && let Some(mut plan) =
+                    super::plan(context, &[stmt], facts, dialect, 0, call, CallWidth::Ignore)
+            {
+                plan.start = index;
+                plan.sink = index;
+                // CALL 仍在原位置，参数决策由新表达式接替；此计划确实重发调用，
+                // 不能按没有外部 producer 把它降为仅保留声明前缀的请求。
+                plan.replayed_effects.push(index);
+                plans.push(plan);
+            }
+            return;
+        }
         let HirStmt::LocalDecl(decl) = stmt else {
             return;
         };
@@ -518,43 +543,7 @@ pub(super) fn lookup_value_plans(
         let Some(mut builder) = frame_builder(context, &[], facts, dialect, home.slot()) else {
             return;
         };
-        let valid_value = |value: &HirExpr, builder: &mut FrameBuilder<'_>| {
-            match value {
-                HirExpr::Boolean(_) => true,
-                HirExpr::TableAccess(access) => {
-                    let Some(layout) = facts.native_table_read_layout(access) else {
-                        return false;
-                    };
-                    // 所有动态读取在同一结果槽写回，base 保持在声明前缀中；
-                    // 不引入高槽准备，不在下一次 GETTABLE 的回调之前清除旧结果。
-                    facts.table_read_result_home(access) == Some(home)
-                        && layout.key.is_none()
-                        && layout.base.slot() < home.slot()
-                        && facts.table_read_base_home(access) == Some(layout.base)
-                        && builder
-                            .expr(value, 0, home.slot(), None, false, true, None)
-                            .is_some()
-                }
-                _ => false,
-            }
-        };
-        if !decision.nodes.iter().all(|node| {
-            matches!(node.test, HirExpr::TableAccess(_))
-                && valid_value(&node.test, &mut builder)
-                && [&node.truthy, &node.falsy]
-                    .iter()
-                    .all(|target| match target {
-                        HirDecisionTarget::Expr(value) => valid_value(value, &mut builder),
-                        HirDecisionTarget::CurrentValue | HirDecisionTarget::Node(_) => true,
-                    })
-        }) {
-            return;
-        }
-        let Some(value) = super::super::super::decision::collapse_value_decision_expr(
-            &crate::hir::decision::analyze_decision(decision),
-            crate::hir::expr_safety::HirExprSafety::for_dialect(dialect),
-            |_| true,
-        ) else {
+        let Some(value) = builder.lookup_decision_value(decision, 0, home.slot()) else {
             return;
         };
         // 图归约不复制共享求值；原生 initializer 的前缀及后继声明义务仍由整批 preview 验证。

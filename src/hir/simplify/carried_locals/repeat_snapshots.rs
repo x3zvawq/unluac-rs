@@ -209,7 +209,8 @@ fn try_rewrite_repeat(
         return None;
     }
     let cleanup_preserves_raw_home = trusted_same_raw_home_merge(
-        promotion_facts.compacts_home_slots(),
+        CarryBinding::Temp(temp).was_compacted(promotion_facts)
+            || CarryBinding::Local(local).was_compacted(promotion_facts),
         promotion_facts.trusted_temp_home_slot(temp),
         promotion_facts.trusted_local_home_slot(local),
     );
@@ -229,11 +230,11 @@ fn try_rewrite_repeat(
 }
 
 fn trusted_same_raw_home_merge(
-    compacts_home_slots: bool,
+    compacted_binding: bool,
     temp_home: Option<HomeSlotKey>,
     local_home: Option<HomeSlotKey>,
 ) -> bool {
-    !compacts_home_slots && temp_home.is_some() && temp_home == local_home
+    !compacted_binding && temp_home.is_some() && temp_home == local_home
 }
 
 fn assign_shape(assign: &HirAssign) -> Option<(&HirLValue, &HirExpr)> {

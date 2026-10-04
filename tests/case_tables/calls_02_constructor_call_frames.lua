@@ -2,6 +2,13 @@
 -- GC 观察使用当前方言的源码输出作基线，不假定不同 VM 的栈扫描范围相同。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[table-set-list]]
+-- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=20]]
+-- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=45]]
+-- unluac: expect-count [[= nil, nil, nil]] [[2]]
+-- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=30]]
+-- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=41]]
+-- unluac: expect-instruction-count [[branch]] [[2]] [[@proto=30]]
+-- unluac: expect-instruction-count [[branch]] [[3]] [[@proto=41]]
 
 local function open_widths()
     local function tail(many)
@@ -239,6 +246,42 @@ local function branch_scratch_union()
     print("branch-scratch-union", false, seen)
     build({}, true, receive, methods)
     print("branch-scratch-union", true, seen)
+    local false_result = build(false, true, receive, methods)
+    assert(false_result.k == false and false_result.q == 1)
+    print("branch-scratch-union-falsy", false_result.k, seen)
+    local nil_result = build(nil, true, receive, methods)
+    assert(nil_result.k == nil and nil_result.q == 1)
+    print("branch-scratch-union-falsy", nil_result.k, seen)
     collectgarbage("restart")
 end
 branch_scratch_union()
+
+-- 两个 LOADNIL 结果和末项 RK nil 一起写回；元方法观察原逆序，后继调用
+-- 复用准备槽，不能留下 nil 中转声明或把三次写重新排序。
+do
+    local function clear(values, observe)
+        assert(values[1] == 1)
+        values[1], values[2], values[3] = nil, nil, nil
+        observe("cleared")
+    end
+    local values = {1, 2, 3}
+    local calls = 0
+    clear(values, function(label)
+        assert(label == "cleared" and values[1] == nil and values[2] == nil and values[3] == nil)
+        calls = calls + 1
+    end)
+    local writes = ""
+    local proxy = setmetatable({}, {
+        __index = function(_, key) assert(key == 1); return 1 end,
+        __newindex = function(_, key, value)
+            assert(value == nil)
+            writes = writes .. key
+        end,
+    })
+    clear(proxy, function(label)
+        assert(label == "cleared" and writes == "321")
+        calls = calls + 1
+    end)
+    assert(calls == 2)
+    print("parallel nil writes", writes, calls)
+end

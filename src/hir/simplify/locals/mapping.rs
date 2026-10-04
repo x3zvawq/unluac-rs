@@ -11,11 +11,17 @@ pub(super) struct LocalMapping {
     undo: Vec<(TempId, Option<LocalId>, Option<HomeSlotKey>, bool)>,
     declared_homes: BTreeMap<LocalId, HomeSlotKey>,
     declared_undo: Vec<LocalId>,
+    /// 当前词法前缀的身份计数；多个 SSA 版本和已物化声明只占一个 local。
+    visible_locals: BTreeMap<LocalId, usize>,
 }
 
 impl LocalMapping {
     pub(super) fn bindings(&self) -> &BTreeMap<TempId, LocalId> {
         &self.bindings
+    }
+
+    pub(super) fn visible_local_count(&self) -> usize {
+        self.visible_locals.len()
     }
 
     pub(super) fn checkpoint(&self) -> (usize, usize) {
@@ -26,8 +32,9 @@ impl LocalMapping {
     pub(super) fn declare(&mut self, local: LocalId, ctx: &PromotionCtx<'_>) {
         if let Some(home) = ctx.facts.trusted_local_home_slot(local) {
             assert!(self.declared_homes.insert(local, home).is_none());
-            self.declared_undo.push(local);
         }
+        self.declared_undo.push(local);
+        *self.visible_locals.entry(local).or_default() += 1;
     }
 
     pub(super) fn insert(&mut self, temp: TempId, local: LocalId, ctx: &PromotionCtx<'_>) {
@@ -54,6 +61,7 @@ impl LocalMapping {
     }
 
     fn add_home(&mut self, local: LocalId, home: Option<HomeSlotKey>, entry_nil: bool) {
+        *self.visible_locals.entry(local).or_default() += 1;
         *self
             .homes
             .entry(local)
@@ -70,7 +78,19 @@ impl LocalMapping {
         }
     }
 
+    fn remove_visible_local(&mut self, local: LocalId) {
+        let count = self
+            .visible_locals
+            .get_mut(&local)
+            .expect("visible local has an owner");
+        *count -= 1;
+        if *count == 0 {
+            self.visible_locals.remove(&local);
+        }
+    }
+
     fn remove_home(&mut self, local: LocalId, home: Option<HomeSlotKey>, entry_nil: bool) {
+        self.remove_visible_local(local);
         let homes = self
             .homes
             .get_mut(&local)
@@ -107,6 +127,7 @@ impl LocalMapping {
         while self.declared_undo.len() > checkpoint.1 {
             let local = self.declared_undo.pop().unwrap();
             self.declared_homes.remove(&local);
+            self.remove_visible_local(local);
         }
         while self.undo.len() > checkpoint.0 {
             let (temp, previous, home, entry_nil) = self.undo.pop().unwrap();

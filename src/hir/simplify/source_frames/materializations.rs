@@ -3568,19 +3568,19 @@ impl MaterializationScopes<'_> {
 
 /// 原 LOADNIL 的声明可能被 SSA 合流按首次写回拆开。只在同一词法块中，
 /// 将尚未被其它写入复用的精确 home 接回完整原批次。初始化仍在原位置和原槽，
-/// 只退休无读匿名 seed 与后补的空声明，不改写后续读值或新增物理根。
+/// 匿名 seed 的读取须全部位于原 phi initializer；它们接回同一绑定，后续写仍在原处。
 pub(in crate::hir::simplify) fn restore_split_nil_declarations(
     proto: &mut HirProto,
     facts: &mut ProtoPromotionFacts,
 ) -> bool {
-    let mut reads = BTreeSet::new();
+    let mut reads = BTreeMap::<TempId, usize>::new();
     let mut writes = BTreeMap::new();
     visit_stmts(
         &proto.body.stmts,
         &mut (
             BindingReadCollector(|binding| {
                 if let HirBinding::Temp(temp) = binding {
-                    reads.insert(temp);
+                    *reads.entry(temp).or_default() += 1;
                 }
             }),
             BindingWriteCollector(|binding| {
@@ -3590,6 +3590,18 @@ pub(in crate::hir::simplify) fn restore_split_nil_declarations(
             }),
         ),
     );
+    let mut targets = BTreeMap::new();
+    for (initial, local) in facts.phi_overwrite_predecessors() {
+        targets
+            .entry(initial)
+            .and_modify(|target| *target = None)
+            .or_insert(Some(local));
+    }
+    let mut captures = (
+        CaptureCollector::new(HirCaptureMode::ByReference),
+        CaptureCollector::new(HirCaptureMode::ByValue),
+    );
+    visit_stmts(&proto.body.stmts, &mut captures);
     let protected = proto
         .local_debug_hints
         .iter()
@@ -3604,8 +3616,11 @@ pub(in crate::hir::simplify) fn restore_split_nil_declarations(
         )
         .collect::<BTreeSet<_>>();
     struct NilSeeds<'a> {
-        reads: &'a BTreeSet<TempId>,
+        reads: &'a BTreeMap<TempId, usize>,
+        targets: &'a BTreeMap<TempId, Option<LocalId>>,
         writes: &'a BTreeMap<TempId, usize>,
+        captured_temps: BTreeSet<TempId>,
+        captured_locals: BTreeSet<LocalId>,
         protected_temps: BTreeSet<TempId>,
         protected_locals: BTreeSet<LocalId>,
     }
@@ -3620,7 +3635,12 @@ pub(in crate::hir::simplify) fn restore_split_nil_declarations(
         let mut pending = BTreeMap::new();
         let mut groups = BTreeMap::<usize, NilTargets>::new();
         for (index, stmt) in body.stmts.iter_mut().enumerate() {
-            if let Some(temps) = original_nil_write(stmt, facts, seeds.reads, seeds.writes)
+            if let Some(temps) = original_nil_write_shape(stmt, facts)
+                && temps.iter().all(|temp| {
+                    seeds.writes.get(temp) == Some(&1)
+                        && (!seeds.reads.contains_key(temp)
+                            || matches!(seeds.targets.get(temp), Some(Some(_))))
+                })
                 && temps
                     .iter()
                     .all(|temp| !seeds.protected_temps.contains(temp))
@@ -3636,19 +3656,48 @@ pub(in crate::hir::simplify) fn restore_split_nil_declarations(
             }
             if let HirStmt::LocalDecl(decl) = stmt
                 && decl.initializer_merge_transaction.is_none()
-                && (decl.values.is_empty()
+                && decl.generic_for_initializer_producer.is_none()
+                && decl.values.tail.is_none()
+            {
+                let mut current_reads = BTreeMap::<TempId, usize>::new();
+                for value in &decl.values.fixed {
+                    crate::hir::visit::visit_expr(
+                        value,
+                        &mut BindingReadCollector(|binding| {
+                            if let HirBinding::Temp(temp) = binding {
+                                *current_reads.entry(temp).or_default() += 1;
+                            }
+                        }),
+                    );
+                }
+                let old_shape = decl.values.is_empty()
                     || decl.bindings.len() == 1
                         && matches!(
                             (decl.values.fixed.as_slice(), &decl.values.tail),
                             ([HirExpr::LocalRef(_) | HirExpr::ParamRef(_)], None)
-                        ))
-            {
+                        );
                 for local in &decl.bindings {
-                    if let Some(home) = facts.trusted_local_home_slot(*local)
-                        && let Some((seed, offset, epoch)) = pending.remove(&home)
-                        && epochs.get(&home) == Some(&epoch)
+                    let Some(home) = facts.trusted_local_home_slot(*local) else {
+                        continue;
+                    };
+                    let Some(&(seed, offset, epoch)) = pending.get(&home) else {
+                        continue;
+                    };
+                    let initial = groups[&seed].0[offset];
+                    // 原 phi 的所有入边保留或覆盖同一个 seed；只允许 initializer
+                    // 内的旧版本读取接回 local，不能把其它位置的 SSA 快照一并改写。
+                    // 不读取 seed 的值决策仍由原 owner 整理，不能强行变为变量自更新。
+                    let phi_target = seeds.targets.get(&initial) == Some(&Some(*local))
+                        && decl.bindings.len() == 1
+                        && !seeds.captured_temps.contains(&initial)
+                        && !seeds.captured_locals.contains(local)
+                        && current_reads.contains_key(&initial)
+                        && current_reads.get(&initial) == seeds.reads.get(&initial);
+                    if epochs.get(&home) == Some(&epoch)
                         && !seeds.protected_locals.contains(local)
+                        && (phi_target || old_shape && !seeds.reads.contains_key(&initial))
                     {
+                        pending.remove(&home);
                         groups.get_mut(&seed).unwrap().1[offset] = Some((index, *local));
                     }
                 }
@@ -3742,8 +3791,23 @@ pub(in crate::hir::simplify) fn restore_split_nil_declarations(
     let mut merges = Vec::new();
     let seeds = NilSeeds {
         reads: &reads,
+        targets: &targets,
         writes: &writes,
         protected_locals: protected,
+        captured_temps: captures
+            .0
+            .bindings
+            .temps
+            .into_iter()
+            .chain(captures.1.bindings.temps)
+            .collect(),
+        captured_locals: captures
+            .0
+            .bindings
+            .locals
+            .into_iter()
+            .chain(captures.1.bindings.locals)
+            .collect(),
         protected_temps: proto
             .temp_debug_locals
             .iter()
@@ -3765,13 +3829,23 @@ pub(in crate::hir::simplify) fn restore_split_nil_declarations(
         &mut merges,
         &mut BTreeMap::new(),
     );
+    if merges.is_empty() {
+        return false;
+    }
+    let replacements = merges
+        .iter()
+        .map(|&(temp, local)| (temp, HirExpr::LocalRef(local)))
+        .collect();
+    for stmt in &mut proto.body.stmts {
+        crate::hir::rewrite::replace_temps_in_stmt(stmt, &replacements);
+    }
     for &(temp, local) in &merges {
         proto.inline_dispositions.promote_temp_to_local(temp, local);
         proto
             .inline_dispositions
             .preserve_local(local, HirInlineRetentionReason::PhysicalFramePrefix);
     }
-    !merges.is_empty()
+    true
 }
 
 fn collect_candidates(

@@ -210,7 +210,8 @@ pub(super) fn try_collapse_adjacent_local_seed_handoff(
     // 候选拒绝[SemanticBarrier:Scope]：for binding 每轮重建且只在 loop body 可见；
     // 合并会把 per-iteration refresh 改成外层/跨轮状态。
     // 候选拒绝[SemanticBarrier:Lifetime]：tail 仍读取旧 seed 时，carried 写入改名为 seed 会让该读取看到新 epoch。
-    if promotion_facts.compacts_home_slots()
+    if CarryBinding::Local(seed).was_compacted(promotion_facts)
+        || CarryBinding::Local(carried).was_compacted(promotion_facts)
         || !bindings_share_exact_home_slot(
             CarryBinding::Local(carried),
             CarryBinding::Local(seed),

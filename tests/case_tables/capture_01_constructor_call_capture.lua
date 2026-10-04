@@ -2,6 +2,9 @@
 -- A constructor call may stay explicit when folding its installed field changes allocation.
 -- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=4]]
+-- 原 callee、对象及捕获值足够表达两个构造过程，不需要额外调用中转。
+-- unluac: expect-ast-max [[local-binding]] [[7]]
+-- unluac: expect-ast-count [[function]] [[6]]
 local function build()
     local callee = function(table_value, value)
         return table_value.get()

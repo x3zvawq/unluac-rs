@@ -675,6 +675,8 @@ fn inline_temps_in_block(
             && kept_rev.last().is_some_and(|next| {
                 occupies_branch_call_prefix(temp, value, next, facts)
                     || occupies_binary_input_prefix(temp, value, next, facts)
+                    || (workspace.dialect == DecompileDialect::Luau
+                        && occupies_fixed_return_suffix(temp, value, next, facts, live_use_counts))
             })
         {
             // 后续 locals/inline-exprs 也必须消费同一前缀义务；单轮拒绝内联不足以保留身份。
@@ -1594,6 +1596,44 @@ impl PureInlineContext<'_> {
     }
 }
 
+/// 固定返回包沿用已有低槽值时，尾项 CALL 是同槽初始化，而不是新的返回准备区。
+fn occupies_fixed_return_suffix(
+    temp: TempId,
+    value: &HirExpr,
+    sink: &HirStmt,
+    facts: &ProtoPromotionFacts,
+    live_use_counts: &[usize],
+) -> bool {
+    let (HirExpr::Call(call), HirStmt::Return(ret)) = (value, sink) else {
+        return false;
+    };
+    let Some((last, prefix)) = ret.values.fixed.split_last() else {
+        return false;
+    };
+    if prefix.is_empty() || *last != HirExpr::TempRef(temp) || ret.values.tail.is_some() {
+        return false;
+    }
+    let Some(frame) = facts.native_return_frame(ret) else {
+        return false;
+    };
+    let Some(call_frame) = facts.native_call_frame(call) else {
+        return false;
+    };
+    matches!(frame.values, crate::transformer::ValuePack::Fixed(pack) if pack.len == ret.values.fixed.len())
+        && matches!(call_frame.results, Some(crate::transformer::ResultPack::Fixed(pack)) if pack.len == 1)
+        && facts.fixed_call_result(call, 0) == Some(temp)
+        && facts.fixed_return_input(ret, prefix.len()) == Some(temp)
+        && call_frame.home.slot() == frame.home.slot() + prefix.len()
+        && prefix.iter().enumerate().all(|(index, value)| {
+            matches!(value, HirExpr::TempRef(input) if facts.fixed_return_input(ret, index) == Some(*input))
+        })
+        // 已有共享身份不能被返回包重新分配；纯返回准备 COPY 只有这一处读取，
+        // 仍留给完整 return 帧消费，不能按相同寄存器布局一律冻结 CALL。
+        && prefix.iter().any(|value| {
+            matches!(value, HirExpr::TempRef(input) if total_use_count(*input, live_use_counts) > 1)
+        })
+}
+
 fn occupies_branch_call_prefix(
     temp: TempId,
     value: &HirExpr,
@@ -1759,6 +1799,12 @@ fn occupies_scalar_frame_prefix(
     }
     let prefix = match sink {
         HirStmt::CallStmt(stmt) => facts.native_call_layout(&stmt.call).map(|frame| frame.home),
+        // 表分配以下的原标量也属于声明前缀。把键常量移入构造器会删除其原槽，
+        // 使后继帧缺口阻断嵌套调用，回调还可观察到表声明的槽位改变。
+        HirStmt::Assign(assign) => match (assign.values.fixed.as_slice(), &assign.values.tail) {
+            ([HirExpr::TableConstructor(table)], None) => facts.allocation_result_home(table),
+            _ => None,
+        },
         // CLOSE/debug 产生的嵌套块仍从原高槽声明开始；跨块内联低槽常量
         // 会先抹掉声明前缀，完整帧 owner 随后只能看到无法填补的缺口。
         // 这里只延期删除，原初始化及词法末端仍由 source-frames 原子验证。

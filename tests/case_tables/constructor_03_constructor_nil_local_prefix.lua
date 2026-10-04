@@ -3,6 +3,11 @@
 -- unluac: expect-order [[local r1_0 = {}]] [[r1_0.value = 7]]
 -- unluac: expect-order [[local r2_1 = nil]] [[r2_0.value = r2_1]]
 
+-- 两条路径都只需要原表和 later 声明。
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=2]]
+-- unluac: expect-ast-count [[table-constructor]] [[2]]
+-- unluac: expect-ast-count [[function]] [[2]]
 local function fold_independent(flag)
     local result = {}
     local later
@@ -32,4 +37,10 @@ end
 local preserved, preserved_later = preserve_dependency(true)
 assert(preserved.value == nil)
 assert(preserved_later == "used")
+local skipped, skipped_later = fold_independent(false)
+assert(skipped.value == 7 and skipped_later == nil)
+assert(select("#", fold_independent(nil)) == 2)
+local dependent_skipped, dependent_later = preserve_dependency(nil)
+assert(dependent_skipped.value == nil and dependent_later == nil)
+assert(select("#", preserve_dependency(false)) == 2)
 print("regress_429_constructor_nil_local_prefix", folded_later, preserved_later)

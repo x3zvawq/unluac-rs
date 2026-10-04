@@ -330,7 +330,8 @@ fn same_exact_home_slot(
     state: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
-    !promotion_facts.compacts_home_slots()
+    !result.was_compacted(promotion_facts)
+        && !state.was_compacted(promotion_facts)
         && binding_home_slot(result, promotion_facts)
             .zip(binding_home_slot(state, promotion_facts))
             .is_some_and(|(result, state)| result == state)

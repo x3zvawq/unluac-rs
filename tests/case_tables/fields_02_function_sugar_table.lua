@@ -2,6 +2,9 @@
 -- unluac: expect-contains [[{ r2_0.table_relaxed(r2_0, 41) }]]
 -- unluac: expect-ast-count [[method-call]] [[0]] [[@proto=2]]
 -- unluac: expect-ast-max [[local-decl]] [[2]] [[@proto=2]]
+-- unluac: expect-ast-count [[method-call]] [[1]] [[@proto=5]]
+-- unluac: expect-ast-max [[local-decl]] [[2]] [[@proto=5]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=7]]
 
 local method_owner = {}
 function method_owner:table_relaxed(value)

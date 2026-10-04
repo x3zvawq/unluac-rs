@@ -532,7 +532,7 @@ pub(super) fn simplify_hir(
                                 proto,
                                 facts,
                                 safety,
-                                &std::collections::BTreeSet::new(),
+                                &call_frames::DeferredLookupDecisions::default(),
                             ) || restored
                         }
                         24 => branch_control_folding::fold_tail_loop_conditions_in_proto(proto),

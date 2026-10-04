@@ -188,6 +188,58 @@ impl FrameBuilder<'_> {
         })
     }
 
+    /// KCDATA 不是 Eq 的内嵌常量：每个高槽输入仍须按原 use→Def 重发，
+    /// Boolean 写回使用同一准备区的首槽。低槽现成输入不占准备槽。
+    pub(super) fn jit_cdata_comparison_preparations(
+        &self,
+        binary: &crate::hir::common::HirBinaryExpr,
+        before: usize,
+        slot: usize,
+    ) -> Option<[Option<crate::hir::common::TempId>; 2]> {
+        use crate::hir::common::HirBinaryOpKind::{Eq, Le, Lt};
+        self.jit_boolean_result_home(binary, slot)?;
+        if !matches!(binary.op, Eq | Lt | Le) {
+            return None;
+        }
+        let layout = self.facts.native_binary_layout(binary)?;
+        let mut preparations = [None; 2];
+        let mut scratch = slot;
+        for (index, (value, original)) in [&binary.lhs, &binary.rhs]
+            .into_iter()
+            .zip([layout.lhs, layout.rhs])
+            .enumerate()
+        {
+            if self
+                .facts
+                .direct_binary_operand_home(binary, index)
+                .is_some_and(|home| home.slot() < self.base && original == Some(home))
+            {
+                continue;
+            }
+            let prepared = match value {
+                HirExpr::LocalRef(local) => {
+                    scalar_local(self.run[self.definition(*local, before)?])?.1
+                }
+                value => value,
+            };
+            if !matches!(
+                prepared,
+                HirExpr::Int64(_) | HirExpr::UInt64(_) | HirExpr::Complex { .. }
+            ) {
+                return None;
+            }
+            let (producer, home) = self
+                .facts
+                .binary_operand_preparation(binary, index, prepared)?;
+            if original != Some(home) || home.slot() != scratch {
+                return None;
+            }
+            preparations[index] = Some(producer);
+            scratch += 1;
+        }
+        (scratch > slot).then_some(preparations)
+    }
+
     /// JIT 比较参数复用首个 lookup 的槽；第二个 lookup 才占其相邻后一槽。
     /// `assert(t[1] == value and t[2] == nil)` 保留原 TGETB、低槽读取与 Boolean 写回；
     /// 不消费 run 中的新 producer；动态键须由原输入准备证明，不能借先前 COPY 的槽。

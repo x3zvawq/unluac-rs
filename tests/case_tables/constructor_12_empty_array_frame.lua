@@ -2,9 +2,12 @@
 -- unluac: expect-contains [[in ipairs({ {}, { 10 }, { 20, 30 } })]]
 -- unluac: expect-not-contains [[ = nil]]
 -- unluac: expect-not-contains [[= ipairs]]
+-- unluac: expect-ast-max [[local-binding]] [[3]]
+-- unluac: expect-ast-count [[table-constructor]] [[4]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
 local total = 0
 for index, row in ipairs({ {}, { 10 }, { 20, 30 } }) do
-    print("empty-array-row", index, #row)
+    print("empty-array-row", index, #row, row[1], row[2])
     total = total + #row
 end
 assert(total == 3)

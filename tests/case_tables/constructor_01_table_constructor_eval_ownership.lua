@@ -1,6 +1,12 @@
 -- regress_235_table_constructor_eval_ownership: moved producers keep one ordered evaluation
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- 完成于分配前的值/键保留独立初始化；原索引赋值中的两个调用直接按序展示。
+-- unluac: expect-ast-max [[local-binding]] [[13]] [[@proto=0]]
+-- unluac: expect-ast-max [[assign]] [[10]] [[@proto=0]]
+-- unluac: expect-ast-count [[table-constructor]] [[10]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
+-- unluac: expect-contains [[("direct-key")] =]]
 local log = {}
 
 local function mark(value)

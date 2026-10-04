@@ -1,3 +1,8 @@
+-- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=4]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[local-binding]] [[43]]
+-- unluac: expect-ast-count [[table-constructor]] [[41]]
+-- unluac: expect-ast-count [[function]] [[16]]
+-- unluac: expect-ast-max [[if]] [[0]]
 -- 确定字段值允许深层私有构造器折叠；GC输出始终比较各VM自己的源码基线。
 -- stripped产物的外层字段不能重新拆成独立store；debug保留源码identity另由运行验证。
 -- unluac: expect-not-contains [[r1_0.root =]]

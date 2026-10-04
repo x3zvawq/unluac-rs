@@ -1,5 +1,7 @@
 -- regress_402_method_alias_nested_write_ids: child direct writes do not target an outer same-numbered alias
 -- 点调用的参数 COPY 在 lookup 后发生；SELF 预写会提前清掉旧参数槽中的根。
+-- 混合字段写回保持原顺序，后续方法读取无需结果或 callee 接棒。
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=23]]
 -- unluac: expect-contains [[r1_0.m(r1_0)]]
 -- unluac: expect-ast-count [[method-call]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]

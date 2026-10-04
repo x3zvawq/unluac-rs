@@ -3,6 +3,15 @@
 -- unluac: expect-contains [[local function r1_0(]]
 -- unluac: expect-not-line [[local r1_0]]
 -- unluac: expect-contains [[labels = { "raw", "derived" }]]
+-- 独立初始化与调用参数直接表达，不为递归或返回值新增中转绑定。
+-- unluac: expect-ast-count [[function]] [[5]]
+-- unluac: expect-ast-count [[table-constructor]] [[7]]
+-- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=0]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=4]]
+-- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=5]]
 local function factorial(n)
     local function loop(current, result)
         if current <= 1 then
@@ -57,4 +66,8 @@ assert(overwritten.extra_count == 0 and overwritten.extra_first == nil)
 -- 地址不是程序稳定输出；只归一化这一个已确认的表地址文本，表身份/字段另由上面的断言检查。
 local summary = summarize(4):gsub(";labels=table: [%xxX]+$", ";labels=<table>")
 assert(summary == "count=3;extra_count=2;extra_first=note;first=4;labels=<table>")
+local empty = collect({}, false, nil)
+assert(empty.count == 0 and empty.first == nil)
+assert(empty.extra_count == 2 and empty.extra_first == false)
+assert(select("#", pair(0)) == 2)
 print("recursive-table-results", factorial(5), first, second, third, summary)

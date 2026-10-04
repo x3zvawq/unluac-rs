@@ -1,6 +1,8 @@
 -- 模板键集合与后续字段写入不同；静态化新的稀疏 key 会提前改变 hash/array 扩容。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[table-constructor]] [[5]]
+-- 保留动态键所需的初始化值，但不引入字段或调用的接棒变量。
+-- unluac: expect-ast-max [[local-binding]] [[11]]
 -- TDUP 常量 hash 按稳定键身份展示；后续运行时字段仍保留原写入次序。
 -- unluac: expect-contains [[left = true, right = true]] [[@dialect=luajit]]
 local function build(a)

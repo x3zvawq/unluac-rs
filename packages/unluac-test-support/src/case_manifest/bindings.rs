@@ -2,6 +2,22 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_bindings/assignment_17_nil_branch_initializers.lua",
+        &["nil-batch", "phi", "debug-write", "recompile"],
+        "并列 nil 初始化承接原同槽条件写回，谓词调用的 debug.setlocal 仍写入原变量，后续调用不遗留准备中转。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_bindings/scalar_01_luau_length_frame.lua",
         &["scalar", "length", "call-frame", "runtime-observer"],
         "长度及数值运算不建立伪 GC 根，后继同槽字段读取与格式化帧保持声明数量及重编译收敛。",
@@ -1613,7 +1629,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             "eval-order",
             "readability",
         ],
-        "并行左值在元方法改写目标前完成快照，两项比较在上值写回前完成求值。",
+        "并行左值保持原快照时点；字段与捕获局部的混合写回按原顺序提交，保留后继调用声明前缀。",
         &[
             LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),
