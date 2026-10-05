@@ -94,6 +94,24 @@ fn expression(value: &AstExpr, locals: &Environment<'_>) -> Option<Cost> {
         {
             Some(expression(&access.index, locals)?.add(Cost::fixed(1)))
         }
+        AstExpr::TableConstructor(table) => {
+            table
+                .fields
+                .iter()
+                .try_fold(Cost::fixed(10), |cost, field| {
+                    let value = match field {
+                        AstTableField::Array(value) => expression(value, locals)?,
+                        AstTableField::Record(record) => {
+                            let key = match &record.key {
+                                AstTableKey::Name(_) => Cost::literal(),
+                                AstTableKey::Expr(key) => expression(key, locals)?,
+                            };
+                            key.add(expression(&record.value, locals)?)
+                        }
+                    };
+                    Some(cost.add(value).add(Cost::fixed(1)))
+                })
+        }
         AstExpr::FunctionExpr(_) => Some(Cost::fixed(10)),
         _ => None,
     }
@@ -108,8 +126,10 @@ fn invocation(call: &AstCallExpr, locals: &Environment<'_>) -> Option<Cost> {
             (3, true)
         }
         AstExpr::Var(AstNameRef::Global(name))
-            if matches!(name.text.as_str(), "assert" | "rawequal" | "type")
-                && call.args.len() <= 2 =>
+            if matches!(
+                name.text.as_str(),
+                "assert" | "rawequal" | "type" | "setmetatable"
+            ) && call.args.len() <= 2 =>
         {
             (2, false)
         }
@@ -203,13 +223,26 @@ fn block_cost(block: &AstBlock, locals: &mut Environment<'_>, depth: usize) -> O
                         total = total.add(invocation(call, locals)?.add(Cost::fixed(1)));
                         continue;
                     }
-                    let ([AstLValue::Name(AstNameRef::Local(local))], [value]) =
-                        (assign.targets.as_slice(), assign.values.as_slice())
+                    let ([target], [value]) = (assign.targets.as_slice(), assign.values.as_slice())
                     else {
                         return None;
                     };
-                    locals.locals.insert(*local, Cost::variable(false));
-                    expression(value, locals)?.argument()
+                    match target {
+                        AstLValue::Name(AstNameRef::Local(local)) => {
+                            locals.locals.insert(*local, Cost::variable(false));
+                            expression(value, locals)?.argument()
+                        }
+                        AstLValue::IndexAccess(access)
+                            if matches!(access.base, AstExpr::Var(AstNameRef::Local(_)))
+                                && matches!(access.index, AstExpr::Var(AstNameRef::Local(_))) =>
+                        {
+                            expression(&access.base, locals)?
+                                .add(expression(&access.index, locals)?)
+                                .add(Cost::fixed(1))
+                                .add(expression(value, locals)?)
+                        }
+                        _ => return None,
+                    }
                 }
                 AstStmt::If(branch) => {
                     let condition = expression(&branch.cond, locals)?;

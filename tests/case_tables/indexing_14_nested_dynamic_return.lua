@@ -1,3 +1,4 @@
+-- unluac: expect-ast-max [[local-binding]] [[12]] [[@proto=0]]
 -- base 与动态 key 都可触发回调；key 改写来源不能让最终读取换到新表。
 -- unluac: expect-contains [=[return self.values[self.index]]=] [[@debug=retained]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=luau]]
@@ -9,8 +10,12 @@ end
 -- unluac: expect-contains [=[t[i][j]]=] [[@debug=retained]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=luau]]
 -- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=3]] [[@dialect=luau]]
--- O2 展开的连续更新仍各自保留未赋值路径，不因初始化同块而逐轮变成自赋值选择式。
--- unluac: expect-ast-count [[if]] [[4]] [[@proto=0]] [[@variant=O2]] [[@debug=retained]]
+-- O2 展开体恢复为现存 find 调用；条件更新保留在双循环中，运行轨迹同时固定四次读取顺序。
+-- unluac: expect-contains [=[assert(find(grid, 2) == 21)]=] [[@debug=retained]]
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=3]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[numeric-for]] [[2]] [[@proto=3]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=0]] [[@dialect=luau]] [[@variant=O2]]
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=0]] [[@dialect=luau]] [[@variant=O2]]
 -- O2 将 key 参数替成字符串，仍保留 IndexExpr 的高槽 base，不能改成复用结果槽的点语法。
 -- unluac: expect-contains [=[values["chosen"]]=] [[@dialect=luau]] [[@variant=O2]]
 local function read_key(self, key)

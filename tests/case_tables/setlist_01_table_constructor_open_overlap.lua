@@ -2,8 +2,10 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-ast-count [[table-constructor]] [[2]] [[@proto=0]]
--- unluac: expect-ast-max [[local-decl]] [[5]] [[@proto=0]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[table-record-field]] [[2]] [[@proto=0]] [[@dialect=luajit]]
+-- 两个旧字段与两个开放尾均留在构造器内，不拆出写回或调用结果的临时绑定。
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=0]]
+-- unluac: expect-ast-count [[table-record-field]] [[2]] [[@proto=0]]
+-- unluac: expect-ast-count [[table-list-field]] [[4]] [[@proto=0]]
 local calls = 0
 
 local function many()

@@ -16,6 +16,8 @@ mod calling_values;
 mod value_uses;
 pub(in crate::hir::simplify::call_frames) use calling_values::Frames as CallingValueFrames;
 mod captured;
+mod captured_transfers;
+pub(in crate::hir::simplify::call_frames) use captured_transfers::Frames as CapturedTransferFrames;
 mod captured_predicates;
 mod conditional_methods;
 mod constant_control;
@@ -38,6 +40,7 @@ mod value_expressions;
 pub(in crate::hir::simplify::call_frames) use value_expressions::Frames as ValueExpressionFrames;
 mod array_fold;
 mod guarded_counter;
+mod nested_search;
 mod numeric_exit;
 mod numeric_repeat;
 mod published_tables;
@@ -46,7 +49,9 @@ mod repeat_prefix;
 mod reset_counter;
 mod returned_calls;
 mod stateful_generic;
-pub(super) use published_tables::is_publication as is_published_table_write;
+pub(super) fn is_expanded_table_write(context: NativeFrameContext<'_>, stmt: &HirStmt) -> bool {
+    published_tables::is_publication(context, stmt) || captured_transfers::is_append(context, stmt)
+}
 mod scalar;
 mod snapshots;
 
@@ -66,7 +71,7 @@ pub(in crate::hir::simplify::call_frames) struct Callee {
     repeat_prefix: Option<repeat_prefix::Body>,
     literal_choice: Option<literal_choices::Body>,
     value_expression: Option<value_expressions::Body>,
-    readonly_captures: Vec<LocalId>,
+    capture_locals: Vec<LocalId>,
 }
 
 pub(in crate::hir::simplify::call_frames) type Callees =
@@ -183,10 +188,23 @@ pub(in crate::hir::simplify) fn restore(
         .iter()
         .map(crate::hir::luau_inlining::array_fold_template)
         .collect::<Vec<_>>();
+    let nested_searches = module
+        .protos
+        .iter()
+        .map(crate::hir::luau_inlining::nested_search_template)
+        .collect::<Vec<_>>();
     let array_names = module
         .protos
         .iter()
         .map(crate::hir::luau_inlining::array_fold_names)
+        .collect::<Vec<_>>();
+    let transfer_templates = module
+        .protos
+        .iter()
+        .map(|proto| {
+            crate::hir::luau_inlining::captured_transfers::template(proto)
+                .map(|(label, result)| (label.clone(), result.clone()))
+        })
         .collect::<Vec<_>>();
     let calling_templates = calling_values::Templates::new(module, promotion);
     let bodies = module
@@ -195,9 +213,31 @@ pub(in crate::hir::simplify) fn restore(
         .map(|proto| {
             body_key(proto)
                 .or_else(|| {
+                    transfer_templates[proto.id.index()]
+                        .as_ref()
+                        .map(|(_, result)| {
+                            (
+                                HirLuauInliningBody::CapturedAppendTransfer {
+                                    template: proto.id.index(),
+                                },
+                                result.clone(),
+                            )
+                        })
+                })
+                .or_else(|| {
                     reset_counters[proto.id.index()].map(|_| {
                         (
                             HirLuauInliningBody::ResetCounter {
+                                template: proto.id.index(),
+                            },
+                            "".into(),
+                        )
+                    })
+                })
+                .or_else(|| {
+                    nested_searches[proto.id.index()].as_ref().map(|_| {
+                        (
+                            HirLuauInliningBody::NestedSearch {
                                 template: proto.id.index(),
                             },
                             "".into(),
@@ -360,9 +400,10 @@ pub(in crate::hir::simplify) fn restore(
     let mut nested_bodies = BTreeMap::new();
     let mut seeded_bodies = BTreeMap::new();
     for output in &mut module.protos {
-        if output.id != module.entry || !output.params.is_empty() {
+        if !output.params.is_empty() {
             continue;
         }
+        let nested_owner = output.id != module.entry;
         let Some(original_facts) = promotion.get_mut(output.id.index()) else {
             continue;
         };
@@ -383,26 +424,32 @@ pub(in crate::hir::simplify) fn restore(
         .any(|callee| {
             matches!(
                 callee.body,
-                HirLuauInliningBody::SnapshotClosureFactory { .. }
-                    | HirLuauInliningBody::CapturedCallablePair
-                    | HirLuauInliningBody::RepeatPrefix { .. }
-                    | HirLuauInliningBody::RepeatLookup { .. }
-                    | HirLuauInliningBody::CounterRepeat { .. }
-                    | HirLuauInliningBody::NumericRepeat { .. }
-                    | HirLuauInliningBody::GuardedCounter { .. }
-                    | HirLuauInliningBody::GenericLookupWhile { .. }
-                    | HirLuauInliningBody::ResetCounter { .. }
-                    | HirLuauInliningBody::ArrayFold { .. }
-                    | HirLuauInliningBody::GenericCounter { .. }
-                    | HirLuauInliningBody::GenericBreak { .. }
-                    | HirLuauInliningBody::CounterWhile { .. }
-            )
+                HirLuauInliningBody::CapturedAppendTransfer { .. }
+            ) || !nested_owner
+                && matches!(
+                    callee.body,
+                    HirLuauInliningBody::SnapshotClosureFactory { .. }
+                        | HirLuauInliningBody::CapturedCallablePair
+                        | HirLuauInliningBody::RepeatPrefix { .. }
+                        | HirLuauInliningBody::RepeatLookup { .. }
+                        | HirLuauInliningBody::CounterRepeat { .. }
+                        | HirLuauInliningBody::NumericRepeat { .. }
+                        | HirLuauInliningBody::GuardedCounter { .. }
+                        | HirLuauInliningBody::GenericLookupWhile { .. }
+                        | HirLuauInliningBody::ResetCounter { .. }
+                        | HirLuauInliningBody::ArrayFold { .. }
+                        | HirLuauInliningBody::NestedSearch { .. }
+                        | HirLuauInliningBody::GenericCounter { .. }
+                        | HirLuauInliningBody::GenericBreak { .. }
+                        | HirLuauInliningBody::CounterWhile { .. }
+                )
         });
         let mut prepared_facts = snapshot_candidate.then(|| original_facts.clone());
         let prepared = if let Some(facts) = &mut prepared_facts {
-            let Some((proto, _)) = prepare_source_frames(output.clone(), facts, dialect) else {
+            let Some((mut proto, _)) = prepare_source_frames(output.clone(), facts, dialect) else {
                 continue;
             };
+            prefix::restore_call_result_prefix(&mut proto, facts);
             Some(proto)
         } else {
             None
@@ -411,7 +458,7 @@ pub(in crate::hir::simplify) fn restore(
         let prepared_proto = prepared.as_ref().unwrap_or(output);
         let generic_draft = generic_break::prepare(prepared_proto, facts, &bodies);
         let prepared_proto = generic_draft.as_ref().unwrap_or(prepared_proto);
-        let initial_callees = callees(
+        let mut initial_callees = callees(
             prepared_proto,
             facts,
             &bodies,
@@ -424,6 +471,14 @@ pub(in crate::hir::simplify) fn restore(
             &literal_choices,
             &value_expressions,
         );
+        initial_callees.retain(|_, callee| {
+            !nested_owner
+                || matches!(
+                    callee.body,
+                    HirLuauInliningBody::CapturedValue
+                        | HirLuauInliningBody::CapturedAppendTransfer { .. }
+                )
+        });
         let comparison_draft =
             literal_choices::debug_arguments(prepared_proto, facts, &initial_callees);
         let comparison_proto = comparison_draft
@@ -462,7 +517,9 @@ pub(in crate::hir::simplify) fn restore(
         let seeded_proto = seeded_frames
             .as_ref()
             .map_or(seeded_proto, |draft| &draft.proto);
-        let calling_draft = calling_values::prepare(seeded_proto, facts, &calling_templates);
+        let calling_draft = (!nested_owner)
+            .then(|| calling_values::prepare(seeded_proto, facts, &calling_templates))
+            .flatten();
         let calling_proto = calling_draft
             .as_ref()
             .map_or(seeded_proto, |draft| &draft.proto);
@@ -519,7 +576,15 @@ pub(in crate::hir::simplify) fn restore(
             &literal_choices,
             &value_expressions,
         );
-        callees.retain(|_, callee| !published.contains(&(proto.id, callee.local)));
+        callees.retain(|_, callee| {
+            !published.contains(&(proto.id, callee.local))
+                && (!nested_owner
+                    || matches!(
+                        callee.body,
+                        HirLuauInliningBody::CapturedValue
+                            | HirLuauInliningBody::CapturedAppendTransfer { .. }
+                    ))
+        });
         if structured {
             // 候选拒绝[ProofIncomplete:Lifetime]：结构化后缀只覆盖已证明的展开帧；其它对象根仍需完整的结构化重放证书。
             callees.retain(|(body, _), _| {
@@ -536,6 +601,7 @@ pub(in crate::hir::simplify) fn restore(
                         | HirLuauInliningBody::GuardedCounter { .. }
                         | HirLuauInliningBody::ResetCounter { .. }
                         | HirLuauInliningBody::ArrayFold { .. }
+                        | HirLuauInliningBody::NestedSearch { .. }
                         | HirLuauInliningBody::CallingValue { .. }
                         | HirLuauInliningBody::CallingSharedValue { .. }
                         | HirLuauInliningBody::CallingObservedValue { .. }
@@ -547,6 +613,7 @@ pub(in crate::hir::simplify) fn restore(
         if callees.is_empty() {
             continue;
         }
+        let transfer_frames = captured_transfers::frames(&callees, &transfer_templates);
         let compared_choices = literal_choices::compared_callees(&callees, facts);
         let expression_frames = value_expressions::frames(proto, &callees, facts);
         let control_frames = constant_control::frames(&callees, facts, &constant_controls);
@@ -555,6 +622,7 @@ pub(in crate::hir::simplify) fn restore(
         let context = NativeFrameContext {
             rk_literals: None,
             expanded_callees: Some(&callees),
+            captured_transfers: Some(&transfer_frames),
             compared_choices: Some(&compared_choices),
             value_expressions: Some(&expression_frames),
             constant_controls: Some(&control_frames),
@@ -571,6 +639,10 @@ pub(in crate::hir::simplify) fn restore(
         let mut expanded = Vec::new();
         let array_recovery = array_fold::plans(context, facts, &array_folds, &array_names);
         let proto = array_recovery.draft.as_ref().unwrap_or(proto);
+        let context = NativeFrameContext { proto, ..context };
+
+        let search_recovery = nested_search::plans(context, facts, &nested_searches);
+        let proto = search_recovery.draft.as_ref().unwrap_or(proto);
         let context = NativeFrameContext { proto, ..context };
 
         let mut start = 0;
@@ -690,6 +762,7 @@ pub(in crate::hir::simplify) fn restore(
         }
         expanded.extend(numeric_recovery.nested_plans);
         expanded.extend(array_recovery.plans);
+        expanded.extend(search_recovery.plans);
         if let Some(draft) = &calling_draft {
             expanded.extend(draft.plans(context, facts));
         }
@@ -752,9 +825,14 @@ pub(in crate::hir::simplify) fn restore(
                 Some((region.source, facts.trusted_temp_home_slot(region.result)?))
             })
             .collect::<BTreeMap<_, _>>();
+        let operand_copy_homes = facts
+            .operand_copy_frames()
+            .map(|(site, copy)| (site, copy.target_home.slot()))
+            .collect::<BTreeMap<_, _>>();
         let mut first = None;
         for plan in &mut plans {
             let mut captured_updates = BTreeSet::new();
+            let mut captured_transfers = BTreeSet::new();
             for value in plan
                 .values
                 .fixed
@@ -767,7 +845,15 @@ pub(in crate::hir::simplify) fn restore(
                         && let HirExpr::LocalRef(local) = call.callee
                     {
                         let callee = by_local[&local];
-                        if callee.capture.is_some() {
+                        if matches!(
+                            callee.body,
+                            HirLuauInliningBody::CapturedAppendTransfer { .. }
+                        ) {
+                            captured_transfers.insert(site);
+                        }
+                        if callee.capture.is_some()
+                            && callee.body != HirLuauInliningBody::CapturedValue
+                        {
                             captured_updates.insert(site);
                         }
                         first = Some(
@@ -811,7 +897,9 @@ pub(in crate::hir::simplify) fn restore(
                         }
                         if matches!(
                             callee.body,
-                            HirLuauInliningBody::SnapshotClosureFactory { .. }
+                            HirLuauInliningBody::CapturedValue
+                                | HirLuauInliningBody::CapturedAppendTransfer { .. }
+                                | HirLuauInliningBody::SnapshotClosureFactory { .. }
                                 | HirLuauInliningBody::CapturedCallablePair
                                 | HirLuauInliningBody::LiteralChoice { .. }
                                 | HirLuauInliningBody::ValueExpression { .. }
@@ -822,6 +910,7 @@ pub(in crate::hir::simplify) fn restore(
                                 | HirLuauInliningBody::GuardedCounter { .. }
                                 | HirLuauInliningBody::ResetCounter { .. }
                                 | HirLuauInliningBody::ArrayFold { .. }
+                                | HirLuauInliningBody::NestedSearch { .. }
                                 | HirLuauInliningBody::CallingValue { .. }
                                 | HirLuauInliningBody::CallingSharedValue { .. }
                                 | HirLuauInliningBody::CallingObservedValue { .. }
@@ -843,7 +932,17 @@ pub(in crate::hir::simplify) fn restore(
                                 .result_frame_slots
                                 .insert(
                                     site,
-                                    if let Some(home) = seeded_frames
+                                    if matches!(
+                                        callee.body,
+                                        HirLuauInliningBody::CapturedAppendTransfer { .. }
+                                    ) {
+                                        facts
+                                            .operation_result_home(site)
+                                            .expect("validated captured transfer result")
+                                            .slot()
+                                    } else if callee.body == HirLuauInliningBody::CapturedValue {
+                                        operand_copy_homes[&site]
+                                    } else if let Some(home) = seeded_frames
                                         .as_ref()
                                         .and_then(|frames| frames.result_home(site))
                                     {
@@ -853,6 +952,7 @@ pub(in crate::hir::simplify) fn restore(
                                         .get(&site)
                                         .or_else(|| guarded_recovery.result_slots.get(&site))
                                         .or_else(|| array_recovery.result_slots.get(&site))
+                                        .or_else(|| search_recovery.result_slots.get(&site))
                                     {
                                         *home
                                     } else if let Some(result) = calling_frames
@@ -921,6 +1021,9 @@ pub(in crate::hir::simplify) fn restore(
                     false
                 });
             }
+            let effects =
+                captured_transfers::replayed(proto, &root_indices, plan, &captured_transfers);
+            plan.replayed_effects.extend(effects);
             plan.replayed_effects
                 .extend(plan.removed.iter().copied().filter(|index| {
                 matches!(root_indices.binary_search(index).ok().and_then(|root| scalar_local(&proto.body.stmts[root])), Some((_, HirExpr::Binary(binary)))
@@ -959,6 +1062,7 @@ pub(in crate::hir::simplify) fn restore(
         if array_recovery
             .obligations
             .iter()
+            .chain(search_recovery.obligations.iter())
             .any(|obligation| !certified_sites.contains(obligation))
         {
             continue;
@@ -1060,6 +1164,7 @@ pub(in crate::hir::simplify) fn restore(
                     | HirLuauInliningBody::GuardedCounter { .. }
                     | HirLuauInliningBody::ResetCounter { .. }
                     | HirLuauInliningBody::ArrayFold { .. }
+                    | HirLuauInliningBody::NestedSearch { .. }
                     | HirLuauInliningBody::CallingValue { .. }
                     | HirLuauInliningBody::CallingSharedValue { .. }
                     | HirLuauInliningBody::CallingObservedValue { .. }
@@ -1495,6 +1600,7 @@ fn callees(
                         | HirLuauInliningBody::GuardedCounter { .. }
                         | HirLuauInliningBody::ResetCounter { .. }
                         | HirLuauInliningBody::ArrayFold { .. }
+                        | HirLuauInliningBody::NestedSearch { .. }
                         | HirLuauInliningBody::CallingValue { .. }
                         | HirLuauInliningBody::CallingSharedValue { .. }
                         | HirLuauInliningBody::CallingObservedValue { .. }
@@ -1514,7 +1620,7 @@ fn callees(
             continue;
         }
         let capture = match (key.0, closure.captures.as_slice()) {
-            (HirLuauInliningBody::PublishedTableFactory { .. }, [capture])
+            (HirLuauInliningBody::CapturedValue | HirLuauInliningBody::PublishedTableFactory { .. }, [capture])
                 if capture.mode == HirCaptureMode::ByValue =>
             {
                 match capture.binding {
@@ -1522,7 +1628,7 @@ fn callees(
                     _ => continue,
                 }
             }
-            (HirLuauInliningBody::PublishedTableFactory { .. }, _) => continue,
+            (HirLuauInliningBody::CapturedValue | HirLuauInliningBody::PublishedTableFactory { .. }, _) => continue,
             (HirLuauInliningBody::ClosureFactory { .. }, [capture])
                 if capture.mode == HirCaptureMode::ByValue
                     && capture.binding == HirBinding::Local(local) =>
@@ -1545,6 +1651,12 @@ fn callees(
                 if !captures.is_empty() && captures.iter().all(|capture|
                     capture.mode == HirCaptureMode::ByValue
                         && matches!(capture.binding, HirBinding::Local(local) if writes.get(&local) == Some(&1))) => None,
+            (HirLuauInliningBody::CapturedAppendTransfer { .. }, [trace, target, source])
+                if trace.mode == HirCaptureMode::ByValue && source.mode == HirCaptureMode::ByValue
+                    && target.mode == HirCaptureMode::ByReference
+                    && [trace, source].iter().all(|capture| matches!(capture.binding,
+                        HirBinding::Local(local) if writes.get(&local) == Some(&1)))
+                    && matches!(target.binding, HirBinding::Local(_)) => None,
             (_, []) => None,
             _ => continue,
         };
@@ -1570,7 +1682,7 @@ fn callees(
                     repeat_prefix: repeat_prefixes[closure.proto.index()].clone(),
                     literal_choice: literal_choices[closure.proto.index()].clone(),
                     value_expression: value_expressions[closure.proto.index()].clone(),
-                    readonly_captures: closure
+                    capture_locals: closure
                         .captures
                         .iter()
                         .filter_map(|capture| match capture.binding {

@@ -128,10 +128,11 @@ pub(in crate::hir::simplify::call_frames::native::expanded) fn prepare(
     let mut replacements = BTreeMap::new();
     for invocation in &invocations {
         let candidate = &invocation.candidate;
-        let frame = facts.branch_value_frame(candidate.result)?;
+        let frame = facts.branch_value_frame_at(candidate.predicate)?;
         let result = frame
             .results
             .iter()
+            .chain(frame.edge_results(facts))
             .find(|result| result.value == candidate.result)?;
         let initial = result
             .incoming

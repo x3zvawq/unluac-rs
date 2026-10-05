@@ -1,3 +1,7 @@
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=5]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]]
 -- 计算 key 后读取上值目标，RHS 回调改写同名 cell 不能改变目标表快照。
 -- unluac: expect-contains [[.name .. ":" .. tostring(]]
 -- unluac: expect-not-contains [[= tostring(]]

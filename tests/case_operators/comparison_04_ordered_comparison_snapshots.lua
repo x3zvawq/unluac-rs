@@ -1,7 +1,9 @@
+-- unluac: expect-ast-count [[function]] [[11]]
+-- unluac: expect-ast-count [[if]] [[4]]
+-- unluac: expect-ast-max [[local-binding]] [[18]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=10]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=11]]
 -- >/>= 保持左读取、右调用和 VM 反向关系的元方法参数，不用补集替换有序关系。
--- unluac: expect-ast-count [[function]] [[9]]
--- unluac: expect-ast-count [[if]] [[3]]
--- unluac: expect-ast-max [[local-binding]] [[15]]
 -- unluac: expect-contains [[numeric_left, numeric_right = 1, 0 / 0]] [[@debug=retained]]
 local events = {}
 local old = getmetatable(_G)
@@ -24,10 +26,14 @@ local mt = {
     end,
 }
 setmetatable(_G, {__index = function(_, key)
-    if key == "ordered_comparison_left" then
-        events[#events + 1] = "left"
-        if nan_mode then return numeric_left end
-        return setmetatable({side = "left"}, mt)
+    if key == "ordered_comparison_left" or key == "ordered_comparison_right" then
+        local side = key == "ordered_comparison_left" and "left" or "right"
+        events[#events + 1] = side
+        if nan_mode then
+            if side == "left" then return numeric_left end
+            return numeric_right
+        end
+        return setmetatable({side = side}, mt)
     end
 end})
 local function right()
@@ -49,6 +55,14 @@ local function less()
 end
 local function less_equal()
     return ordered_comparison_left <= right()
+end
+local function global_pair()
+    return ordered_comparison_left > ordered_comparison_right
+        and ordered_comparison_left >= ordered_comparison_right
+end
+local function global_assert()
+    assert(ordered_comparison_left > ordered_comparison_right
+        and ordered_comparison_left >= ordered_comparison_right)
 end
 assert(greater())
 assert(not greater_equal())
@@ -103,6 +117,28 @@ reversed_arguments = false
 assert(select("#", less()) == 1)
 assert(select("#", less_equal()) == 1)
 assert(table.concat(events, ",") == "left,right,lt,left,right,le,left,right,lt,left,right,lt,left,right,le")
+-- 两侧环境读取均可观察；规范化的反向关系不能把右读取移到左读取前。
+reversed_arguments = true
+events = {}
+lt_result, le_result = true, false
+assert(global_pair() == false)
+assert(table.concat(events, ",") == "left,right,lt,left,right,le")
+events = {}
+lt_result, le_result = false, true
+assert(global_pair() == false)
+assert(table.concat(events, ",") == "left,right,lt")
+events = {}
+lt_result = true
+assert(global_pair() == true)
+assert(table.concat(events, ",") == "left,right,lt,left,right,le")
+events = {}
+global_assert()
+assert(table.concat(events, ",") == "left,right,lt,left,right,le")
+events = {}
+nan_mode = true
+numeric_left, numeric_right = 1, 0 / 0
+assert(global_pair() == false)
+assert(table.concat(events, ",") == "left,right")
 setmetatable(_G, old)
 assert(getmetatable(_G) == old)
 print("ordered-comparison-snapshots-ok")

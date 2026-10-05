@@ -3,9 +3,11 @@
 -- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=2]] [[@dialect=luajit]]
 -- unluac: expect-not-contains [[__eq = 0]]
--- unluac: expect-ast-count [[function]] [[2]]
 -- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[7]]
+-- unluac: expect-ast-count [[repeat]] [[0]]
+-- unluac: expect-ast-count [[function]] [[6]]
+-- unluac: expect-ast-max [[local-binding]] [[15]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=6]]
 local function compare(flag, value, yes, no, expected)
     local matched = value == (flag and yes or no)
     assert(matched == expected)
@@ -41,3 +43,44 @@ assert(select("#", compare(true, first, same, second, true)) == 1)
 assert(comparisons == 8)
 assert(not pcall(compare, true, first, same, second, false))
 assert(comparisons == 9)
+
+-- 外层短路中的算术选择臂仍是值准备；左快照必须先于 __add，再由 __eq 消费。
+local trace = {}
+local ordered_meta = {__eq = function(a, b)
+    trace[#trace + 1] = "eq"
+    return a.value == b.value
+end}
+local read_value = setmetatable({value = "same"}, ordered_meta)
+local computed = setmetatable({value = "same"}, ordered_meta)
+local record = setmetatable({}, {__index = function(_, key)
+    assert(key == "time")
+    trace[#trace + 1] = "read"
+    return read_value
+end})
+local operand = setmetatable({}, {__add = function(a, b)
+    assert(a == 1000 and type(b) == "table")
+    trace[#trace + 1] = "add"
+    read_value = false
+    return computed
+end})
+local function nested(enabled, choose, source, input)
+    return enabled and source.time == (choose and 0 or 1000 + input)
+end
+assert(nested(true, false, record, operand) == true)
+assert(table.concat(trace, ",") == "read,add,eq" and read_value == false)
+trace = {}
+read_value = setmetatable({value = "different"}, ordered_meta)
+assert(nested(true, false, record, operand) == false)
+assert(table.concat(trace, ",") == "read,add,eq")
+trace = {}
+read_value = 0
+assert(nested(true, true, record, operand) == true)
+assert(table.concat(trace, ",") == "read" and read_value == 0)
+trace = {}
+assert(nested(false, false, record, operand) == false)
+assert(nested(nil, false, record, operand) == nil)
+assert(#trace == 0)
+assert(select("#", nested(false, false, record, operand)) == 1)
+assert(not pcall(nested, true, false, record, nil))
+assert(table.concat(trace, ",") == "read")
+print("nested-comparison-preparation", table.concat(trace, ","))

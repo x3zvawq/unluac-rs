@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub(super) mod literal_globals;
+pub(super) mod globals;
 pub(super) mod nil;
 pub(super) mod prepared_writes;
 

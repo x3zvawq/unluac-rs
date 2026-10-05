@@ -1,3 +1,9 @@
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=7]] [[@dialect=luajit]]
 -- 完整索引赋值保持各 VM 的目标读取时点、CALL 单结果宽度与匿名 CLOSURE 返回槽。
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.2]]

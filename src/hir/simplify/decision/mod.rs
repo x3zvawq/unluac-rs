@@ -119,6 +119,12 @@ fn reduce_decision_expr(
 ) -> Option<ReducedDecision> {
     let topology = analyze_decision(decision);
 
+    // 先消费完整 DAG 的共享出口；先把 child 的 CurrentValue 链变成表达式，
+    // 会丢失父子相同 fallback 的图关系，令可直接恢复的 and/or 退回一般三元值。
+    if let Some(expr) = collapse_value_decision_expr(&topology, safety, |_| false) {
+        return Some(ReducedDecision::Expr(expr));
+    }
+
     let mut nodes = decision.nodes.clone();
     let mut replacements = vec![None; nodes.len()];
     let mut changed = false;

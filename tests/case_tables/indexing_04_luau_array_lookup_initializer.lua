@@ -1,3 +1,7 @@
+-- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=1]]
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=6]]
+-- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=12]]
+-- unluac: expect-ast-max [[local-binding]] [[6]] [[@proto=8]]
 -- regress_588: 原数组缓冲与低槽读取组成初始化，保留 NaN 捕获和接收调用的参数语境。
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]

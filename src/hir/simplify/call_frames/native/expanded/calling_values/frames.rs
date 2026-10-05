@@ -349,10 +349,11 @@ impl FrameBuilder<'_> {
         let source = self.facts.promoted_local_for_temp(candidate.value_source)?;
         let initial_write = self.definition(initial, before)?;
         let value_write = self.definition(candidate.value, initial_write)?;
-        let frame = self.facts.branch_value_frame(candidate.result)?;
+        let frame = self.facts.branch_value_frame_at(candidate.predicate)?;
         let result = frame
             .results
             .iter()
+            .chain(frame.edge_results(self.facts))
             .find(|result| result.value == candidate.result)?;
         let initial_value = result
             .incoming

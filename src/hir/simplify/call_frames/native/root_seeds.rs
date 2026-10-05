@@ -21,6 +21,7 @@ pub(super) fn attach(
         .collect::<BTreeMap<_, _>>();
     let seeds = facts
         .copy_root_seed_locals()
+        .chain(facts.observing_copy_root_holders())
         .chain(handoffs.keys().copied())
         .collect::<BTreeSet<_>>();
     if seeds.is_empty() {
@@ -137,21 +138,7 @@ pub(super) fn attach(
         {
             declarations.push((index, decl.bindings.clone()));
         }
-        let HirStmt::Assign(assign) = stmt else {
-            return;
-        };
-        let Some(crate::hir::common::HirRootRelease::CopyOverwrite { released, .. }) =
-            &assign.root_release
-        else {
-            return;
-        };
-        for temp in released {
-            let Some(local) = facts
-                .promoted_local_for_temp(*temp)
-                .filter(|local| seeds.contains(local))
-            else {
-                continue;
-            };
+        let mut record_retirement = |local| {
             retirement_statements
                 .entry(local)
                 .or_default()
@@ -170,6 +157,29 @@ pub(super) fn attach(
                     }
                 })
                 .or_insert(owner);
+        };
+        match stmt {
+            HirStmt::LocalRootRelease(local) if seeds.contains(local) => {
+                // 可观察覆盖先完成原读取/调用，再释放独立 holder；只有消费该事件的
+                // 完整帧能接替入口 nil，不能把它误当作没有退休义务的空声明。
+                record_retirement(*local);
+            }
+            HirStmt::Assign(assign) => {
+                if let Some(crate::hir::common::HirRootRelease::CopyOverwrite {
+                    released, ..
+                }) = &assign.root_release
+                {
+                    for temp in released {
+                        if let Some(local) = facts
+                            .promoted_local_for_temp(*temp)
+                            .filter(|local| seeds.contains(local))
+                        {
+                            record_retirement(local);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     });
     for (declaration, bindings) in declarations {

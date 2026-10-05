@@ -1,4 +1,4 @@
-//! 恢复连续字面量准备及全局写回的赋值帧。
+//! 恢复连续字面量、旧值快照与全局写回组成的赋值帧。
 //!
 //! 全局环境可能带写入元方法，写回次序不能交换；每项准备依赖原 use→Def，
 //! 方言的正序/逆序写回和末项 RK 规则在完整源码前缀事务内一起核对。
@@ -47,8 +47,10 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
             .and_then(Option::as_ref)
             .is_some_and(|entry| {
                 plain_copy(entry.stmt)
-                    && (scalar_local(entry.stmt).is_some_and(|(_, value)| literal(value))
-                        || nil_argument_group(entry.stmt, facts).is_some())
+                    && (scalar_local(entry.stmt).is_some_and(|(_, value)| {
+                        literal(value)
+                            || matches!(value, HirExpr::LocalRef(_) | HirExpr::ParamRef(_))
+                    }) || nil_argument_group(entry.stmt, facts).is_some())
             })
         {
             index += 1;
@@ -57,6 +59,13 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
             index += 1;
             continue;
         }
+        let first = flat[start].unwrap().stmt;
+        let base = scalar_local(first)
+            .and_then(|(local, _)| facts.trusted_local_home_slot(local))
+            .or_else(|| {
+                let group = nil_argument_group(first, facts)?;
+                facts.trusted_temp_home_slot(*group.first()?)
+            });
         let first_write = index;
         while flat
             .get(index)
@@ -72,7 +81,17 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
                 })
             })
         {
+            let (_, global, _) = global_write(flat[index].unwrap().stmt).unwrap();
             index += 1;
+            // 逆序写回消费最低准备槽时结束本帧，后继独立全局写属于下一语句。
+            // 这里仅界定候选窗口；原 use→Def 与所有准备事件仍由 candidate 核对。
+            if dialect != DecompileDialect::Luau
+                && base.is_some_and(|base| {
+                    facts.global_write_value_home(global, dialect) == Some(base)
+                })
+            {
+                break;
+            }
         }
         // 单目标写回也能消费完整准备区，原输入版本、槽位与求值顺序
         // 仍由 candidate 统一核对，不依赖第二个全局写回提供证明。
@@ -141,21 +160,38 @@ fn candidate(
             writes.len() - offset - 1
         }];
         let (target, global, value) = global_write(write.stmt)?;
-        let original = if let Some(binding) = HirBinding::from_expr(value) {
-            inputs.get(&binding)?
+        let original = HirBinding::from_expr(value)
+            .and_then(|binding| inputs.get(&binding))
+            .unwrap_or(value);
+        let preparation = if literal(original) {
+            facts
+                .global_write_value_preparation(global, original)
+                .or_else(|| {
+                    matches!(original, HirExpr::Nil)
+                        .then(|| facts.global_nil_batch_preparation(global))
+                        .flatten()
+                })
         } else {
-            value
+            facts
+                .global_write_value_copy(global, dialect)
+                .and_then(|copy| {
+                    (facts.promoted_binding_for_temp(copy.source?)?.expr() == *original)
+                        .then_some((copy.target, copy.target_home))
+                })
         };
-        if !literal(original) {
-            return None;
-        }
-        let input = if let Some((temp, home)) = facts
-            .global_write_value_preparation(global, original)
-            .or_else(|| {
-                matches!(original, HirExpr::Nil)
-                    .then(|| facts.global_nil_batch_preparation(global))
-                    .flatten()
-            }) {
+        let input = if let Some((binding, home)) = facts.global_write_value_binding(global, dialect)
+            && home.slot() < base.slot()
+        {
+            // PUC/JIT 的末项可直接读取已有低槽，首项已在原 scratch 中快照。
+            // 末项对应最先发生的全局写，不越过任何 __newindex 再读取来源。
+            if dialect == DecompileDialect::Luau
+                || offset + 1 != writes.len()
+                || HirBinding::from_expr(value) != Some(binding)
+            {
+                return None;
+            }
+            None
+        } else if let Some((temp, home)) = preparation {
             if home.slot() != base.slot() + offset
                 || facts.global_write_value_home(global, dialect) != Some(home)
                 || matches!(value, HirExpr::LocalRef(local) if facts.promoted_local_for_temp(temp) != Some(*local))

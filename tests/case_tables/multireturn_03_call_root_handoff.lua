@@ -1,7 +1,12 @@
 -- constructor 在 SSA call result 身份尚未合并前消费整个区域，字段接管已结束的物理根。
 -- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-min [[table-constructor]] [[5]]
--- unluac: expect-ast-min [[numeric-for]] [[3]]
+-- unluac: expect-ast-count [[table-constructor]] [[5]]
+-- unluac: expect-ast-count [[numeric-for]] [[3]]
+-- list 尾调用保持开放，keyed 每项保持单值；构造器直接承接结果，不另建临时根声明。
+-- unluac: expect-ast-count [[table-list-field]] [[3]]
+-- unluac: expect-ast-count [[table-record-field]] [[5]]
+-- unluac: expect-ast-max [[local-binding]] [[10]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
 local weak = setmetatable({}, { __mode = "v" })
 local calls = 0
 local function object(index)

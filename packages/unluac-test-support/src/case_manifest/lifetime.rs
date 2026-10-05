@@ -1702,4 +1702,22 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             }),
         ],
     ),
+    LuaCaseDefinition::new(
+        "tests/case_lifetime/snapshot_07_concat_choice_root.lua",
+        &[
+            "gc-root",
+            "concat",
+            "short-circuit",
+            "observing-overwrite",
+            "debug",
+        ],
+        "拼接副本与条件取值共享准备槽，回调修改参数后仍按各 VM 的原 CONCAT/查找覆盖边界保活和退休，不保留合成 holder。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
 ];

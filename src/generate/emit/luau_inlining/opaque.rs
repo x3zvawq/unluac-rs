@@ -79,6 +79,13 @@ impl<'a> Functions<'a> {
         }
     }
 
+    pub(super) fn capture_layout(
+        &self,
+        function: crate::hir::HirProtoRef,
+    ) -> Option<&HirClosureExpr> {
+        self.captures.get(&function).copied().flatten()
+    }
+
     pub(super) fn validate(&self, func: &AstFunctionExpr) -> bool {
         if costly_callback_return(func) {
             return true;

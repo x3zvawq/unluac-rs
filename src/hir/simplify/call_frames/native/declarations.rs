@@ -4,7 +4,9 @@
 //! 整组声明再交给 native preview 验证源码前缀和被消费身份的后继使用。
 
 use super::*;
+mod discarded;
 use crate::hir::simplify::table_constructors::{ConstructorWrite, constructor_write};
+pub(super) use discarded::collect as collect_discarded;
 
 /// 同一绑定的后续 nil 准备不必持有最初的空声明；只有全部显式 nil 写都被本批
 /// 原帧重发时才解除保护。未知或仍留在 HIR 中的 nil 初始化继续保留原 owner。

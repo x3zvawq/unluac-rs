@@ -183,6 +183,7 @@ fn restore_call_value(
         NativeFrameContext {
             rk_literals: None,
             expanded_callees: None,
+            captured_transfers: None,
             compared_choices: None,
             value_expressions: None,
             constant_controls: None,

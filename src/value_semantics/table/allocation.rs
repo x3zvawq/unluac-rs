@@ -19,6 +19,30 @@ pub struct TablePreallocation {
     pub array_sizing: ArraySizing,
 }
 
+/// Luau 显式整数键按出现顺序形成数组区；未解析的准备变量只延后候选判断。
+#[derive(Default)]
+pub(crate) struct LuauRecordIndices {
+    count: i64,
+    non_indices: usize,
+    unresolved: bool,
+}
+
+impl LuauRecordIndices {
+    pub(crate) fn push(&mut self, key: &impl super::TableExpression) {
+        if key.table_integer_key() == Some(self.count + 1) {
+            self.count += 1;
+        } else {
+            self.non_indices += 1;
+        }
+        self.unresolved |= key.table_key().is_none();
+    }
+
+    /// 只排除已知需要 hash 区的前缀，不为尚未还原的键签发完整布局证明。
+    pub(crate) fn may_be_array_prefix(&self) -> bool {
+        self.unresolved || self.non_indices == 0
+    }
+}
+
 impl TablePreallocation {
     /// Luau 非空候选的官方编译器布局；空表的后续写入推断仍留给原构造区域。
     pub(crate) fn matches_luau<'a, E: super::TableExpression + 'a>(
@@ -27,7 +51,8 @@ impl TablePreallocation {
         trailing_vararg: bool,
     ) -> bool {
         use super::TableFieldRef;
-        let (mut arrays, mut records, mut named, mut indices) = (0, 0, 0, 0);
+        let (mut arrays, mut records, mut named) = (0, 0, 0);
+        let mut indices = LuauRecordIndices::default();
         for field in fields {
             match field {
                 TableFieldRef::Array { .. } => arrays += 1,
@@ -37,9 +62,7 @@ impl TablePreallocation {
                 }
                 TableFieldRef::Record { key, .. } => {
                     records += 1;
-                    if key.table_integer_key() == Some(indices + 1) {
-                        indices += 1;
-                    }
+                    indices.push(key);
                 }
             }
         }
@@ -51,8 +74,8 @@ impl TablePreallocation {
             // DUPTABLE 使用独立的原键身份，不在此重建编译器模板去重规则。
             return false;
         }
-        if arrays == 0 && records == named + indices as usize {
-            arrays = indices as usize;
+        if arrays == 0 && records == named + indices.count as usize {
+            arrays = indices.count as usize;
             records = named;
         }
         self.matches(arrays - usize::from(trailing_vararg), records)

@@ -2,9 +2,11 @@
 -- unluac: expect-count [[and true]] [[3]] [[@dialect=luau]]
 -- unluac: expect-contains [[assert(lhs == rhs)]] [[@debug=retained]]
 -- unluac: expect-not-contains [[__eq = 0]]
--- unluac: expect-ast-count [[function]] [[5]]
+-- unluac: expect-ast-count [[function]] [[6]]
 -- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[11]]
+-- unluac: expect-ast-max [[local-binding]] [[12]]
+-- 预写已并入 initializer 时，完整参数仍消费原结果身份；后续拼接比较不留接棒声明。
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]] [[@dialect=luau]]
 -- 并列 RHS 共享 Luau scratch，不能拆出 CALL 结果和参数 COPY 的声明链。
 -- unluac: expect-ast-count [[local-decl]] [[3]] [[@proto=0]] [[@dialect=luau]]
 -- PUC/LuaJIT 编译器保留三个 marker 比较，stripped 的常量内联不能删除这些操作。
@@ -28,6 +30,10 @@ end
 local function stringify(lhs, rhs)
     local marker = 1
     return tostring(lhs == rhs and marker == 1)
+end
+local function compound(flag, count, dark, trace)
+    assert(count == (flag and 3 or 2) and dark == count * 2, "compound condition")
+    assert(trace == "start" .. (flag and "on" or "") .. "end", "compound trace")
 end
 local comparisons = 0
 local meta = {
@@ -57,3 +63,12 @@ assert(select("#", direct(7, 7)) == 0)
 assert(select("#", prewritten(false, false)) == 0)
 assert(select("#", message("same", "same", "same value")) == 0)
 assert(stringify(7, 7) == "true" and comparisons == 8)
+compound(true, 3, 6, "startonend")
+compound(false, 2, 4, "startend")
+compound(0, 3, 6, "startonend")
+compound(nil, 2, 4, "startend")
+-- 首项为假时不执行 count 的乘法；若错误求值，报错将来自算术而不是指定的 assert。
+assert(string.find(select(2, pcall(compound, true, {}, 6, "startonend")), "compound condition", 1, true))
+assert(string.find(select(2, pcall(compound, true, 3, 5, "startonend")), "compound condition", 1, true))
+assert(string.find(select(2, pcall(compound, true, 3, 6, "wrong")), "compound trace", 1, true))
+print("compound prewrite", comparisons)

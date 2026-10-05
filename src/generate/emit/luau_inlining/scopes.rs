@@ -82,7 +82,8 @@ pub(super) fn increment_identity(
         && ret.values.as_slice() == [AstExpr::Var(AstNameRef::Param(func.params[0]))]
 }
 
-// 只累计确定的成本下界：函数创建为 10，已签证的普通 local CALL 至少为 3；
+// 共享成本分析覆盖表、索引和调用；结构化模板另可用确定的成本下界证明。
+// 下界中函数创建为 10，已签证的普通 local CALL 至少为 3；
 // repeat 的 body 和 condition 在 pinned CostModel 中均按 3 倍计。无参数函数
 // 没有实参常量折扣；成本至少 28 时已超过 25 * (cost + 3) / cost 的阈值。
 pub(super) fn costly(func: &AstFunctionExpr) -> bool {
@@ -123,5 +124,76 @@ pub(super) fn costly(func: &AstFunctionExpr) -> bool {
         }
         cost
     }
-    func.params.is_empty() && block(&func.body) >= 28
+    func.params.is_empty()
+        && (constant_control::cost(func, None).is_some_and(|cost| !cost.permits_inline(cost))
+            || block(&func.body) >= 28)
+}
+
+/// Boolean 实参预留结果槽后，按顺序准备 getter 的原 COPY；低槽引用和右侧
+/// 内嵌常量不占准备区。只签发此只读模板，其余比较继续由既有 owner 核对。
+pub(super) fn captured_value_slots(
+    call: &AstCallExpr,
+    active: usize,
+    occurrences: &BTreeMap<crate::hir::HirSourceSite, crate::hir::LocalId>,
+    bodies: &BTreeMap<crate::hir::LocalId, HirLuauInliningBody>,
+    slots: &BTreeMap<crate::hir::HirSourceSite, usize>,
+    seen: &mut BTreeSet<crate::hir::HirSourceSite>,
+) -> bool {
+    let getter = |value: &AstExpr| {
+        let AstExpr::Call(call) = value else {
+            return None;
+        };
+        let site = call.required_luau_inlining?;
+        (occurrences.get(&site).and_then(|local| bodies.get(local))
+            == Some(&HirLuauInliningBody::CapturedValue))
+        .then_some(site)
+    };
+    for (argument, value) in call.args.iter().enumerate() {
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            match value {
+                AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+                    pending.extend([&logical.rhs, &logical.lhs]);
+                }
+                AstExpr::SingleValue(value) => pending.push(value),
+                AstExpr::Unary(unary)
+                    if unary.op == AstUnaryOpKind::Not && !unary.original_operation =>
+                {
+                    pending.push(&unary.expr);
+                }
+                AstExpr::Binary(binary)
+                    if getter(&binary.lhs).is_some() || getter(&binary.rhs).is_some() =>
+                {
+                    if binary.op != AstBinaryOpKind::Eq {
+                        return false;
+                    }
+                    let mut next = active + argument + 2;
+                    for (side, value) in [&binary.lhs, &binary.rhs].into_iter().enumerate() {
+                        if let Some(site) = getter(value) {
+                            if slots.get(&site) != Some(&next) || !seen.insert(site) {
+                                return false;
+                            }
+                            next += 1;
+                        } else if !matches!(
+                            value,
+                            AstExpr::Var(AstNameRef::Local(_) | AstNameRef::Param(_))
+                        ) && !(side == 1
+                            && matches!(
+                                value,
+                                AstExpr::Nil
+                                    | AstExpr::Boolean(_)
+                                    | AstExpr::Integer(_)
+                                    | AstExpr::Number(_)
+                                    | AstExpr::String(_)
+                            ))
+                        {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    true
 }

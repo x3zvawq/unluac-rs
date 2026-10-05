@@ -250,8 +250,10 @@ pub(super) fn collect_scalar_pairs(
         };
         let first_site = InstrRef(index);
         let (snapshot_reg, copied_input, literal_input) = match first {
-            LowInstr::Move(first) if first.src < first.dst
-                && !epochs.reference_capture_may_be_open(first.src, first_site) => {
+            LowInstr::Move(first) if first.src < first.dst => {
+                // 首项仍在原 COPY 时点读取当前 cell，再执行末项与逆序写回；
+                // 已打开捕获不改变这个时序。保存原绑定和 epoch，后层须核对当前
+                // 同 home 的绑定读取，不能把 cell 的旧 SSA 定义当作当前值内联。
                 let input = binding(dataflow.use_value(first_site, first.src))?;
                 (first.dst, Some((input, HomeSlotKey::new(first.src.index(), epochs.epoch_at(first.src, first_site)))), None)
             }
@@ -319,7 +321,7 @@ pub(super) fn collect_scalar_pairs(
         for (offset, (reg, site)) in regs.into_iter().zip([first_site, second_write, last_site]).enumerate() {
             let def = dataflow.instr_def_for_reg(site, reg)?;
             // 只退休高槽快照；两个低槽仍按原逆序写回，捕获 cell 的发布时点不变。
-            // 输入 COPY 已在各自读取处排除开放捕获，不能把该限制再套到写目标上。
+            // 被退休的快照自身不能是捕获 cell；首项来源和两个写目标仍保留原绑定。
             if fixed_temps[def.index()] != TempId(def.index())
                 || offset == 0 && epochs.reference_capture_may_be_open(reg, site)
             {

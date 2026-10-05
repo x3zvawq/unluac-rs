@@ -12,12 +12,21 @@ pub(super) struct ConstructorShape<'a> {
     table: &'a crate::hir::common::HirTableConstructor,
     arrays: usize,
     records: usize,
+    luau_record_indices: crate::value_semantics::table::allocation::LuauRecordIndices,
 }
 
 impl<'a> ConstructorShape<'a> {
     pub(super) fn new(table: &'a crate::hir::common::HirTableConstructor) -> Self {
+        let mut luau_record_indices =
+            crate::value_semantics::table::allocation::LuauRecordIndices::default();
+        for field in &table.fields {
+            if let HirTableField::Record(record) = field {
+                luau_record_indices.push(&record.key);
+            }
+        }
         Self {
             table,
+            luau_record_indices,
             arrays: table
                 .fields
                 .iter()
@@ -35,6 +44,7 @@ impl<'a> ConstructorShape<'a> {
         use crate::value_semantics::table::TableExpression;
         match write {
             ConstructorWrite::Record { access, .. } => {
+                self.luau_record_indices.push(&access.key);
                 let key = access.key.table_key();
                 let allowed = match &self.table.allocation {
                     // 零容量分配已完成空构造器；动态 key 也属于之后的普通字段写，
@@ -47,6 +57,13 @@ impl<'a> ConstructorShape<'a> {
                         if allocation.array_capacity == 0 && allocation.hash_capacity == 0 =>
                     {
                         false
+                    }
+                    HirTableAllocation::Luau(allocation) if allocation.hash_capacity == 0 => {
+                        // 候选拒绝[SemanticBarrier:TableShape]：纯数组预分配不能接收
+                        // 乱序显式键；order_06 中独立 [2]、[1] 写回合并后会改成 hash 分配。
+                        self.arrays == 0
+                            && self.records < allocation.array_capacity as usize
+                            && self.luau_record_indices.may_be_array_prefix()
                     }
                     // TNEW 未预留 hash 时，固定字符串字段不可能属于原初始化形状。
                     // 后续普通字段写会动态扩容，不能因此独占它的 CALL 准备区。
@@ -1010,6 +1027,48 @@ fn luau_template_shape_matches(table: &crate::hir::common::HirTableConstructor) 
 }
 
 impl FrameBuilder<'_> {
+    /// 参数区的数组查询消费原分配 Def，后继对同一匿名 local 的覆盖不属于该值。
+    /// 与独立初始化共用布局证明，事件仍随外层 CALL 一起提交。
+    pub(super) fn scalar_array_lookup_argument(
+        &mut self,
+        access: &HirTableAccess,
+        before: usize,
+        slot: usize,
+    ) -> Option<HirExpr> {
+        let context = self.native?;
+        let HirExpr::LocalRef(source) = access.base else {
+            return None;
+        };
+        let index = self.definition(source, before)?;
+        let (_, HirExpr::TableConstructor(table)) = scalar_local(self.run[index])? else {
+            return None;
+        };
+        let producer = self.facts.table_read_base_value(access)?;
+        let target = self.facts.table_read_result_home(access)?;
+        if self.dialect != DecompileDialect::Luau
+            || target.slot() != slot
+            || self.facts.operation_result_temp(match table.sources {
+                crate::hir::common::HirOperationSources::Single(site) => site,
+                _ => return None,
+            }) != Some(producer)
+            || !self.homes_match(source, index, slot + 1, None, Some(producer))
+            || context.proto.local_debug_hints[source.index()].is_some()
+            || context.proto.local_debug_scopes[source.index()].is_some()
+            || context
+                .proto
+                .inline_dispositions
+                .local(source)
+                .must_preserve()
+            || !self.facts.allocation_result_reference_unaliased(table)
+            || context.closed.contains(&HomeSlotKey::new(slot + 1, 0))
+        {
+            return None;
+        }
+        let rebuilt = scalar_array_lookup(self.facts, table, access, target)?;
+        self.finish_event(index)?;
+        Some(rebuilt)
+    }
+
     /// O0 常量字段仍逐项准备 key/value；O1/O2 内嵌模板不需要这两个 scratch。
     fn completed_luau_template_layout(
         &self,
@@ -1829,11 +1888,9 @@ impl FrameBuilder<'_> {
                 return None;
             };
             let scratch = slot + 1 + usize::from(prepared_key);
-            if layout.value.is_none_or(|home| home.slot() != scratch) {
-                return None;
-            }
             // scratch 是编译位置，原 TSET 输入的完整 home 仍由共享字段操作数证明；
-            // 循环 CLOSE 形成的新 epoch 不能重置为零，也不能借同槽其它版本。
+            // 现成低槽值由 TSET 直接读取，不额外准备 scratch。循环 CLOSE 形成的
+            // 新 epoch 不能重置为零，也不能借同槽其它版本。
             let (value, _) = self.record_operand_impl(
                 value,
                 layout.value,

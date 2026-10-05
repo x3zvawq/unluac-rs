@@ -244,7 +244,7 @@ pub(super) fn parallel_preparations(
 }
 
 /// Luau 并列固定字段写先连续准备 RHS，再按源码顺序写回；两个准备槽须一起退休。
-pub(super) fn parallel_literals(
+pub(super) fn parallel_fixed_fields(
     context: NativeFrameContext<'_>,
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
@@ -263,7 +263,7 @@ pub(super) fn parallel_literals(
     for (offset, (preparation, write)) in
         run.into_iter().zip([write_first, write_second]).enumerate()
     {
-        let (local, literal) = scalar_local(preparation)?;
+        let (local, prepared) = scalar_local(preparation)?;
         let HirStmt::Assign(assign) = write.stmt else {
             return None;
         };
@@ -274,7 +274,7 @@ pub(super) fn parallel_literals(
         ) else {
             return None;
         };
-        let home = facts.luau_literal_table_write_frame(access, literal)?;
+        let home = facts.luau_fixed_table_write_frame(access)?;
         if home.slot() != base.slot() + offset
             || facts.trusted_local_home_slot(local) != Some(home)
             || value != &HirExpr::LocalRef(local)
@@ -286,12 +286,46 @@ pub(super) fn parallel_literals(
         {
             return None;
         }
-        let (producer, original_home) = facts.table_write_value_preparation(access, literal)?;
+        let (producer, original_home) = match prepared {
+            HirExpr::Call(call) => {
+                let frame = facts.native_call_frame(call)?;
+                let producer = facts.operation_result_temp(call.source_site?)?;
+                if !matches!(frame.results, Some(ResultPack::Fixed(pack))
+                    if pack.start.index() == frame.home.slot() && pack.len == 1)
+                    || facts.table_write_value_definition(access) != Some(producer)
+                {
+                    // 候选拒绝[ProofIncomplete:Identity]：每项须是字段实际读取的原单结果 CALL。
+                    return None;
+                }
+                (producer, frame.home)
+            }
+            HirExpr::TableConstructor(table) => {
+                let crate::hir::common::HirOperationSources::Single(source) = table.sources else {
+                    return None;
+                };
+                let producer = facts.operation_result_temp(source)?;
+                if facts.table_write_value_definition(access) != Some(producer) {
+                    // 候选拒绝[ProofIncomplete:Identity]：同一 Local 的另一版分配不属于本次字段值。
+                    return None;
+                }
+                if facts.temp_is_published_allocation_declaration(producer) {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：constructor_16_published_root
+                    // 中字段发布后仍需低槽分配根保活；并列写回不承担其退休责任。
+                    return None;
+                }
+                (producer, facts.allocation_result_home(table)?)
+            }
+            value if tables::literal_rk(value) => {
+                facts.table_write_value_preparation(access, value)?
+            }
+            // 候选拒绝[ProofIncomplete]：其它 RHS 尚无这条并列字段帧的原槽求值证明。
+            _ => return None,
+        };
         if original_home != home || facts.promoted_local_for_temp(producer) != Some(local) {
             return None;
         }
         // SETTABLE 的 use-to-Def 许可让同槽重发消费 PhysicalFramePrefix；
-        // 不能仅因当前字面量相等就把旧槽版本当作本次准备。
+        // CALL 和分配也须对应本次字段实际读取的 Def，不能借同槽的旧结果。
         values.push(builder.expr(
             value,
             run.len(),
@@ -324,8 +358,8 @@ pub(super) fn parallel_literals(
     })
 }
 
-/// 两项字段赋值的首个 RHS 在高槽准备，末项直接读低槽或 RK；PUC/JIT 逆序写回两个字段。
-/// 把快照连同两次写一起重发，避免独立 local 延长到后继复用该槽的调用。
+/// 两项字段赋值先完成 RHS，再按 PUC/JIT 原逆序写回；末项可读取低槽、RK 或相邻 CALL 结果。
+/// 快照、调用和两次写共同重发，避免独立 local 延长到后继复用该槽的调用。
 pub(super) fn parallel_values(
     context: NativeFrameContext<'_>,
     facts: &ProtoPromotionFacts,
@@ -347,18 +381,26 @@ pub(super) fn parallel_values(
         HirExpr::ParamRef(param) => facts.trusted_param_home_slot(*param),
         _ => None,
     };
+    let call_result = |value: &HirExpr| {
+        let HirExpr::Call(call) = value else {
+            return None;
+        };
+        let frame = facts.native_call_frame(call)?;
+        let result = facts.operation_result_temp(call.source_site?)?;
+        (matches!(frame.results, Some(ResultPack::Fixed(pack))
+            if pack.start.index() == frame.home.slot() && pack.len == 1)
+            && facts.trusted_temp_home_slot(result) == Some(frame.home))
+        .then_some((result, frame.home))
+    };
+    let first_call = call_result(source);
     let home = facts.trusted_local_home_slot(snapshot)?;
     if !(tables::literal_rk(source)
-        || direct_home(source).is_some_and(|source| source.slot() < home.slot()))
+        || direct_home(source).is_some_and(|source| source.slot() < home.slot())
+        || first_call.is_some_and(|(_, result)| result == home))
         || context.barred.contains(&home)
         || context.closed.contains(&home)
         || context.proto.local_debug_hints[snapshot.index()].is_some()
         || context.proto.local_debug_scopes[snapshot.index()].is_some()
-        || context
-            .proto
-            .inline_dispositions
-            .local(snapshot)
-            .must_preserve()
     {
         return None;
     }
@@ -388,15 +430,46 @@ pub(super) fn parallel_values(
     ) else {
         return None;
     };
+    let second_call = call_result(second_value);
+    let has_call = first_call.is_some() || second_call.is_some();
+    if matches!(context.proto.inline_dispositions.local(snapshot),
+        crate::hir::common::HirInlineDisposition::Preserve(reasons)
+            if reasons.iter().any(|reason| !has_call
+                || *reason != HirInlineRetentionReason::PhysicalFramePrefix))
+    {
+        return None;
+    }
     let second_home = if tables::literal_rk(second_value) {
         None
+    } else if let Some((_, result)) = second_call {
+        (result.slot() == home.slot() + 1).then_some(result)
     } else {
         Some(direct_home(second_value)?)
     };
-    if *read != snapshot || second_home.is_some_and(|second| second.slot() >= home.slot()) {
+    if *read != snapshot
+        || second_call.is_some() && second_home.is_none()
+        || second_call.is_none() && second_home.is_some_and(|second| second.slot() >= home.slot())
+    {
         return None;
     }
-    if tables::literal_rk(source) || !matches!(first.stmt, HirStmt::LocalDecl(_)) {
+    let first_definition = if has_call {
+        let definition = facts.table_write_value_definition(first_target)?;
+        if facts.trusted_temp_home_slot(definition) != Some(home)
+            || facts.promoted_local_for_temp(definition) != Some(snapshot)
+            || first_call.is_some_and(|(result, _)| result != definition)
+            || second_call.is_some_and(|(result, _)| {
+                facts.table_write_value_definition(second_target) != Some(result)
+            })
+        {
+            return None;
+        }
+        Some(definition)
+    } else {
+        None
+    };
+    if first_call.is_none()
+        && (tables::literal_rk(source) || !matches!(first.stmt, HirStmt::LocalDecl(_)))
+    {
         // 新的常量准备或复用写必须消费本次 SETTABLE 的原 use→Def，不能把
         // 同槽较早的字面量或后继 callee 版本当作并列 RHS。旧根退休仍由整批验证。
         let (producer, original_home) =
@@ -433,13 +506,43 @@ pub(super) fn parallel_values(
             return None;
         }
     }
+    let values = if let Some(definition) = first_definition {
+        // 两个 RHS 仍在原相邻槽准备；先完整执行 CALL，再按原顺序发布字段。
+        // 不单独内联首项，也不凭相同槽号代替 SETTABLE 实际读取的结果 Def。
+        let run = [first.stmt];
+        let mut builder = frame_builder(context, &run, facts, dialect, home.slot())?;
+        let left = builder.expr(
+            &HirExpr::LocalRef(snapshot),
+            1,
+            home.slot(),
+            None,
+            false,
+            true,
+            Some(definition),
+        )?;
+        let right = builder.expr(
+            second_value,
+            1,
+            home.slot() + 1,
+            None,
+            false,
+            true,
+            second_call.map(|(result, _)| result),
+        )?;
+        if builder.first_event != Some(0) || builder.next_event != run.len() {
+            return None;
+        }
+        vec![left, right].into()
+    } else {
+        vec![source.clone(), second_value.clone()].into()
+    };
     let mut plan = Plan {
         prefix_at_sink: false,
         luau_function_declaration: false,
         start: first.id,
         sink: last.id,
         base: home,
-        values: vec![source.clone(), second_value.clone()].into(),
+        values,
         result_locals: Vec::new(),
         assignment_targets: vec![
             write_first.targets[0].clone(),
@@ -865,10 +968,12 @@ pub(super) fn plan(
     }
     let existing_key_frame = key_home.is_some_and(|key| {
         facts.direct_table_write_input_home(access, 1) == Some(key)
-            && value_home.is_some_and(|value| key.slot() < value.slot())
+            && value_home
+                .or_else(|| register_layout.map(|layout| layout.base))
+                .is_some_and(|prepared| key.slot() < prepared.slot())
     });
     let existing_key = || {
-        // key 也可以是循环变量等已有低槽输入，此时只准备 RHS。
+        // 已有低槽 key 不需重新准备；RK 常量 RHS 不占槽时，仍可消费它上方的目标快照。
         // 仍由原 SETTABLE 输入身份及 scalar_rhs 的完整事件/前缀证明约束。
         existing_key_frame
             .then(|| {
@@ -1444,13 +1549,16 @@ fn scalar_rhs(
     // 只有 SETTABLE 的唯一原读取 Def 才是可消费的左值快照；多次读取的现成表仍是低槽变量。
     // t.a[1]=t.b[2]+5 必须先保存 t.a；weak[1]=holder.inner.child 同样不能把
     // GETUPVAL 拖到 RHS 之后。内嵌常量 RHS 则不新增结果准备槽。
-    // 全局表的 GETGLOBAL/GETTABUP 快照遵守同一合同，仍先读取目标再创建字段闭包。
+    // CALL 结果同样绑定本次 SETTABLE 的唯一原 Def；调用参数和结果槽由完整帧重放。
     let snapshot = match &access.base {
         _ if layout.is_none() => None,
         HirExpr::TempRef(temp) => builder.temp_definitions.get(temp).and_then(|&index| {
             let (
                 HirBinding::Temp(definition),
-                source @ (HirExpr::TableAccess(_) | HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_)),
+                source @ (HirExpr::TableAccess(_)
+                | HirExpr::UpvalueRef(_)
+                | HirExpr::GlobalRef(_)
+                | HirExpr::Call(_)),
             ) = scalar_binding(run[index])?
             else {
                 return None;
@@ -1466,7 +1574,10 @@ fn scalar_rhs(
         HirExpr::LocalRef(local) => builder.definition(*local, run.len()).and_then(|index| {
             let (
                 _,
-                source @ (HirExpr::TableAccess(_) | HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_)),
+                source @ (HirExpr::TableAccess(_)
+                | HirExpr::UpvalueRef(_)
+                | HirExpr::GlobalRef(_)
+                | HirExpr::Call(_)),
             ) = scalar_local(run[index])?
             else {
                 return None;
@@ -1476,18 +1587,23 @@ fn scalar_rhs(
                 && snapshot_matches_target(source, home, access, facts, dialect))
             .then_some((producer, home))
         }),
-        HirExpr::TableAccess(_) | HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_) => facts
+        HirExpr::TableAccess(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::Call(_) => facts
             .table_write_base_preparation(access, &access.base)
             .filter(|(_, home)| {
                 snapshot_matches_target(&access.base, *home, access, facts, dialect)
             }),
         _ => None,
     };
+    // 标量事务只消费紧邻 RHS 的目标准备。两者之间仍有 key 声明时，
+    // 目标是保留的低槽快照；下方沿原 SETTABLE 输入身份验证，只重发 RHS。
+    let snapshot =
+        snapshot.filter(|(_, home)| value_home.is_none_or(|value| value.slot() == home.slot() + 1));
     let base = if let Some((_, home)) = snapshot {
         let layout = layout?;
-        if home != layout.base
-            || value_home.is_some_and(|value_home| value_home.slot() != home.slot() + 1)
-        {
+        if home != layout.base {
             return None;
         }
         home

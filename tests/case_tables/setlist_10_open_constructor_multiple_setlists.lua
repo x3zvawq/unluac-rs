@@ -1,9 +1,15 @@
 -- regress_432_open_constructor_multiple_setlists: a fixed SETLIST batch may precede the final open batch
--- unluac: expect-contains [[local r0_1 = {]] [[@dialect=lua5.4]]
--- unluac: expect-not-contains [[local r0_1 = {}]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[12]] [[@proto=0]]
+-- unluac: expect-ast-count [[table-constructor]] [[7]] [[@proto=0]]
+-- unluac: expect-ast-count [[table-list-field]] [[52]] [[@proto=0]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[repeat]] [[0]]
+-- unluac: expect-ast-count [[if]] [[0]]
 -- unluac: expect-not-contains [[table-set-list]]
 -- unluac: expect-not-contains [[unluac error]]
+local tail_calls = 0
 local function tail()
+    tail_calls = tail_calls + 1
     return 51, 52, 53
 end
 
@@ -16,7 +22,10 @@ local values = {
     tail(),
 }
 
-assert(#values == 53)
+assert(#values == 53 and tail_calls == 1)
+for i = 1, #values do
+    assert(values[i] == i)
+end
 assert(values[1] == 1 and values[50] == 50)
 assert(values[51] == 51 and values[52] == 52 and values[53] == 53)
 print("regress_432_open_constructor_multiple_setlists", "ok")
@@ -72,9 +81,12 @@ local function build_records(catalog, state)
 end
 local catalog = {themes = {picked = {particles = {{name = "result"}}}}}
 local state = {theme = "picked"}
+arrayResetFirst, arrayResetSecond = true, false
 local records, selected = build_records(catalog, state)
 assert(arrayResetFirst == nil and arrayResetSecond == nil)
 assert(arrayAngle > arraySurplus and arraySurplus > 0)
+assert(arrayAngle == 0.75 * math.pi)
+assert(arraySurplus == arrayAngle - math.pi * 0.5)
 assert(state.keep() == records and selected[1] == "result")
 local total = 0
 for i, row in ipairs(records) do

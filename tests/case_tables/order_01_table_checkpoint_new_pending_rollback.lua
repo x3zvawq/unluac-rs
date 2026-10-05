@@ -2,6 +2,10 @@
 -- unluac: expect-contains [[[2] = "second"]]
 -- unluac: expect-contains [[[1] =]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 失败回滚保留两个字段写，调用结果直接初始化，不遗留 callee/结果接棒赋值。
+-- unluac: expect-ast-max [[assign]] [[2]] [[@proto=0]]
+-- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=0]]
+-- unluac: expect-ast-count [[table-constructor]] [[1]]
 local calls = 0
 
 local function produce()

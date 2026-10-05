@@ -826,7 +826,15 @@ impl FrameBuilder<'_> {
         if matches!(
             self.dialect,
             DecompileDialect::Lua54 | DecompileDialect::Lua55
-        ) && let Some((producer, home)) = self.facts.table_read_late_upvalue_base(access)
+        ) && let Some(prepared_base) = match &access.base {
+            HirExpr::LocalRef(local) => self
+                .definition(*local, before)
+                .and_then(|index| scalar_local(self.run[index]))
+                .map(|(_, value)| value),
+            value => Some(value),
+        } && let Some((producer, home)) = self
+            .facts
+            .table_read_late_upvalue_base(access, prepared_base)
         {
             let result = self.facts.table_read_result_home(access)?;
             if result.slot() != slot
@@ -851,8 +859,17 @@ impl FrameBuilder<'_> {
             );
             self.indexed_key_base = previous_key_base;
             self.register_operand = previous;
+            let key = key?;
+            // base 还未树化时，在完整 key 之后消费原 GETUPVAL；其 Local 可以
+            // 复用先前的 CONCAT 输入槽，不能要求它先独立通过内联才承认这个协议。
+            let base = if matches!(access.base, HirExpr::LocalRef(_)) {
+                self.register_table_base(access, before, layout.base.slot())?
+            } else {
+                access.base.clone()
+            };
             return Some(HirExpr::TableAccess(Box::new(HirTableAccess {
-                key: key?,
+                base,
+                key,
                 ..access.clone()
             })));
         }

@@ -1,6 +1,9 @@
 -- 相邻 fixed SETLIST 恢复字段/动态索引构造器，保留读取顺序和 nil/false 槽。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[table-set-list]]
+-- unluac: expect-ast-count [[local-binding]] [[12]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[14]]
+-- unluac: expect-ast-count [[table-list-field]] [[7]]
 -- unluac: expect-ast-count [[table-list-field]] [[5]] [[@proto=1]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[table-list-field]] [[2]] [[@proto=2]] [[@dialect=lua5.1]]
 local DS = {

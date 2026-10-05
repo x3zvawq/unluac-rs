@@ -45,6 +45,18 @@ fn expression(value: &HirExpr, locals: &Environment<'_>) -> Option<Cost> {
         {
             Some(expression(&access.key, locals)?.add(Cost::fixed(1)))
         }
+        HirExpr::TableConstructor(table) if table.trailing_multivalue.is_none() => table
+            .fields
+            .iter()
+            .try_fold(Cost::fixed(10), |cost, field| {
+                let value = match field {
+                    crate::hir::HirTableField::Array(value) => expression(value, locals)?,
+                    crate::hir::HirTableField::Record(record) => {
+                        expression(&record.key, locals)?.add(expression(&record.value, locals)?)
+                    }
+                };
+                Some(cost.add(value).add(Cost::fixed(1)))
+            }),
         HirExpr::Closure(_) => Some(Cost::fixed(10)),
         _ => None,
     }
@@ -57,8 +69,10 @@ fn invocation(call: &HirCallExpr, locals: &Environment<'_>) -> Option<Cost> {
     let (base, copies) = match &call.callee {
         HirExpr::LocalRef(_) if expression(&call.callee, locals).is_some() => (3, true),
         HirExpr::GlobalRef(global)
-            if matches!(global.key.as_utf8(), Some("assert" | "rawequal" | "type"))
-                && call.fastcall.is_some()
+            if matches!(
+                global.key.as_utf8(),
+                Some("assert" | "rawequal" | "type" | "setmetatable")
+            ) && call.fastcall.is_some()
                 && call.args.fixed.len() + usize::from(call.args.tail.is_some()) <= 2 =>
         {
             (2, false)
@@ -147,15 +161,24 @@ fn block_cost(block: &HirBlock, locals: &mut Environment<'_>, depth: usize) -> O
                         total = total.add(expression(tail.as_expr(), locals)?.add(Cost::fixed(1)));
                         continue;
                     }
-                    let ([HirLValue::Local(local)], [value], None) = (
+                    let ([target], [value], None) = (
                         assign.targets.as_slice(),
                         assign.values.fixed.as_slice(),
                         &assign.values.tail,
                     ) else {
                         return None;
                     };
-                    locals.locals.insert(*local, Cost::variable(false));
-                    expression(value, locals)?.argument()
+                    match target {
+                        HirLValue::Local(local) => {
+                            locals.locals.insert(*local, Cost::variable(false));
+                            expression(value, locals)?.argument()
+                        }
+                        HirLValue::TableAccess(access) if matches!(access.base, HirExpr::LocalRef(_)) && matches!(access.key, HirExpr::LocalRef(_)) => {
+                            expression(&access.base, locals)?.add(expression(&access.key, locals)?)
+                                .add(Cost::fixed(1)).add(expression(value, locals)?)
+                        }
+                        _ => return None,
+                    }
                 }
                 HirStmt::If(branch) => {
                     let condition = expression(&branch.cond, locals)?;

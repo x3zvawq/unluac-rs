@@ -1,4 +1,6 @@
 -- regress_337: fixed call results may be nil, so raw SETLIST must not be split into SETTABLE.
+-- unluac: expect-ast-count [[local-binding]] [[15]] [[@proto=0]]
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=0]]
 -- unluac: expect-ast-count [[table-list-field]] [[16]]
 -- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=10]] [[@dialect=luajit]]
 -- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=10]] [[@dialect=luajit]]

@@ -80,7 +80,11 @@ pub(crate) fn build_value_decision_expr(
         })
         .collect::<Option<Vec<_>>>()?;
     (!nodes.is_empty() && entry.index() < nodes.len()).then_some(HirDecisionExpr {
-        source_result: None,
+        source_result: {
+            let temp = lowering.bindings.phi_temps[decision.result_phi.index()];
+            (temp.index() == lowering.dataflow.defs.len() + decision.result_phi.index())
+                .then_some(temp)
+        },
         entry,
         nodes,
         emit_as_luau_if: false,

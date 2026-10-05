@@ -1,3 +1,10 @@
+-- unluac: expect-ast-max [[local-binding]] [[8]] [[@proto=1]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=5]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=5]]
+-- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=8]]
+-- unluac: expect-ast-count [[assign]] [[5]] [[@proto=8]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=8]]
 -- 元方法改变低槽 key 和原 target 来源：写表仍使用原目标快照、最终 key 读取。
 local function run()
     local log = {}
@@ -22,6 +29,8 @@ local function run()
     source.branch[key] = input.value + 1
     assert(original.after == 21 and original.before == nil)
     assert(next(replacement) == nil)
+    assert(selected == replacement and key == "after")
+    assert(table.concat(log, ",") == "target:branch,rhs:value,add")
     print("order", table.concat(log, ","), original.after)
 end
 run()

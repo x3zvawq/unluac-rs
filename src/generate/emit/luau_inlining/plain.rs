@@ -5,7 +5,7 @@ use super::*;
 
 pub(super) struct PlainExpressions<'a> {
     callees: &'a BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
-    written: BTreeSet<AstNameRef>,
+    nonconstant: BTreeSet<AstNameRef>,
     stable_loops: BTreeSet<AstBindingRef>,
     runtime_body: bool,
 }
@@ -14,7 +14,7 @@ impl<'a> PlainExpressions<'a> {
     pub(super) fn new(callees: &'a BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>) -> Self {
         Self {
             callees,
-            written: BTreeSet::new(),
+            nonconstant: BTreeSet::new(),
             stable_loops: BTreeSet::new(),
             runtime_body: false,
         }
@@ -91,7 +91,9 @@ impl<'a> PlainExpressions<'a> {
                     binary.op,
                     AstBinaryOpKind::Sub | AstBinaryOpKind::Mul | AstBinaryOpKind::Div
                 ) || binary.op == AstBinaryOpKind::Mod
-                    && !matches!(binary.lhs, AstExpr::Var(AstNameRef::Local(_))) =>
+                    && !matches!(binary.lhs, AstExpr::Var(AstNameRef::Local(_)))
+                    || binary.op == AstBinaryOpKind::Add
+                        && !matches!(binary.rhs, AstExpr::Integer(_) | AstExpr::Number(_)) =>
             {
                 self.runtime_arithmetic(expr)
             }
@@ -180,7 +182,11 @@ impl<'a> PlainExpressions<'a> {
         // LocalId 属于 child 自身；进入函数前已排除 required callee 的跨层捕获。
         let locals = BTreeMap::new();
         let mut scope = PlainExpressions::new(&locals);
-        scope.written = crate::ast::written_names(&function.body);
+        scope.nonconstant = crate::ast::written_names(&function.body);
+        // 独立函数体的参数在运行时入口写入；外围调用是否再次内联由调用点合同另证。
+        scope
+            .nonconstant
+            .extend(function.params.iter().copied().map(AstNameRef::Param));
         if let Some((_, loops)) = constant_control::runtime_summary(function) {
             scope.stable_loops = loops;
             scope.runtime_body = true;
@@ -247,11 +253,11 @@ impl<'a> PlainExpressions<'a> {
 
     fn runtime_arithmetic(&self, expr: &AstExpr) -> bool {
         // 只在完整算术子树的入口检查一次；失败后不对各后缀重复扫描。
-        // 未写入的名字可以是常量操作数，但每个算术节点均须依赖运行时写入。
+        // 未证明的名字可以是常量操作数，但每个算术节点均须依赖参数或运行时写入。
         runtime_arithmetic(expr, &|name| match name {
             AstNameRef::Local(local) if self.callees.contains_key(local) => None,
             AstNameRef::Local(_) | AstNameRef::Param(_) | AstNameRef::Upvalue(_) => {
-                Some(self.written.contains(name))
+                Some(self.nonconstant.contains(name))
             }
             _ => None,
         }) == Some(true)

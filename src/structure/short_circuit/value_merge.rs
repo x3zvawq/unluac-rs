@@ -446,23 +446,17 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
                 terminal.is_some()
             },
             |block| {
-                // 内嵌取值表达式的字面量臂不是外层 result leaf；继续收集到其
-                // 消费谓词，由最终选择证明内部 phi、原写入与单次消费的归属。
+                // 内嵌操作数的固定值准备不是外层 result leaf；继续收集到消费
+                // 谓词，再由最终选择核对完整依赖、原写入与单次消费。算术可能
+                // 调用元方法，不能在候选提取阶段把这类准备误当作不可跨越的语句。
                 let range = self.cfg.blocks[block.index()].instrs;
-                self.proto.instrs[range.start.index()..range.end()]
-                    .iter()
-                    .all(|instr| {
-                        matches!(
-                            instr,
-                            crate::transformer::LowInstr::LoadNil(_)
-                                | crate::transformer::LowInstr::LoadBool(_)
-                                | crate::transformer::LowInstr::LoadConst(_)
-                                | crate::transformer::LowInstr::LoadInteger(_)
-                                | crate::transformer::LowInstr::LoadNumber(_)
-                                | crate::transformer::LowInstr::Move(_)
-                                | crate::transformer::LowInstr::Jump(_)
+                (range.start.index()..range.end()).all(|index| {
+                    !self.dataflow.instr_defs[index].is_empty()
+                        || matches!(
+                            self.proto.instrs[index],
+                            crate::transformer::LowInstr::Jump(_)
                         )
-                    })
+                })
             },
         )?;
         self.blocks.extend(followed.traversed);

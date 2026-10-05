@@ -4,6 +4,7 @@
 -- unluac: expect-ast-max [[local-decl]] [[2]] [[@proto=0]]
 -- unluac: expect-order [[first_global =]] [[second_global =]]
 -- unluac: expect-contains [[assert(meta.get_owner() == replacement and reads == 1)]] [[@debug=retained]]
+-- unluac: expect-contains [[copied_left, copied_right = first, second]] [[@debug=retained]]
 local writes = {}
 local proxy = setmetatable({}, {
     __index = _G,
@@ -13,6 +14,10 @@ local proxy = setmetatable({}, {
             assert(value == false)
         elseif key == "literal_right" or key == "separate_right" then
             assert(value == true)
+        elseif key == "copied_left" then
+            assert(value == 10)
+        elseif key == "copied_right" then
+            assert(value == 20)
         end
     end,
 })
@@ -28,6 +33,7 @@ local function run()
     literal_left, literal_right = false, true
     separate_left = false
     separate_right = true
+    copied_left, copied_right = first, second
 end
 
 if setfenv then
@@ -41,6 +47,7 @@ assert(writes[1] == "first_global")
 assert(writes[2] == "second_global")
 assert(writes[3] == "literal_right" and writes[4] == "literal_left")
 assert(writes[5] == "separate_left" and writes[6] == "separate_right")
+assert(writes[7] == "copied_right" and writes[8] == "copied_left" and #writes == 8)
 print("regress_223_multiret_global_write_order#1", writes[1], writes[2])
 
 -- 参数表已完成字段合并后，外层 CALL 仍须重发全局读取及闭包分配的原 scratch。

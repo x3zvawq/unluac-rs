@@ -1,4 +1,15 @@
 -- Non-nil result facts may recover array fields; possible nil must preserve allocation holes.
+-- 允许方言所需的分步写入，但不增加表根、接棒声明或额外构造器。
+-- unluac: expect-ast-count [[table-constructor]] [[17]]
+-- unluac: expect-ast-max [[local-binding]] [[43]]
+-- unluac: expect-ast-max [[local-binding]] [[39]] [[@dialect=luau]]
+-- Luau 的可能 nil 首值必须保持 record 形状；非 nil 返回可直接组成数组。
+-- unluac: expect-ast-count [[table-list-field]] [[3]] [[@proto=1]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[table-list-field]] [[0]] [[@proto=3]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[table-record-field]] [[2]] [[@proto=3]] [[@dialect=luau]]
+-- 原数值 record 不是 list 字段；全部方言的该原型编号相同。
+-- unluac: expect-ast-count [[table-record-field]] [[3]] [[@proto=8]]
+-- unluac: expect-ast-count [[table-list-field]] [[0]] [[@proto=8]]
 local function build(flag, left, right)
     local result = {}
     result[1] = not flag

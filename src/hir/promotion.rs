@@ -1079,6 +1079,21 @@ impl ProtoPromotionFacts {
             .collect()
     }
 
+    /// 可观察覆盖后的 COPY 根由 lowering 分配独立 holder；其入口 nil 没有原寄存器槽。
+    /// 只投影仍绑定该原根且保持无 home 的身份，消费方还须核对声明及所有退休事件。
+    pub(super) fn observing_copy_root_holders(&self) -> impl Iterator<Item = LocalId> + '_ {
+        self.copy_root_retirements
+            .after_releases
+            .values()
+            .flatten()
+            .filter_map(|&temp| {
+                let local = self.promoted_local_for_temp(temp)?;
+                (self.trusted_temp_home_slot(temp).is_some()
+                    && self.local_has_no_physical_home(local))
+                .then_some(local)
+            })
+    }
+
     pub(super) fn has_copy_root_boundary(&self, range: std::ops::Range<usize>) -> bool {
         self.copy_root_retirements
             .boundaries
@@ -1533,7 +1548,9 @@ impl ProtoPromotionFacts {
         &self,
         call: &crate::hir::common::HirCallExpr,
     ) -> Option<&[call_roots::NativeResultWriteback]> {
-        self.native_call_layout(call)?;
+        self.native_call_layout(call)
+            .map(|_| ())
+            .or_else(|| self.native_fastcall_frame(call).map(|_| ()))?;
         self.calls
             .get(&call.source_site?.instr)?
             .result_writebacks
@@ -2384,6 +2401,30 @@ impl ProtoPromotionFacts {
                     target_home: copy.write.target_home,
                 })
             })
+    }
+
+    /// 已打开 cell 的原 COPY 只投影写入 binding；来源仍须保持原值版本与 home。
+    /// 不发布独立目标 Def，也不授权消去、延后或穿透这次捕获写。
+    pub(super) fn captured_copy_binding(
+        &self,
+        site: crate::hir::HirSourceSite,
+    ) -> Option<NativeCopyBindings> {
+        if self.source_proto != Some(site.proto) {
+            return None;
+        }
+        let copy = self.value_result_copies.captured_writes.get(&site.instr)?;
+        if !self.state_copy_input_valid(copy)
+            || self.trusted_temp_home_slot(copy.target_binding) != Some(copy.write.target_home)
+        {
+            return None;
+        }
+        Some(NativeCopyBindings {
+            site,
+            source: self.promoted_binding_for_temp(copy.write.source?)?,
+            target: self.promoted_binding_for_temp(copy.target_binding)?,
+            source_home: copy.write.source_home,
+            target_home: copy.write.target_home,
+        })
     }
 
     /// 参数 COPY 必须直接读取指定原操作的写回，不能用同槽的另一版状态替代。
@@ -3283,6 +3324,29 @@ impl ProtoPromotionFacts {
         .then_some(copy)
     }
 
+    /// 当前仍可信的二元输入 COPY 及其原写入位置；多个 use 可引用同一写，
+    /// 消费者按指令建立本次事务索引，不把普通输入复制混入合流返回协议。
+    pub(super) fn operand_copy_frames(
+        &self,
+    ) -> impl Iterator<Item = (crate::hir::HirSourceSite, &ImmediateMoveWrite)> {
+        self.operand_copies
+            .iter()
+            .filter_map(|(&(instruction, _), copy)| {
+                let use_site = crate::hir::HirSourceSite {
+                    proto: self.source_proto?,
+                    instr: instruction,
+                };
+                let write = self.operand_copy(use_site, copy.write.target_home)?;
+                Some((
+                    crate::hir::HirSourceSite {
+                        instr: copy.source,
+                        ..use_site
+                    },
+                    write,
+                ))
+            })
+    }
+
     /// COPY 之前唯一标量准备的原值；与同一次二元 use 的来源共同消费。
     pub(super) fn binary_copy_preparation(
         &self,
@@ -3628,21 +3692,26 @@ impl ProtoPromotionFacts {
 
     /// PUC 先完成动态键，再读取上值 base；两者占结果槽及其紧邻高槽。
     /// 两个输入必须是同块的独占原 Def，且当前表达式仍指向这次准备。
+    /// 尚未树化的 Local 也须映射到同一原 base Def，而非同槽的其它值版本。
     pub(super) fn table_read_late_upvalue_base(
         &self,
         access: &crate::hir::common::HirTableAccess,
+        value: &HirExpr,
     ) -> Option<(TempId, HomeSlotKey)> {
         let crate::hir::common::HirOperationSources::Single(source) = access.sources else {
             return None;
         };
-        if !matches!(access.base, HirExpr::UpvalueRef(_)) {
+        if !matches!(value, HirExpr::UpvalueRef(_)) {
             return None;
         }
         let preparation = self.table_preparations.get(&source.instr)?;
         let base = preparation.base.as_ref()?;
         let (key, home) = self.table_key_value_preparation(access)?;
         let result = self.table_read_result_home(access)?;
-        (base.matches(&access.base)
+        (base.matches(value)
+            && (&access.base == value
+                || matches!(access.base, HirExpr::LocalRef(local)
+                    if self.promoted_local_for_temp(base.temp) == Some(local)))
             && preparation.key.read.index() < base.read.index()
             && ((home == result && base.home.slot() == result.slot() + 1)
                 || (base.home == result && home.slot() == result.slot() + 1))
@@ -3940,7 +4009,19 @@ impl ProtoPromotionFacts {
                 | HirExpr::Integer(_)
                 | HirExpr::Number(_)
                 | HirExpr::String(_)
-        ) || !matches!(&access.key, HirExpr::String(key)
+        ) {
+            return None;
+        }
+        self.luau_fixed_table_write_frame(access)
+    }
+
+    /// 固定字段的左值直接读取低槽，不建立独立 base/key 准备区。
+    /// RHS 类型与原输入 Def 由各自的完整赋值事务继续证明。
+    pub(super) fn luau_fixed_table_write_frame(
+        &self,
+        access: &crate::hir::common::HirTableAccess,
+    ) -> Option<HomeSlotKey> {
+        if !matches!(&access.key, HirExpr::String(key)
                 if key.as_utf8().is_some_and(|key|
                     crate::decompile::DecompileDialect::Luau.is_identifier_name(key)))
         {
@@ -4045,6 +4126,38 @@ impl ProtoPromotionFacts {
         value: &HirExpr,
     ) -> Option<(TempId, HomeSlotKey)> {
         self.write_value_preparation(&global.sources, value)
+    }
+
+    /// 全局写消费原 COPY 的目标版本；来源和目标仍使用各自的绑定及 epoch。
+    pub(super) fn global_write_value_copy(
+        &self,
+        global: &crate::hir::common::HirGlobalRef,
+        dialect: crate::decompile::DecompileDialect,
+    ) -> Option<&ImmediateMoveWrite> {
+        let crate::hir::common::HirOperationSources::Single(source) = global.sources else {
+            return None;
+        };
+        self.operand_copy(source, self.global_write_value_home(global, dialect)?)
+    }
+
+    /// 全局写直接读取的当前绑定；低槽末项不能用同 home 的另一版值替代。
+    pub(super) fn global_write_value_binding(
+        &self,
+        global: &crate::hir::common::HirGlobalRef,
+        dialect: crate::decompile::DecompileDialect,
+    ) -> Option<(HirBinding, HomeSlotKey)> {
+        let crate::hir::common::HirOperationSources::Single(source) = global.sources else {
+            return None;
+        };
+        let home = self.global_write_value_home(global, dialect)?;
+        let input = self.operation_value_operand(source, home)?;
+        let binding = self.promoted_binding_for_temp(input.value)?;
+        let current = match binding {
+            HirBinding::Local(local) => self.trusted_local_home_slot(local),
+            HirBinding::Param(param) => self.trusted_param_home_slot(param),
+            _ => None,
+        };
+        (current == Some(home)).then_some((binding, home))
     }
 
     /// 仅提供批量 LOADNIL 的精确输入成员；调用方必须完整消费原写组。
@@ -4176,6 +4289,23 @@ impl ProtoPromotionFacts {
         &self,
         access: &crate::hir::common::HirTableAccess,
     ) -> Option<TempId> {
+        let input = self.table_write_value_operand(access)?;
+        input.is_phi.then_some(input.value)
+    }
+
+    /// 原字段写直接消费的定义；完整 RHS 帧据此核对 CALL 等操作结果，合流值仍走 phi 合同。
+    pub(super) fn table_write_value_definition(
+        &self,
+        access: &crate::hir::common::HirTableAccess,
+    ) -> Option<TempId> {
+        let input = self.table_write_value_operand(access)?;
+        (!input.is_phi).then_some(input.value)
+    }
+
+    fn table_write_value_operand(
+        &self,
+        access: &crate::hir::common::HirTableAccess,
+    ) -> Option<NativeValueOperand> {
         let crate::hir::common::HirOperationSources::Single(source) = access.sources else {
             return None;
         };
@@ -4184,8 +4314,7 @@ impl ProtoPromotionFacts {
             NativeTableWriteLayout::Upvalue(layout) => layout.value,
             NativeTableWriteLayout::Environment { value, .. } => value,
         }?;
-        let input = self.operation_value_operand(source, home)?;
-        input.is_phi.then_some(input.value)
+        self.operation_value_operand(source, home)
     }
 
     /// 原字段写读取的 COPY 版本；来源和目标各自保留完整 home，不用局部变量名代替源值。
@@ -4345,6 +4474,13 @@ impl ProtoPromotionFacts {
         parallel_target_seeds.extend(
             calls
                 .values()
+                // 单结果 COPY 只证明写回；旧槽可能是已结束作用域的独立根，
+                // 不能因此继承为并列赋值的声明身份。
+                .filter(|call| {
+                    call.fixed_results
+                        .as_ref()
+                        .is_some_and(|results| results.len() > 1)
+                })
                 .filter_map(|call| call.result_writebacks.as_ref())
                 .flatten()
                 .filter_map(|write| write.previous),

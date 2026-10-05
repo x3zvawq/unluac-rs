@@ -8,7 +8,7 @@ use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBlock, HirCallExpr, HirDecisionExpr, HirDecisionNode,
     HirDecisionTarget, HirExpr, HirGenericFor, HirIf, HirLValue, HirLocalDecl, HirLogicalExpr,
     HirNumericFor, HirPackTail, HirRecordField, HirStmt, HirTableAccess, HirTableConstructor,
-    HirTableField, HirUnaryExpr, HirValuePack, LocalId,
+    HirTableField, HirUnaryExpr, HirValuePack, LocalId, TempId,
 };
 use crate::hir::expr_safety::{HirExprSafety, expr_requires_ordered_snapshot};
 
@@ -334,8 +334,26 @@ pub(super) fn extract_value_expr(
         return (Vec::new(), collapsed, true);
     }
 
-    let (prefix, value) = materialize_value(expr, state, safety);
+    // 普通调用/运算只抽取内部决策的控制前缀，结果仍由原表达式产生；
+    // 整个值本身需要分支写入时，prepare_pure_expr 才交给结果物化。
+    let (prefix, value) = prepare_pure_expr(expr, state, safety);
     (prefix, value, true)
+}
+
+pub(super) fn independent_decision_result(
+    expr: &HirExpr,
+    state: &EliminationState<'_>,
+) -> Option<TempId> {
+    let HirExpr::Decision(decision) = expr else {
+        return None;
+    };
+    let temp = decision.source_result?;
+    (state.promotion_facts.trusted_temp_home_slot(temp).is_some()
+        && state
+            .promotion_facts
+            .promoted_local_for_temp(temp)
+            .is_none())
+    .then_some(temp)
 }
 
 fn materialize_value(
@@ -343,15 +361,8 @@ fn materialize_value(
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirExpr) {
-    if let HirExpr::Decision(decision) = &expr
-        && let Some(temp) = decision.source_result
-        && state.promotion_facts.trusted_temp_home_slot(temp).is_some()
-        && state
-            .promotion_facts
-            .promoted_local_for_temp(temp)
-            .is_none()
-    {
-        // 原操作数只有一个消费点，独立 phi 尚未并入可见 binding。
+    if let Some(temp) = independent_decision_result(&expr, state) {
+        // 原决策结果的独立 phi 尚未并入可见 binding。
         // 恢复其分支写入，让 Locals 依据原 home/初始化归属确定声明位置。
         let prefix = materialize_expr_into_target(expr, HirLValue::Temp(temp), state, safety);
         return (prefix, HirExpr::TempRef(temp));
@@ -397,6 +408,15 @@ pub(super) fn materialize_expr_for_assignment(
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
 ) -> Vec<HirStmt> {
+    if let Some(result) = independent_decision_result(&expr, state)
+        && target != HirLValue::Temp(result)
+    {
+        // 内联可能把原决策接进后继 COPY；先恢复原结果写回，再执行该复制，
+        // 不能让调用准备槽取代决策的低槽 owner 及其覆盖时点。
+        let mut prefix = materialize_expr_into_target(expr, HirLValue::Temp(result), state, safety);
+        prefix.push(assign_stmt(target, HirExpr::TempRef(result)));
+        return prefix;
+    }
     if matches!(target, HirLValue::Temp(_)) {
         return materialize_expr_into_target(expr, target, state, safety);
     }

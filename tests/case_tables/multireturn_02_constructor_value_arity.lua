@@ -5,8 +5,19 @@
 -- unluac: expect-contains [[.numeric_marker()]]
 -- unluac: expect-contains [[.iterator_marker()]]
 -- unluac: expect-not-contains [[call_marker = function]]
+-- 保持原构造分配与两个开放尾，不把后装的 getter/marker 塞回 hash 字段。
+-- unluac: expect-ast-count [[table-constructor]] [[8]]
+-- unluac: expect-ast-count [[table-record-field]] [[0]]
+-- unluac: expect-ast-count [[table-list-field]] [[2]]
+-- 结果与消费者直接衔接；包含新增的两个求值计数器，不增加准备区接棒声明。
+-- unluac: expect-ast-max [[local-binding]] [[48]]
+-- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=3]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- unluac: expect-ast-count [[generic-for]] [[1]]
 
+local pair_calls = 0
 local function pair()
+    pair_calls = pair_calls + 1
     return 7, 99
 end
 
@@ -28,8 +39,11 @@ local count, value, marker = build()
 assert(count == 1, count)
 assert(value == 7, value)
 assert(marker == 1, marker)
+assert(pair_calls == 1, pair_calls)
 
+local triple_calls = 0
 local function triple()
+    triple_calls = triple_calls + 1
     return 11, 22, 33
 end
 
@@ -66,6 +80,7 @@ local nested_count, nested_first, nested_second, nested_third, nested_marker =
 assert(nested_count == 3, nested_count)
 assert(nested_first == 11 and nested_second == 22 and nested_third == 33)
 assert(nested_marker == "nested", nested_marker)
+assert(triple_calls == 2, triple_calls)
 
 local function consume_call_stmt(tbl)
     assert(tbl.call_marker() == "call")

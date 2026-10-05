@@ -20,7 +20,7 @@ use super::eliminate_materialize::{
     assign_target_supports_direct_materialization, eliminate_condition_expr, empty_local_decl,
     expr_contains_eliminable_decision, extract_assign, extract_call_expr, extract_generic_for,
     extract_numeric_for, extract_value_expr, extract_value_pack, extract_value_pack_with_leading,
-    materialize_expr_for_assignment, materialize_expr_into_target,
+    independent_decision_result, materialize_expr_for_assignment, materialize_expr_into_target,
 };
 use super::eliminate_state::EliminationState;
 
@@ -102,6 +102,11 @@ fn eliminate_stmt(
             if local_decl.bindings.len() == 1
                 && local_decl.values.tail.is_none()
                 && local_decl.values.fixed.len() == 1
+                && matches!(local_decl.values.fixed[0],
+                    HirExpr::Decision(_) | HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
+                // 原结果尚未物化时，声明接收的是后继 COPY；交给普通抽取路径，
+                // 在原结果写回之后再声明，避免用新的高槽绑定替代原 owner。
+                && independent_decision_result(&local_decl.values.fixed[0], state).is_none()
                 && expr_contains_eliminable_decision(&local_decl.values.fixed[0]) =>
         {
             let binding = local_decl.bindings[0];

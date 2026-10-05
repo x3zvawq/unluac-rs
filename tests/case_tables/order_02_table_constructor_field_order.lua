@@ -2,6 +2,47 @@
 -- regress_212_table_constructor_field_order#2: pending integer fields keep metamethod order
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- 并行写回之后的调用直接读取原函数，不复用快照变量承接 callee。
+-- unluac: expect-not-contains [[ = animate_branch]] [[@debug=retained]]
+-- 已树化的短路参数仍属于原 CALL，不把字段读取留下作后续 callee 的前缀占位。
+-- unluac: expect-not-contains [[ = owner.loading]] [[@debug=retained]]
+-- 短路参数和后续全局恢复共同收回 callee、字段值及旧值快照的占位声明。
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=41]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=41]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=41]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=41]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=41]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=49]] [[@dialect=luajit]]
+-- unluac: expect-ast-max [[local-binding]] [[10]] [[@proto=41]] [[@dialect=luau]]
+-- 全局恢复复用原并行赋值的快照帧，不再为旧 ui 留下第十二个声明。
+-- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=11]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=11]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=11]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=11]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=11]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=75]] [[@dialect=luajit]]
+-- 字段并行 CALL 不留下首项快照，后继构造器和查表函数保持独立源码绑定。
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=23]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=23]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=23]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=23]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=23]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=67]] [[@dialect=luajit]]
+-- Luau 正序写回同样保留完整并行 RHS，不留下后续调用的准备声明。
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=23]] [[@dialect=luau]]
+-- 模板字段直接读取 image/scale，完整嵌套调用不为这些低槽输入留下临时声明。
+-- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=86]] [[@dialect=luajit]]
+-- 闭包直接写入全局后，原临时槽交给后续调用，不生成接棒函数变量。
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=18]] [[@dialect=luajit]]
+-- 数组容量提示不认领乱序字段写，调用结果直接写回原表。
+-- unluac: expect-contains [[binding_result[1] = mutate()]] [[@debug=retained]] [[@dialect=luau]]
+-- 两次独立字段写恢复后，顶层不保留 Boolean 预写和后续辅助调用的别名链。
+-- unluac: expect-ast-max [[local-binding]] [[30]] [[@proto=0]] [[@dialect=luau]]
+-- 索引键 CONCAT 消费自己的原操作数区；比较和返回不保留上值读取快照。
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=25]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=27]] [[@dialect=luau]]
+-- Boolean 预写并入 initializer 后继续完成 assert 帧，后续拼接不保留临时变量。
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=80]] [[@dialect=luau]]
 local value = 20
 
 local function mutate()
@@ -135,7 +176,8 @@ local function check_branch_writeback()
     animate_branch(owner, button)
     local queue = result.interval
     assert(queue.tag == owner and queue[1] == queue[3] and queue[2] == queue[4] and queue[6] == nil)
-    assert(queue[1].interval.target == image and queue[1].interval.x == 1.1)
+    assert(queue[1].interval.target == image and queue[1].interval.x == 1.1 and queue[1].interval.y == 1.1)
+    assert(queue[2].interval.target == image and queue[2].interval.x == 1 and queue[2].interval.y == 1)
     assert(queue[1].interval.duration == 250 and queue[2].interval.duration == 250)
     assert(queue[5].duration == 500)
     assert(trace == "image;child;visible;counter;scale;in;scale;out;wait;queue;loop;add;layout;")

@@ -154,3 +154,32 @@ for stop = 0, 2 do
     end
     assert(table.concat(events, ",") == (stop == 2 and "lookup" or "lookup,concat"))
 end
+
+-- 两个 CALL 的结果先占据连续 RHS 槽，再逆序发布；元方法不能观察到半次求值。
+local function call_field_pair()
+    local calls, writes = "", ""
+    local weak = setmetatable({}, {__mode = "v"})
+    local sink = setmetatable({}, {__newindex = function(self, key, value)
+        assert(calls == "AB")
+        writes = writes .. key .. ";"
+        rawset(self, key, value)
+    end})
+    local function make(tag)
+        calls = calls .. tag
+        if tag == "B" then
+            collectgarbage("collect")
+            collectgarbage("collect")
+            assert(weak.A ~= nil)
+        end
+        local value = {tag = tag}
+        weak[tag] = value
+        return value
+    end
+    sink.first, sink.second = make("A"), make("B")
+    assert(sink.first.tag == "A" and sink.second.tag == "B" and calls == "AB")
+    assert(writes == "second;first;")
+    print("field_call_pair", calls, writes)
+end
+call_field_pair()
+-- unluac: expect-contains [[sink.first, sink.second =]] [[@debug=retained]]
+-- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=18]]

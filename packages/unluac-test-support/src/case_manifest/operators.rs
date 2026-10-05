@@ -1737,4 +1737,30 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 }),
         ],
     ),
+    LuaCaseDefinition::new(
+        "tests/case_operators/comparison_19_ordered_global_frames.lua",
+        &[
+            "comparison",
+            "short-circuit",
+            "metamethod",
+            "evaluation-order",
+            "fastcall",
+        ],
+        "双全局有序比较按原准备顺序恢复返回值和调用参数；环境读取、元方法方向、短路次数及NaN结果分别观察。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
 ];

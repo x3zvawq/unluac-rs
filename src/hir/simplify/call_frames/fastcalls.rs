@@ -281,15 +281,22 @@ impl FrameBuilder<'_> {
         {
             return None;
         }
-        if matches!(argument, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
+        let value = match argument {
+            HirExpr::LocalRef(local) => self
+                .definition(*local, before)
+                .and_then(|index| scalar_local(self.run[index]))
+                .map_or(argument, |(_, value)| value),
+            value => value,
+        };
+        if matches!(value, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
             && reference_uncaptured
             && !self.temp_definitions.contains_key(&initial)
             && facts
                 .promoted_local_for_temp(initial)
                 .is_none_or(|local| self.definition(local, before).is_none())
         {
-            // 前轮已将预写并入原 CALL 的值树。树本身重发 Boolean 写，不再要求
-            // 已退休的声明；各叶来源、原结果槽与整个调用的声明前缀仍须重新核对。
+            // 前轮已将预写并入结果 initializer 或原 CALL 的值树。Local 的结果身份
+            // 已在入口配对；后续 expr 仍核对声明、各叶来源和原结果槽，不再要求已退休的预写。
             return Some(());
         }
         let index = if let Some(&index) = self.temp_definitions.get(&initial) {

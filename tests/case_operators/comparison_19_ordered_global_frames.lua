@@ -1,0 +1,54 @@
+-- 双全局有序比较保持原读取顺序、元方法方向和 Boolean 参数槽。
+-- unluac: expect-ast-count [[function]] [[2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]]
+-- unluac: expect-ast-count [[if]] [[0]]
+-- unluac-runtime: local run = ...
+-- unluac-runtime: local pair, checked = run()
+-- unluac-runtime: local events = {}
+-- unluac-runtime: local left, right = {}, {}
+-- unluac-runtime: local lt, le, numeric = true, false, false
+-- unluac-runtime: local mt = {
+-- unluac-runtime:     __lt = function(a, b)
+-- unluac-runtime:         assert(a == right and b == left)
+-- unluac-runtime:         events[#events + 1] = "lt"
+-- unluac-runtime:         return lt
+-- unluac-runtime:     end,
+-- unluac-runtime:     __le = function(a, b)
+-- unluac-runtime:         assert(a == right and b == left)
+-- unluac-runtime:         events[#events + 1] = "le"
+-- unluac-runtime:         return le
+-- unluac-runtime:     end,
+-- unluac-runtime: }
+-- unluac-runtime: setmetatable(left, mt); setmetatable(right, mt)
+-- unluac-runtime: local env = setmetatable({assert = assert}, {__index = function(_, key)
+-- unluac-runtime:     if key == "ordered_left" then
+-- unluac-runtime:         events[#events + 1] = "left"
+-- unluac-runtime:         if numeric then return 1 end
+-- unluac-runtime:         return left
+-- unluac-runtime:     end
+-- unluac-runtime:     assert(key == "ordered_right")
+-- unluac-runtime:     events[#events + 1] = "right"
+-- unluac-runtime:     if numeric then return 0 / 0 end
+-- unluac-runtime:     return right
+-- unluac-runtime: end})
+-- unluac-runtime: setfenv(pair, env); setfenv(checked, env)
+-- unluac-runtime: assert(pair() == false)
+-- unluac-runtime: assert(table.concat(events, ",") == "left,right,lt,left,right,le")
+-- unluac-runtime: events = {}; lt, le = false, true
+-- unluac-runtime: assert(pair() == false)
+-- unluac-runtime: assert(table.concat(events, ",") == "left,right,lt")
+-- unluac-runtime: events = {}; lt = true
+-- unluac-runtime: assert(pair() == true)
+-- unluac-runtime: assert(table.concat(events, ",") == "left,right,lt,left,right,le")
+-- unluac-runtime: events = {}
+-- unluac-runtime: assert(select("#", checked()) == 0)
+-- unluac-runtime: assert(table.concat(events, ",") == "left,right,lt,left,right,le")
+-- unluac-runtime: events = {}; numeric = true
+-- unluac-runtime: assert(pair() == false)
+-- unluac-runtime: assert(table.concat(events, ",") == "left,right")
+-- unluac-runtime: print("ordered-global-frames-ok")
+return function()
+    return ordered_left > ordered_right and ordered_left >= ordered_right
+end, function()
+    assert(ordered_left > ordered_right and ordered_left >= ordered_right)
+end

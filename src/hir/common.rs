@@ -90,6 +90,12 @@ pub(crate) enum HirLuauInliningBody {
         leaf: usize,
         result: usize,
     },
+    /// 只读按值捕获的单值返回；原 MOVE 由必需内联的零参数调用重放。
+    CapturedValue,
+    /// 捕获表追加后交接可写 cell，固定单值返回与副作用共同重放。
+    CapturedAppendTransfer {
+        template: usize,
+    },
     CapturedConcatSum,
     CapturedAddIdentity,
     /// 捕获 cell 按常量增量更新，参数原样返回；用于保留内联后的字面量 TEST。
@@ -134,6 +140,9 @@ pub(crate) enum HirLuauInliningBody {
         template: usize,
     },
     /// 数组数值遍历返回索引和累积状态，两个低槽结果共同接收原返回 COPY。
+    NestedSearch {
+        template: usize,
+    },
     ArrayFold {
         template: usize,
     },
@@ -895,7 +904,7 @@ pub struct HirLogicalExpr {
 /// `local + if + assign`。只有完整源码帧已证明的 Luau 条件选值树可作为原生 if 表达式流到 AST。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirDecisionExpr {
-    /// 内嵌操作数的独立原 phi；仅完整值图保留，子图投影不得继承该结果身份。
+    /// 完整值决策或内嵌操作数的独立原 phi；子图投影不得继承该结果身份。
     pub(crate) source_result: Option<TempId>,
     pub entry: HirDecisionNodeRef,
     pub nodes: Vec<HirDecisionNode>,

@@ -97,6 +97,7 @@ fn lookup_decision_plans(
         constants_fit_rk: true,
         rk_literals: None,
         expanded_callees: None,
+        captured_transfers: None,
         compared_choices: None,
         value_expressions: None,
         constant_controls: None,
@@ -242,6 +243,7 @@ pub(in crate::hir::simplify) fn prepare_source_frames(
         NativeFrameContext {
             rk_literals: None,
             expanded_callees: None,
+            captured_transfers: None,
             compared_choices: None,
             value_expressions: None,
             constant_controls: None,
@@ -385,6 +387,7 @@ pub(super) fn prepare(
     let context = NativeFrameContext {
         rk_literals: None,
         expanded_callees: None,
+        captured_transfers: None,
         compared_choices: None,
         value_expressions: None,
         constant_controls: None,
@@ -447,6 +450,7 @@ pub(in crate::hir::simplify) fn preserve_existing_call_prefixes(
         NativeFrameContext {
             rk_literals: None,
             expanded_callees: None,
+            captured_transfers: None,
             compared_choices: None,
             value_expressions: None,
             constant_controls: None,
@@ -659,7 +663,11 @@ fn collect_native_plans(
     // 并列 CALL 不能先提交其中一个 RHS；声明组优先于与其重叠的单调用候选。
     let grouped = constructors
         .iter()
-        .filter(|plan| plan.result_locals.len() > 1)
+        .filter(|plan| {
+            plan.result_locals.len() > 1
+                || !plan.result_locals.is_empty()
+                    && plan.values.fixed.len() > plan.result_locals.len()
+        })
         .flat_map(|plan| plan.removed.iter().copied().chain([plan.sink]))
         .collect::<BTreeSet<_>>();
     plans.retain(|plan| {
@@ -818,6 +826,7 @@ fn commit_plans(
     let context = NativeFrameContext {
         rk_literals: None,
         expanded_callees: None,
+        captured_transfers: None,
         compared_choices: None,
         value_expressions: None,
         constant_controls: None,
@@ -1151,6 +1160,7 @@ fn recover_assignment_prefixes(
     let context = NativeFrameContext {
         rk_literals: None,
         expanded_callees: None,
+        captured_transfers: None,
         compared_choices: None,
         value_expressions: None,
         constant_controls: None,
@@ -1274,6 +1284,9 @@ fn validate_plan_batch(
             },
         )
     }));
+    let rebuilt = plans.iter().map(|plan| plan.sink).collect();
+    prefix::require_inline_prefixes(original, facts, dialect, removed, &rebuilt, &mut candidates)
+        .map_err(prefix::PrefixFailures::invalid_from)?;
     conditional::require_result_prefixes(proto, removed, facts, &mut candidates);
     let dependent =
         retained_inputs::require_suffix_frames(proto, removed, plans, facts, &mut candidates)
@@ -1668,7 +1681,7 @@ fn collect_plans(
     }
     let mut constructor_high = None::<usize>;
     let mut prepared_local_plans = assignments::prepared_local_plans(context, facts, &flat);
-    let mut literal_globals = assignments::literal_globals::plans(context, facts, dialect, &flat);
+    let mut global_values = assignments::globals::plans(context, facts, dialect, &flat);
     let mut prepared_assignments =
         assignments::prepared_writes::plans(context, facts, dialect, &flat, &following_frame_floor);
     let statements = flat
@@ -1708,7 +1721,7 @@ fn collect_plans(
             constructor_high = None;
             continue;
         }
-        if let Some((plan, end)) = literal_globals.remove(&index) {
+        if let Some((plan, end)) = global_values.remove(&index) {
             plans.push(plan);
             start = end + 1;
             constructor_high = None;
@@ -1812,7 +1825,7 @@ fn collect_plans(
         }
         if let Some([Some(first), Some(second), Some(third), Some(last)]) =
             flat.get(index..index + 4)
-            && let Some(plan) = indexed::parallel_literals(
+            && let Some(plan) = indexed::parallel_fixed_fields(
                 context,
                 facts,
                 dialect,
@@ -2985,7 +2998,7 @@ fn collect_plans(
         if let Some((end, assign, call_rhs)) = indexed_sink
             && end > start
             // 发布新表是已知展开体的中间事件；只有完整外层 CALL 可以消费它。
-            && !expanded::is_published_table_write(context, flat[end].unwrap().stmt)
+            && !expanded::is_expanded_table_write(context, flat[end].unwrap().stmt)
             // 未完成构造器的字段准备属于原构造事务，不在这里拆走其 CONCAT 或 key。
             && !nested.writes.contains(&end)
             && !nested.producers.contains(&(end - 1))
@@ -3289,7 +3302,8 @@ fn collect_plans(
                                 if !super::super::mention::expr_mentions_local(&branch.cond, local)))
                 }))
             || (!pending_result_store
-                && !nested.producers.contains(&index)
+                && (!nested.producers.contains(&index)
+                    || nested.shared_producers.contains(&index))
                 // 多次读取或物理根保活都需要独立结果身份；即使结果随后直接被覆盖，
                 // 也可合回同槽初始化。单次嵌套消费仍留给外层完整帧，不提前截断准备区。
                 && (nested.shared_producers.contains(&index)
@@ -3504,7 +3518,8 @@ fn collect_plans(
                     assign.targets.as_slice(),
                     assign.values.fixed.as_slice(),
                     &assign.values.tail,
-                ) && matches!(target, HirLValue::Local(_))
+                ) && (matches!(target, HirLValue::Local(_))
+                    || matches!(target, HirLValue::Global(_)) && assignments::plain_copy(stmt))
                     && let Some(frame) = facts
                         .native_call_frame(call)
                         .or_else(|| facts.native_fastcall_frame(call))
@@ -3663,7 +3678,8 @@ fn collect_plans(
         }
         // 三类 VM 的字段/SETLIST 都已由 FrameBuilder 核对原布局与事件；
         // 收集器保留完整参数构造区，不能在接收 CALL 前先丢掉其 allocation/callee。
-        let constructor_step = super::super::table_constructors::constructor_write(stmt).is_some()
+        let constructor_step = expanded::is_expanded_table_write(context, stmt)
+            || super::super::table_constructors::constructor_write(stmt).is_some()
             || matches!(stmt, HirStmt::LocalRootRelease(_));
         let pending_initializer = matches!(stmt, HirStmt::LocalDecl(decl)
             if decl.values.is_empty())
@@ -6425,13 +6441,14 @@ fn plan(
     let frame = facts
         .native_call_frame(call)
         .or_else(|| facts.native_fastcall_frame(call))?;
+    // 全局写可能已由内联合入 CALL；它仍没有左值准备区，须按原结果槽
+    // 消费 callee/参数，并连同后继复用一起验证，不能只识别尚未树化的 COPY。
     let assignment_targets = match stmts[sink] {
         HirStmt::Assign(assign)
-            if scalar_local(stmts[sink]).is_some_and(|(local, _)| {
-                facts
-                    .trusted_local_home_slot(local)
-                    .is_some_and(|home| home.slot() < frame.home.slot())
-            }) =>
+            if matches!(assign.targets.as_slice(), [target]
+                if matches!(target, HirLValue::Local(_) | HirLValue::Global(_))
+                    && call_assignment_targets(target, frame.home, facts, dialect,
+                    context.constants_fit_rk, context.barred).is_some()) =>
         {
             assign.targets.clone()
         }
@@ -7766,7 +7783,8 @@ pub(super) fn frame_builder<'a>(
                 definitions.entry(local).or_default().push(index);
                 nil_group_members.insert((index, HirBinding::Local(local)), (offset, group.len()));
             }
-        } else if !(super::super::table_constructors::constructor_write(stmt).is_some()
+        } else if !(expanded::is_expanded_table_write(context, stmt)
+            || super::super::table_constructors::constructor_write(stmt).is_some()
             || matches!(stmt, HirStmt::LocalRootRelease(_))
             // 空声明不提供值定义，但可以留在本次候选之前。事件游标不会跳过
             // 窗口内部的声明；不能因无关前缀含空声明而拒绝后面的完整调用帧。
@@ -7995,19 +8013,22 @@ fn collect_constructor_plans(
     grouped.extend(declarations::collect_comparisons(
         context, facts, dialect, &flat,
     ));
-    let debug_groups = declarations::collect_debug_groups(context, facts, dialect, &flat);
-    let debug_statements = debug_groups
+    let mut declaration_groups = declarations::collect_debug_groups(context, facts, dialect, &flat);
+    declaration_groups.extend(declarations::collect_discarded(
+        context, facts, dialect, &flat,
+    ));
+    let declaration_statements = declaration_groups
         .iter()
         .flat_map(|plan| plan.removed.iter().copied().chain([plan.sink]))
         .collect::<BTreeSet<_>>();
     grouped.retain(|plan| {
-        !debug_statements.contains(&plan.sink)
+        !declaration_statements.contains(&plan.sink)
             && plan
                 .removed
                 .iter()
-                .all(|index| !debug_statements.contains(index))
+                .all(|index| !declaration_statements.contains(index))
     });
-    grouped.extend(debug_groups);
+    grouped.extend(declaration_groups);
     let grouped_statements = grouped
         .iter()
         .flat_map(|plan| plan.removed.iter().copied().chain([plan.sink]))
@@ -8273,10 +8294,10 @@ fn logical_call_result_frame(
             HirExpr::Unary(unary) if unary.op == crate::hir::common::HirUnaryOpKind::Neg => {
                 facts.unary_result_home(unary)?
             }
-            // 原 Phi 已给出目标 home；相邻空声明只补词法身份。首谓词可以是
-            // 既有低槽值或比较，仍由 comparison_tree 核对各叶布局及右臂事件边界。
+            // 原 Phi 已给出目标 home；结果可直接声明，也可由相邻空声明承接。
+            // 首谓词的准备仍由 comparison_tree 核对，右臂不能消费无条件事件。
             HirExpr::LocalRef(_) | HirExpr::ParamRef(_) | HirExpr::Binary(_)
-                if split_initializer =>
+                if split_initializer || matches!(stmt, HirStmt::LocalDecl(_)) =>
             {
                 facts.trusted_local_home_slot(target)?
             }
@@ -8742,10 +8763,11 @@ fn operation_initializer_plan(
     if following_floor.is_some_and(|floor| base.slot() >= floor)
         && context.proto.local_debug_hints[target.index()].is_none()
         && context.proto.local_debug_scopes[target.index()].is_none()
-        && !context.barred.contains(&base)
+        && (!context.barred.contains(&base) || facts.operation_result_reference_unaliased(source))
     {
         // 匿名运算结果仍可能是后继低槽 CALL 的参数；先独立提交会截断完整准备区。
-        // debug/capture 的既有身份必须保留，其余结果留给外层帧共同消费。
+        // debug/capture 的既有身份必须保留；原结果 Def 尚未被捕获时，后续同槽
+        // 创建的 cell 不能让这个准备值提前变成独立 initializer。
         return None;
     }
     if split_initializer && let Some(scope) = context.proto.local_debug_scopes[target.index()] {
@@ -9651,9 +9673,7 @@ fn completed_value_assignment(
                 facts.operation_result_reference_unaliased(site),
             )
         }
-        HirExpr::Closure(closure)
-            if closure.creation.is_some() && dialect != DecompileDialect::Luajit =>
-        {
+        HirExpr::Closure(closure) if closure.creation.is_some() => {
             let source = closure.source_site?;
             let result = facts.operation_result_temp(source)?;
             if facts.temp_is_published_allocation_declaration(result) {
@@ -9669,7 +9689,7 @@ fn completed_value_assignment(
             {
                 return None;
             }
-            if dialect == DecompileDialect::Luau {
+            if matches!(dialect, DecompileDialect::Luau | DecompileDialect::Luajit) {
                 // 原闭包的分配槽、创建身份和低槽捕获沿用完整表达式帧证明；
                 // 同批 preview 再恢复后续 callee 覆盖，不能只内联全局安装的 RHS。
                 rebuilt =

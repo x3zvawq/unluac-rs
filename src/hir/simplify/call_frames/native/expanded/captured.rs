@@ -1,4 +1,4 @@
-//! 恢复写入捕获 cell 后返回算术值的 Luau 展开帧。
+//! 恢复捕获读取及捕获 cell 更新的 Luau 展开帧。
 //!
 //! 以捕获身份和原指令布局配对既存闭包；参数与调用帧须整体重放，保留更新顺序、
 //! 返回宽度以及元方法可观察的引用存活时间。
@@ -10,6 +10,21 @@ pub(super) fn body_key(
     proto: &HirProto,
     facts: &ProtoPromotionFacts,
 ) -> Option<(HirLuauInliningBody, crate::LuaString)> {
+    if !proto.signature.is_vararg
+        && proto.params.is_empty()
+        && proto.upvalues.as_slice() == [UpvalueId(0)]
+        && proto.children.is_empty()
+        && proto.mutable_upvalues.is_empty()
+        && proto.failure.is_none()
+        && let [HirStmt::Return(ret)] = proto.body.stmts.as_slice()
+        && ret.values.fixed == [HirExpr::UpvalueRef(UpvalueId(0))]
+        && ret.values.tail.is_none()
+        && facts.native_return_frame(ret).is_some_and(|frame|
+            frame.home == HomeSlotKey::new(0, 0)
+                && matches!(frame.values, ValuePack::Fixed(pack) if pack.start.index() == 0 && pack.len == 1))
+    {
+        return Some((HirLuauInliningBody::CapturedValue, "".into()));
+    }
     if let Some(key) = identity_body_key(proto, facts) {
         return Some(key);
     }
@@ -466,4 +481,89 @@ fn captured_sum_call(
         plain_method_syntax: false,
         boolean_prewrite_arguments: Vec::new(),
     }))
+}
+
+impl FrameBuilder<'_> {
+    /// 原比较的 COPY 必须来自现存 getter 的唯一只读捕获；普通低槽引用不能
+    /// 省掉这次高槽写。两个操作数一起证明后，再按原事件顺序消费准备声明。
+    pub(in crate::hir::simplify::call_frames) fn captured_value_comparison(
+        &mut self,
+        binary: &HirBinaryExpr,
+        before: usize,
+        slot: usize,
+    ) -> Option<HirExpr> {
+        if self.dialect != DecompileDialect::Luau || binary.op != HirBinaryOpKind::Eq {
+            return None;
+        }
+        let context = self.native?;
+        let callee = context
+            .expanded_callees?
+            .get(&(HirLuauInliningBody::CapturedValue, "".into()))?;
+        let capture = callee.capture?;
+        if self.facts.trusted_local_home_slot(callee.local)?.slot() >= self.base {
+            return None;
+        }
+        let layout = self.facts.native_binary_layout(binary)?;
+        let mut next = self.boolean_operand_start(slot);
+        let mut values = [binary.lhs.clone(), binary.rhs.clone()];
+        let mut events = Vec::with_capacity(2);
+        for (operand, (value, original)) in
+            values.iter_mut().zip([layout.lhs, layout.rhs]).enumerate()
+        {
+            if self
+                .facts
+                .direct_binary_operand_home(binary, operand)
+                .is_some_and(|home| home.slot() < self.base && original == Some(home))
+                || original.is_none() && tables::literal_rk(value)
+            {
+                continue;
+            }
+            let HirExpr::LocalRef(local) = value else {
+                return None;
+            };
+            let index = self.definition(*local, before)?;
+            let copy = self.facts.binary_operand_copy(binary, operand)?;
+            let site = crate::hir::HirSourceSite {
+                proto: context.proto.id,
+                instr: self
+                    .facts
+                    .binary_operand_copy_instruction(binary, operand)?,
+            };
+            if index < self.next_event
+                || copy.target_home.slot() != next
+                || original != Some(copy.target_home)
+                || self.facts.promoted_local_for_temp(copy.source?) != Some(capture)
+                || self.facts.trusted_local_home_slot(capture) != Some(copy.source_home)
+                || scalar_local(self.run[index]) != Some((*local, &HirExpr::LocalRef(capture)))
+                || !self.homes_match(*local, index, next, None, Some(copy.target))
+                || context.proto.local_debug_hints[local.index()].is_some()
+                || context.proto.local_debug_scopes[local.index()].is_some()
+                || context.closed.contains(&copy.target_home)
+                || context.barred.contains(&copy.target_home)
+                || callee.creation.proto != site.proto
+                || callee.creation.instr.index() >= site.instr.index()
+            {
+                return None;
+            }
+            *value = factories::factory_call(callee.local, Some(site), Vec::new().into());
+            events.push(index);
+            next += 1;
+        }
+        if events.is_empty() {
+            return None;
+        }
+        let cursor = (self.first_event, self.next_event);
+        for index in events {
+            if self.finish_event(index).is_none() {
+                (self.first_event, self.next_event) = cursor;
+                return None;
+            }
+        }
+        let [lhs, rhs] = values;
+        Some(HirExpr::Binary(Box::new(HirBinaryExpr {
+            lhs,
+            rhs,
+            ..binary.clone()
+        })))
+    }
 }

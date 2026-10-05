@@ -17,8 +17,61 @@ pub(super) mod coordinates;
 mod materializations;
 pub(super) use materializations::{close_gc_inert_terminal_prefix, indexed_assignment_frame};
 pub(super) use materializations::{
-    pending_nil_prefix_temps, restore_materializations, restore_split_nil_declarations,
+    pending_nil_prefix_temps, restore_call_result_prefix, restore_materializations,
+    restore_split_nil_declarations,
 };
+
+/// 已提交的必须内联调用仍依赖其源码前缀；其它帧不能只验证自己的入口后删除这些声明。
+/// 按当前语句坐标补入请求；已删除或在 sink 重建的语句由同批完整事务的入口负责。
+pub(super) fn require_inline_prefixes(
+    proto: &HirProto,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    removed: &[bool],
+    rebuilt: &BTreeSet<usize>,
+    requests: &mut BTreeMap<usize, PrefixRequest>,
+) -> Result<(), usize> {
+    struct Required(bool);
+    impl HirVisitor<'_> for Required {
+        fn is_complete(&self) -> bool {
+            self.0
+        }
+        fn visit_call(&mut self, call: &crate::hir::HirCallExpr) {
+            self.0 |= call.required_luau_inlining.is_some();
+        }
+    }
+    let mut failed = None;
+    coordinates::visit(&proto.body, &mut 0, &mut |index, kind, stmt| {
+        if kind != coordinates::PointKind::Statement || removed[index] || rebuilt.contains(&index) {
+            return;
+        }
+        let mut required = Required(false);
+        crate::hir::visit::visit_stmt_header(stmt, &mut required);
+        if required.0 {
+            let home = materializations::statement_frame(stmt, facts, dialect).or_else(|| {
+                let HirStmt::If(branch) = stmt else {
+                    return None;
+                };
+                let predicate = branch.predicate_source?;
+                let literal = facts.literal_predicate(predicate)?;
+                // 原 LOADBOOL 的唯一 TEST 仍是已签证条件的输入；不能把这个条件
+                // 当成未知 CALL，也不能凭当前布尔值跳过它的原准备槽。
+                (facts.original_truthy_input(predicate) == Some((literal.input, literal.home)))
+                    .then_some(literal.home)
+            });
+            if let Some(home) = home {
+                requests.entry(index).or_insert_with(|| PrefixRequest {
+                    home,
+                    required: BTreeSet::new(),
+                });
+            } else {
+                // 候选拒绝[ProofIncomplete:Lifetime]：没有原入口帧时，不能让其它事务移动已签证调用的前缀。
+                failed.get_or_insert(index);
+            }
+        }
+    });
+    failed.map_or(Ok(()), Err)
+}
 
 /// 臂首原 CALL 及其准备写均位于条件输入之上时，该输入仍占据声明前缀。
 /// 只检查连续准备区；任何低槽写或控制结构都会结束本次证明。

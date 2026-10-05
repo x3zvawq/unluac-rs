@@ -132,10 +132,11 @@ pub(super) fn build_value_operands(
             return None;
         }
         values[group] = Some(HirDecisionExpr {
-            source_result: operand.and_then(|operand| {
-                let temp = lowering.bindings.phi_temps[operand.phi.index()];
-                (temp.index() == lowering.dataflow.defs.len() + operand.phi.index()).then_some(temp)
-            }),
+            source_result: {
+                let phi = operand.map_or(plan.result_phi, |operand| operand.phi);
+                let temp = lowering.bindings.phi_temps[phi.index()];
+                (temp.index() == lowering.dataflow.defs.len() + phi.index()).then_some(temp)
+            },
             emit_as_luau_if: false,
             entry: HirDecisionNodeRef(dense[entry]),
             nodes,

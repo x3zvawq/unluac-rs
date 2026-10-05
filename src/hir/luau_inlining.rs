@@ -5,6 +5,7 @@
 use super::{HirExpr, HirMethodCall, HirProto, HirStmt, HirUnaryOpKind, ParamId, UpvalueId};
 use crate::LuaString;
 
+pub(crate) mod captured_transfers;
 mod reset_counter;
 pub(crate) use reset_counter::{ResetCounterTemplate, reset_counter_template};
 mod array_fold;
@@ -16,8 +17,10 @@ mod guarded_counter;
 pub(crate) use guarded_counter::{
     CounterLoopKind, GuardedCounterTemplate, guarded_counter_template,
 };
+mod nested_search;
 mod numeric_repeat;
 pub(crate) use checked_reads::{CheckedReadTemplate, checked_read_template};
+pub(crate) use nested_search::{NestedSearchTemplate, nested_search_count, nested_search_template};
 pub(crate) use numeric_repeat::{NumericRepeatTemplate, numeric_repeat_template};
 mod observed_values;
 mod parameter_writebacks;

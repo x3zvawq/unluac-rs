@@ -149,6 +149,7 @@ pub(super) fn prepare_body(
         proto,
         rk_literals: None,
         expanded_callees: None,
+        captured_transfers: None,
         compared_choices: None,
         value_expressions: None,
         constant_controls: None,
@@ -414,7 +415,7 @@ pub(super) fn plans(context: NativeFrameContext<'_>, facts: &ProtoPromotionFacts
             let rebuilt =
                 builder.call(call, run.len(), frame.home.slot(), false, CallWidth::Single)?;
             if builder.first_event.is_some() && builder.next_event != run.len()
-                || !same_call(&body.producer, &rebuilt, &callee.readonly_captures)
+                || !same_call(&body.producer, &rebuilt, &callee.capture_locals)
             {
                 return None;
             }

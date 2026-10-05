@@ -2,6 +2,27 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_bindings/assignment_18_captured_input_snapshot.lua",
+        &[
+            "parallel-assignment",
+            "snapshot",
+            "closure-cell",
+            "recompile",
+        ],
+        "闭包改写后按原时点读取捕获 cell，完整并行写回保留当前对象身份并消除高槽中转。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_bindings/assignment_17_nil_branch_initializers.lua",
         &["nil-batch", "phi", "debug-write", "recompile"],
         "并列 nil 初始化承接原同槽条件写回，谓词调用的 debug.setlocal 仍写入原变量，后续调用不遗留准备中转。",
@@ -1696,6 +1717,44 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             "recompile",
         ],
         "入口 nil 承接同槽 Boolean Def/Phi；无出口协程循环持续读取原绑定，覆盖真假及非 Boolean 参数。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_bindings/assignment_19_luau_parallel_field_values.lua",
+        &[
+            "parallel-assignment",
+            "call-frame",
+            "allocation",
+            "metamethod",
+            "recompile",
+        ],
+        "Luau 字段并行赋值先完成两项调用或分配，再正序触发写入元方法，不遗留 RHS 接棒声明。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_bindings/phi_15_decision_result_owner.lua",
+        &["phi", "call-frame", "conditional-write", "recompile"],
+        "完整决策的原 phi 承接闭包条件重赋值，真假路径保留旧函数调用与后继调用帧。",
         &[
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),

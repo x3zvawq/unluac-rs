@@ -11,6 +11,8 @@
 -- unluac: expect-ast-count [[call]] [[5]] [[@proto=0]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[call]] [[1]] [[@proto=1]]
+-- unpack 保留为构造器的开放列表尾，不物化单个返回值或分离字段写。
+-- unluac: expect-ast-count [[table-list-field]] [[1]] [[@proto=1]]
 -- 外部环境观察独立编译，避免 setfenv 进入被测模块并禁止原 O2 内联。
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local weak = setmetatable({}, { __mode = "v" })

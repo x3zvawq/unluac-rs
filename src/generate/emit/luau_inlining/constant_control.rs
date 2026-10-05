@@ -268,6 +268,18 @@ impl Model<'_> {
             AstExpr::FieldAccess(field) => self.expression(&field.base)?.add(Cost::fixed(1)),
             AstExpr::Call(call)
                 if call.method_key.is_none()
+                    && matches!(call.callee, AstExpr::Var(AstNameRef::Local(_))) =>
+            {
+                // 源码 CostModel 对普通 local CALL 按原始调用计费；
+                // 其保留或内联义务由函数体和 occurrence 合同另行验证。
+                let mut cost = Cost::fixed(3);
+                for argument in &call.args {
+                    cost = cost.add(self.expression(argument)?.argument());
+                }
+                cost
+            }
+            AstExpr::Call(call)
+                if call.method_key.is_none()
                     && call.required_luau_inlining.is_none()
                     && matches!(&call.callee, AstExpr::Var(AstNameRef::Global(name)) if name.text == "print") =>
             {

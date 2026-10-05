@@ -576,7 +576,7 @@ fn result_writebacks(
     let ResultPack::Fixed(pack) = call.results else {
         return None;
     };
-    if pack.len < 2 || pack.start != call.callee {
+    if pack.len == 0 || pack.start != call.callee {
         return None;
     }
     let mut writes = Vec::with_capacity(pack.len);
@@ -1016,6 +1016,8 @@ pub(super) struct ResultCopies {
     pub by_site: BTreeMap<InstrRef, ImmediateMoveWrite>,
     pub writes: Vec<ImmediateMoveWrite>,
     pub state_writes: BTreeMap<TempId, StateCopy>,
+    /// 只读来源写入已打开的 cell；只供重放原写，不能借为独立值 Def。
+    pub captured_writes: BTreeMap<InstrRef, StateCopy>,
     /// COPY 读取的确切数值字面量 Def；用于没有算术节点携带来源的常量返回。
     pub literals: BTreeMap<TempId, (TempId, HirExpr)>,
 }
@@ -1043,6 +1045,7 @@ pub(super) fn value_result_copies(
     let mut by_site = BTreeMap::new();
     let mut writes = Vec::new();
     let mut state_writes = BTreeMap::new();
+    let mut captured_writes = BTreeMap::new();
     let mut literals = BTreeMap::new();
     for (index, block) in cfg.blocks.iter().enumerate() {
         if block.instrs.is_empty() || !cfg.reachable_blocks.contains(&BlockRef(index)) {
@@ -1056,7 +1059,6 @@ pub(super) fn value_result_copies(
             let value = dataflow.use_value(instr, copy.src);
             if let [target] = dataflow.instr_defs[instr.index()].as_slice()
                 && !epochs.reference_capture_may_be_open(copy.src, instr)
-                && !epochs.reference_capture_may_be_open(copy.dst, instr)
             {
                 let source = match value {
                     SsaValue::Def(def) => {
@@ -1066,26 +1068,28 @@ pub(super) fn value_result_copies(
                     _ => None,
                 };
                 if let Some((source, producer)) = source {
-                    state_writes.insert(
-                        TempId(target.index()),
-                        StateCopy {
-                            site: instr,
-                            target_binding: fixed_temps[target.index()],
-                            write: ImmediateMoveWrite {
-                                source: Some(source),
-                                target: TempId(target.index()),
-                                source_home: HomeSlotKey::new(
-                                    copy.src.index(),
-                                    epochs.epoch_at(copy.src, instr),
-                                ),
-                                target_home: HomeSlotKey::new(
-                                    copy.dst.index(),
-                                    epochs.epoch_at(copy.dst, instr),
-                                ),
-                            },
-                            producer,
+                    let write = StateCopy {
+                        site: instr,
+                        target_binding: fixed_temps[target.index()],
+                        write: ImmediateMoveWrite {
+                            source: Some(source),
+                            target: TempId(target.index()),
+                            source_home: HomeSlotKey::new(
+                                copy.src.index(),
+                                epochs.epoch_at(copy.src, instr),
+                            ),
+                            target_home: HomeSlotKey::new(
+                                copy.dst.index(),
+                                epochs.epoch_at(copy.dst, instr),
+                            ),
                         },
-                    );
+                        producer,
+                    };
+                    if epochs.reference_capture_may_be_open(copy.dst, instr) {
+                        captured_writes.insert(instr, write);
+                    } else {
+                        state_writes.insert(TempId(target.index()), write);
+                    }
                 }
             }
             let Some(result) =
@@ -1148,6 +1152,7 @@ pub(super) fn value_result_copies(
         by_site,
         writes,
         state_writes,
+        captured_writes,
         literals,
     }
 }

@@ -2176,7 +2176,127 @@ fn materialized_local(
     local
 }
 
-fn statement_frame(
+/// 展开帧的草稿需要连续原声明前缀；已合入低槽赋值的 CALL 结果可占据原来的空位。
+/// 仅恢复紧邻后继声明证明的单槽缺口，保留原 CALL 和 COPY，最终仍须验证整个草稿。
+pub(in crate::hir::simplify) fn restore_call_result_prefix(
+    proto: &mut HirProto,
+    facts: &mut ProtoPromotionFacts,
+) -> bool {
+    let mut mentions = BTreeSet::new();
+    visit_stmts(
+        &proto.body.stmts,
+        &mut BindingReadCollector(|binding| {
+            if let HirBinding::Local(local) = binding {
+                mentions.insert(local);
+            }
+        }),
+    );
+    let mut writes = BTreeSet::new();
+    visit_stmts(
+        &proto.body.stmts,
+        &mut BindingWriteCollector(|binding| {
+            if let HirBinding::Local(local) = binding {
+                writes.insert(local);
+            }
+        }),
+    );
+    mentions.extend(writes);
+    let original = std::mem::take(&mut proto.body.stmts);
+    let mut statements = Vec::with_capacity(original.len());
+    let mut active = Some(proto.params.len());
+    let mut changed = false;
+    for (index, stmt) in original.iter().enumerate() {
+        let candidate = (|| {
+            let top = active?;
+            let HirStmt::Assign(assign) = stmt else {
+                return None;
+            };
+            let ([HirLValue::Local(target)], [HirExpr::Call(call)], None) = (
+                assign.targets.as_slice(),
+                assign.values.fixed.as_slice(),
+                &assign.values.tail,
+            ) else {
+                return None;
+            };
+            let HirStmt::LocalDecl(next) = original.get(index + 1)? else {
+                return None;
+            };
+            let first = next.bindings.first()?;
+            let layout = facts
+                .native_call_frame(call)
+                .or_else(|| facts.native_fastcall_frame(call))?;
+            let result = facts.operation_result_temp(call.source_site?)?;
+            let [write] = facts.native_result_writebacks(call)? else {
+                return None;
+            };
+            if layout.home.slot() != top
+                || !matches!(layout.results, Some(crate::transformer::ResultPack::Fixed(pack)) if pack.len == 1 && pack.start.index() == top)
+                || facts.trusted_temp_home_slot(result) != Some(layout.home)
+                || facts.trusted_local_home_slot(*first)?.slot() != top + 1
+                || facts.trusted_local_home_slot(*target) != Some(write.target_home)
+                || write.target_home.slot() >= top
+                || write.result_index != 0
+                || facts.promoted_local_for_temp(write.writeback) != Some(*target)
+                || assign.is_phi_transfer
+                || assign.root_release.is_some()
+                || assign.initializer_merge_transaction.is_some()
+                || assign.generic_for_initializer_producer.is_some()
+                || assign.method_rewrite_transaction.is_some()
+                || !facts.operation_result_reference_unaliased(call.source_site?)
+                || facts
+                    .promoted_local_for_temp(result)
+                    .is_some_and(|local| mentions.contains(&local))
+            {
+                return None;
+            }
+            Some((result, call.clone()))
+        })();
+        if let Some((result, call)) = candidate {
+            let local = facts
+                .promoted_local_for_temp(result)
+                .unwrap_or_else(|| materialized_local(proto, facts, result));
+            proto
+                .inline_dispositions
+                .preserve_local(local, HirInlineRetentionReason::PhysicalFramePrefix);
+            statements.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![local],
+                values: vec![HirExpr::Call(call)].into(),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
+            })));
+            let HirStmt::Assign(mut assign) = stmt.clone() else {
+                unreachable!()
+            };
+            assign.values = vec![HirExpr::LocalRef(local)].into();
+            statements.push(HirStmt::Assign(assign));
+            active = active.map(|top| top + 1);
+            changed = true;
+        } else {
+            match stmt {
+                HirStmt::LocalDecl(decl) => {
+                    active = active.and_then(|top| {
+                        decl.bindings
+                            .iter()
+                            .enumerate()
+                            .all(|(offset, local)| {
+                                facts
+                                    .trusted_local_home_slot(*local)
+                                    .is_some_and(|home| home.slot() == top + offset)
+                            })
+                            .then_some(top + decl.bindings.len())
+                    });
+                }
+                HirStmt::Assign(_) | HirStmt::CallStmt(_) | HirStmt::Return(_) => {}
+                _ => active = None,
+            }
+            statements.push(stmt.clone());
+        }
+    }
+    proto.body.stmts = statements;
+    changed
+}
+
+pub(super) fn statement_frame(
     stmt: &HirStmt,
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,

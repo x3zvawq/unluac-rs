@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod array_fold;
 mod calling_values;
+mod captured_transfers;
 mod checked_reads;
 mod conditional_methods;
 mod constant_control;
@@ -22,6 +23,7 @@ mod generic_lookup;
 mod guarded_counter;
 mod literal_choices;
 mod loops;
+mod nested_search;
 mod numeric_exit;
 mod numeric_repeat;
 mod observed_values;
@@ -81,15 +83,19 @@ pub(super) fn validate(module: &AstModule, hir: &crate::hir::HirModule) -> bool 
         }
         validated.insert(owner);
     }
-    validate_scope(
-        module.entry_function,
-        &module.body,
-        by_owner
-            .get(&module.entry_function)
-            .map_or(&[], Vec::as_slice),
-        hir,
-        &validated,
-    )
+    // 子函数的成本已证明它保留独立调用帧；入口没有自己的签证时，
+    // 不对无关兄弟函数体重复建立内联合同。
+    by_owner
+        .get(&module.entry_function)
+        .is_none_or(|requirements| {
+            validate_scope(
+                module.entry_function,
+                &module.body,
+                requirements,
+                hir,
+                &validated,
+            )
+        })
 }
 
 fn validate_scope(
@@ -147,6 +153,7 @@ fn validate_scope(
                 | HirLuauInliningBody::GuardedCounter { .. }
                 | HirLuauInliningBody::ResetCounter { .. }
                 | HirLuauInliningBody::ArrayFold { .. }
+                | HirLuauInliningBody::NestedSearch { .. }
                 | HirLuauInliningBody::CallingValue { .. }
                 | HirLuauInliningBody::CallingSharedValue { .. }
                 | HirLuauInliningBody::CallingObservedValue { .. }
@@ -194,6 +201,7 @@ fn validate_scope(
                 | HirLuauInliningBody::GuardedCounter { .. }
                 | HirLuauInliningBody::ResetCounter { .. }
                 | HirLuauInliningBody::ArrayFold { .. }
+                | HirLuauInliningBody::NestedSearch { .. }
         )
     }) {
         constant_control::extend_runtime_values(body, &mut nonconstant_locals);
@@ -305,7 +313,9 @@ fn validate_scope(
     for requirement in requirements {
         if matches!(
             requirement.body,
-            HirLuauInliningBody::EventClosureFactory { .. }
+            HirLuauInliningBody::CapturedValue
+                | HirLuauInliningBody::CapturedAppendTransfer { .. }
+                | HirLuauInliningBody::EventClosureFactory { .. }
                 | HirLuauInliningBody::PublishedClosureFactory { .. }
                 | HirLuauInliningBody::SnapshotClosureFactory { .. }
                 | HirLuauInliningBody::CapturedCallablePair
@@ -318,6 +328,7 @@ fn validate_scope(
                 | HirLuauInliningBody::GuardedCounter { .. }
                 | HirLuauInliningBody::ResetCounter { .. }
                 | HirLuauInliningBody::ArrayFold { .. }
+                | HirLuauInliningBody::NestedSearch { .. }
                 | HirLuauInliningBody::CallingValue { .. }
                 | HirLuauInliningBody::CallingSharedValue { .. }
                 | HirLuauInliningBody::CallingObservedValue { .. }
@@ -377,6 +388,7 @@ fn validate_scope(
                     | HirLuauInliningBody::GuardedCounter { .. }
                     | HirLuauInliningBody::ResetCounter { .. }
                     | HirLuauInliningBody::ArrayFold { .. }
+                    | HirLuauInliningBody::NestedSearch { .. }
                     | HirLuauInliningBody::CallingValue { .. }
                     | HirLuauInliningBody::CallingSharedValue { .. }
                     | HirLuauInliningBody::CallingObservedValue { .. }
@@ -439,12 +451,17 @@ fn validate_scope(
                             constant_controls.declaration(local)
                         } else if let HirLuauInliningBody::ResetCounter { template } = fields[&local].0 {
                             hir.protos.get(template).is_some_and(|proto| reset_counter::body(&decl.func, proto))
+                        } else if let HirLuauInliningBody::NestedSearch { template } = fields[&local].0 {
+                            hir.protos.get(template).is_some_and(|proto| nested_search::body(&decl.func, proto))
                         } else if let HirLuauInliningBody::ArrayFold { template } = fields[&local].0 {
                             hir.protos.get(template).is_some_and(|proto| array_fold::body(&decl.func, proto))
                         } else if let HirLuauInliningBody::GuardedCounter { template } = fields[&local].0 {
                             hir.protos.get(template).is_some_and(|proto| guarded_counter::body(&decl.func, proto))
                         } else if let HirLuauInliningBody::NumericRepeat { template } = fields[&local].0 {
                             hir.protos.get(template).is_some_and(|proto| numeric_repeat::body(&decl.func, proto))
+                        } else if let HirLuauInliningBody::CapturedAppendTransfer { template } = fields[&local].0 {
+                            hir.protos.get(template).zip(opaque_functions.capture_layout(decl.func.function))
+                                .is_some_and(|(proto, closure)| captured_transfers::body(&decl.func, proto, closure))
                         } else if let HirLuauInliningBody::ParameterWriteback { template } = fields[&local].0 {
                             hir.protos.get(template).is_some_and(|proto| parameter_writebacks::body(&decl.func, proto))
                         } else if let HirLuauInliningBody::CallingValue { template } | HirLuauInliningBody::CallingSharedValue { template } | HirLuauInliningBody::CallingObservedValue { template } | HirLuauInliningBody::CallingReadPair { template } = fields[&local].0 {
@@ -471,6 +488,7 @@ fn validate_scope(
                 active += 1;
             }
             AstStmt::LocalDecl(decl) => {
+                if decl.values.iter().enumerate().any(|(offset, value)| matches!(value, AstExpr::Call(call) if !captured_transfers::slots(call, active + offset, &occurrences, &bodies, &result_slots, &mut seen_result_slots))) { return false; }
                 // 整组 local 的 target 已预留；只允许一对一的 fixed-one 调用。
                 if let [AstExpr::Call(call)] = decl.values.as_slice()
                     && let Some(site) = call.required_luau_inlining
@@ -547,6 +565,10 @@ fn validate_scope(
                 let AstCallKind::Call(call) = &stmt.call else {
                     return false;
                 };
+                if !captured_transfers::slots(call, active, &occurrences, &bodies, &result_slots, &mut seen_result_slots) { return false; }
+                if !scopes::captured_value_slots(call, active, &occurrences, &bodies, &result_slots, &mut seen_result_slots) {
+                    return false;
+                }
                 if !literal_choices::comparison_slots(call, active, &occurrences, &bodies, &result_slots, &mut seen_result_slots) {
                     return false;
                 }
@@ -576,7 +598,7 @@ fn validate_scope(
                         || !seen_result_slots.insert(site)) { return false; }
                 if let Some(site) = counter_while::comparison_result(call)
                     && occurrences.get(&site).and_then(|local| bodies.get(local))
-                        .is_some_and(|body| matches!(body, HirLuauInliningBody::CounterWhile { .. } | HirLuauInliningBody::NumericRepeat { .. }))
+                        .is_some_and(|body| matches!(body, HirLuauInliningBody::CounterWhile { .. } | HirLuauInliningBody::NumericRepeat { .. } | HirLuauInliningBody::NestedSearch { .. }))
                     && (result_slots.get(&site) != Some(&(active + 2))
                         || !seen_result_slots.insert(site))
                 {
@@ -933,7 +955,9 @@ impl InvocationExpressions<'_> {
                             3
                         } else if matches!(
                             self.bodies[callee],
-                            HirLuauInliningBody::TableFactory { .. }
+                            HirLuauInliningBody::CapturedValue
+                                | HirLuauInliningBody::CapturedAppendTransfer { .. }
+                                | HirLuauInliningBody::TableFactory { .. }
                                 | HirLuauInliningBody::PublishedTableFactory { .. }
                                 | HirLuauInliningBody::ClosureFactory { .. }
                                 | HirLuauInliningBody::PublishedClosureFactory { .. }
@@ -945,6 +969,7 @@ impl InvocationExpressions<'_> {
                             HirLuauInliningBody::RepeatPrefix { .. }
                                 | HirLuauInliningBody::RepeatLookup { .. }
                                 | HirLuauInliningBody::GenericLookupWhile { .. }
+                                | HirLuauInliningBody::NestedSearch { .. }
                         ) {
                             2
                         } else if matches!(
@@ -1024,6 +1049,10 @@ impl InvocationExpressions<'_> {
                         self.bodies[callee],
                         HirLuauInliningBody::NumericRepeat { .. }
                     ) || numeric_repeat::arguments(&call.args, self.nonconstant_locals))
+                    && (!matches!(
+                        self.bodies[callee],
+                        HirLuauInliningBody::NestedSearch { .. }
+                    ) || nested_search::arguments(&call.args, self.written_locals))
                     && (!matches!(
                         self.bodies[callee],
                         HirLuauInliningBody::GuardedCounter { .. }
@@ -1349,6 +1378,19 @@ fn callee_body(
     }
     if let HirLuauInliningBody::CapturedIncrementIdentity { increment } = body {
         return scopes::increment_identity(func, capture, increment);
+    }
+    if body == HirLuauInliningBody::CapturedValue {
+        let Some(capture) = capture else {
+            return false;
+        };
+        return func.params.is_empty()
+            && !func.is_vararg
+            && func.named_vararg.is_none()
+            && func.captured_bindings == BTreeSet::from([AstBindingRef::Local(capture)])
+            && func.captured_params.is_empty()
+            && func.capture_write_names.is_empty()
+            && matches!(func.body.stmts.as_slice(), [AstStmt::Return(ret)]
+                if ret.values == [AstExpr::Var(AstNameRef::Upvalue(crate::hir::UpvalueId(0)))]);
     }
     if body == HirLuauInliningBody::CapturedAddIdentity {
         return captured_identity_body(func, capture);

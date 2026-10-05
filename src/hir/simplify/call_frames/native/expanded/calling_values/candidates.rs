@@ -7,6 +7,8 @@ use crate::transformer::InstrRef;
 #[derive(Debug, Clone)]
 pub(super) struct Candidate {
     pub source: crate::hir::HirSourceSite,
+    /// 原条件 owner；结果可由 RegionResult 或分支内的 EdgeCopy 持有。
+    pub predicate: crate::hir::HirSourceSite,
     pub source_pc: u32,
     pub end: InstrRef,
     pub result: TempId,
@@ -80,13 +82,17 @@ pub(super) fn candidate(
     };
     let predicate = branch.predicate_source?;
     let frame = facts.branch_value_frame_at(predicate)?;
+    // 外层 Boolean 合流可由分支内的 edge-copy 持有；Frame 已证明其全部入口
+    // 仍来自当前分支，恢复完整调用时与 RegionResult 一起消费，不能仅按 disposition 漏掉它。
     let result = frame
         .results
         .iter()
+        .chain(frame.edge_results(facts))
         .find(|result| facts.promoted_local_for_temp(result.value) == Some(target))?;
     let state = frame
         .results
         .iter()
+        .chain(frame.edge_results(facts))
         .find(|result| facts.promoted_local_for_temp(result.value) == Some(counter))?;
     let original = |instr| crate::hir::HirSourceSite {
         proto: proto.id,
@@ -136,7 +142,7 @@ pub(super) fn candidate(
     let lookup_layout = facts.native_table_read_layout(lookup)?;
     let value_copy = facts.binary_operand_copy(comparison, 0)?;
     let value_source = value_copy.source?;
-    if frame.results.len() != 2
+    if frame.results.len() + frame.edge_results(facts).count() != 2
         || frame.predicates != [predicate.instr]
         || frame.begin > source.instr
         || source.instr.index() + 1 != predicate.instr.index()
@@ -229,6 +235,7 @@ pub(super) fn candidate(
     }
     Some(Candidate {
         source,
+        predicate,
         source_pc: facts.binary_operand_copy_after_pc(comparison, 0)?,
         end: frame.end,
         result: result.value,
