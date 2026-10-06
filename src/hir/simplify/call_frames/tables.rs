@@ -7,12 +7,13 @@ use crate::hir::common::{HirBinding, HirRecordField, HirTableAccess};
 use crate::hir::simplify::table_constructors::{ConstructorWrite, TableBinding, constructor_write};
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
-/// 只排除已知超出原分配形状的字段；未解析的 key 和未完成的批次仍须留给完整帧证明。
+/// 排除超出原分配形状或已知会丢失求值的字段；未解析的 key 和未完成的批次仍须留给完整帧证明。
 pub(super) struct ConstructorShape<'a> {
     table: &'a crate::hir::common::HirTableConstructor,
     arrays: usize,
     records: usize,
     luau_record_indices: crate::value_semantics::table::allocation::LuauRecordIndices,
+    template_writes: crate::value_semantics::table::LuauTemplateWriteOrder,
 }
 
 impl<'a> ConstructorShape<'a> {
@@ -27,6 +28,7 @@ impl<'a> ConstructorShape<'a> {
         Self {
             table,
             luau_record_indices,
+            template_writes: crate::value_semantics::table::LuauTemplateWriteOrder::default(),
             arrays: table
                 .fields
                 .iter()
@@ -40,10 +42,26 @@ impl<'a> ConstructorShape<'a> {
         }
     }
 
-    pub(super) fn push(&mut self, write: &ConstructorWrite<'_>) -> bool {
+    pub(super) fn push<'b>(
+        &mut self,
+        write: &ConstructorWrite<'b>,
+        resolve: impl Fn(&'b HirExpr) -> &'b HirExpr,
+    ) -> bool {
         use crate::value_semantics::table::TableExpression;
         match write {
-            ConstructorWrite::Record { access, .. } => {
+            ConstructorWrite::Record { access, value, .. } => {
+                if matches!(
+                    self.table.allocation,
+                    HirTableAllocation::LuauTemplate { .. }
+                ) && !self
+                    .template_writes
+                    .record(resolve(&access.key).table_key(), literal_rk(resolve(value)))
+                {
+                    // 候选拒绝[SemanticBarrier:EvalCount]：template_06 的后续常量覆盖
+                    // 若并入同一 DUPTABLE，Luau constant-pack 会删除先前同键 CALL。
+                    // 保留已经完整的前缀，把这次覆盖交给独立赋值帧。
+                    return false;
+                }
                 self.luau_record_indices.push(&access.key);
                 let key = access.key.table_key();
                 let allowed = match &self.table.allocation {
@@ -314,9 +332,20 @@ pub(super) fn nested_initializers<'a>(
                 // 普通 table 写（如 weak[key]=result）不是构造器字段，不能把此前
                 // 返回 weak 的 CALL 当成 seed，反向吞掉不相关的调用初始化边界。
                 owner = definitions.get(&local).copied().filter(|seed| {
-                    constructor_seeds
-                        .get_mut(seed)
-                        .is_some_and(|shape: &mut ConstructorShape<'_>| shape.push(&write))
+                    constructor_seeds.get_mut(seed).is_some_and(
+                        |shape: &mut ConstructorShape<'_>| {
+                            shape.push(&write, |value| {
+                                if let HirExpr::LocalRef(local) = value {
+                                    definitions
+                                        .get(local)
+                                        .and_then(|&index| preparations[index])
+                                        .unwrap_or(value)
+                                } else {
+                                    value
+                                }
+                            })
+                        },
+                    )
                 });
                 if owner.is_none()
                     && let Some(seed) = definitions.get(&local)
@@ -532,12 +561,17 @@ impl RkLiterals {
         if dialect == DecompileDialect::Luajit {
             struct Kgc {
                 strings: BTreeSet<crate::LuaString>,
+                template_literals: BTreeSet<usize>,
                 other: usize,
             }
             impl HirVisitor<'_> for Kgc {
                 fn visit_expr(&mut self, expr: &HirExpr) {
                     match expr {
-                        HirExpr::String(value) => {
+                        HirExpr::String(value)
+                            if !self
+                                .template_literals
+                                .contains(&(std::ptr::from_ref(expr) as usize)) =>
+                        {
                             self.strings.insert(value.clone());
                         }
                         HirExpr::GlobalRef(global) => {
@@ -546,7 +580,26 @@ impl RkLiterals {
                         HirExpr::TableConstructor(table)
                             if matches!(table.allocation, HirTableAllocation::Template { .. }) =>
                         {
-                            self.other += 1
+                            self.other += 1;
+                            // TDUP 的静态内容属于一个表常量，不逐项占运行时 KGC。
+                            // 只排除直接字面量；后续动态写和未树化的准备仍独立计数。
+                            for field in &table.fields {
+                                match field {
+                                    HirTableField::Array(value) if literal_rk(value) => {
+                                        self.template_literals
+                                            .insert(std::ptr::from_ref(value) as usize);
+                                    }
+                                    HirTableField::Record(record)
+                                        if literal_rk(&record.key) && literal_rk(&record.value) =>
+                                    {
+                                        self.template_literals
+                                            .insert(std::ptr::from_ref(&record.key) as usize);
+                                        self.template_literals
+                                            .insert(std::ptr::from_ref(&record.value) as usize);
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                         HirExpr::Closure(_) => self.other += 1,
                         _ => {}
@@ -560,6 +613,7 @@ impl RkLiterals {
             }
             let mut kgc = Kgc {
                 strings: BTreeSet::new(),
+                template_literals: BTreeSet::new(),
                 other: 0,
             };
             visit_stmts(&proto.body.stmts, &mut kgc);
@@ -574,22 +628,6 @@ impl RkLiterals {
             }
             return result;
         }
-        struct Tags(BTreeSet<u8>);
-        impl HirVisitor<'_> for Tags {
-            fn visit_expr(&mut self, expr: &HirExpr) {
-                match expr {
-                    HirExpr::Nil => {
-                        self.0.insert(0);
-                    }
-                    HirExpr::Boolean(value) => {
-                        self.0.insert(1 + u8::from(*value));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let mut tags = Tags(BTreeSet::new());
-        visit_stmts(&proto.body.stmts, &mut tags);
         struct Bounds<'a> {
             facts: &'a ProtoPromotionFacts,
             possible: BTreeSet<Constant>,
@@ -597,14 +635,15 @@ impl RkLiterals {
             required_tags: BTreeSet<u8>,
             roles: BTreeMap<usize, (crate::hir::common::HirSourceSite, bool)>,
             numeric_operands: BTreeSet<usize>,
+            non_rk_tags: BTreeSet<usize>,
             result: RkLiterals,
             mandatory: bool,
             valid: bool,
-            tags: usize,
+            tags: BTreeSet<u8>,
         }
         impl Bounds<'_> {
             fn capacity(&self) -> Option<bool> {
-                if self.possible.len() + self.tags < 256 {
+                if self.possible.len() + self.tags.len() < 256 {
                     Some(true)
                 } else if self.required.len() + self.required_tags.len() >= 256 {
                     Some(false)
@@ -720,19 +759,52 @@ impl RkLiterals {
                     self.role(&access.key, &access.sources, false);
                     self.role(value, &access.sources, true);
                 } else if let HirStmt::Assign(assign) = stmt
-                    && let ([HirLValue::Global(global)], [value], None) = (
-                        assign.targets.as_slice(),
-                        assign.values.fixed.as_slice(),
-                        &assign.values.tail,
-                    )
-                    && self
-                        .facts
-                        .global_write_has_no_preparation(global, self.result.dialect)
+                    && assign.values.tail.is_none()
+                    && assign.targets.len() == assign.values.fixed.len()
                 {
-                    self.role(value, &global.sources, true);
+                    for (target, value) in assign.targets.iter().zip(&assign.values.fixed) {
+                        let HirLValue::Global(global) = target else {
+                            continue;
+                        };
+                        if self
+                            .facts
+                            .global_write_has_no_preparation(global, self.result.dialect)
+                        {
+                            // 并列写回的末项也可能是 RK nil/Boolean，仍须贡献常量池下界。
+                            self.role(value, &global.sources, true);
+                        } else if self.result.dialect == DecompileDialect::Lua51 {
+                            // SETGLOBAL 只读取寄存器；字面 nil/Boolean 不进入常量池。
+                            self.non_rk_tags.insert(std::ptr::from_ref(value) as usize);
+                        }
+                    }
                 }
             }
+            fn visit_call(&mut self, call: &HirCallExpr) {
+                // 参数直接写缓冲槽；语句调用与表达式调用共享同一边界。
+                self.non_rk_tags.extend(
+                    call.args
+                        .fixed
+                        .iter()
+                        .map(|value| std::ptr::from_ref(value) as usize),
+                );
+            }
             fn visit_expr(&mut self, expr: &HirExpr) {
+                // 上界只包含当前发射前缀：后面的数组 nil/Boolean 不能反向占用
+                // 先前字符串的 RK 编号。当前已见的准备值仍保守计入，候选可将其内联为 RK。
+                if !self
+                    .non_rk_tags
+                    .contains(&(std::ptr::from_ref(expr) as usize))
+                {
+                    match expr {
+                        HirExpr::Nil => {
+                            self.tags.insert(0);
+                        }
+                        HirExpr::Boolean(value) => {
+                            self.tags.insert(1 + u8::from(*value));
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(&role) = self.roles.get(&(std::ptr::from_ref(expr) as usize)) {
                     let capacity = self.capacity();
 
@@ -763,6 +835,8 @@ impl RkLiterals {
                             if let HirTableField::Record(record) = field {
                                 self.role(&record.key, &record.write_sources, false);
                                 self.role(&record.value, &record.write_sources, true);
+                            } else if let HirTableField::Array(value) = field {
+                                self.non_rk_tags.insert(std::ptr::from_ref(value) as usize);
                             }
                         }
                     }
@@ -823,10 +897,11 @@ impl RkLiterals {
             required_tags: BTreeSet::new(),
             roles: BTreeMap::new(),
             numeric_operands: BTreeSet::new(),
+            non_rk_tags: BTreeSet::new(),
             result: empty,
             mandatory: false,
             valid: true,
-            tags: tags.0.len(),
+            tags: BTreeSet::new(),
         };
         visit_stmts(&proto.body.stmts, &mut bounds);
         bounds.result
@@ -1282,6 +1357,15 @@ impl FrameBuilder<'_> {
             trailing_multivalue: None,
         };
         let buffer = self.array_buffer_start(slot);
+        let reserved_arrays = matches!(table.allocation, HirTableAllocation::Luau(_)).then(|| {
+            (table
+                .fields
+                .iter()
+                .filter(|field| matches!(field, HirTableField::Array(_)))
+                .count()
+                + usize::from(table.trailing_multivalue.is_some()))
+            .min(16)
+        });
         let mut arrays = 0;
         self.constructor_depth += 1;
         for field in &table.fields {
@@ -1290,6 +1374,7 @@ impl FrameBuilder<'_> {
             } else {
                 arrays
             };
+            let record_scratch = buffer + reserved_arrays.unwrap_or(buffered);
             match field {
                 HirTableField::Array(value) => {
                     // JIT 逐项写数组，上一项已进表；PUC/Luau 保留整批连续缓冲。
@@ -1321,6 +1406,11 @@ impl FrameBuilder<'_> {
                     if literal_rk(&record.key)
                         && literal_rk(&record.value)
                         && (self.dialect == DecompileDialect::Luau
+                            || matches!(table.allocation, HirTableAllocation::Template { .. })
+                                && matches!(
+                                    record.write_sources,
+                                    crate::hir::common::HirOperationSources::Unknown
+                                )
                             || self.dialect != DecompileDialect::Lua51
                                 && self.native?.constants_fit_rk
                             || self
@@ -1359,14 +1449,14 @@ impl FrameBuilder<'_> {
                     // 字段 owner 已消费键初始化；重放同一记录不能额外 COPY 其值。
                     rebuilt.fields.push(field.clone());
                 }
-                HirTableField::Record(record) if self.completed_record_field(record, home) => {
+                HirTableField::Record(record)
+                    if self.completed_record_field(record, home, record_scratch) =>
+                {
                     let layout = self
                         .facts
                         .native_record_write_layout(&record.write_sources)?;
                     let (key, key_scratch) = if self.dialect == DecompileDialect::Luau
-                        && layout
-                            .key
-                            .is_some_and(|key| key.slot() == slot + buffered + 1)
+                        && layout.key.is_some_and(|key| key.slot() == record_scratch)
                         && matches!(&record.key, HirExpr::String(key)
                             if key.as_utf8().is_some_and(|key| self.dialect.is_identifier_name(key)))
                     {
@@ -1378,7 +1468,7 @@ impl FrameBuilder<'_> {
                             &record.key,
                             layout.key,
                             before,
-                            slot + buffered + 1,
+                            record_scratch,
                             Some((&record.write_sources, false)),
                         )?
                     };
@@ -1386,7 +1476,7 @@ impl FrameBuilder<'_> {
                         &record.value,
                         layout.value,
                         before,
-                        slot + buffered + 1 + usize::from(key_scratch),
+                        record_scratch + usize::from(key_scratch),
                         Some((&record.write_sources, true)),
                     )?;
                     rebuilt.fields.push(HirTableField::Record(HirRecordField {
@@ -2011,8 +2101,10 @@ impl FrameBuilder<'_> {
                 Some(key) => self.expr(&access.key, index, key.slot(), None, false, true, None)?,
                 None => access.key.clone(),
             };
-            if !(matches!(table.allocation, HirTableAllocation::LuauTemplate { .. })
-                && matches!(&key, HirExpr::String(key)
+            if !(matches!(
+                table.allocation,
+                HirTableAllocation::LuauTemplate { .. } | HirTableAllocation::Luau(_)
+            ) && matches!(&key, HirExpr::String(key)
                     if key.as_utf8().is_some_and(|key| self.dialect.is_identifier_name(key))))
                 && !(matches!(table.allocation, HirTableAllocation::Luau(_))
                     // SETTABLEN 只内嵌 1..256；其余整数键先占 scratch，
@@ -2241,7 +2333,12 @@ impl FrameBuilder<'_> {
 
     /// 完成字段不能再次吸收 producer：直接输入须保留原槽，已树化的读取或分配须
     /// 在原字段 scratch 重发。嵌套表的递归布局仍由 record_operand 验证。
-    fn completed_record_field(&self, record: &HirRecordField, home: HomeSlotKey) -> bool {
+    fn completed_record_field(
+        &self,
+        record: &HirRecordField,
+        home: HomeSlotKey,
+        scratch: usize,
+    ) -> bool {
         let Some(layout) = self.facts.native_record_write_layout(&record.write_sources) else {
             return false;
         };
@@ -2251,21 +2348,27 @@ impl FrameBuilder<'_> {
             }
             None => literal_rk(expr),
         };
-        let named_key_scratch = layout.key.is_some_and(|key| key.slot() == home.slot() + 1)
-            && (self.dialect == DecompileDialect::Luau
-                && matches!(&record.key, HirExpr::String(key)
+        let key_scratch = layout.key.is_some_and(|key| key.slot() == scratch)
+            && (self.facts.record_key_preparation(record) == layout.key
+                || self.dialect == DecompileDialect::Luau
+                    && matches!(&record.key, HirExpr::String(key)
                     if key.as_utf8().is_some_and(|key| self.dialect.is_identifier_name(key)))
                 || literal_rk(&record.key)
                     && self.literal_uses_rk(&record.key, Some((&record.write_sources, false)))
                         == Some(false));
         // scratch 位置由字段布局决定，生命周期身份必须来自原指令。
-        let value_slot = home.slot() + 1 + usize::from(named_key_scratch);
+        let value_slot = scratch + usize::from(key_scratch);
         layout.base == home
-            && (matches_operand(&record.key, layout.key) || named_key_scratch)
+            && (matches_operand(&record.key, layout.key) || key_scratch)
             && (matches_operand(&record.value, layout.value)
                 || layout.value.is_some_and(|value_home| {
                     value_home.slot() == value_slot
                         && match &record.value {
+                            HirExpr::Call(_) => {
+                                // 只接受本次字段写读取的原单结果 CALL；完整调用仍由
+                                // record_operand/expr 核对参数、结果宽度及准备顺序。
+                                self.facts.record_value_preparation(record) == Some(value_home)
+                            }
                             HirExpr::UpvalueRef(_) => {
                                 self.facts.record_value_preparation(record) == layout.value
                             }
@@ -2318,23 +2421,24 @@ impl FrameBuilder<'_> {
             if !table.matches_allocation_capacity(0)
                 || !table.fields.iter().all(|field| {
                     matches!(field, HirTableField::Record(record)
-                    if self.completed_record_field(record, home))
+                    if self.completed_record_field(record, home, self.array_buffer_start(home.slot())))
                 })
             {
                 return None;
             }
         } else {
-            // 数组字段按原批次复用同一缓冲；中间批次必须完整，开放尾只属于末批。
+            // 混合表的记录字段不占数组批次；仍按出现位置核对其暂存区，不挪动求值。
+            let arrays = table
+                .fields
+                .iter()
+                .filter(|field| matches!(field, HirTableField::Array(_)))
+                .count();
             let batches = self.facts.native_allocation_batches(table)?;
             let buffer = self.array_buffer_start(home.slot());
             let mut fixed = 0;
             for (index, batch) in batches.iter().enumerate() {
                 let last = index + 1 == batches.len();
-                let width = if last {
-                    table.fields.len().checked_sub(fixed)?
-                } else {
-                    50
-                };
+                let width = if last { arrays.checked_sub(fixed)? } else { 50 };
                 if batch.base != home
                     || batch.buffer.slot() != buffer
                     || batch.start_index as usize != fixed + 1
@@ -2349,29 +2453,41 @@ impl FrameBuilder<'_> {
                 }
                 fixed += width;
             }
-            if batches.is_empty()
-                || fixed != table.fields.len()
-                || !table
-                    .fields
-                    .iter()
-                    .all(|field| matches!(field, HirTableField::Array(_)))
-            {
+            if batches.is_empty() || fixed != arrays || !table.matches_allocation_capacity(arrays) {
                 return None;
             }
-            for (offset, field) in table.fields.iter().enumerate() {
+            let mut offset = 0;
+            for field in &table.fields {
+                let buffered = if matches!(table.allocation, HirTableAllocation::PucBatched(_)) {
+                    offset % 50
+                } else {
+                    offset
+                };
+                if let HirTableField::Record(record) = field {
+                    let scratch = buffer
+                        + if matches!(table.allocation, HirTableAllocation::Luau(_)) {
+                            (arrays + usize::from(table.trailing_multivalue.is_some())).min(16)
+                        } else {
+                            buffered
+                        };
+                    if !matches!(
+                        table.allocation,
+                        HirTableAllocation::PucBatched(_) | HirTableAllocation::Luau(_)
+                    ) || !self.completed_record_field(record, home, scratch)
+                    {
+                        return None;
+                    }
+                    continue;
+                }
                 if let HirTableField::Array(HirExpr::Closure(closure)) = field {
                     let producer = self.facts.operation_result_temp(closure.source_site?)?;
                     let field_home = self.facts.trusted_temp_home_slot(producer)?;
-                    let offset = if matches!(table.allocation, HirTableAllocation::PucBatched(_)) {
-                        offset % 50
-                    } else {
-                        offset
-                    };
-                    if field_home.slot() != buffer + offset {
+                    if field_home.slot() != buffer + buffered {
                         return None;
                     }
                     self.constructor_closure_producer(closure, field_home)?;
                 }
+                offset += 1;
             }
         }
         Some(())
@@ -2397,6 +2513,14 @@ impl FrameBuilder<'_> {
         expr: &HirExpr,
         operand: Option<(&crate::hir::common::HirOperationSources, bool)>,
     ) -> Option<bool> {
+        if self.deferred_constructor_rk
+            && self.constructor_depth != 0
+            && let Some((sources, rhs)) = operand
+            && let Some(layout) = self.facts.native_record_write_layout(sources)
+        {
+            // 这里只形成保留原 scratch 的候选；build_preview 在完整字段语法上重证常量池。
+            return Some(if rhs { layout.value } else { layout.key }.is_none());
+        }
         if self.dialect == DecompileDialect::Luajit
             && let Some((sources, true)) = operand
             && self.facts.native_record_write_layout(sources).is_some()

@@ -1,4 +1,4 @@
-//! 恢复连续字面量、旧值快照与全局写回组成的赋值帧。
+//! 恢复连续字面量、字段读取、旧值快照与全局写回组成的赋值帧。
 //!
 //! 全局环境可能带写入元方法，写回次序不能交换；每项准备依赖原 use→Def，
 //! 方言的正序/逆序写回和末项 RK 规则在完整源码前缀事务内一起核对。
@@ -49,7 +49,12 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
                 plain_copy(entry.stmt)
                     && (scalar_local(entry.stmt).is_some_and(|(_, value)| {
                         literal(value)
-                            || matches!(value, HirExpr::LocalRef(_) | HirExpr::ParamRef(_))
+                            || matches!(
+                                value,
+                                HirExpr::LocalRef(_)
+                                    | HirExpr::ParamRef(_)
+                                    | HirExpr::TableAccess(_)
+                            )
                     }) || nil_argument_group(entry.stmt, facts).is_some())
             })
         {
@@ -73,6 +78,10 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
             .is_some_and(|entry| {
                 global_write(entry.stmt).is_some_and(|(_, global, value)| {
                     matches!(value, HirExpr::LocalRef(_) | HirExpr::TempRef(_))
+                        || matches!(value, HirExpr::TableAccess(_))
+                            && facts
+                                .global_write_value_preparation(global, value)
+                                .is_some()
                         || literal(value)
                             && (facts.global_write_has_no_preparation(global, dialect)
                                 || facts
@@ -163,7 +172,9 @@ fn candidate(
         let original = HirBinding::from_expr(value)
             .and_then(|binding| inputs.get(&binding))
             .unwrap_or(value);
-        let preparation = if literal(original) {
+        let preparation = if literal(original) || matches!(original, HirExpr::TableAccess(_)) {
+            // 字段快照也由本次环境写的原 use→Def 绑定；builder 按准备顺序
+            // 重发 __index，全部读取完成后才按方言顺序写回全局。
             facts
                 .global_write_value_preparation(global, original)
                 .or_else(|| {

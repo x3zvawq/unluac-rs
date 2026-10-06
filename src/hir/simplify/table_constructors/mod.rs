@@ -2466,6 +2466,11 @@ pub(super) fn constructor_with_native_records(
     for record in records {
         builder.push_record_field(record);
     }
+    if !builder.preserves_field_evaluations() {
+        // 候选拒绝[SemanticBarrier:EvalCount]：template_06 的同键常量覆盖不能
+        // 随完整帧一起并回构造器，否则目标编译器会删除原运行时字段求值。
+        return None;
+    }
     let constructor = builder.into_constructor();
     let arrays = constructor
         .fields

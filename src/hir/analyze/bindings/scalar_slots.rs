@@ -86,6 +86,10 @@ pub(in crate::hir::analyze) fn bind_scalar_slots(
             || iterator_input
             || dataflow.reg_is_reference_captured(def.reg)
             || emission.prefix_is_hoisted(def.block)
+            || !emission.scope_contains(cfg.entry_block, def.block)
+            || dataflow.def_uses[def.id.index()].iter().any(|site| {
+                !emission.scope_contains(cfg.entry_block, cfg.instr_to_block[site.instr.index()])
+            })
         {
             blocked.insert(def.reg);
         }
@@ -101,6 +105,11 @@ pub(in crate::hir::analyze) fn bind_scalar_slots(
     // Phi 仍是原寄存器的值身份；循环自反馈并不创建另一份声明。
     // 不从普通 Def 的使用情况猜合流绑定，直接消费 canonical Phi→Temp 映射。
     for phi in &dataflow.phi_candidates {
+        // CFG 入口也可能位于合成的单次 repeat 壳内；它不词法支配壳外的结果合流。
+        // 跨域身份交回通用声明 owner，不能把 RETURN 所读的 binding 固定在壳内。
+        if !emission.scope_contains(cfg.entry_block, phi.block) {
+            blocked.insert(phi.reg);
+        }
         if let Some(temps) = writes.get_mut(&phi.reg) {
             temps.insert(bindings.phi_temps[phi.id.index()]);
         }

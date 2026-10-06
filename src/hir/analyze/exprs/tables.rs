@@ -108,3 +108,73 @@ pub(in crate::hir::analyze) fn expr_for_new_table(
     };
     HirExpr::TableConstructor(Box::new(table))
 }
+
+/// 被冻结的条件/值区域不再单独发射内部字段写；按 Dataflow 的私有初始化组
+/// 完整降低它们，不能只返回 NEWTABLE 的空 seed。组内原容量和单类写序已验证。
+pub(super) fn expr_for_private_initialization(
+    lowering: &super::ProtoLowering<'_>,
+    allocation: crate::structure::DefId,
+    instruction: &NewTableInstr,
+) -> HirExpr {
+    use crate::hir::common::{HirOperationSources, HirSourceSite};
+    use crate::transformer::{AccessKey, LowInstr};
+    let source = HirSourceSite {
+        proto: lowering.id,
+        instr: lowering.dataflow.def_instr(allocation),
+    };
+    let HirExpr::TableConstructor(mut table) =
+        expr_for_new_table(lowering.proto, instruction, source)
+    else {
+        unreachable!("NEWTABLE lowers to a constructor");
+    };
+    for &instr in lowering.dataflow.table_initialization_writes(allocation) {
+        let block = lowering.dataflow.def_block(allocation);
+        match &lowering.proto.instrs[instr.index()] {
+            LowInstr::SetTable(write)
+                if matches!(instruction.allocation, TableAllocation::Indexed { .. }) =>
+            {
+                // Dataflow 已核对连续的 TSETI 数组位置；开放尾批次继续使用原 value pack。
+                let value = super::expr_for_value_operand_single_eval_pure_operand(
+                    lowering,
+                    block,
+                    instr,
+                    write.value,
+                );
+                table.fields.push(HirTableField::Array(value));
+            }
+            LowInstr::SetTable(write) => {
+                let key = match write.key {
+                    AccessKey::Const(key) => expr_for_const(lowering.proto, key),
+                    AccessKey::Integer(key) => HirExpr::Integer(key),
+                    AccessKey::Reg(key) => super::expr_for_reg_use_single_eval_with_call_policy(
+                        lowering, block, instr, key, true,
+                    ),
+                };
+                let value = super::expr_for_value_operand_single_eval_pure_operand(
+                    lowering,
+                    block,
+                    instr,
+                    write.value,
+                );
+                table.fields.push(HirTableField::Record(HirRecordField {
+                    write_sources: HirOperationSources::Single(HirSourceSite {
+                        proto: lowering.id,
+                        instr,
+                    }),
+                    key,
+                    value,
+                }));
+            }
+            LowInstr::SetList(write) => {
+                let values =
+                    super::lower_value_pack_single_eval(lowering, block, instr, write.values);
+                table
+                    .fields
+                    .extend(values.fixed.into_iter().map(HirTableField::Array));
+                table.trailing_multivalue = values.tail;
+            }
+            _ => unreachable!("private initialization has only field/list writes"),
+        }
+    }
+    HirExpr::TableConstructor(table)
+}

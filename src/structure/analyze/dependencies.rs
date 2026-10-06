@@ -19,6 +19,11 @@ pub(super) fn shared_fixed_evaluation_defs(
         }
         let method = dataflow.method_setup_for_call(proto, crate::transformer::InstrRef(index));
         for (reg, value) in uses.fixed.iter() {
+            // 私有构造器的原字段/列表写延续分配，不在每次 base 使用时再求值一次。
+            // 前层已排除重复操作数、别名、捕获和初始化前的发布。
+            if dataflow.is_table_initialization_use(crate::transformer::InstrRef(index), reg) {
+                continue;
+            }
             // 原 SELF/NAMECALL 的隐式首参与 lookup 共享 receiver 求值；配对由前层证明。
             // 同槽还被显式参数读取时仍按重复使用处理。
             if method.as_ref().is_some_and(|setup| setup.first_arg == reg)
@@ -83,6 +88,13 @@ pub(super) fn mark_region_dependencies(
                 let Some(definition) = dataflow.defs.get(def.index()) else {
                     return false;
                 };
+                pending_values.extend(
+                    dataflow
+                        .table_initialization_writes(def)
+                        .iter()
+                        .copied()
+                        .map(EvaluationDependency::Instruction),
+                );
                 pending_values.push(EvaluationDependency::Instruction(definition.instr));
             }
             EvaluationDependency::Instruction(instr) => {

@@ -9,8 +9,10 @@
 do
     local plain = { f = function() return "old" end }
     assert(plain.f() == "old")
+    local previous = plain.f
     plain.f = function() return "new" end
     assert(plain.f() == "new")
+    assert(previous ~= plain.f and previous() == "old")
 end
 local seed = 4
 local reads = 0

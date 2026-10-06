@@ -15,7 +15,9 @@ use crate::hir::visit::{HirVisitor, visit_stmts};
 
 pub(super) mod coordinates;
 mod materializations;
-pub(super) use materializations::{close_gc_inert_terminal_prefix, indexed_assignment_frame};
+pub(super) use materializations::{
+    close_finished_prefix_scopes, close_gc_inert_terminal_prefix, indexed_assignment_frame,
+};
 pub(super) use materializations::{
     pending_nil_prefix_temps, restore_call_result_prefix, restore_materializations,
     restore_split_nil_declarations,

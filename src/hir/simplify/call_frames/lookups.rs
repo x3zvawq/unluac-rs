@@ -963,19 +963,13 @@ impl FrameBuilder<'_> {
                 // O0 在结果上方显式加载原字面键；该 use→Def 不能被当作可省略的 RK。
                 access.key.clone()
             } else if matches!(access.key, HirExpr::UpvalueRef(_))
-                && !matches!(
-                    self.dialect,
-                    DecompileDialect::Luau | DecompileDialect::Luajit
-                )
+                && self.dialect != DecompileDialect::Luau
                 && self.facts.table_key_preparation(access) == Some(home)
             {
-                // 原 GETUPVAL 只供本次索引使用，仍在 key_slot 重发；base 已在上方验证。
+                // 原 GETUPVAL/UGET 只供本次索引使用，仍在 key_slot 重发；base 已在上方验证。
                 access.key.clone()
             } else if let HirExpr::LocalRef(local) = access.key
-                && !matches!(
-                    self.dialect,
-                    DecompileDialect::Luau | DecompileDialect::Luajit
-                )
+                && self.dialect != DecompileDialect::Luau
                 && self
                     .definition(local, before)
                     .and_then(|index| scalar_local(self.run[index]))

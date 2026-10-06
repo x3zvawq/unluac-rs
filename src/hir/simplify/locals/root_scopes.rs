@@ -78,10 +78,14 @@ impl HirRewritePass for ScopePass<'_> {
                 !scope_statement(stmt)
                     && !matches!(
                         stmt,
-                        HirStmt::Block(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_)
+                        HirStmt::Block(_)
+                            | HirStmt::NumericFor(_)
+                            | HirStmt::ToBeClosed(_)
+                            | HirStmt::Close(_)
                     )
             })
             .unwrap_or(block.stmts.len());
+        // 数值 for 已有封闭控制协议，只分隔前后窗口；其内部仍独立递归处理。
         // 未闭合协议阻止扫描其自身及后缀，但不阻止之前已由原覆盖端点闭合的窗口。
         // 全 proto 读取索引仍拒绝任何逃逸到后缀的定义；不在未知节点之后重新起窗。
         let stmts = &block.stmts[..scan_end];
@@ -308,7 +312,14 @@ impl ScopePass<'_> {
                     let Some(home) = self.facts.trusted_temp_home_slot(temp) else {
                         continue;
                     };
-                    if self.reads.get(&temp).is_none_or(|&reads| reads < 2)
+                    let previous = callees
+                        .get(&temp)
+                        .copied()
+                        .flatten()
+                        .and_then(|(_, previous)| previous);
+                    let closes_closure =
+                        previous.is_some_and(|index| self.closure_root_at(stmts, index, home));
+                    if (self.reads.get(&temp).is_none_or(|&reads| reads < 2) && !closes_closure)
                         || callees_in_calls.contains(&temp)
                         || self.facts.operation_result_temp(source) != Some(temp)
                         || self.facts.direct_global_read_home(source) != Some(home)
@@ -318,8 +329,9 @@ impl ScopePass<'_> {
                         continue;
                     }
                     // 原低槽环境读取可开始新的独立身份，不必随后作为 callee 使用。
-                    // 单指令来源保证没有尚在旧域中的输入准备，覆盖端点仍由共享 root 分析签发。
-                    (home, index, index, None)
+                    // 单指令来源排除旧域中的输入准备；原 CLOSURE 的同槽后继即使只读一次，
+                    // 也可与完整调用下界、读写闭合性共同证明旧声明末端。其它覆盖沿用 root 分析。
+                    (home, index, index, previous)
                 } else {
                     continue;
                 };
@@ -341,7 +353,8 @@ impl ScopePass<'_> {
                         )
                     })
             });
-            let Some(mut start) = literal_start.or_else(|| {
+            let closure_start = previous.filter(|&index| self.closure_root_at(stmts, index, home));
+            let Some(mut start) = literal_start.or(closure_start).or_else(|| {
                 roots
                     .overwrite_pair_for_home(overwrite, home)
                     .or_else(|| scalar_roots.overwrite_pair_for_home(overwrite, home))
@@ -353,7 +366,7 @@ impl ScopePass<'_> {
                 continue;
             }
             // 多结果只能连同全部目标结束；不能把同一次 CALL 的 owner 拆成独立词法块。
-            if literal_start.is_none() {
+            if literal_start.is_none() && closure_start.is_none() {
                 // 一个宽返回组可能在多个 home 上陆续被覆盖；先按原 CALL 排除非首结果，
                 // 避免为每个成员的候选重复展开整组目标。
                 if let Some(producer) = direct_call_in_stmt(&stmts[start])
@@ -463,8 +476,10 @@ impl ScopePass<'_> {
             if start < scanned || start >= end {
                 continue;
             }
-            if literal_start.is_some() && call_floors.minimum(start, end) <= home.slot() {
-                // 常量不承载独立 GC 身份；其词法槽仍须在窗口中的每次调用下方。
+            if (literal_start.is_some() || closure_start.is_some())
+                && call_floors.minimum(start, end) <= home.slot()
+            {
+                // 原声明槽须在窗口中的每次调用下方；闭包同样不能借词法结束改变原覆盖时点。
                 // 若中途调用已复用该槽，不能把原准备临时量猜成跨调用声明。
                 // 这类参数准备不是可扫描窗口，不能推进 scanned 而屏蔽外围完整结果域。
                 continue;
@@ -502,6 +517,20 @@ impl ScopePass<'_> {
 }
 
 impl ScopePass<'_> {
+    // 原 CLOSURE 与后继同槽新帧直接给出声明入口/末端；不删除创建或缩短物理根。
+    // 窗口仍须通过调用下界和所有读写/capture 的闭合性证明。
+    fn closure_root_at(&self, stmts: &[HirStmt], index: usize, home: HomeSlotKey) -> bool {
+        let Some((temp, HirExpr::Closure(closure))) = stmts[index].scalar_temp_assignment() else {
+            return false;
+        };
+        closure.creation.is_some()
+            && self.facts.trusted_temp_home_slot(temp) == Some(home)
+            && closure.source_site.is_some_and(|source| {
+                self.facts.operation_result_temp(source) == Some(temp)
+                    && self.facts.operation_result_home(source) == Some(home)
+            })
+    }
+
     /// nil 接收者、高槽分配与低槽 COPY 共同确定原声明入口，不从同槽末次写猜测对象身份。
     fn allocation_copy_start(
         &self,

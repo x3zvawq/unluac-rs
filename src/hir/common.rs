@@ -1812,13 +1812,6 @@ impl HirTableConstructor {
         let zero_key = self.fields.iter().any(|field| {
             matches!(field, HirTableField::Record(record) if record.key == HirExpr::Integer(0))
         });
-        let generated = if count == 0 && !zero_key {
-            0
-        } else if count >= 2046 {
-            2048
-        } else {
-            count.max(2) as u32
-        };
         let records = self
             .fields
             .iter()
@@ -1830,15 +1823,9 @@ impl HirTableConstructor {
         let HirTableAllocation::Indexed { hash_bits, .. } = self.allocation else {
             unreachable!()
         };
-        capacity == generated && hash_bits == indexed_hash_bits(records)
-    }
-}
-
-pub(in crate::hir) fn indexed_hash_bits(entries: usize) -> u8 {
-    if entries == 0 {
-        0
-    } else {
-        (usize::BITS - (entries - 1).leading_zeros()).max(1) as u8
+        crate::value_semantics::table::allocation::matches_indexed_capacity(
+            capacity, hash_bits, count, records, zero_key,
+        )
     }
 }
 

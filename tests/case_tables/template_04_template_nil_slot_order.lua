@@ -1,6 +1,8 @@
 -- 模板 nil 槽可恢复为运行时数组字段，但填充顺序不能跨过另一个运行时字段。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[table-set-list]]
+-- unluac: expect-ast-count [[table-constructor]] [[7]]
+-- unluac: expect-ast-count [[if]] [[0]]
 local events = {}
 local function left()
     events[#events + 1] = "left"

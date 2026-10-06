@@ -85,6 +85,12 @@ pub(super) fn try_extend_constructor_from_steps(
         return None;
     }
 
+    if !builder.preserves_field_evaluations() {
+        // 候选拒绝[SemanticBarrier:EvalCount]：template_06 的后续常量覆盖会使
+        // Luau constant-pack 删除先前同键 CALL；整段回滚，保留上一个已验证前缀。
+        builder.rollback(checkpoint, context.scratch);
+        return None;
+    }
     if !builder.fits_preallocated_field_count() {
         builder.rollback(checkpoint, context.scratch);
         return None;

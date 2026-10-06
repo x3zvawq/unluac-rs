@@ -73,13 +73,19 @@ local function fastcall_argument_copies()
 end
 
 -- 开放参数保留全部返回值，不压成一个 Boolean。
+-- unluac: expect-contains [[assert(factory())]] [[@debug=retained]]
 local function open_assert(factory)
     assert(factory())
 end
 local function open_values()
     return true, "tail", 3
 end
+local function rejected_values()
+    return false, "open-tail-marker"
+end
 open_assert(open_values)
+local ok, message = pcall(open_assert, rejected_values)
+assert(not ok and string.find(message, "open-tail-marker", 1, true))
 
 assert(repeated_zero() == "v")
 assert(ordered_fields() == "abc")
@@ -89,5 +95,7 @@ assert(fastcall_argument_copies())
 -- getfenv 将当前环境标为不安全；再次调用覆盖同一字节码的 fallback 路径。
 getfenv(0)
 open_assert(open_values)
+ok, message = pcall(open_assert, rejected_values)
+assert(not ok and string.find(message, "open-tail-marker", 1, true))
 assert(fastcall_argument_copies())
 print("regress_594_luau_template_initialization_recompile", "ok")

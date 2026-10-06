@@ -125,6 +125,11 @@ pub(crate) fn expr_for_fixed_def_single_eval(
     let absorbed = block_is_absorbed_decision(lowering, def_block);
 
     match instr {
+        LowInstr::NewTable(table) if absorbed && table.dst == def_reg => {
+            return Some(super::tables::expr_for_private_initialization(
+                lowering, def_id, table,
+            ));
+        }
         LowInstr::Move(move_instr) if move_instr.dst == def_reg => {
             if !absorbed && lowering.dataflow.reg_is_reference_captured(move_instr.src) {
                 return None;

@@ -257,11 +257,13 @@ pub(in crate::hir::simplify) fn pending_nil_prefix_temps(
 /// 只恢复外层声明段的词法末端，不内联、删除或移动任何求值。
 /// 未修改子块的内部声明不影响外层前缀；验证其声明栈投影，避免把内部尚未恢复的
 /// CALL 帧当作本事务的依赖。窗口末端仍须由原同槽新帧、完整读写和捕获事实共同证明。
-fn close_finished_prefix_scopes(
+/// 联合消费末端准备时，terminal_frame 额外约束最终消费点，不能只关闭无关的较早声明段。
+pub(in crate::hir::simplify) fn close_finished_prefix_scopes(
     proto: &mut HirProto,
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
     is_chunk_entry: bool,
+    terminal_frame: Option<crate::hir::promotion::HomeSlotKey>,
 ) -> bool {
     let mut writes = BTreeMap::new();
     let mut captures = CaptureCollector::new(HirCaptureMode::ByReference);
@@ -286,16 +288,38 @@ fn close_finished_prefix_scopes(
         constants_fit_rk: crate::hir::simplify::call_frames::constants_fit_rk(proto),
     };
     let mut scopes = boundaries.closed_prefix_scopes(&proto.body, 0);
-    // 直线声明段仍交给完整帧事务，避免先包装词法块而截断并行赋值候选。
+    // 直线段只有在原独立调用已完成后才先结束作用域；未完成的并列赋值准备
+    // 仍交给完整帧事务，不能为恢复前缀而把一次 RHS 从中截断。
     // 已闭合子域中的声明不占外层后缀槽；跨子域的临时值由下方逃逸检查拒绝，
     // 新块两端仍须通过完整声明前缀验证，不能仅凭最后一次读取缩短原根生命周期。
+    let debug_end = |local: LocalId| {
+        let scope = proto.local_debug_scopes[local.index()]?;
+        proto.debug_scopes[scope].map(|scope| scope.end_pc)
+    };
+    let mut debug_starts = BTreeMap::new();
+    for (index, stmt) in proto.body.stmts.iter().enumerate() {
+        if let HirStmt::LocalDecl(decl) = stmt {
+            for end in decl.bindings.iter().filter_map(|&local| debug_end(local)) {
+                debug_starts.entry(end).or_insert(index);
+            }
+        }
+    }
     scopes.retain(|start, end| {
         proto.body.stmts[*start..*end].iter().any(|stmt| {
             matches!(
                 stmt,
                 HirStmt::NumericFor(_) | HirStmt::GenericFor(_) | HirStmt::Block(_)
             )
-        })
+        }) || matches!(&proto.body.stmts[*end - 1], HirStmt::CallStmt(call)
+            if facts.native_call_frame(&call.call).or_else(|| facts.native_fastcall_frame(&call.call))
+                .is_some_and(|frame| matches!(frame.results, Some(crate::transformer::ResultPack::Ignore))))
+            // 不能把已知同时结束的一组 debug 声明只包住后半段；完整作用域 owner
+            // 还会恢复其共同末端，提前提交会留下没有原身份依据的重复嵌套块。
+            && proto.body.stmts[*start..*end].iter().all(|stmt| {
+                let HirStmt::LocalDecl(decl) = stmt else { return true; };
+                decl.bindings.iter().filter_map(|&local| debug_end(local))
+                    .all(|end| debug_starts[&end] >= *start)
+            })
     });
     if scopes.is_empty() {
         return false;
@@ -353,6 +377,25 @@ fn close_finished_prefix_scopes(
         .peekable();
     while let Some((index, stmt)) = old.next() {
         if let Some(&home) = endpoints.get(&index) {
+            requests.insert(
+                count,
+                PrefixRequest {
+                    home,
+                    required: BTreeSet::new(),
+                },
+            );
+        }
+        if old.peek().is_none()
+            && let Some(home) = terminal_frame
+        {
+            // 结束旧声明段不等于末端帧已成立；联合事务必须再核对实际消费点。
+            if !matches!(stmt, HirStmt::CallStmt(_) | HirStmt::Return(_))
+                || requests
+                    .get(&count)
+                    .is_some_and(|request| request.home != home)
+            {
+                return false;
+            }
             requests.insert(
                 count,
                 PrefixRequest {
@@ -421,7 +464,7 @@ pub(in crate::hir::simplify) fn restore_materializations(
     dialect: DecompileDialect,
     is_chunk_entry: bool,
 ) -> bool {
-    if close_finished_prefix_scopes(proto, facts, dialect, is_chunk_entry)
+    if close_finished_prefix_scopes(proto, facts, dialect, is_chunk_entry, None)
         || close_inert_carrier_scopes(proto, facts, dialect, is_chunk_entry)
     {
         return true;

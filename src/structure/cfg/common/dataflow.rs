@@ -6,7 +6,7 @@
 //! 与 SSA 读写和副作用标签分别表达值依赖、可见事件及 root 存活边界。
 //! 寄存器捕获模式保留整个 proto 的按值/引用事实，包括不可达 closure；它不表示某点的开放 cell。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::{Range, RangeBounds};
 
@@ -75,6 +75,8 @@ pub struct DataflowFacts {
     pub effect_summaries: Vec<SideEffectSummary>,
     /// 原基本块中新建且未暴露的表读取；只证明当前读取不进入元方法。
     pub plain_table_reads: Vec<bool>,
+    /// 未发布的新表在单块内完成的初始化写；不授权后层改变分配或写入顺序。
+    pub(crate) table_initializations: BTreeMap<DefId, Vec<InstrRef>>,
     pub defs: Vec<Def>,
     pub open_defs: Vec<OpenDef>,
     /// 同条指令的 fixed Def 按 Reg 严格递增，保留 effect 的有序写入域。
@@ -300,6 +302,24 @@ impl DataflowFacts {
             .get(instr.index())
             .expect("dataflow should have a use-value summary for every instruction")
             .fixed
+    }
+
+    /// 分配的唯一外部读取之前，仍属于同一私有表的字段/列表初始化。
+    /// 事实只对原 CFG/SSA 有效；消费者须同时保留这些写的输入与求值顺序。
+    pub(crate) fn table_initialization_writes(&self, allocation: DefId) -> &[InstrRef] {
+        self.table_initializations
+            .get(&allocation)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// 初始化的 base 引用延续同一次分配，不代表表达式重复求值。
+    pub(crate) fn is_table_initialization_use(&self, instr: InstrRef, reg: Reg) -> bool {
+        let SsaValue::Def(allocation) = self.use_value(instr, reg) else {
+            return false;
+        };
+        self.table_initialization_writes(allocation)
+            .binary_search(&instr)
+            .is_ok()
     }
 
     /// 同时枚举固定 SSA 值与开放包 producer；f(g()) 的 g 不属于 fixed reads。

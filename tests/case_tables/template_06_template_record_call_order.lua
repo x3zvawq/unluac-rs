@@ -1,5 +1,8 @@
 -- 同键最后写常量时，Luau constant-pack 可能删除源码构造器中的早先调用。
 -- 原分离写不能合并成 { a = event(), a = 5 } 并丢掉副作用。
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]]
+-- unluac: expect-ast-count [[table-record-field]] [[4]] [[@proto=0]]
+-- unluac: expect-contains [[first.a = 5]] [[@debug=retained]]
 local trace = ""
 local function event(label, value)
     trace = trace .. label

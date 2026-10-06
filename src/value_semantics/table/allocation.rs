@@ -139,3 +139,27 @@ fn hash_capacity(entries: u32) -> Option<u32> {
         entries.checked_next_power_of_two()
     }
 }
+
+/// LuaJIT TNEW 的源码容量规则；数组数包含开放尾项，零键单独占用最小数组区。
+/// 调用方仍须证明原字段身份、批次范围及写入次序。
+pub(crate) fn matches_indexed_capacity(
+    capacity: u32,
+    hash_bits: u8,
+    arrays: usize,
+    records: usize,
+    zero_key: bool,
+) -> bool {
+    let generated = if arrays == 0 && !zero_key {
+        0
+    } else if arrays >= 2046 {
+        2048
+    } else {
+        arrays.max(2) as u32
+    };
+    let generated_hash = if records == 0 {
+        0
+    } else {
+        (usize::BITS - (records - 1).leading_zeros()).max(1) as u8
+    };
+    capacity == generated && hash_bits == generated_hash
+}

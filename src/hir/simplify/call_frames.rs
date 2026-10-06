@@ -304,6 +304,7 @@ fn plan(
         constructors: BTreeMap::new(),
         expanded_inputs: BTreeMap::new(),
         constructor_depth: 0,
+        deferred_constructor_rk: false,
         declaration_reserved_top: None,
         indexed_key_base: None,
         register_operand: false,
@@ -337,6 +338,8 @@ struct FrameBuilder<'a> {
     constructors: BTreeMap<usize, Vec<(usize, super::table_constructors::ConstructorWrite<'a>)>>,
     expanded_inputs: BTreeMap<HomeSlotKey, Vec<(usize, LocalId)>>,
     constructor_depth: usize,
+    // 仅独立构造候选使用原操作数布局；native 的整批预览必须重新验证目标常量池。
+    deferred_constructor_rk: bool,
     // Luau 声明和 CALL 末参数的已预留上界；内部 scratch 不能覆盖尚待消费的槽。
     declaration_reserved_top: Option<usize>,
     // PUC 上值索引先为 base 保留一槽，key 中间结果可以暂用该槽。
@@ -1556,10 +1559,7 @@ impl FrameBuilder<'_> {
             }
             HirExpr::Binary(binary)
                 if self.native.is_some()
-                    && !matches!(
-                        self.dialect,
-                        DecompileDialect::Luajit | DecompileDialect::Luau
-                    )
+                    && self.dialect != DecompileDialect::Luau
                     && matches!(
                         binary.op,
                         crate::hir::common::HirBinaryOpKind::Eq
@@ -2527,12 +2527,14 @@ impl FrameBuilder<'_> {
                 .and_then(|index| scalar_local(self.run[index]).map(|(_, value)| value)),
             value => Some(value),
         };
-        // 单值 CALL 也在比较结果槽准备；其参数、派发与结果写回由 register_operand
-        // 转交完整 call builder，不能套用双侧都占 scratch 的相邻槽规则。
+        // 单值 CALL/CONCAT 也在比较结果槽准备；register_operand 将参数、
+        // 拼接缓冲区和求值顺序交给对应完整帧，不能套用双侧 scratch 的相邻槽规则。
         matches!(value, Some(HirExpr::TableAccess(_) | HirExpr::Call(_)))
             || matches!(value, Some(HirExpr::Unary(unary))
                 if unary.op == crate::hir::common::HirUnaryOpKind::Not)
-            || matches!(value, Some(HirExpr::Binary(binary)) if is_scalar_binary_operation(binary.op))
+            || matches!(value, Some(HirExpr::Binary(binary))
+                if is_scalar_binary_operation(binary.op)
+                    || binary.op == crate::hir::common::HirBinaryOpKind::Concat)
     }
 
     fn comparison_value_subject(

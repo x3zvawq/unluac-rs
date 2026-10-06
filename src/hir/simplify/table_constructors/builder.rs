@@ -50,6 +50,7 @@ pub(super) struct ConstructorBuilder {
     // 首次字段位置使搬移/降级不改变键身份，回滚只需移除检查点之后首次出现的键。
     numeric_key_first_fields: BTreeMap<i64, usize>,
     moved_fields: usize,
+    template_writes: crate::value_semantics::table::LuauTemplateWriteOrder,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ pub(super) struct BuilderCheckpoint {
     restored_pending_integer_fields_len: usize,
     restored_array_fields_len: usize,
     moved_fields: usize,
+    template_writes: (usize, usize),
 }
 
 impl ConstructorBuilder {
@@ -100,6 +102,7 @@ impl ConstructorBuilder {
             last_unknown_key_field: None,
             numeric_key_first_fields: BTreeMap::new(),
             moved_fields: 0,
+            template_writes: crate::value_semantics::table::LuauTemplateWriteOrder::default(),
         };
         for (index, field) in constructor.fields.into_iter().enumerate() {
             if implicit_template_fields.contains(&index) {
@@ -180,10 +183,12 @@ impl ConstructorBuilder {
             restored_pending_integer_fields_len: scratch.restored_pending_integer_fields.len(),
             restored_array_fields_len: scratch.restored_array_fields.len(),
             moved_fields: self.moved_fields,
+            template_writes: self.template_writes.checkpoint(),
         }
     }
 
     pub(super) fn rollback(&mut self, checkpoint: BuilderCheckpoint, scratch: &mut RebuildScratch) {
+        self.template_writes.rollback(checkpoint.template_writes);
         self.fields.truncate(checkpoint.fields_len);
         self.implicit_template_fields
             .retain(|index| *index < checkpoint.fields_len);
@@ -272,6 +277,10 @@ impl ConstructorBuilder {
         self.allocation.indexed_array_capacity().is_some()
     }
 
+    pub(super) fn preserves_field_evaluations(&self) -> bool {
+        self.template_writes.preserves_evaluations()
+    }
+
     pub(super) fn push_array_value(&mut self, value: HirExpr) {
         self.numeric_key_first_fields
             .entry(i64::from(self.next_array_index))
@@ -311,6 +320,12 @@ impl ConstructorBuilder {
         field: crate::hir::common::HirRecordField,
         policy: RecordPromotionPolicy,
     ) {
+        if matches!(self.allocation, HirTableAllocation::LuauTemplate { .. }) {
+            self.template_writes.record(
+                field.key.table_key(),
+                crate::value_semantics::table::table_constant_kind(&field.value).is_some(),
+            );
+        }
         self.shadow_aliased_pending_integer_fields(&field.key);
         let current_next_index = i64::from(self.next_array_index);
         let numeric_key = field.key.table_integer_key();

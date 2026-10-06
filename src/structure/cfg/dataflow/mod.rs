@@ -14,7 +14,7 @@ pub(crate) use scalars::low_instr_def_may_hold_gc_root;
 mod slot_captures;
 mod ssa;
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::decompile::{DecompileContext, DecompileDialect, DecompileError, DecompileState};
 use crate::structure::StructureError;
@@ -120,6 +120,7 @@ pub fn compute_dataflow_facts(
         if source == DecompileDialect::Luau {
             facts.gc_inert_values = scalars::collect(frame.proto, frame.cfg, &facts);
         }
+        facts.table_initializations = plain_tables::initializations(frame.proto, frame.cfg, &facts);
         facts.children = frame.children;
         if let Some(parent) = stack.last_mut() {
             parent.children.push(facts);
@@ -292,6 +293,7 @@ fn compute_dataflow_proto(
         instr_effects,
         effect_summaries,
         plain_table_reads,
+        table_initializations: BTreeMap::new(),
         defs,
         open_defs,
         instr_defs,

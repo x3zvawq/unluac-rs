@@ -1,7 +1,11 @@
 -- 常量的运行时 binding 不能消失成 TDUP 模板，改变重编译后的数组容量。
 -- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-min [[table-constructor]] [[8]]
+-- unluac: expect-ast-count [[table-constructor]] [[9]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
+-- 三类常量各保留一个运行时 binding，不能被静态化成另一个容量的模板。
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=9]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=8]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=7]]
 local function boolean_value(a, c)
     local value = true
     return {a, value, c}

@@ -53,6 +53,50 @@ impl TableTemplateKey {
     }
 }
 
+/// Luau constant-pack 在同键的末项为常量时跳过该键的全部运行时字段。
+/// 记录源码候选的真实写入；模板占位不调用 record。增量日志只撤回本段的写入。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LuauTemplateWriteOrder {
+    // 每个键分别记录是否曾有运行时字段，以及当前末项是否为常量。
+    keys: std::collections::BTreeMap<TableTemplateKey, (bool, bool)>,
+    changes: Vec<(TableTemplateKey, Option<(bool, bool)>)>,
+    erased_keys: usize,
+}
+
+impl LuauTemplateWriteOrder {
+    pub(crate) fn record(&mut self, key: Option<TableTemplateKey>, constant: bool) -> bool {
+        if let Some(key) = key {
+            let previous = self.keys.get(&key).copied();
+            let (runtime, was_constant) = previous.unwrap_or_default();
+            self.erased_keys -= usize::from(runtime && was_constant);
+            let runtime = runtime || !constant;
+            self.erased_keys += usize::from(runtime && constant);
+            self.keys.insert(key.clone(), (runtime, constant));
+            self.changes.push((key, previous));
+        }
+        self.preserves_evaluations()
+    }
+
+    pub(crate) fn preserves_evaluations(&self) -> bool {
+        self.erased_keys == 0
+    }
+
+    pub(crate) fn checkpoint(&self) -> (usize, usize) {
+        (self.changes.len(), self.erased_keys)
+    }
+
+    pub(crate) fn rollback(&mut self, (len, erased): (usize, usize)) {
+        for (key, previous) in self.changes.drain(len..).rev() {
+            if let Some(previous) = previous {
+                self.keys.insert(key, previous);
+            } else {
+                self.keys.remove(&key);
+            }
+        }
+        self.erased_keys = erased;
+    }
+}
+
 /// 原分配对候选模板的约束，借用不可变原键集合，不依赖两层表达式表示。
 #[derive(Clone, Copy)]
 pub(crate) enum TableInitializationConstraint<'a> {

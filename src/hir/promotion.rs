@@ -2888,8 +2888,17 @@ impl ProtoPromotionFacts {
             let home = self.direct_global_read_home(source).or_else(|| {
                 let home = self.operation_result_home(source)?;
                 let preparation = self.table_preparations.get(&source.instr)?;
-                let base = preparation.base.as_ref()?;
                 let key = &preparation.key;
+                if matches!(self.upvalue_table_reads.get(&source.instr),
+                    Some((_, HirExpr::TempRef(temp))) if *temp == key.temp)
+                    && key.home == home
+                    && self.trusted_temp_home_slot(key.temp) == Some(home)
+                    && key.matches(&HirExpr::String(global.key.clone()))
+                {
+                    // 宽常量 GETTABUP 在结果槽准备环境键，不存在独立的 base 寄存器。
+                    return Some(home);
+                }
+                let base = preparation.base.as_ref()?;
                 // GlobalRef 已由 lowering 证明环境身份；此处只消费单次上值准备和
                 // 原字符串 key 的 SSA 证书，核对整个 GETUPVAL/LOADK/GETTABLE 布局。
                 (base.is_upvalue_read()
@@ -4352,7 +4361,24 @@ impl ProtoPromotionFacts {
         .then_some((preparation.temp, preparation.home))
     }
 
-    /// 已并入 record 的上值读取仍绑定原 SETTABLE value Def，不借字段名推测 scratch。
+    /// 已树化字段的动态键仍绑定原 SETTABLE use→Def；不以同槽 CALL 猜键身份。
+    pub(super) fn record_key_preparation(
+        &self,
+        record: &crate::hir::common::HirRecordField,
+    ) -> Option<HomeSlotKey> {
+        let crate::hir::common::HirOperationSources::Single(source) = record.write_sources else {
+            return None;
+        };
+        if self.source_proto != Some(source.proto) {
+            return None;
+        }
+        let preparation = &self.table_preparations.get(&source.instr)?.key;
+        (preparation.matches(&record.key)
+            && self.trusted_temp_home_slot(preparation.temp) == Some(preparation.home))
+        .then_some(preparation.home)
+    }
+
+    /// 已并入 record 的 RHS 仍绑定原 SETTABLE value Def，不借字段名推测 scratch。
     pub(super) fn record_value_preparation(
         &self,
         record: &crate::hir::common::HirRecordField,

@@ -2,6 +2,7 @@
 -- unluac: expect-ast-count [[table-list-field]] [[2]] [[@proto=1]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[table-list-field]] [[2]] [[@proto=1]] [[@dialect=lua5.4]]
 -- unluac: expect-ast-count [[table-list-field]] [[2]] [[@proto=1]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=61]] [[@dialect=luajit]]
 -- 列表准备和 iterator 结果必须共同恢复，循环携带的 sum 不应截断构造事务。
 local function total(Activity)
     local sum = 0
@@ -213,6 +214,7 @@ check_rerank()
 -- 动态全局表左值必须先于 key 求值，不能留下阻断整个后缀的快照 local。
 -- unluac: expect-contains [[FrameInherit(definition.name, {]] [[@debug=retained]]
 -- unluac: expect-contains [[FrameOthers = {]]
+-- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=28]] [[@dialect=luajit]]
 local function branch_frames(object, flag)
     local definition = FrameDefinition(object.name)
     if definition then
@@ -239,10 +241,18 @@ local function branch_frames(object, flag)
     end
 end
 
+-- 字段读取直接组成并列全局写回；不保留七个只用于交接的快照声明。
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=36]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=36]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=36]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=36]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=36]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=36]] [[@dialect=lua5.5]]
 local function check_branch_frames()
     local old = {FrameDefinition, FrameNormalize, FrameCreate, FrameHats, FrameInherit, FrameOthers, FrameRemove}
     local events, received = "", nil
     FrameDefinition = function(name)
+        assert(name == "bird" or name == "missing")
         events=events.."definition;"
         if name=="bird" then return {name=name} end
     end
@@ -409,6 +419,13 @@ do
 end
 
 -- 旧调用别名的词法段结束后，尾调用复用原槽，并原样消费含 nil 的 VARARG 包。
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=56]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=56]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=56]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=56]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=56]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=7]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=56]] [[@dialect=luau]]
 do
     local function process(consumer, ...)
         local names = {"ab", "cd"}
@@ -433,6 +450,11 @@ end
 
 -- 开放 SETLIST 的旧 callee 槽在兄弟分支内各自成为新声明，不能相互延长身份。
 -- unluac: expect-contains [[:setEpochFrames({]]
+-- unluac: expect-contains [[EpochUI = {]]
+-- unluac: expect-contains [[EpochAPI = {]]
+-- 比较在原 Boolean 槽消费算术/CONCAT 准备，不留下 callee 与结果接棒变量。
+-- unluac: expect-contains [[assert(made == 1 + (left and 1 or 0) + (right and 1 or 0))]] [[@debug=retained]]
+-- unluac: expect-contains [[assert(events == "dark;on;dark;off;store;" ..]] [[@debug=retained]]
 do
     local saved_ui, saved_api = EpochUI, EpochAPI
     local events, made = "", 0

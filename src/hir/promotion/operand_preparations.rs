@@ -128,7 +128,11 @@ pub(super) fn collect(
         || dataflow.def_reg(def) != reg
         || uses.len() != 1
         || uses[0].instr != site
-        || !dataflow.def_phi_uses[def.index()].is_empty()
+        // 无实际消费者的合流不读取这个准备值；沿 Dataflow 已计算的传递活性核对，
+        // 不让后继同槽覆盖前的死 phi 阻断完整帧。活跃合流仍保留独立值身份。
+        || dataflow.def_phi_uses[def.index()]
+            .iter()
+            .any(|&phi| !dataflow.phi_is_truly_dead(phi))
         // SETTABLE 的 RHS、二元运算和比较的右操作数可含分支，先读的快照仍由同一 SSA Def 支配。
         // 这里只保留读取身份；跨分支的实际求值和准备区由完整赋值帧核对。
         || (dataflow.def_block(def) != cfg.instr_to_block[site.index()]
