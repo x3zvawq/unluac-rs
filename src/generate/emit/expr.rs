@@ -100,6 +100,7 @@ impl<'a> Emitter<'a> {
             for (index, segment) in segments.iter().enumerate() {
                 parts.push(Doc::text(super::syntax::format_interpolation_fragment(
                     segment,
+                    self.options.readable_strings,
                 )));
                 if let Some(arg) = call.args.get(index) {
                     parts.push(Doc::text("{"));
@@ -181,7 +182,11 @@ impl<'a> Emitter<'a> {
                 self.number_is_f32,
             )),
             AstExpr::String(value) => (
-                Doc::text(format_string_literal(value, self.options.quote_style)),
+                Doc::text(format_string_literal(
+                    value,
+                    self.options.quote_style,
+                    self.options.readable_strings,
+                )),
                 PREC_LITERAL,
                 Assoc::Non,
             ),

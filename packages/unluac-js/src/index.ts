@@ -63,6 +63,8 @@ export interface UnluacDecompileOptions {
     maxLineLength?: number;
     numberFormat?: UnluacNumberFormat;
     quoteStyle?: UnluacQuoteStyle;
+    /** Decode literals to readable UTF-8 (default true); false preserves original bytes. */
+    readableStrings?: boolean;
     tableStyle?: UnluacTableStyle;
     luauVectorConstructor?: UnluacLuauVectorConstructor;
     comment?: boolean;

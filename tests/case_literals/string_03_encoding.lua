@@ -1,4 +1,4 @@
--- common_12_string_encoding#1: 解码展示不能改变非 UTF-8 字符串的原始字节。
+-- 原字节模式：解码展示不能改变非 UTF-8 字符串的原始字节。
 -- unluac: expect-contains [["\214\208\206\196"]]
 -- unluac: expect-count [["中文"]] [[1]]
 -- unluac: expect-contains [[\214\208\n\206\196]]

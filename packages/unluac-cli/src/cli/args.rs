@@ -332,6 +332,9 @@ struct GenerateArgs {
         help_heading = "Generate"
     )]
     quote_style: Option<QuoteStyle>,
+    /// Emit decoded strings as readable UTF-8 text (default: true); false preserves original bytes.
+    #[arg(long, value_name = "BOOL", value_parser = BoolishValueParser::new(), help_heading = "Generate")]
+    readable_strings: Option<bool>,
     /// Number literal style.
     #[arg(
         long,
@@ -383,6 +386,10 @@ impl GenerateArgs {
         set_if_some(&mut options.generate.indent_width, self.indent_width);
         set_if_some(&mut options.generate.max_line_length, self.max_line_length);
         set_if_some(&mut options.generate.quote_style, self.quote_style);
+        set_if_some(
+            &mut options.generate.readable_strings,
+            self.readable_strings,
+        );
         set_if_some(&mut options.generate.number_format, self.number_format);
         set_if_some(&mut options.generate.table_style, self.table_style);
         if let (Some(constructor), Some(size)) =

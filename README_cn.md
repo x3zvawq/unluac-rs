@@ -70,6 +70,13 @@ unluac-cli -s example.lua -D lua5.4
 
 需要目标方言可接受的 Lua 源码时，请使用 `--generate-mode strict`。默认的 permissive 模式可能为不可表达的结构输出诊断伪源码。`--output` 用于保存最终源码，不能与调试 dump、计时输出或提前停止流水线的选项组合。
 
+字符串默认以解码后的可读文本输出为 UTF-8（`--readable-strings true`）。例如 GBK 输入可用
+`unluac-cli -i sample.luac --encoding gbk -o recovered.lua` 直接输出中文；`auto` 对短字符串可能误判，
+已知字符集时请显式指定。需要保持字符串的原始字节、长度和二进制协议时，使用
+`--readable-strings false`。无可用解码文本时仍输出原字节转义。Rust 对应
+`options.generate.readable_strings`，JS/WASM 对应 `generate.readableStrings`，Web 的“可读字符串”开关默认开启。
+对生成的 UTF-8 源码重新编译后，应按 UTF-8 解码，不再沿用原输入的 GBK 设置。
+
 通过 `--naming-mode` / `-n` 选择后备命名策略。所有模式优先保留合法 debug 名；使用 `--ignore-debug` 可忽略它们。
 
 | 模式 | 无 debug 信息时的名字 |

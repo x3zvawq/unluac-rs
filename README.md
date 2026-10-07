@@ -70,6 +70,14 @@ Source input (`--source`) requires an explicit dialect and a compatible external
 
 Use `--generate-mode strict` when you require target-compatible Lua output. The default permissive mode can return diagnostic pseudocode for constructs that cannot be represented. `--output` writes final source and cannot be combined with debug dumps, timing output or an earlier pipeline stage.
 
+Strings default to decoded, readable UTF-8 text (`--readable-strings true`). For GBK input, use
+`unluac-cli -i sample.luac --encoding gbk -o recovered.lua` to emit Chinese directly. Auto detection can
+misidentify short strings, so specify a known input encoding. Use `--readable-strings false` to preserve
+original string bytes, byte lengths and binary protocols. Strings without decoded text retain byte escapes.
+The option is `options.generate.readable_strings` in Rust and `generate.readableStrings` in JS/WASM;
+the Web “Readable Strings” switch is enabled by default. Recompiled generated UTF-8 source should be
+decoded as UTF-8, rather than reusing the original input's GBK setting.
+
 Choose fallback names with `--naming-mode` / `-n`. All modes prefer valid debug names; use `--ignore-debug` to disregard them.
 
 | Mode | Names without debug information |

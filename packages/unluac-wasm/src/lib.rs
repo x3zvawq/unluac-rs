@@ -65,6 +65,7 @@ struct WasmGenerateOptions {
     max_line_length: Option<usize>,
     number_format: Option<String>,
     quote_style: Option<String>,
+    readable_strings: Option<bool>,
     table_style: Option<String>,
     luau_vector_constructor: Option<WasmLuauVectorConstructor>,
     comment: Option<bool>,
@@ -269,6 +270,9 @@ impl WasmGenerateOptions {
         }
         if let Some(value) = self.quote_style {
             options.generate.quote_style = parse_option("generate.quoteStyle", &value)?;
+        }
+        if let Some(value) = self.readable_strings {
+            options.generate.readable_strings = value;
         }
         if let Some(value) = self.number_format {
             options.generate.number_format = parse_option("generate.numberFormat", &value)?;

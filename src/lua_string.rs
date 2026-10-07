@@ -1,8 +1,8 @@
 //! Lua 字符串字面量的字节值。
 //!
 //! Lua string 是任意字节序列，不等同于 Rust `String`。HIR 之后的表达式层必须保留
-//! 原始字节；只有在需要生成字段名、全局名或调试名这类文本身份时，才临时尝试 UTF-8
-//! 视图。字节与已解码文本使用 `Arc` 共享，RawString -> HIR -> AST 的机械 Clone
+//! 原始字节；Generate 可按输出选项消费已解码文本，分析和等值判断始终使用字节。
+//! 字节与已解码文本使用 `Arc` 共享，RawString -> HIR -> AST 的机械 Clone
 //! 不应随 pipeline 阶段重复深拷贝字面量。
 
 use std::borrow::Cow;
@@ -63,6 +63,21 @@ impl LuaString {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// 从同一字符串导出的片段沿用已解析的编码，不重新猜测短片段的字符集。
+    pub(crate) fn derived_bytes(&self, bytes: Vec<u8>) -> Self {
+        let text = self.encoding.and_then(|encoding| {
+            encoding
+                .decode(0, &bytes, crate::parser::StringDecodeMode::Strict)
+                .ok()
+                .map(|(_, text)| Arc::from(text))
+        });
+        Self {
+            bytes: bytes.into(),
+            text,
+            encoding: self.encoding,
+        }
     }
 
     pub fn decoded_text(&self) -> Option<&str> {

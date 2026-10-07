@@ -179,8 +179,13 @@ pub(super) fn format_complex_literal(real: f64, imag: f64) -> Result<String, Gen
     Ok(format!("{coefficient}i"))
 }
 
-pub(super) fn format_string_literal(value: &LuaString, quote_style: QuoteStyle) -> String {
-    if let Some(text) = value.as_utf8()
+pub(super) fn format_string_literal(
+    value: &LuaString,
+    quote_style: QuoteStyle,
+    readable_strings: bool,
+) -> String {
+    let text = string_text(value, readable_strings);
+    if let Some(text) = text
         && can_use_long_bracket_string(text)
     {
         return format_long_bracket_string(text);
@@ -192,7 +197,7 @@ pub(super) fn format_string_literal(value: &LuaString, quote_style: QuoteStyle) 
         QuoteStyle::MinEscape => ['"', '\''],
     };
     let preferred = if matches!(quote_style, QuoteStyle::MinEscape) {
-        if escape_cost(value, '"') <= escape_cost(value, '\'') {
+        if escape_cost(value, text, '"') <= escape_cost(value, text, '\'') {
             '"'
         } else {
             '\''
@@ -202,19 +207,36 @@ pub(super) fn format_string_literal(value: &LuaString, quote_style: QuoteStyle) 
     };
     let mut rendered = String::new();
     rendered.push(preferred);
-    push_quoted_string_body(&mut rendered, value, preferred);
+    push_quoted_string_body(&mut rendered, value, text, preferred);
     rendered.push(preferred);
     rendered
 }
 
-pub(super) fn format_interpolation_fragment(value: &LuaString) -> String {
+pub(super) fn format_interpolation_fragment(value: &LuaString, readable_strings: bool) -> String {
     let mut rendered = String::new();
-    push_quoted_string_body(&mut rendered, value, '`');
+    push_quoted_string_body(
+        &mut rendered,
+        value,
+        string_text(value, readable_strings),
+        '`',
+    );
     rendered.replace('{', "\\{").replace('}', "\\}")
 }
 
-fn push_quoted_string_body(rendered: &mut String, value: &LuaString, quote: char) {
-    if let Some(text) = value.as_utf8() {
+fn string_text(value: &LuaString, readable_strings: bool) -> Option<&str> {
+    if readable_strings && let Some(text) = value.decoded_text() {
+        return Some(text);
+    }
+    value.as_utf8()
+}
+
+fn push_quoted_string_body(
+    rendered: &mut String,
+    value: &LuaString,
+    text: Option<&str>,
+    quote: char,
+) {
+    if let Some(text) = text {
         push_utf8_string_body(rendered, text, quote);
     } else {
         push_byte_string_body(rendered, value.as_bytes(), quote);
@@ -298,8 +320,8 @@ fn long_bracket_eqs(value: &str) -> String {
     unreachable!("unbounded search over bracket delimiters should always terminate")
 }
 
-fn escape_cost(value: &LuaString, quote: char) -> usize {
-    if let Some(text) = value.as_utf8() {
+fn escape_cost(value: &LuaString, text: Option<&str>, quote: char) -> usize {
+    if let Some(text) = text {
         return text
             .chars()
             .map(|ch| match ch {

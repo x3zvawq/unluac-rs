@@ -43,6 +43,8 @@ pub struct GenerateOptions {
     pub max_line_length: usize,
     pub number_format: NumberFormat,
     pub quote_style: QuoteStyle,
+    /// 优先将已解码字符串作为 UTF-8 文本输出；关闭时保留原字节值。
+    pub readable_strings: bool,
     pub table_style: TableStyle,
     pub comment: bool,
     /// 把 Luau vector 常量重新表达成源码时使用的宿主构造器。
@@ -57,6 +59,7 @@ impl Default for GenerateOptions {
             max_line_length: 100,
             number_format: NumberFormat::Decimal,
             quote_style: QuoteStyle::MinEscape,
+            readable_strings: true,
             table_style: TableStyle::Balanced,
             comment: true,
             luau_vector_constructor: None,

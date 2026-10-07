@@ -282,10 +282,10 @@ fn segments(template: &LuaString, arguments: usize) -> Option<Vec<LuaString>> {
         }
         match bytes.next()? {
             b'%' => current.push(b'%'),
-            b'*' => chunks.push(LuaString::from_bytes(std::mem::take(&mut current))),
+            b'*' => chunks.push(template.derived_bytes(std::mem::take(&mut current))),
             _ => return None,
         }
     }
-    chunks.push(LuaString::from_bytes(current));
+    chunks.push(template.derived_bytes(current));
     (chunks.len() == arguments + 1).then_some(chunks)
 }

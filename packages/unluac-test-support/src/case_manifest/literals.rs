@@ -2,6 +2,30 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_literals/encoding_02_readable_gbk.lua",
+        &["encoding", "gbk", "readable-string", "escape"],
+        "GBK 字面量与字符串键默认输出中文，保留引号、反斜杠、NUL 和换行边界及查表结果。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                string_encoding: Some("gbk"),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_literals/encoding_03_readable_interpolation.lua",
+        &["encoding", "gbk", "readable-string", "interpolation"],
+        "Luau 插值片段继承模板编码并输出中文，保留百分号与花括号。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                string_encoding: Some("gbk"),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_literals/number_08_float32_roundtrip.lua",
         &["float32", "format", "roundtrip", "sign-bit"],
         "以官方 Lua 5.3 chunk 改写数字宽度，逐值观察 f32 位模式并断言紧凑文本；不声称验证 f32 VM 算术。",
@@ -201,6 +225,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "GBK样字节、真正UTF-8、内嵌换行/引号和NUL+255后接数字均保持原字节。",
         &[
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                readable_strings: Some(false),
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
@@ -221,6 +246,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "三个独立函数保留NUL数字转义、开头换行及UTF-8控制字符的原字节与返回值布局。",
         &[
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                readable_strings: Some(false),
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),

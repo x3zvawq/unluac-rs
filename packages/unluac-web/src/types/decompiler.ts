@@ -66,6 +66,7 @@ export interface DecompileOptions {
     maxLineLength: number
     numberFormat: UnluacNumberFormat
     quoteStyle: UnluacQuoteStyle
+    readableStrings: boolean
     tableStyle: UnluacTableStyle
     luauVectorConstructor: LuauVectorConstructor | null
     comment: boolean

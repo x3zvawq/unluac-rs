@@ -113,6 +113,7 @@ function buildCliArgs(): string {
   )
   pushOption(args, '--number-format', options.generate.numberFormat, defaults.generate.numberFormat)
   pushOption(args, '--quote-style', options.generate.quoteStyle, defaults.generate.quoteStyle)
+  pushOption(args, '--readable-strings', options.generate.readableStrings, defaults.generate.readableStrings)
   pushOption(args, '--table-style', options.generate.tableStyle, defaults.generate.tableStyle)
   if (options.generate.luauVectorConstructor) {
     if (options.generate.luauVectorConstructor.library) {
@@ -444,6 +445,16 @@ const tableStyleOptions = [
                 :max="200"
                 size="small"
               />
+            </div>
+            <div>
+              <div class="mb-1 flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.generate.readableStrings') }}</label>
+                <NTooltip>
+                  <template #trigger><span class="cursor-help opacity-50">ⓘ</span></template>
+                  {{ t('settings.tips.readableStrings') }}
+                </NTooltip>
+                <NSwitch v-model:value="settings.options.generate.readableStrings" :aria-label="t('settings.generate.readableStrings')" size="small" />
+              </div>
             </div>
             <div>
               <div class="mb-1 flex items-center gap-1">

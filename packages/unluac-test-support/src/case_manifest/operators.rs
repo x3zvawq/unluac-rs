@@ -1565,20 +1565,24 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "低槽左值与右侧 LEN 恢复为完整 Boolean 参数，保持短路和元方法调用次数。",
         &[
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                readable_strings: Some(false),
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
+                readable_strings: Some(false),
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
             LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                readable_strings: Some(false),
                 recompile_rounds: Some(3),
                 ..LUAU_OPTIMIZED_OPTIONS
             }),
             LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
                 retain_debug: true,
+                readable_strings: Some(false),
                 recompile_rounds: Some(3),
                 ..LUAU_OPTIMIZED_OPTIONS
             }),

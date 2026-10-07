@@ -540,14 +540,18 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
         } else {
             prev_chunk_bytes
         };
-        let recompile_result =
-            decompile(&prev_chunk_bytes, decompile_options(entry)).map_err(|error| {
-                TestFailure::new(
-                    FailureKind::RecompileDecompileFailed,
-                    format!("[{round_label}] decompile failed: {error}"),
-                    format!("[{round_label}] decompile failed: {error}"),
-                )
-            })?;
+        let mut round_options = decompile_options(entry);
+        if round_options.generate.readable_strings {
+            // Generate 已将可读文本编码为 UTF-8；输入文件的 GBK 等选项不属于新产物。
+            round_options.parse.string_encoding = unluac::parser::StringEncoding::Utf8;
+        }
+        let recompile_result = decompile(&prev_chunk_bytes, round_options).map_err(|error| {
+            TestFailure::new(
+                FailureKind::RecompileDecompileFailed,
+                format!("[{round_label}] decompile failed: {error}"),
+                format!("[{round_label}] decompile failed: {error}"),
+            )
+        })?;
         assert_auto_dialect(
             &round_label,
             recompile_result.state.dialect,

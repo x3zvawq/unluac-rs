@@ -9,6 +9,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             LuaCaseConfiguration::new(LUAU_ONLY)
                 .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
                 .with_options(LuaCaseOptions {
+                    readable_strings: Some(false),
                     recompile_rounds: Some(3),
                     ..LuaCaseOptions::DEFAULT
                 }),
@@ -16,6 +17,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
                 .with_options(LuaCaseOptions {
                     retain_debug: true,
+                    readable_strings: Some(false),
                     recompile_rounds: Some(3),
                     ..LuaCaseOptions::DEFAULT
                 }),
@@ -262,6 +264,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "保证constructor字符串key仅在合法标识符时转field-name糖。",
         &[
             LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54]).with_options(LuaCaseOptions {
+                readable_strings: Some(false),
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
