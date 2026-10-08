@@ -269,12 +269,25 @@ impl ConditionSafetyWorkspace {
         self.pending.clear();
     }
 
-    pub(super) fn source_initializer_blocks(&self, cfg: &Cfg) -> Vec<bool> {
+    /// 在连通分量成形前保留独立前缀；与最终条件选择消费相同的单块求值证明。
+    pub(super) fn condition_entry_blocks(
+        &mut self,
+        proto: &LoweredProto,
+        cfg: &Cfg,
+        dataflow: &DataflowFacts,
+    ) -> Vec<bool> {
         cfg.blocks
             .iter()
-            .map(|block| {
-                (block.instrs.start.index()..block.instrs.start.index() + block.instrs.len)
-                    .any(|index| self.source_initializers[index])
+            .enumerate()
+            .map(|(index, _)| {
+                cfg.branch_edges(super::super::BlockRef(index)).is_some()
+                    && block_has_unabsorbed_effects(
+                        proto,
+                        cfg,
+                        dataflow,
+                        super::super::BlockRef(index),
+                        self,
+                    )
             })
             .collect()
     }

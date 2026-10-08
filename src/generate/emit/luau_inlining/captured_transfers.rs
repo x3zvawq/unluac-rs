@@ -79,7 +79,7 @@ pub(super) fn slots(
     base: usize,
     occurrences: &BTreeMap<crate::hir::HirSourceSite, crate::hir::LocalId>,
     bodies: &BTreeMap<crate::hir::LocalId, HirLuauInliningBody>,
-    slots: &BTreeMap<crate::hir::HirSourceSite, usize>,
+    slots: &BTreeMap<crate::hir::HirSourceSite, crate::hir::HirLuauResultFrame>,
     seen: &mut BTreeSet<crate::hir::HirSourceSite>,
 ) -> bool {
     for (argument, value) in outer.args.iter().enumerate() {
@@ -98,7 +98,7 @@ pub(super) fn slots(
             Some(HirLuauInliningBody::CapturedAppendTransfer { .. })
         ) && (outer.method_key.is_some()
             || outer.required_luau_inlining.is_some()
-            || slots.get(&site) != Some(&(base + argument + 1))
+            || slots.get(&site).map(|frame| frame.base) != Some(base + argument + 1)
             || !seen.insert(site))
         {
             return false;

@@ -93,14 +93,7 @@ fn shape(func: &AstFunctionExpr) -> Option<GuardedCounterTemplate> {
 }
 
 pub(super) fn body(func: &AstFunctionExpr, proto: &crate::hir::HirProto) -> bool {
-    if func.function != proto.id
-        || func.params.len() != 3
-        || func.is_vararg
-        || func.named_vararg.is_some()
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-    {
+    if func.function != proto.id || func.params.len() != 3 {
         return false;
     }
     let Some(expected) = guarded_counter_template(proto) else {
@@ -109,13 +102,15 @@ pub(super) fn body(func: &AstFunctionExpr, proto: &crate::hir::HirProto) -> bool
     if shape(func).as_ref() != Some(&expected) {
         return false;
     }
-    let Some(baseline) = constant_control::cost(func, None) else {
+    let costs = constant_control::CostAnalysis::new(func);
+    let Some(baseline) = costs.cost(None) else {
         return false;
     };
     // 三种专化分别保留观察、跳过 break、保留共同 break；原动态调用没有控制参数折扣。
     !baseline.permits_inline(baseline)
         && [0, 1, 3].into_iter().all(|mask| {
-            constant_control::cost(func, Some(mask))
+            costs
+                .cost(Some(mask))
                 .is_some_and(|profile| profile.permits_inline(baseline))
         })
 }

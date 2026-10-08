@@ -102,14 +102,7 @@ fn shape(func: &AstFunctionExpr) -> Option<(NumericRepeatTemplate, &AstNumericFo
 }
 
 pub(super) fn body(func: &AstFunctionExpr, proto: &crate::hir::HirProto) -> bool {
-    if func.function != proto.id
-        || func.params.len() != 3
-        || func.is_vararg
-        || func.named_vararg.is_some()
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-    {
+    if func.function != proto.id || func.params.len() != 3 {
         return false;
     }
     let Some(expected) = numeric_repeat_template(proto) else {
@@ -121,7 +114,8 @@ pub(super) fn body(func: &AstFunctionExpr, proto: &crate::hir::HirProto) -> bool
     if actual != expected {
         return false;
     }
-    let Some(baseline) = constant_control::cost(func, None) else {
+    let costs = constant_control::CostAnalysis::new(func);
+    let Some(baseline) = costs.cost(None) else {
         return false;
     };
     if baseline.permits_inline(baseline) {
@@ -130,10 +124,10 @@ pub(super) fn body(func: &AstFunctionExpr, proto: &crate::hir::HirProto) -> bool
     // 参数1只用作 repeat 的裸条件；CostModel 对常量和动态 local 都收取0。
     // 分别验证两种常量值，也约束同一模板的动态条件配置；循环不得另读索引变量。
     for mask in [1, 2, 3] {
-        let Some(cost) = constant_control::cost(func, Some(mask)) else {
+        let Some(cost) = costs.cost(Some(mask)) else {
             return false;
         };
-        let Some(loop_cost) = constant_control::block_cost(func, &loop_.body, Some(mask)) else {
+        let Some(loop_cost) = costs.block_cost(&loop_.body, Some(mask)) else {
             return false;
         };
         if !cost.permits_inline(baseline)

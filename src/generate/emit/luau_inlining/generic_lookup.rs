@@ -13,14 +13,7 @@ pub(super) fn body(
     key: i64,
     result: &crate::LuaString,
 ) -> bool {
-    if func.function.index() != template
-        || func.params.len() != 2
-        || func.is_vararg
-        || func.named_vararg.is_some()
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-    {
+    if func.function.index() != template || func.params.len() != 2 {
         return false;
     }
     let [AstStmt::While(loop_), AstStmt::Return(ret)] = func.body.stmts.as_slice() else {

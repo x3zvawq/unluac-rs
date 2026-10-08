@@ -190,7 +190,7 @@ pub(super) fn plans(context: NativeFrameContext<'_>, facts: &ProtoPromotionFacts
         let Some(Some(Specialization { callee, mask })) = indexed.get(&(actions, returned)) else {
             continue;
         };
-        let HirLuauInliningBody::ConstantControl { parameters, .. } = callee.body else {
+        let HirLuauInliningBody::ConstantControl { .. } = callee.body else {
             unreachable!()
         };
         // 候选拒绝[ProofIncomplete:Frame]：整段须属于同一闭包之后的匿名高槽准备，
@@ -204,7 +204,7 @@ pub(super) fn plans(context: NativeFrameContext<'_>, facts: &ProtoPromotionFacts
         {
             continue;
         }
-        let mut args = (0..parameters - 1)
+        let mut args = (0..callee.parameters - 1)
             .map(|bit| HirExpr::Boolean(*mask & (1 << bit) != 0))
             .collect::<Vec<_>>();
         args.push(HirExpr::TableConstructor(table.clone()));
@@ -305,7 +305,7 @@ impl FrameBuilder<'_> {
         updates.push(Action::Initialize(small_integer(value)?));
         updates.reverse();
         let &Specialization { callee, mask } = frames.indexed.get(&(updates, 0))?.as_ref()?;
-        let HirLuauInliningBody::ConstantControl { parameters, .. } = callee.body else {
+        let HirLuauInliningBody::ConstantControl { .. } = callee.body else {
             return None;
         };
         let at = self.next_event;
@@ -353,7 +353,7 @@ impl FrameBuilder<'_> {
             true,
             Some(input),
         )?;
-        let mut args = (0..parameters - 1)
+        let mut args = (0..callee.parameters - 1)
             .map(|bit| HirExpr::Boolean(mask & (1 << bit) != 0))
             .collect::<Vec<_>>();
         args.push(argument);

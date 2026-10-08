@@ -822,12 +822,19 @@ pub(super) fn plan(
             })
             .unwrap_or(&access.key);
         let layout = register_layout?;
+        // 构造器尚在独立声明中时，快照把左值 key 错放在整个 RHS 的入池之后。
+        // 此处只形成原帧候选；父事务在完整赋值预览上重新核对 key 的 RK 布局。
+        let deferred_constructor_key = matches!(
+            dialect,
+            DecompileDialect::Lua51 | DecompileDialect::Lua52 | DecompileDialect::Lua53
+        ) && matches!(rhs, HirExpr::TableConstructor(_));
         // 字面 key 核对 RK/LOADK；动态 key 必须保留原寄存器输入，内部常量
         // 再由共享表达式 builder 逐层核对，不能因整个池较大而拒绝无 RK 的目标。
         if dialect == DecompileDialect::Luajit
             || if tables::literal_rk(key) {
-                context.literal_uses_rk(key, Some((&access.sources, false)), dialect)
-                    != Some(layout.key.is_none())
+                !deferred_constructor_key
+                    && context.literal_uses_rk(key, Some((&access.sources, false)), dialect)
+                        != Some(layout.key.is_none())
             } else {
                 layout.key.is_none()
             }

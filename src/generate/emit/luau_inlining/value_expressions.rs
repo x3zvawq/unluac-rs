@@ -7,11 +7,6 @@ pub(super) fn body(func: &AstFunctionExpr, template: usize, parameters: usize) -
     if func.function.index() != template
         || func.params.len() != parameters
         || !(2..=4).contains(&parameters)
-        || func.is_vararg
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-        || func.named_vararg.is_some()
     {
         return false;
     }

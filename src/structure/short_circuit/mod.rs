@@ -76,7 +76,7 @@ pub(super) struct ClosedControlDagContext<'a> {
     pub(super) cfg: &'a Cfg,
     pub(super) graph_facts: &'a GraphFacts,
     pub(super) dataflow: &'a DataflowFacts,
-    pub(super) source_initializer_blocks: &'a [bool],
+    pub(super) condition_entry_blocks: &'a [bool],
 }
 
 pub(super) fn analyze_closed_control_dags(

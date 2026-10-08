@@ -6,8 +6,8 @@
 mod analyze;
 mod common;
 pub(crate) use common::{
-    HirLuauCallableArgument, HirLuauCallableSource, HirLuauInliningBody, HirRequiredLuauInlining,
-    HirSourceSite, luau_loop_unroll_blocked, luau_repeat_prefix_costs,
+    HirLuauCallableArgument, HirLuauCallableSource, HirLuauInliningBody, HirLuauResultFrame,
+    HirRequiredLuauInlining, HirSourceSite, luau_loop_unroll_blocked, luau_repeat_prefix_costs,
 };
 #[cfg(feature = "decompile-debug")]
 mod debug;

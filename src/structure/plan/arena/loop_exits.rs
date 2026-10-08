@@ -56,9 +56,9 @@ pub(super) fn verified_while_lexical_arms(
     domain: WhileLexicalArmDomain<'_>,
     workspace: &mut WhileLexicalArmWorkspace,
 ) -> Result<BTreeSet<BlockRef>, StructureError> {
-    let Some(continuation) = domain.continuation else {
-        return Ok(BTreeSet::new());
-    };
+    // 没有正常 continuation 的循环仍可拥有提前 return 臂；此时唯一允许的
+    // 完成边界是函数出口，其余单入口、支配及边动作证明与普通 while 相同。
+    let continuation = domain.continuation.unwrap_or(cfg.exit_block);
     let candidate = domain.candidate;
     let natural = domain.natural;
     workspace.begin_loop();

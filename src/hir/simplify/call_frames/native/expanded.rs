@@ -63,6 +63,7 @@ pub(in crate::hir::simplify::call_frames) struct Callee {
     field: crate::LuaString,
     body: HirLuauInliningBody,
     capture: Option<LocalId>,
+    parameters: usize,
     parameter_name: Option<String>,
     result_name: Option<String>,
     factory: Option<factories::Factory>,
@@ -280,7 +281,6 @@ pub(in crate::hir::simplify) fn restore(
                         (
                             HirLuauInliningBody::LiteralChoice {
                                 template: proto.id.index(),
-                                parameters: proto.params.len(),
                             },
                             "".into(),
                         )
@@ -292,7 +292,6 @@ pub(in crate::hir::simplify) fn restore(
                         (
                             HirLuauInliningBody::ValueExpression {
                                 template: proto.id.index(),
-                                parameters: proto.params.len(),
                             },
                             "".into(),
                         )
@@ -370,7 +369,6 @@ pub(in crate::hir::simplify) fn restore(
                         (
                             HirLuauInliningBody::ConstantControl {
                                 template: proto.id.index(),
-                                parameters: proto.params.len(),
                             },
                             "".into(),
                         )
@@ -398,6 +396,11 @@ pub(in crate::hir::simplify) fn restore(
         .map(control::leaf_unchanged)
         .collect::<Vec<_>>();
     let mut nested_bodies = BTreeMap::new();
+    let parameter_counts = module
+        .protos
+        .iter()
+        .map(|proto| proto.params.len())
+        .collect::<Vec<_>>();
     let mut seeded_bodies = BTreeMap::new();
     for output in &mut module.protos {
         if !output.params.is_empty() {
@@ -411,6 +414,7 @@ pub(in crate::hir::simplify) fn restore(
             output,
             original_facts,
             &bodies,
+            &parameter_counts,
             &parameter_names,
             &result_names,
             &factories,
@@ -462,6 +466,7 @@ pub(in crate::hir::simplify) fn restore(
             prepared_proto,
             facts,
             &bodies,
+            &parameter_counts,
             &parameter_names,
             &result_names,
             &factories,
@@ -567,6 +572,7 @@ pub(in crate::hir::simplify) fn restore(
             proto,
             facts,
             &bodies,
+            &parameter_counts,
             &parameter_names,
             &result_names,
             &factories,
@@ -831,6 +837,15 @@ pub(in crate::hir::simplify) fn restore(
             .collect::<BTreeMap<_, _>>();
         let mut first = None;
         for plan in &mut plans {
+            let tail_result = plan.values.tail.as_ref().and_then(|tail| {
+                let HirExpr::Call(call) = tail.as_expr() else {
+                    return None;
+                };
+                Some((
+                    call.required_luau_inlining?,
+                    tail.exact_width().expect("fixed expanded result pack"),
+                ))
+            });
             let mut captured_updates = BTreeSet::new();
             let mut captured_transfers = BTreeSet::new();
             for value in plan
@@ -869,7 +884,7 @@ pub(in crate::hir::simplify) fn restore(
                                 body: callee.body,
                                 capture: callee.capture,
                                 occurrences: Vec::new(),
-                                result_frame_slots: BTreeMap::new(),
+                                result_frames: BTreeMap::new(),
                                 callable_arguments: Default::default(),
                                 nil_guards: Default::default(),
                             })
@@ -926,13 +941,10 @@ pub(in crate::hir::simplify) fn restore(
                                 | HirLuauInliningBody::StatefulGenericWhile { .. }
                         ) {
                             // 使用已证明的原返回槽；比较型展开帧还预留 callee/Boolean。
-                            certificates
-                                .get_mut(&local)
-                                .unwrap()
-                                .result_frame_slots
-                                .insert(
-                                    site,
-                                    if matches!(
+                            certificates.get_mut(&local).unwrap().result_frames.insert(
+                                site,
+                                crate::hir::HirLuauResultFrame {
+                                    base: if matches!(
                                         callee.body,
                                         HirLuauInliningBody::CapturedAppendTransfer { .. }
                                     ) {
@@ -1015,7 +1027,11 @@ pub(in crate::hir::simplify) fn restore(
                                                 0
                                             }
                                     },
-                                );
+                                    width: tail_result
+                                        .filter(|(source, _)| *source == site)
+                                        .map_or(1, |(_, width)| width),
+                                },
+                            );
                         }
                     }
                     false
@@ -1508,6 +1524,7 @@ fn callees(
     proto: &HirProto,
     facts: &ProtoPromotionFacts,
     bodies: &[Option<(HirLuauInliningBody, crate::LuaString)>],
+    parameter_counts: &[usize],
     parameter_names: &[Option<String>],
     result_names: &[Option<String>],
     factories: &[Option<factories::Factory>],
@@ -1674,6 +1691,7 @@ fn callees(
                     field: key.1.clone(),
                     body: key.0,
                     capture,
+                    parameters: parameter_counts[closure.proto.index()],
                     parameter_name: parameter_names[closure.proto.index()].clone(),
                     result_name: result_names[closure.proto.index()].clone(),
                     factory: factories[closure.proto.index()].clone(),

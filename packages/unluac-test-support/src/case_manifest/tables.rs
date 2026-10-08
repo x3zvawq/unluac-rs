@@ -2,6 +2,50 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_tables/constructor_22_upvalue_before_capture.lua",
+        &["constructor", "setlist", "upvalue", "capture", "eval-order"],
+        "嵌套表字段的上值快照按原定义恢复，后续同槽捕获不改变先前读取及调用顺序。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_20_indexed_wide_arrays.lua",
+        &["constructor", "constant-pool", "setlist", "readability"],
+        "宽数组安装按完整赋值顺序核对索引键 RK，保留空根发布和各项独立安装。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_21_reused_short_circuit_slot.lua",
+        &["constructor", "short-circuit", "identity", "readability"],
+        "槽复用后的空表备用值保持短路分配及已有表身份，后继嵌套构造恢复完整初始化。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/constructor_19_wide_constant_nested_fields.lua",
         &[
             "constructor",

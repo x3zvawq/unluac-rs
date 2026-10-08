@@ -23,40 +23,44 @@ use super::object_flow::{
     transfer_root_node,
 };
 
-/// Deferred 阶段补齐 repeat 条件仍可观察的物理 root。
-///
-/// 新 root 身份会唤醒 locals，令无显式读取的 aggregate 也在 body 内得到词法 owner；
-/// 直到身份与形状共同收敛，再把最终 endpoint certificate 交给 AST。
+/// 在请求模块效果前收集 repeat owner，空候选不触发分析。
+pub(super) fn candidate_protos(module: &HirModule) -> Vec<usize> {
+    module
+        .protos
+        .iter()
+        .enumerate()
+        .filter_map(|(index, proto)| {
+            proto
+                .body
+                .stmts
+                .iter()
+                .any(|stmt| {
+                    any_stmt_structure(stmt, &mut |stmt| matches!(stmt, HirStmt::Repeat(_)))
+                })
+                .then_some(index)
+        })
+        .collect()
+}
+
+/// 候选来自当前树；仅更新保留要求，不移动节点或改变控制、值和 capture。
+/// 新 root 身份仍需唤醒 locals 安排词法 owner，稳定后将 endpoint certificate 交给 AST。
 pub(super) fn mark_repeat_trailing_condition_roots(
     module: &mut HirModule,
+    candidates: &[usize],
     promotion_facts: &[ProtoPromotionFacts],
     context: RootAnalysisContext<'_>,
 ) -> bool {
     let RootAnalysisContext { safety, effects } = context;
-    let relevant = module
-        .protos
-        .iter()
-        .map(|proto| {
-            proto.body.stmts.iter().any(|stmt| {
-                any_stmt_structure(stmt, &mut |stmt| matches!(stmt, HirStmt::Repeat(_)))
-            })
-        })
-        .collect::<Vec<_>>();
-    if !relevant.iter().any(|present| *present) {
-        return false;
-    }
-    let mut roots = Vec::with_capacity(module.protos.len());
-    for (proto, relevant) in module.protos.iter().zip(relevant) {
-        if !relevant {
-            roots.push(RepeatRoots::default());
-            continue;
-        }
+    let mut roots = Vec::with_capacity(candidates.len());
+    for &index in candidates {
+        let proto = &module.protos[index];
         let facts = promotion_facts.get(proto.id.index());
         roots.push(collect_proto_repeat_roots(proto, facts, effects, safety));
     }
 
     let mut changed = false;
-    for (proto, roots) in module.protos.iter_mut().zip(roots) {
+    for (&index, roots) in candidates.iter().zip(roots) {
+        let proto = &mut module.protos[index];
         let old_local_count = proto.physical_root_locals.len();
         let old_temp_count = proto.physical_root_temps.len();
         proto.physical_root_locals.extend(roots.locals);

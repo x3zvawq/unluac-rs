@@ -214,8 +214,7 @@ pub(super) fn collapse_adjacent_call_alias_runs(
     trailing_condition: Option<&AstExpr>,
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
-    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let (use_index, write_index) = BindingUseIndex::with_writes(&old_stmts, trailing_condition);
     let run_facts = CandidateRunFacts::new(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
@@ -521,8 +520,7 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
     trailing_condition: Option<&AstExpr>,
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
-    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let (use_index, write_index) = BindingUseIndex::with_writes(&old_stmts, trailing_condition);
     let run_facts = CandidateRunFacts::new(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
@@ -687,8 +685,7 @@ pub(super) fn collapse_mechanical_runs(
     trailing_condition: Option<&AstExpr>,
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
-    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let (use_index, write_index) = BindingUseIndex::with_writes(&old_stmts, trailing_condition);
     let run_facts = CandidateRunFacts::new(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;

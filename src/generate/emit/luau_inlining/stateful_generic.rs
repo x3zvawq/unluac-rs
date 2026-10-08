@@ -21,11 +21,6 @@ pub(super) fn body(
 ) -> bool {
     if func.function.index() != template
         || func.params.len() != 4
-        || func.is_vararg
-        || func.named_vararg.is_some()
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
         || i16::try_from(initial).is_err()
         || i16::try_from(increment).is_err()
     {

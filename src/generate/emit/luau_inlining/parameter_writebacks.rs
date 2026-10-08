@@ -8,14 +8,7 @@ pub(super) fn body(func: &AstFunctionExpr, proto: &crate::hir::HirProto) -> bool
     else {
         return false;
     };
-    if func.function != proto.id
-        || func.params != proto.params
-        || func.is_vararg
-        || func.named_vararg.is_some()
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-    {
+    if func.function != proto.id || func.params != proto.params {
         return false;
     }
     let Some((AstStmt::Return(ret), writes)) = func.body.stmts.split_last() else {

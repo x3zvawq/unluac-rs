@@ -249,14 +249,15 @@ fn analyze_structure_proto_one(
         .collect::<BTreeSet<_>>();
     let mut loop_condition_safety_workspace =
         ConditionSafetyWorkspace::new(proto, cfg, graph_facts, dataflow, &short_circuit_candidates);
-    let source_initializer_blocks = loop_condition_safety_workspace.source_initializer_blocks(cfg);
+    let condition_entry_blocks =
+        loop_condition_safety_workspace.condition_entry_blocks(proto, cfg, dataflow);
     let closed_control_dags = short_circuit::analyze_closed_control_dags(
         short_circuit::ClosedControlDagContext {
             proto,
             cfg,
             graph_facts,
             dataflow,
-            source_initializer_blocks: &source_initializer_blocks,
+            condition_entry_blocks: &condition_entry_blocks,
         },
         &irreducible_regions,
         &loop_candidates,

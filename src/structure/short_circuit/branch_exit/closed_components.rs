@@ -69,7 +69,7 @@ pub(in crate::structure::short_circuit) fn analyze_closed_branch_components(
         cfg,
         graph_facts,
         dataflow,
-        source_initializer_blocks,
+        condition_entry_blocks,
     } = context;
     let mut blocked = vec![false; cfg.blocks.len()];
     for block in irreducible_regions
@@ -201,18 +201,21 @@ pub(in crate::structure::short_circuit) fn analyze_closed_branch_components(
                 truthy,
                 edges,
                 connector_blocks,
+                // 无独立条件的循环正文和 VM-for 正文使用完整 DAG 证明共享判断；
+                // while/repeat 的共享节点还可能连接 break 与尾条件，由 loop owner
+                // 保留两者边界，不能在条件分量中提前合并（repeat_04、loop_11）。
                 target: if eligible.get(target.index()).copied().unwrap_or(false)
-                    // 声明属于新条件的入口，不能被前一个条件吞入同一分量。
+                    // 声明及谓词之外的原操作属于新条件的入口，不能被前一个条件吞入同一分量。
                     // 在建连通分量前切边，入口之后的共享短路 DAG 才仍有独立候选。
-                    && !source_initializer_blocks[target.index()]
+                    && !condition_entry_blocks[target.index()]
                     && loop_owner[target.index()] == loop_owner[block.index()]
-                    // 计数/迭代循环的 control 与 body 已有独立协议；body 内的共享
-                    // 判断仍由完整 DAG 验证。while/repeat 的共享节点可能同时承担
-                    // break 和尾条件，继续要求 loop owner 的专门边界证据。
                     && (loop_owner[target.index()].is_none()
                         || reachable_predecessor_count(cfg, target) == 1
                         || loop_owner[target.index()].is_some_and(|owner| matches!(loops[owner].kind_hint,
-                            crate::structure::LoopKindHint::NumericForLike | crate::structure::LoopKindHint::GenericForLike)))
+                            crate::structure::LoopKindHint::NumericForLike
+                                | crate::structure::LoopKindHint::GenericForLike
+                                | crate::structure::LoopKindHint::WhileTrueLike
+                                | crate::structure::LoopKindHint::Unknown)))
                 {
                     RawConditionTarget::Node(target)
                 } else {

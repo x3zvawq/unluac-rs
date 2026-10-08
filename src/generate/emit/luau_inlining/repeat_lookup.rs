@@ -17,14 +17,7 @@ fn integer(value: &AstExpr) -> Option<i64> {
 }
 
 pub(super) fn body(func: &AstFunctionExpr, template: usize, key: i64, result: i64) -> bool {
-    if func.function.index() != template
-        || func.params.len() != 2
-        || func.is_vararg
-        || func.named_vararg.is_some()
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-    {
+    if func.function.index() != template || func.params.len() != 2 {
         return false;
     }
     let [AstStmt::Repeat(loop_), AstStmt::Return(ret)] = func.body.stmts.as_slice() else {

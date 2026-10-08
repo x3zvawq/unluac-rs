@@ -63,33 +63,73 @@ impl BindingUseIndex {
         stmts: &[AstStmt],
         trailing_expr: Option<&AstExpr>,
     ) -> Self {
+        Self::collect(stmts, trailing_expr, None, None)
+    }
+
+    /// 同一快照只分派一次名字事件；尾条件只参与读取，不成为语句写入位置。
+    pub(super) fn with_writes(
+        stmts: &[AstStmt],
+        trailing_expr: Option<&AstExpr>,
+    ) -> (Self, BindingWriteIndex) {
+        let mut writes = BindingWriteIndex::default();
+        let uses = Self::collect(stmts, trailing_expr, Some(&mut writes), None);
+        (uses, writes)
+    }
+
+    pub(super) fn with_mentions(
+        stmts: &[AstStmt],
+        trailing_expr: Option<&AstExpr>,
+    ) -> (Self, BTreeMap<AstBindingRef, usize>) {
+        let mut mentions = BTreeMap::<AstBindingRef, (usize, usize)>::new();
+        let uses = Self::collect(stmts, trailing_expr, None, Some(&mut mentions));
+        (
+            uses,
+            mentions
+                .into_iter()
+                .map(|(id, (_, count))| (id, count))
+                .collect(),
+        )
+    }
+
+    fn collect(
+        stmts: &[AstStmt],
+        trailing_expr: Option<&AstExpr>,
+        mut writes: Option<&mut BindingWriteIndex>,
+        mut mentions: Option<&mut BTreeMap<AstBindingRef, (usize, usize)>>,
+    ) -> Self {
         let stmt_len = stmts.len() + usize::from(trailing_expr.is_some());
-        let mut stmt_counts = Vec::with_capacity(stmt_len);
+        let mut stmt_counts = vec![BTreeMap::new(); stmt_len];
         let mut occurrences = BTreeMap::<AstBindingRef, Vec<(usize, usize)>>::new();
 
-        for (stmt_index, stmt) in stmts.iter().enumerate() {
-            let mut counts = BTreeMap::new();
-            visit::visit_stmt(stmt, &mut use_collector(&mut counts));
-            for (&binding, &count) in &counts {
-                occurrences
-                    .entry(binding)
-                    .or_default()
-                    .push((stmt_index, count));
-            }
-            stmt_counts.push(counts);
+        for (index, stmt) in stmts.iter().enumerate() {
+            visit::visit_stmt(
+                stmt,
+                &mut IndexCollector {
+                    index,
+                    counts: Some(&mut stmt_counts[index]),
+                    writes: writes.as_deref_mut(),
+                    mentions: mentions.as_deref_mut(),
+                },
+            );
         }
-
         if let Some(expr) = trailing_expr {
-            let stmt_index = stmts.len();
-            let mut counts = BTreeMap::new();
-            visit::visit_expr(expr, &mut use_collector(&mut counts));
-            for (&binding, &count) in &counts {
+            visit::visit_expr(
+                expr,
+                &mut IndexCollector {
+                    index: stmts.len(),
+                    counts: Some(&mut stmt_counts[stmts.len()]),
+                    writes: None,
+                    mentions,
+                },
+            );
+        }
+        for (stmt_index, counts) in stmt_counts.iter().enumerate() {
+            for (&binding, &count) in counts {
                 occurrences
                     .entry(binding)
                     .or_default()
                     .push((stmt_index, count));
             }
-            stmt_counts.push(counts);
         }
 
         let suffix_counts = occurrences
@@ -245,10 +285,37 @@ impl<F: FnMut(AstBindingRef, NameAccess)> AstVisitor for BindingCollector<F> {
     }
 }
 
-fn use_collector(counts: &mut BTreeMap<AstBindingRef, usize>) -> impl AstVisitor + '_ {
-    BindingCollector(|binding, access| {
-        if matches!(access, NameAccess::Read | NameAccess::Capture) {
-            *counts.entry(binding).or_default() += 1;
+/// 各查询组合共用一个遍历器实例类型，只填充调用方实际消费的索引。
+struct IndexCollector<'a> {
+    index: usize,
+    counts: Option<&'a mut BTreeMap<AstBindingRef, usize>>,
+    writes: Option<&'a mut BindingWriteIndex>,
+    mentions: Option<&'a mut BTreeMap<AstBindingRef, (usize, usize)>>,
+}
+
+impl AstVisitor for IndexCollector<'_> {
+    fn visit_name(&mut self, name: &AstNameRef, access: NameAccess) -> ControlFlow<()> {
+        if let Some(writes) = &mut self.writes {
+            writes.record(self.index, name, access);
         }
-    })
+        if let Some(binding) = AstBindingRef::from_name_ref(name) {
+            if matches!(access, NameAccess::Read | NameAccess::Capture)
+                && let Some(counts) = &mut self.counts
+            {
+                *counts.entry(binding).or_default() += 1;
+            }
+            if let Some(mentions) = &mut self.mentions {
+                let (last, count) = mentions.entry(binding).or_insert((self.index, 0));
+                if *count == 0 || *last != self.index {
+                    *count += 1;
+                    *last = self.index;
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
+        false
+    }
 }

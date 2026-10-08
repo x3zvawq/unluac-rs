@@ -125,7 +125,9 @@ pub(super) fn costly(func: &AstFunctionExpr) -> bool {
         cost
     }
     func.params.is_empty()
-        && (constant_control::cost(func, None).is_some_and(|cost| !cost.permits_inline(cost))
+        && (constant_control::CostAnalysis::new(func)
+            .cost(None)
+            .is_some_and(|cost| !cost.permits_inline(cost))
             || block(&func.body) >= 28)
 }
 
@@ -136,7 +138,7 @@ pub(super) fn captured_value_slots(
     active: usize,
     occurrences: &BTreeMap<crate::hir::HirSourceSite, crate::hir::LocalId>,
     bodies: &BTreeMap<crate::hir::LocalId, HirLuauInliningBody>,
-    slots: &BTreeMap<crate::hir::HirSourceSite, usize>,
+    slots: &BTreeMap<crate::hir::HirSourceSite, crate::hir::HirLuauResultFrame>,
     seen: &mut BTreeSet<crate::hir::HirSourceSite>,
 ) -> bool {
     let getter = |value: &AstExpr| {
@@ -170,7 +172,9 @@ pub(super) fn captured_value_slots(
                     let mut next = active + argument + 2;
                     for (side, value) in [&binary.lhs, &binary.rhs].into_iter().enumerate() {
                         if let Some(site) = getter(value) {
-                            if slots.get(&site) != Some(&next) || !seen.insert(site) {
+                            if slots.get(&site).map(|frame| frame.base) != Some(next)
+                                || !seen.insert(site)
+                            {
                                 return false;
                             }
                             next += 1;

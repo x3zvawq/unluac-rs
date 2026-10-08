@@ -112,11 +112,6 @@ fn shape(func: &AstFunctionExpr) -> Option<NestedSearchTemplate> {
 pub(super) fn body(func: &AstFunctionExpr, proto: &crate::hir::HirProto) -> bool {
     func.function == proto.id
         && func.params.len() == 2
-        && !func.is_vararg
-        && func.named_vararg.is_none()
-        && func.captured_bindings.is_empty()
-        && func.captured_params.is_empty()
-        && func.capture_write_names.is_empty()
         && nested_search_template(proto)
             .is_some_and(|expected| shape(func).as_ref() == Some(&expected))
 }

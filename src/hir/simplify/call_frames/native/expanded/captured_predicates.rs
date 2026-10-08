@@ -145,13 +145,19 @@ impl HirRewritePass for Rewriter<'_> {
                     body: HirLuauInliningBody::CapturedIncrementIdentity { increment },
                     capture: Some(capture),
                     occurrences: Vec::new(),
-                    result_frame_slots: BTreeMap::new(),
+                    result_frames: BTreeMap::new(),
                     callable_arguments: Default::default(),
                     nil_guards: Default::default(),
                 }
             });
             certificate.occurrences.push(source);
-            certificate.result_frame_slots.insert(source, home.slot());
+            certificate.result_frames.insert(
+                source,
+                crate::hir::HirLuauResultFrame {
+                    base: home.slot(),
+                    width: 1,
+                },
+            );
             self.frames.insert(source, home);
         }
         if removed.is_empty() {

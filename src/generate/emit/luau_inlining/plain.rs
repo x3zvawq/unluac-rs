@@ -187,7 +187,7 @@ impl<'a> PlainExpressions<'a> {
         scope
             .nonconstant
             .extend(function.params.iter().copied().map(AstNameRef::Param));
-        if let Some((_, loops)) = constant_control::runtime_summary(function) {
+        if let Some((_, loops)) = constant_control::CostAnalysis::new(function).runtime_summary() {
             scope.stable_loops = loops;
             scope.runtime_body = true;
         }

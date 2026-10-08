@@ -38,11 +38,18 @@ pub(crate) struct HirRequiredLuauInlining {
     pub capture: Option<LocalId>,
     pub occurrences: Vec<HirSourceSite>,
     /// 固定结果帧须预留原槽；Generate 核对最终声明、赋值或比较参数的词法前缀。
-    pub result_frame_slots: BTreeMap<HirSourceSite, usize>,
+    pub result_frames: BTreeMap<HirSourceSite, HirLuauResultFrame>,
     /// 原展开体调用的闭包参数；最终源码须保持其声明解析或创建位置以及捕获身份。
     pub callable_arguments: BTreeMap<HirSourceSite, HirLuauCallableArgument>,
     /// nil guard 已消去函数参数的调用；缺少原只读别名事实时第三实参只允许 nil。
     pub nil_guards: BTreeSet<HirSourceSite>,
+}
+
+/// 完整帧恢复签发的源码结果布局；宽度来自原结果包，不能由函数体模板猜测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HirLuauResultFrame {
+    pub base: usize,
+    pub width: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,12 +114,10 @@ pub(crate) enum HirLuauInliningBody {
     /// 按已求值参数的真值或标量比较选择常量；固定结果包可包含单返回值的补 nil。
     LiteralChoice {
         template: usize,
-        parameters: usize,
     },
     /// 封闭标量表达式的完整原指令区间；实参先求值，原返回 COPY 及内部分支一起重放。
     ValueExpression {
         template: usize,
-        parameters: usize,
     },
     /// 比较后将字面量选值写回首参数，保留原实参初始化及返回 COPY。
     ParameterWriteback {
@@ -125,7 +130,6 @@ pub(crate) enum HirLuauInliningBody {
     /// 常量 Boolean 控制选择的直线状态操作；最后一个实参仍在原高槽求值。
     ConstantControl {
         template: usize,
-        parameters: usize,
     },
     /// 数值循环内的条件 repeat；不同 occurrence 可保留索引循环或展开为原 ADD 序列。
     NumericRepeat {

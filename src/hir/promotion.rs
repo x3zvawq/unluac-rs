@@ -4344,7 +4344,8 @@ impl ProtoPromotionFacts {
         self.operand_copy(source, home)
     }
 
-    fn write_value_preparation(
+    /// 原字段/全局写的 RHS 准备 Def；完整构造帧也沿相同 use 核对上值快照。
+    pub(super) fn write_value_preparation(
         &self,
         sources: &crate::hir::common::HirOperationSources,
         value: &HirExpr,

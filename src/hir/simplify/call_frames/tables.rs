@@ -2121,7 +2121,12 @@ impl FrameBuilder<'_> {
             } else {
                 value
             };
-            let producer = if let HirExpr::Closure(closure) = prepared {
+            let producer = if matches!(prepared, HirExpr::UpvalueRef(_)) {
+                self.facts
+                    .table_write_value_preparation(access, prepared)
+                    .filter(|(_, home)| Some(*home) == layout.value)
+                    .map(|(producer, _)| producer)
+            } else if let HirExpr::Closure(closure) = prepared {
                 Some(self.constructor_closure_producer(closure, layout.value?)?)
             } else {
                 None
@@ -2142,6 +2147,9 @@ impl FrameBuilder<'_> {
             // 原输入和结果槽，闭包还须核对创建 Def 与低槽 capture。
             // 非空数组复用原 allocation/Batch 证明；字面量和现成 local 不能省掉准备写。
             if !matches!(value, HirExpr::Call(_) | HirExpr::Closure(_) | HirExpr::TableAccess(_) | HirExpr::Unary(_))
+                // 上值字段也会在 scratch 重发 GETUPVAL；只有原 SETTABLE 的
+                // 精确准备 Def 已经随 expr 消费时，才取得这项原位写入证明。
+                && !(matches!(value, HirExpr::UpvalueRef(_)) && producer.is_some())
                 && !matches!(&value, HirExpr::Binary(binary) if (is_scalar_binary_operation(binary.op) || binary.op == crate::hir::common::HirBinaryOpKind::Concat))
                 // 显式键和值均已按相邻 scratch 重放；O0 的 LOADBOOL/LOADK
                 // 不能因结果是常量就被排除，也不能借无键 scratch 的模板路径提前内嵌。
@@ -2298,12 +2306,19 @@ impl FrameBuilder<'_> {
             }
             self.batch_initializer_matches(seed, table, batch, slot)?;
             for (offset, value) in batch.values.fixed.iter().enumerate() {
+                // Luau 的最后一个元素走开放值语境：即使它最终是单值嵌套表，
+                // 内部暂存仍在外层完整预留缓冲之后；前面的元素只保留已求值前缀。
+                let reserved = self.declaration_reserved_top;
+                if last && offset + 1 == batch.values.fixed.len() && batch.values.tail.is_none() {
+                    self.declaration_reserved_top = Some(buffer + arrays);
+                }
                 let element = self.buffered_array_element(
                     value,
                     *index,
                     buffer + offset,
                     self.facts.table_batch_value(batch, offset),
                 );
+                self.declaration_reserved_top = reserved;
                 rebuilt.fields.push(HirTableField::Array(element?));
             }
             if let Some(tail) = &batch.values.tail {
@@ -2579,7 +2594,15 @@ impl FrameBuilder<'_> {
         let prepared = definition
             .and_then(|index| scalar_local(self.run[index]).map(|(_, value)| value))
             .unwrap_or(expr);
-        let producer = if let HirExpr::Closure(closure) = prepared {
+        let producer = if matches!(prepared, HirExpr::UpvalueRef(_)) {
+            // GETUPVAL 没有表达式 source site；字段 use 保存其确切 Def，不能把
+            // 同一匿名 local 后续承接的捕获或异槽写入归到本次字段准备。
+            operand
+                .filter(|(_, is_value)| *is_value)
+                .and_then(|(sources, _)| self.facts.write_value_preparation(sources, prepared))
+                .filter(|(_, prepared_home)| *prepared_home == home)
+                .map(|(producer, _)| producer)
+        } else if let HirExpr::Closure(closure) = prepared {
             Some(self.constructor_closure_producer(closure, home)?)
         } else if matches!(prepared, HirExpr::TableAccess(_) | HirExpr::GlobalRef(_)) {
             let sources = match prepared {

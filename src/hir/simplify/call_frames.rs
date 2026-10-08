@@ -2086,12 +2086,19 @@ impl FrameBuilder<'_> {
                                         .and_then(|index| scalar_local(self.run[index]))
                                         .is_some_and(|(_, value)| matches!(value,
                                             HirExpr::Call(_) | HirExpr::TableAccess(_))))
+                                || self.facts.native_table_read_layout(access).is_some_and(|layout| layout.base.slot() > slot)
+                                    && (matches!(access.base, HirExpr::GlobalRef(_))
+                                        || matches!(access.base, HirExpr::LocalRef(local)
+                                            if self.definition(local, before)
+                                                .and_then(|index| scalar_local(self.run[index]))
+                                                .is_some_and(|(_, value)| matches!(value, HirExpr::GlobalRef(_)))))
                                 || self.native.is_some_and(|context| context.expanded_callees.is_some())
                                     && self.facts.native_table_read_layout(access).is_some_and(|layout|
                                         layout.base == HomeSlotKey::new(slot + 2, 0))))) =>
             {
                 // 动态键可以尚未树化；原准备 Def 与当前值交给 lookup 共同核对。
                 // 已树化的构造器字段或 callee 链逐层核对同槽读取，不另物化中间 base。
+                // 全局表的数字索引同样可在高槽准备 base，不能套用下方同槽读取。
                 self.luau_lookup(access, before, slot)
             }
             HirExpr::TableAccess(access)
@@ -3365,6 +3372,20 @@ impl FrameBuilder<'_> {
             | HirExpr::Integer(_)
             | HirExpr::Number(_)
             | HirExpr::String(_) => Some(expr.clone()),
+            HirExpr::TableConstructor(table)
+                if self.native.is_some()
+                    && matches!(
+                        table.allocation,
+                        HirTableAllocation::PucBatched(_) | HirTableAllocation::Luau(_)
+                    )
+                    && table.fields.is_empty()
+                    && table.trailing_multivalue.is_none() =>
+            {
+                // 空表仍在原短路分支内分配，不吸收准备事件；原分配 home 与容量
+                // 必须匹配值树的共同结果槽，不能把已有表或其它槽的分配当成备用值。
+                self.completed_constructor_layout(table, HomeSlotKey::new(slot, 0))?;
+                Some(expr.clone())
+            }
             HirExpr::Unary(unary)
                 if unary.op == crate::hir::common::HirUnaryOpKind::Neg
                     || unary.op == crate::hir::common::HirUnaryOpKind::Not

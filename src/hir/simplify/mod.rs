@@ -385,6 +385,11 @@ pub(super) fn simplify_hir(
                 if index == 17 {
                     return call_frames::restore_expanded_frames(module, promotion_facts, dialect);
                 }
+                let repeat_candidates =
+                    (index == 15).then(|| repeat_root_lifetimes::candidate_protos(module));
+                if repeat_candidates.as_ref().is_some_and(Vec::is_empty) {
+                    return false;
+                }
                 let effects = (matches!(index, 3 | 15 | 16 | 19)
                     || index == 4 && dialect == DecompileDialect::Luau)
                     .then(|| {
@@ -402,6 +407,9 @@ pub(super) fn simplify_hir(
                 if index == 15 {
                     return repeat_root_lifetimes::mark_repeat_trailing_condition_roots(
                         module,
+                        repeat_candidates
+                            .as_deref()
+                            .expect("repeat candidates were collected"),
                         promotion_facts,
                         roots(),
                     );
@@ -541,7 +549,9 @@ pub(super) fn simplify_hir(
                 })
             });
 
-            if changed {
+            // Repeat owner 只发布保留要求，既不改变效果分析输入，也不移动其对象地址。
+            // 这些要求仍通过 pass 的 invalidation tags 唤醒 locals；真正改树时才废弃值快照。
+            if changed && index != 15 {
                 effect_snapshot = None;
             }
 

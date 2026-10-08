@@ -849,7 +849,7 @@ fn lower_proto_one(
                 body: crate::hir::common::HirLuauInliningBody::Identity,
                 capture: None,
                 occurrences,
-                result_frame_slots: BTreeMap::new(),
+                result_frames: BTreeMap::new(),
                 callable_arguments: Default::default(),
                 nil_guards: Default::default(),
             });
@@ -902,7 +902,7 @@ fn lower_proto_one(
                     capture: None,
                     callable_arguments: BTreeMap::new(),
                     nil_guards: Default::default(),
-                    result_frame_slots: event
+                    result_frames: event
                         .calls
                         .keys()
                         .map(|&instr| {
@@ -911,7 +911,10 @@ fn lower_proto_one(
                             };
                             (
                                 crate::hir::common::HirSourceSite { proto: id, instr },
-                                closure.dst.index(),
+                                crate::hir::HirLuauResultFrame {
+                                    base: closure.dst.index(),
+                                    width: 1,
+                                },
                             )
                         })
                         .collect(),

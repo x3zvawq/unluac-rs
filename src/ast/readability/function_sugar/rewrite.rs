@@ -4,7 +4,7 @@
 
 use super::super::ReadabilityContext;
 use super::super::binding_flow::{
-    BindingUseIndex, BindingWriteIndex, MutableSnapshotNames, mutable_snapshot_names_in_block,
+    BindingUseIndex, MutableSnapshotNames, mutable_snapshot_names_in_block,
 };
 use super::chain::try_chain_local_method_call_stmt;
 use super::constructor::{
@@ -57,8 +57,7 @@ fn rewrite_block(
     // LocalId/SyntheticLocalId are numbered per function. Current-function counting still
     // records explicit capture provenance, while descending into child bodies would conflate
     // unrelated bindings that happen to reuse the same numeric id.
-    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_expr);
-    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let (use_index, write_index) = BindingUseIndex::with_writes(&old_stmts, trailing_expr);
     let constructor_runs = ConstructorRunFacts::for_stmts(&old_stmts);
 
     let mut new_stmts = Vec::with_capacity(old_stmts.len());

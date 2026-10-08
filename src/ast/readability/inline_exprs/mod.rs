@@ -171,9 +171,8 @@ fn rewrite_current_block(
     );
 
     let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index =
-        BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition.as_deref());
-    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let (use_index, write_index) =
+        BindingUseIndex::with_writes(&old_stmts, trailing_condition.as_deref());
     let run_facts = CandidateRunFacts::new(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
@@ -510,9 +509,8 @@ fn collapse_stable_copy_aliases(
     mut trailing_condition: Option<&mut AstExpr>,
 ) -> bool {
     let mut stmts = std::mem::take(&mut block.stmts);
-    let use_index =
-        BindingUseIndex::for_stmts_with_trailing_expr(&stmts, trailing_condition.as_deref());
-    let write_index = BindingWriteIndex::for_stmts(&stmts);
+    let (use_index, write_index) =
+        BindingUseIndex::with_writes(&stmts, trailing_condition.as_deref());
     // 本批只替换表达式，声明删除延迟到批末；label、终结语句和顶层下标均保持不变。
     // 因此所有 handoff 候选可按需共用当前快照的支配事实。
     let control_flow = std::cell::OnceCell::new();

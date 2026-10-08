@@ -1,6 +1,6 @@
 //! 求解 Dataflow 的寄存器活跃性。
 //!
-//! 真实 use/def 决定逻辑活性，物理观察另外约束 SSA 保留需求，两者独立发布。
+//! 一次收集 use/def 与物理观察，复用同一 defs 分别求解逻辑活性和 SSA 根保留需求。
 
 use super::*;
 
@@ -25,9 +25,10 @@ pub(super) fn solve_liveness(
     instr_effects: &[InstrEffect],
     fixed_uses: &FixedUseFacts<'_>,
     reg_count: usize,
-    root_observations: Option<&[SideEffectSummary]>,
-) -> Result<BlockLiveness, StructureError> {
+    root_observations: &[SideEffectSummary],
+) -> Result<(BlockLiveness, BlockLiveness), StructureError> {
     let mut block_uses = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
+    let mut root_uses = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
     let mut block_defs = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
 
     for block in cfg.block_order.iter().copied() {
@@ -37,26 +38,25 @@ pub(super) fn solve_liveness(
 
         let defs = &mut block_defs[block.index()];
         let uses = &mut block_uses[block.index()];
+        let roots = &mut root_uses[block.index()];
         let mut observed_prefix_end = 0;
 
         for instr_index in instr_indices {
             // root 观察是 SSA 保留需求，不是真实读取；独立求解，不能伪造 UseSite
             // 或改变对外发布的逻辑 live-in/live-out。
-            if let Some(summaries) = root_observations {
-                let end = match summaries[instr_index].root_observation {
-                    RootObservation::PrefixLowerBound { end } => end,
-                    RootObservation::Call { caller_end } => caller_end.index(),
-                    _ => 0,
-                };
-                // uses/defs 在块内只增不减；每个观察前缀槽只检查一次。
-                let end = end.min(reg_count);
-                for reg in (observed_prefix_end..end).map(Reg) {
-                    if !defs.contains(reg)? {
-                        uses.insert(reg)?;
-                    }
+            let end = match root_observations[instr_index].root_observation {
+                RootObservation::PrefixLowerBound { end } => end,
+                RootObservation::Call { caller_end } => caller_end.index(),
+                _ => 0,
+            };
+            // uses/defs 在块内只增不减；每个观察前缀槽只检查一次。
+            let end = end.min(reg_count);
+            for reg in (observed_prefix_end..end).map(Reg) {
+                if !defs.contains(reg)? {
+                    roots.insert(reg)?;
                 }
-                observed_prefix_end = observed_prefix_end.max(end);
             }
+            observed_prefix_end = observed_prefix_end.max(end);
             for reg in fixed_uses.liveness_regs(InstrRef(instr_index)) {
                 if !defs.contains(reg)? {
                     uses.insert(reg)?;
@@ -67,8 +67,22 @@ pub(super) fn solve_liveness(
                 defs.insert(*reg)?;
             }
         }
+        roots.extend_from(uses);
     }
 
+    Ok((
+        solve(cfg, graph_facts, &block_uses, &block_defs, reg_count),
+        solve(cfg, graph_facts, &root_uses, &block_defs, reg_count),
+    ))
+}
+
+fn solve(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    block_uses: &[DenseRegSet],
+    block_defs: &[DenseRegSet],
+    reg_count: usize,
+) -> BlockLiveness {
     let mut live_in = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
     let mut live_out = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
 
@@ -111,10 +125,10 @@ pub(super) fn solve_liveness(
         }
     }
 
-    Ok(BlockLiveness {
+    BlockLiveness {
         live_in: live_in.into_iter().map(DenseRegSet::into_regs).collect(),
         live_out: live_out.into_iter().map(DenseRegSet::into_regs).collect(),
-    })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

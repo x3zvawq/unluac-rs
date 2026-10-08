@@ -8,7 +8,7 @@ pub(super) fn comparison_slots(
     active: usize,
     occurrences: &BTreeMap<crate::hir::HirSourceSite, crate::hir::LocalId>,
     bodies: &BTreeMap<crate::hir::LocalId, HirLuauInliningBody>,
-    slots: &BTreeMap<crate::hir::HirSourceSite, usize>,
+    slots: &BTreeMap<crate::hir::HirSourceSite, crate::hir::HirLuauResultFrame>,
     seen: &mut BTreeSet<crate::hir::HirSourceSite>,
 ) -> bool {
     let [argument] = call.args.as_slice() else {
@@ -65,7 +65,7 @@ pub(super) fn comparison_slots(
         {
             continue;
         }
-        if slots.get(&site) != Some(&expected) || !seen.insert(site) {
+        if slots.get(&site).map(|frame| frame.base) != Some(expected) || !seen.insert(site) {
             return false;
         }
     }
@@ -89,11 +89,6 @@ pub(super) fn body(func: &AstFunctionExpr, template: usize, parameters: usize) -
         || func.params.len() != parameters
         || parameters == 0
         || parameters > 4
-        || func.is_vararg
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-        || func.named_vararg.is_some()
     {
         return false;
     }

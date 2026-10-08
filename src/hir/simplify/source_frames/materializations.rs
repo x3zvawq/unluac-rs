@@ -529,6 +529,25 @@ pub(in crate::hir::simplify) fn restore_materializations(
         return false;
     };
     frames_changed |= changed;
+    let refresh_constant_order = changed
+        && matches!(
+            dialect,
+            DecompileDialect::Lua51 | DecompileDialect::Lua52 | DecompileDialect::Lua53
+        )
+        && !crate::hir::simplify::call_frames::constants_fit_rk(&prepared);
+    if refresh_constant_order {
+        // 宽构造器合并会把索引键放回 RHS 之前。后继查表/CALL 的 RK 查询
+        // 只刷新一次，整批前缀仍在下方统一验证，不沿用旧拆分语句的常量顺序。
+        let Some((refreshed, changed)) = crate::hir::simplify::call_frames::prepare_source_frames(
+            prepared,
+            &mut prepared_facts,
+            dialect,
+        ) else {
+            return false;
+        };
+        prepared = refreshed;
+        frames_changed |= changed;
+    }
     if frames_changed {
         // 原 SETLIST/CALL 协议已被完整帧消费，同槽 carrier 才可重新接受归并。
         // 在当前 preview 内调用既有 owner，最后仍统一验证声明布局；不提前发布事实。
@@ -736,6 +755,7 @@ pub(in crate::hir::simplify) fn restore_materializations(
         || (candidates.is_empty()
             && nil_locals.is_empty()
             && !closed_run
+            && !refresh_constant_order
             && !restored_targets
             && !restored_choices)
     {

@@ -193,8 +193,7 @@ fn merge_adjacent_single_value_local_decls(
     trailing_condition: Option<&AstExpr>,
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
-    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let (use_index, write_index) = BindingUseIndex::with_writes(&old_stmts, trailing_condition);
     let mut old_stmts = VecDeque::from(old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
@@ -341,8 +340,7 @@ fn binding_needs_independent_declaration(
 }
 
 fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&AstExpr>) -> bool {
-    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&block.stmts, trailing_condition);
-    let write_index = BindingWriteIndex::for_stmts(&block.stmts);
+    let (use_index, write_index) = BindingUseIndex::with_writes(&block.stmts, trailing_condition);
     let forward_gotos = ForwardGotoIndex::new(&block.stmts);
     let mut index = 0;
     while index < block.stmts.len() {
@@ -795,8 +793,7 @@ fn sink_pending_bindings_into_block(
     pending: &[super::super::common::AstLocalBinding],
     dependency_universe: &[super::super::common::AstLocalBinding],
 ) -> BlockSinkAttempt {
-    let use_index = BindingUseIndex::for_stmts(&block.stmts);
-    let write_index = BindingWriteIndex::for_stmts(&block.stmts);
+    let (use_index, write_index) = BindingUseIndex::with_writes(&block.stmts, None);
     let forward_gotos = ForwardGotoIndex::new(&block.stmts);
     let mut consumed = 0usize;
     let mut index = 0usize;

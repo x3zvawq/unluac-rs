@@ -95,14 +95,11 @@ fn shape(func: &AstFunctionExpr) -> Option<ArrayFoldTemplate> {
 pub(super) fn body(func: &AstFunctionExpr, proto: &crate::hir::HirProto) -> bool {
     func.function == proto.id
         && func.params.len() == 2
-        && !func.is_vararg
-        && func.named_vararg.is_none()
-        && func.captured_bindings.is_empty()
-        && func.captured_params.is_empty()
-        && func.capture_write_names.is_empty()
         && array_fold_template(proto)
             .is_some_and(|expected| shape(func).as_ref() == Some(&expected))
-        && constant_control::cost(func, None).is_some_and(|cost| cost.permits_inline(cost))
+        && constant_control::CostAnalysis::new(func)
+            .cost(None)
+            .is_some_and(|cost| cost.permits_inline(cost))
 }
 
 pub(super) fn arguments(args: &[AstExpr]) -> bool {

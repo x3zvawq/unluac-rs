@@ -189,21 +189,13 @@ fn compute_dataflow_proto(
         entry_open_start,
         &incoming_slots,
     )?;
-    let liveness = solve_liveness(
+    let (liveness, retained_roots) = solve_liveness(
         cfg,
         graph_facts,
         &instr_effects,
         &open.fixed_uses,
         reg_count,
-        None,
-    )?;
-    let retained_roots = solve_liveness(
-        cfg,
-        graph_facts,
-        &instr_effects,
-        &open.fixed_uses,
-        reg_count,
-        Some(&effect_summaries),
+        &effect_summaries,
     )?;
     let mut defs = Vec::new();
     let mut instr_defs = vec![Vec::new(); proto.instrs.len()];

@@ -2,7 +2,7 @@
 //! 成本沿 pinned Luau 的常量分支、局部传播和循环计费规则计算，饱和及阈值复用共享实现。
 
 use super::*;
-use crate::hir::luau_inlining::constant_control::{Action, Trace};
+use crate::hir::luau_inlining::constant_control::trace::{self, State, Step, Syntax};
 use crate::hir::luau_loop_cost::{Cost, trips};
 
 fn truth(expr: &AstExpr, func: &AstFunctionExpr, mask: Option<u8>) -> Option<bool> {
@@ -51,137 +51,88 @@ fn binary_op(op: AstBinaryOpKind) -> Option<crate::hir::HirBinaryOpKind> {
     })
 }
 
-#[derive(PartialEq)]
-enum Flow {
-    Next,
-    Return,
-    Break,
-    Continue,
+struct AstSyntax<'a, 'f> {
+    costs: &'a CostAnalysis<'f>,
+    mask: u8,
 }
 
-struct TraceBuilder<'a> {
-    function: &'a AstFunctionExpr,
-    mask: u8,
-    locals: BTreeMap<AstNameRef, usize>,
-    trace: Trace,
-    budget: usize,
-}
-impl TraceBuilder<'_> {
-    fn block(&mut self, block: &AstBlock, root: bool) -> Option<Flow> {
-        for stmt in &block.stmts {
-            self.budget = self.budget.checked_sub(1)?;
-            let flow = match stmt {
-                AstStmt::LocalDecl(decl) if root && decl.bindings.len() == decl.values.len() => {
-                    for (binding, value) in decl.bindings.iter().zip(&decl.values) {
-                        let state = self.locals.len();
-                        if self
-                            .locals
-                            .insert(binding.id.to_name_ref(), state)
-                            .is_some()
-                        {
-                            return None;
-                        }
-                        self.trace
-                            .actions
-                            .push(Action::Initialize(counter_repeat::integer(value)?));
-                    }
-                    Flow::Next
+impl Syntax for AstSyntax<'_, '_> {
+    type Binding = AstNameRef;
+    type Block = AstBlock;
+    type Stmt = AstStmt;
+    type Expr = AstExpr;
+
+    fn statements(block: &AstBlock) -> &[AstStmt] {
+        &block.stmts
+    }
+
+    fn truth(&self, expr: &AstExpr) -> Option<bool> {
+        truth(expr, self.costs.function, Some(self.mask))
+    }
+
+    fn step<'a>(
+        &self,
+        stmt: &'a AstStmt,
+        root: bool,
+        state: &mut State<AstNameRef>,
+    ) -> Option<Step<'a, AstBlock, AstExpr>> {
+        Some(match stmt {
+            AstStmt::LocalDecl(decl) if root && decl.bindings.len() == decl.values.len() => {
+                for (binding, value) in decl.bindings.iter().zip(&decl.values) {
+                    state.initialize(binding.id.to_name_ref(), counter_repeat::integer(value)?)?;
                 }
-                AstStmt::Assign(assign) => {
-                    let ([AstLValue::Name(local)], [AstExpr::Binary(binary)]) =
-                        (assign.targets.as_slice(), assign.values.as_slice())
-                    else {
-                        return None;
-                    };
-                    if binary.lhs != AstExpr::Var(local.clone()) {
-                        return None;
-                    }
-                    self.trace.actions.push(Action::Update {
-                        state: *self.locals.get(local)?,
-                        op: binary_op(binary.op)?,
-                        value: counter_repeat::integer(&binary.rhs)?,
-                    });
-                    Flow::Next
-                }
-                AstStmt::If(branch) => {
-                    if truth(&branch.cond, self.function, Some(self.mask))? {
-                        self.block(&branch.then_block, false)?
-                    } else if let Some(other) = &branch.else_block {
-                        self.block(other, false)?
-                    } else {
-                        Flow::Next
-                    }
-                }
-                AstStmt::While(loop_) => {
-                    if !truth(&loop_.cond, self.function, Some(self.mask))? {
-                        Flow::Next
-                    } else {
-                        match self.block(&loop_.body, false)? {
-                            Flow::Break => Flow::Next,
-                            Flow::Return => Flow::Return,
-                            _ => return None,
-                        }
-                    }
-                }
-                AstStmt::NumericFor(loop_) => {
-                    let start = counter_repeat::integer(&loop_.start)?;
-                    let limit = counter_repeat::integer(&loop_.limit)?;
-                    let step = counter_repeat::integer(&loop_.step)?;
-                    let count = trips(start, limit, step)?;
-                    // 候选拒绝[TargetConstraint]：轨迹相等不足以让原数值循环消失；
-                    // 最终源码的专化循环体还必须满足 pinned Luau 展开阈值。
-                    if count > 25
-                        || block_cost(self.function, &loop_.body, Some(self.mask))?
-                            .blocks_unroll(start, limit, step)
-                    {
-                        return None;
-                    }
-                    let mut exit = Flow::Next;
-                    for _ in 0..count {
-                        match self.block(&loop_.body, false)? {
-                            Flow::Break => break,
-                            Flow::Return => {
-                                exit = Flow::Return;
-                                break;
-                            }
-                            Flow::Next | Flow::Continue => {}
-                        }
-                    }
-                    exit
-                }
-                AstStmt::Repeat(loop_) => match self.block(&loop_.body, false)? {
-                    Flow::Return => Flow::Return,
-                    Flow::Break => Flow::Next,
-                    Flow::Next | Flow::Continue
-                        if truth(&loop_.cond, self.function, Some(self.mask)) == Some(true) =>
-                    {
-                        Flow::Next
-                    }
-                    _ => return None,
-                },
-                AstStmt::Return(ret) => {
-                    self.trace.returned = ret
-                        .values
-                        .iter()
-                        .map(|value| {
-                            let AstExpr::Var(local) = value else {
-                                return None;
-                            };
-                            self.locals.get(local).copied()
-                        })
-                        .collect::<Option<Vec<_>>>()?;
-                    Flow::Return
-                }
-                AstStmt::Break => Flow::Break,
-                AstStmt::Continue => Flow::Continue,
-                AstStmt::DoBlock(block) => self.block(block, false)?,
-                _ => return None,
-            };
-            if flow != Flow::Next {
-                return Some(flow);
+                Step::Next
             }
-        }
-        Some(Flow::Next)
+            AstStmt::Assign(assign) => {
+                let ([AstLValue::Name(local)], [AstExpr::Binary(binary)]) =
+                    (assign.targets.as_slice(), assign.values.as_slice())
+                else {
+                    return None;
+                };
+                if binary.lhs != AstExpr::Var(local.clone()) {
+                    return None;
+                }
+                state.update(
+                    local,
+                    binary_op(binary.op)?,
+                    counter_repeat::integer(&binary.rhs)?,
+                )?;
+                Step::Next
+            }
+            AstStmt::If(branch) => {
+                Step::If(&branch.cond, &branch.then_block, branch.else_block.as_ref())
+            }
+            AstStmt::While(loop_) => Step::While(&loop_.cond, &loop_.body),
+            AstStmt::Repeat(loop_) => Step::Repeat(&loop_.body, &loop_.cond),
+            AstStmt::NumericFor(loop_) => {
+                let start = counter_repeat::integer(&loop_.start)?;
+                let limit = counter_repeat::integer(&loop_.limit)?;
+                let step = counter_repeat::integer(&loop_.step)?;
+                let count = trips(start, limit, step)?;
+                // 候选拒绝[TargetConstraint]：轨迹相等不足以让原数值循环消失；
+                // 最终源码的专化循环体还必须满足 pinned Luau 展开阈值。
+                if count > 25
+                    || self
+                        .costs
+                        .block_cost(&loop_.body, Some(self.mask))?
+                        .blocks_unroll(start, limit, step)
+                {
+                    return None;
+                }
+                Step::NumericFor(count, &loop_.body)
+            }
+            AstStmt::Return(ret) => {
+                state.returns(ret.values.iter().map(|value| match value {
+                    AstExpr::Var(local) => Some(local),
+                    _ => None,
+                }))?;
+                Step::Return
+            }
+            AstStmt::Break => Step::Break,
+            AstStmt::Continue => Step::Continue,
+            AstStmt::DoBlock(block) => Step::Block(block),
+            _ => return None,
+        })
     }
 }
 
@@ -190,7 +141,7 @@ struct Model<'a> {
     mask: Option<u8>,
     locals: BTreeMap<AstNameRef, Cost>,
     budget: usize,
-    written: BTreeSet<crate::hir::LocalId>,
+    written: &'a BTreeSet<crate::hir::LocalId>,
     // 只用于循环展开的保守下界；base 仍是无实参专化的完整函数成本。
     discount_all: bool,
     stable_loops: BTreeSet<AstBindingRef>,
@@ -508,75 +459,56 @@ impl Model<'_> {
     }
 }
 
-pub(super) fn cost(func: &AstFunctionExpr, mask: Option<u8>) -> Option<Cost> {
-    block_cost(func, &func.body, mask)
+/// 同一份最终函数树的只读输入事实；借用期间不允许改写 AST。
+/// 参数配置和子块查询只共享写入集合，各自重新建立局部传播、预算及循环结果。
+pub(super) struct CostAnalysis<'a> {
+    function: &'a AstFunctionExpr,
+    written: BTreeSet<crate::hir::LocalId>,
 }
 
-/// 独立循环成本从该 body 的局部环境开始；不沿用函数外部的临时折扣。
-pub(super) fn block_cost(
-    func: &AstFunctionExpr,
-    body: &AstBlock,
-    mask: Option<u8>,
-) -> Option<Cost> {
-    Model {
-        function: func,
-        mask,
-        locals: BTreeMap::new(),
-        budget: 1024,
-        written: crate::ast::written_locals(&func.body),
-        discount_all: false,
-        stable_loops: BTreeSet::new(),
+impl<'a> CostAnalysis<'a> {
+    pub fn new(function: &'a AstFunctionExpr) -> Self {
+        Self {
+            function,
+            written: crate::ast::written_locals(&function.body),
+        }
     }
-    .block(body)
-    .map(|(cost, _)| cost)
-}
 
-/// 完整函数中的动态形参不作常量专化；全部变量折扣只用来降低循环成本下界。
-/// 函数成本和所有循环的最大收益拒绝证明在同一次遍历中计算。
-pub(super) fn runtime_summary(func: &AstFunctionExpr) -> Option<(Cost, BTreeSet<AstBindingRef>)> {
-    let mut model = Model {
-        function: func,
-        mask: None,
-        locals: BTreeMap::new(),
-        budget: 1024,
-        written: crate::ast::written_locals(&func.body),
-        discount_all: true,
-        stable_loops: BTreeSet::new(),
-    };
-    let cost = model.block(&func.body)?.0;
-    Some((cost, model.stable_loops))
-}
-
-fn trace_matches(
-    func: &AstFunctionExpr,
-    proto: &crate::hir::HirProto,
-    parameters: usize,
-    mask: u8,
-) -> bool {
-    if func.function != proto.id
-        || func.params.len() != parameters
-        || func.is_vararg
-        || func.named_vararg.is_some()
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-    {
-        return false;
+    fn model(&self, mask: Option<u8>, discount_all: bool) -> Model<'_> {
+        Model {
+            function: self.function,
+            mask,
+            locals: BTreeMap::new(),
+            budget: 1024,
+            written: &self.written,
+            discount_all,
+            stable_loops: BTreeSet::new(),
+        }
     }
+
+    pub fn cost(&self, mask: Option<u8>) -> Option<Cost> {
+        self.block_cost(&self.function.body, mask)
+    }
+
+    /// 独立循环从该 body 的局部环境开始，不沿用函数外部的临时折扣。
+    pub fn block_cost(&self, body: &AstBlock, mask: Option<u8>) -> Option<Cost> {
+        self.model(mask, false).block(body).map(|(cost, _)| cost)
+    }
+
+    /// 不作实参专化；全部变量折扣只用于降低循环成本下界。
+    /// 函数成本和所有循环的最大收益拒绝证明由同一次遍历产生。
+    pub fn runtime_summary(&self) -> Option<(Cost, BTreeSet<AstBindingRef>)> {
+        let mut model = self.model(None, true);
+        let cost = model.block(&self.function.body)?.0;
+        Some((cost, model.stable_loops))
+    }
+}
+
+fn trace_matches(costs: &CostAnalysis<'_>, proto: &crate::hir::HirProto, mask: u8) -> bool {
     let Some(expected) = crate::hir::luau_inlining::constant_control::trace(proto, mask) else {
         return false;
     };
-    let mut builder = TraceBuilder {
-        function: func,
-        mask,
-        locals: BTreeMap::new(),
-        trace: Trace {
-            actions: Vec::new(),
-            returned: Vec::new(),
-        },
-        budget: 256,
-    };
-    builder.block(&func.body, true) == Some(Flow::Return) && builder.trace == expected
+    trace::evaluate(&AstSyntax { costs, mask }, &costs.function.body).as_ref() == Some(&expected)
 }
 
 fn argument_mask(args: &[AstExpr], parameters: usize) -> Option<u8> {
@@ -617,27 +549,34 @@ impl Models {
             let AstBindingRef::Local(local) = decl.name else {
                 continue;
             };
-            let Some(&HirLuauInliningBody::ConstantControl {
-                template,
-                parameters,
-            }) = bodies.get(&local)
+            let Some(&HirLuauInliningBody::ConstantControl { template }) = bodies.get(&local)
             else {
                 continue;
             };
-            if !(2..=8).contains(&parameters) {
+            let proto = hir.protos.get(template)?;
+            let parameters = proto.params.len();
+            if !(2..=8).contains(&parameters)
+                || decl.func.function != proto.id
+                || decl.func.params.len() != parameters
+                || decl.func.is_vararg
+                || decl.func.named_vararg.is_some()
+                || !decl.func.captured_bindings.is_empty()
+                || !decl.func.captured_params.is_empty()
+                || !decl.func.capture_write_names.is_empty()
+            {
                 return None;
             }
-            let baseline = cost(&decl.func, None)?;
+            let costs = CostAnalysis::new(&decl.func);
+            let baseline = costs.cost(None)?;
             let profiles: Vec<_> = (0..1u8 << (parameters - 1))
-                .map(|mask| cost(&decl.func, Some(mask)))
+                .map(|mask| costs.cost(Some(mask)))
                 .collect();
-            let proto = hir.protos.get(template)?;
             let inlined = profiles
                 .iter()
                 .enumerate()
                 .map(|(mask, cost)| {
                     cost.is_some_and(|cost| cost.permits_inline(baseline))
-                        && trace_matches(&decl.func, proto, parameters, mask as u8)
+                        && trace_matches(&costs, proto, mask as u8)
                 })
                 .collect();
             models.insert(

@@ -2,11 +2,9 @@
 //!
 //! 消费共享访问角色，供区间查询使用；不进入 child function 或推断闭包潜在写入。
 
+use crate::ast::common::{AstBindingRef, AstNameRef, AstStmt};
+use crate::ast::visit::{self, NameAccess};
 use std::collections::BTreeMap;
-use std::ops::ControlFlow;
-
-use crate::ast::common::{AstBindingRef, AstFunctionExpr, AstNameRef, AstStmt};
-use crate::ast::visit::{self, AstVisitor, NameAccess};
 
 #[derive(Default)]
 struct NameWrites {
@@ -22,16 +20,36 @@ pub(in crate::ast::readability) struct BindingWriteIndex {
 impl BindingWriteIndex {
     pub(in crate::ast::readability) fn for_stmts(stmts: &[AstStmt]) -> Self {
         let mut index = Self::default();
-        for (stmt_index, stmt) in stmts.iter().enumerate() {
+        for (position, stmt) in stmts.iter().enumerate() {
             visit::visit_stmt(
                 stmt,
-                &mut WriteCollector {
-                    stmt_index,
-                    index: &mut index,
+                &mut super::IndexCollector {
+                    index: position,
+                    counts: None,
+                    writes: Some(&mut index),
+                    mentions: None,
                 },
             );
         }
         index
+    }
+
+    pub(super) fn record(&mut self, stmt_index: usize, name: &AstNameRef, access: NameAccess) {
+        match access {
+            NameAccess::Write => {
+                let assignments = &mut self.names.entry(name.clone()).or_default().assignments;
+                if assignments.last() != Some(&stmt_index) {
+                    assignments.push(stmt_index);
+                }
+            }
+            NameAccess::LocalFunctionDeclaration => {
+                self.names
+                    .entry(name.clone())
+                    .or_default()
+                    .last_function_declaration = Some(stmt_index);
+            }
+            _ => {}
+        }
     }
 
     fn assignments(&self, name: &AstNameRef) -> &[usize] {
@@ -128,45 +146,5 @@ impl BindingWriteIndex {
                     .last_function_declaration
                     .is_some_and(|last| last > stmt_index)
         })
-    }
-}
-
-struct WriteCollector<'a> {
-    stmt_index: usize,
-    index: &'a mut BindingWriteIndex,
-}
-
-impl WriteCollector<'_> {
-    fn record_assignment(&mut self, name: &AstNameRef) {
-        let writes = &mut self
-            .index
-            .names
-            .entry(name.clone())
-            .or_default()
-            .assignments;
-        if writes.last() != Some(&self.stmt_index) {
-            writes.push(self.stmt_index);
-        }
-    }
-}
-
-impl AstVisitor for WriteCollector<'_> {
-    fn visit_name(&mut self, name: &AstNameRef, access: NameAccess) -> ControlFlow<()> {
-        match access {
-            NameAccess::Write => self.record_assignment(name),
-            NameAccess::LocalFunctionDeclaration => {
-                self.index
-                    .names
-                    .entry(name.clone())
-                    .or_default()
-                    .last_function_declaration = Some(self.stmt_index);
-            }
-            _ => {}
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
-        false
     }
 }

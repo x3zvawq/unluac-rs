@@ -59,12 +59,12 @@ fn shape(func: &AstFunctionExpr) -> Option<ResetCounterTemplate> {
 }
 
 pub(super) fn body(func: &AstFunctionExpr, proto: &crate::hir::HirProto) -> bool {
-    func.function == proto.id && func.params.len() == 3 && !func.is_vararg
-        && func.named_vararg.is_none() && func.captured_bindings.is_empty() && func.captured_params.is_empty()
-        && func.capture_write_names.is_empty()
+    func.function == proto.id && func.params.len() == 3
+
+
         && reset_counter_template(proto).is_some_and(|template| shape(func) == Some(template))
         // 前两参数有写入，常量实参不会专化其读取；末参数在条件树中的成本掩码与可写参数相交为空。
-        && constant_control::cost(func, None).is_some_and(|cost| cost.permits_inline(cost))
+        && constant_control::CostAnalysis::new(func).cost(None).is_some_and(|cost| cost.permits_inline(cost))
 }
 
 pub(super) fn arguments(args: &[AstExpr]) -> bool {

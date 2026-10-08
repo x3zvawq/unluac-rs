@@ -112,7 +112,7 @@ fn validate_scope(
     let opaque_functions = opaque::Functions::new(&statements, hir, owner, validated);
     let mut callees = BTreeMap::new();
     let mut occurrences = BTreeMap::new();
-    let mut result_slots = BTreeMap::new();
+    let mut result_frames = BTreeMap::new();
     let published_globals = requirements
         .iter()
         .filter(|requirement| {
@@ -286,29 +286,14 @@ fn validate_scope(
             opaque_locals.insert(local);
         }
     }
-    let scalar_callees = requirements
-        .iter()
-        .filter(|requirement| matches!(requirement.body, HirLuauInliningBody::ScalarNotCall { .. }))
-        .map(|requirement| requirement.callee)
-        .collect::<BTreeSet<_>>();
     let scalar_names = requirements
         .iter()
         .filter(|requirement| matches!(requirement.body, HirLuauInliningBody::ScalarNotCall { .. }))
         .filter_map(|requirement| requirement.field.as_utf8())
         .collect::<BTreeSet<_>>();
-    let captured_callees = requirements
+    let contracts = requirements
         .iter()
-        .filter(|requirement| requirement.body == HirLuauInliningBody::CapturedConcatSum)
-        .map(|requirement| requirement.callee)
-        .collect::<BTreeSet<_>>();
-    let fields = requirements
-        .iter()
-        .map(|requirement| {
-            (
-                requirement.callee,
-                (requirement.body, &requirement.field, requirement.capture),
-            )
-        })
+        .map(|r| (r.callee, *r))
         .collect::<BTreeMap<_, _>>();
     for requirement in requirements {
         if matches!(
@@ -343,21 +328,25 @@ fn validate_scope(
                 | HirLuauInliningBody::NumericForExit { .. }
                 | HirLuauInliningBody::CapturedIncrementIdentity { .. }
                 | HirLuauInliningBody::GenericBreak { .. }
-        ) && (requirement.result_frame_slots.len() != requirement.occurrences.len()
+        ) && (requirement.result_frames.len() != requirement.occurrences.len()
             || requirement
                 .occurrences
                 .iter()
-                .any(|site| !requirement.result_frame_slots.contains_key(site)))
+                .any(|site| !requirement.result_frames.contains_key(site)))
         {
             return false;
         }
-        result_slots.extend(
+        result_frames.extend(
             requirement
-                .result_frame_slots
+                .result_frames
                 .iter()
-                .map(|(&site, &slot)| (site, slot)),
+                .map(|(&site, &frame)| (site, frame)),
         );
-        if requirement.owner != owner
+        if hir
+            .protos
+            .get(requirement.child.index())
+            .is_none_or(|proto| proto.signature.is_vararg)
+            || requirement.owner != owner
             || callees
                 .insert(requirement.callee, requirement.child)
                 .is_some()
@@ -401,20 +390,20 @@ fn validate_scope(
                 shared_factories: &shared_factories,
                 published_globals: &published_globals,
                 bodies: &bodies,
+                hir,
+                result_frames: &result_frames,
                 constant_controls: &constant_controls,
                 opaque_locals: &opaque_locals,
                 runtime_functions: &opaque_functions.runtime,
                 written_locals: &written_locals,
                 nonconstant_locals: &nonconstant_locals,
                 callable_arguments: &callable_arguments,
-                scalar_callees: &scalar_callees,
-                captured_callees: &captured_callees,
                 callees: &callees,
                 occurrences: &occurrences,
                 declared: &declared,
                 seen: &mut seen_occurrences,
             }
-            .condition($value, active, &result_slots, &mut seen_result_slots)
+            .condition($value, active, &result_frames, &mut seen_result_slots)
         }};
     }
 
@@ -442,38 +431,7 @@ fn validate_scope(
                 } else if let Some(child) = callees.get(&local) {
                     *child == decl.func.function
                         && declared.insert(local)
-                        && if fields[&local].0 == HirLuauInliningBody::CapturedCallablePair {
-                            returned_calls::body(&decl.func, fields[&local].1, &opaque_functions)
-                        } else if let HirLuauInliningBody::NumericForExit { template } = fields[&local].0 {
-                            hir.protos.get(template).is_some_and(|proto|
-                                numeric_exit::body(&decl.func, proto, fields[&local].2))
-                        } else if let HirLuauInliningBody::ConstantControl { .. } = fields[&local].0 {
-                            constant_controls.declaration(local)
-                        } else if let HirLuauInliningBody::ResetCounter { template } = fields[&local].0 {
-                            hir.protos.get(template).is_some_and(|proto| reset_counter::body(&decl.func, proto))
-                        } else if let HirLuauInliningBody::NestedSearch { template } = fields[&local].0 {
-                            hir.protos.get(template).is_some_and(|proto| nested_search::body(&decl.func, proto))
-                        } else if let HirLuauInliningBody::ArrayFold { template } = fields[&local].0 {
-                            hir.protos.get(template).is_some_and(|proto| array_fold::body(&decl.func, proto))
-                        } else if let HirLuauInliningBody::GuardedCounter { template } = fields[&local].0 {
-                            hir.protos.get(template).is_some_and(|proto| guarded_counter::body(&decl.func, proto))
-                        } else if let HirLuauInliningBody::NumericRepeat { template } = fields[&local].0 {
-                            hir.protos.get(template).is_some_and(|proto| numeric_repeat::body(&decl.func, proto))
-                        } else if let HirLuauInliningBody::CapturedAppendTransfer { template } = fields[&local].0 {
-                            hir.protos.get(template).zip(opaque_functions.capture_layout(decl.func.function))
-                                .is_some_and(|(proto, closure)| captured_transfers::body(&decl.func, proto, closure))
-                        } else if let HirLuauInliningBody::ParameterWriteback { template } = fields[&local].0 {
-                            hir.protos.get(template).is_some_and(|proto| parameter_writebacks::body(&decl.func, proto))
-                        } else if let HirLuauInliningBody::CallingValue { template } | HirLuauInliningBody::CallingSharedValue { template } | HirLuauInliningBody::CallingObservedValue { template } | HirLuauInliningBody::CallingReadPair { template } = fields[&local].0 {
-                            hir.protos.get(template).is_some_and(|proto| calling_values::body(&decl.func, proto))
-                        } else {
-                            callee_body(
-                                &decl.func,
-                                fields[&local].0,
-                                fields[&local].1,
-                                fields[&local].2,
-                            )
-                        }
+                        && callee_body(&decl.func, contracts[&local], hir, &opaque_functions, &constant_controls)
                 } else {
                     if validated.contains(&decl.func.function) { true }
                     else if opaque_functions.locals.contains(&local) {
@@ -488,22 +446,15 @@ fn validate_scope(
                 active += 1;
             }
             AstStmt::LocalDecl(decl) => {
-                if decl.values.iter().enumerate().any(|(offset, value)| matches!(value, AstExpr::Call(call) if !captured_transfers::slots(call, active + offset, &occurrences, &bodies, &result_slots, &mut seen_result_slots))) { return false; }
+                if decl.values.iter().enumerate().any(|(offset, value)| matches!(value, AstExpr::Call(call) if !captured_transfers::slots(call, active + offset, &occurrences, &bodies, &result_frames, &mut seen_result_slots))) { return false; }
                 // 整组 local 的 target 已预留；只允许一对一的 fixed-one 调用。
                 if let [AstExpr::Call(call)] = decl.values.as_slice()
                     && let Some(site) = call.required_luau_inlining
-                    && let Some(&slot) = result_slots.get(&site)
+                    && let Some(frame) = result_frames.get(&site)
                 {
                     // 宏必须作为原固定结果声明发射；不允许移入参数树后复用一个估算的 top。
-                    let width = if matches!(occurrences.get(&site).and_then(|local| bodies.get(local)),
-                        Some(HirLuauInliningBody::CapturedCallablePair | HirLuauInliningBody::LiteralChoice { .. } | HirLuauInliningBody::CallingReadPair { .. } | HirLuauInliningBody::ArrayFold { .. }))
-                    {
-                        2
-                    } else {
-                        1
-                    };
-                    if decl.bindings.len() != width
-                        || active != slot
+                    if decl.bindings.len() != frame.width
+                        || active != frame.base
                         || !seen_result_slots.insert(site)
                     {
                         return false;
@@ -520,7 +471,7 @@ fn validate_scope(
                             && matches!(occurrences.get(&site).and_then(|local| bodies.get(local)),
                                 Some(HirLuauInliningBody::GuardedCounter { .. }))
                             && (decl.bindings.len() != decl.values.len()
-                                || result_slots.get(&site) != Some(&(active + offset))
+                                || result_frames.get(&site).map(|frame| frame.base) != Some(active + offset)
                                 || !seen_result_slots.insert(site))
                         {
                             return false;
@@ -532,14 +483,14 @@ fn validate_scope(
                     shared_factories: &shared_factories,
                     published_globals: &published_globals,
                     bodies: &bodies,
+                hir,
+                result_frames: &result_frames,
                 constant_controls: &constant_controls,
                     opaque_locals: &opaque_locals,
                 runtime_functions: &opaque_functions.runtime,
                     written_locals: &written_locals,
                 nonconstant_locals: &nonconstant_locals,
                     callable_arguments: &callable_arguments,
-                    scalar_callees: &scalar_callees,
-                    captured_callees: &captured_callees,
                     callees: &callees,
                     occurrences: &occurrences,
                     declared: &declared,
@@ -565,11 +516,11 @@ fn validate_scope(
                 let AstCallKind::Call(call) = &stmt.call else {
                     return false;
                 };
-                if !captured_transfers::slots(call, active, &occurrences, &bodies, &result_slots, &mut seen_result_slots) { return false; }
-                if !scopes::captured_value_slots(call, active, &occurrences, &bodies, &result_slots, &mut seen_result_slots) {
+                if !captured_transfers::slots(call, active, &occurrences, &bodies, &result_frames, &mut seen_result_slots) { return false; }
+                if !scopes::captured_value_slots(call, active, &occurrences, &bodies, &result_frames, &mut seen_result_slots) {
                     return false;
                 }
-                if !literal_choices::comparison_slots(call, active, &occurrences, &bodies, &result_slots, &mut seen_result_slots) {
+                if !literal_choices::comparison_slots(call, active, &occurrences, &bodies, &result_frames, &mut seen_result_slots) {
                     return false;
                 }
                 for (argument, value) in call.args.iter().enumerate() {
@@ -584,7 +535,7 @@ fn validate_scope(
                 | HirLuauInliningBody::ConstantControl { .. }
                         | HirLuauInliningBody::NumericRepeat { .. } | HirLuauInliningBody::CallingValue { .. } | HirLuauInliningBody::CallingSharedValue { .. }
  | HirLuauInliningBody::CallingObservedValue { .. }))
-                        && (result_slots.get(&site) != Some(&(active + 1 + argument))
+                        && (result_frames.get(&site).map(|frame| frame.base) != Some(active + 1 + argument)
                             || !seen_result_slots.insert(site))
                     {
                         // 完整观察帧按从左到右的实参槽承接每次展开返回。
@@ -594,12 +545,12 @@ fn validate_scope(
                 if let Some(site) = generic_lookup::comparison_result(call)
                     && occurrences.get(&site).and_then(|local| bodies.get(local))
                         .is_some_and(|body| matches!(body, HirLuauInliningBody::GenericLookupWhile { .. }))
-                    && (result_slots.get(&site) != Some(&(active + 2))
+                    && (result_frames.get(&site).map(|frame| frame.base) != Some(active + 2)
                         || !seen_result_slots.insert(site)) { return false; }
                 if let Some(site) = counter_while::comparison_result(call)
                     && occurrences.get(&site).and_then(|local| bodies.get(local))
                         .is_some_and(|body| matches!(body, HirLuauInliningBody::CounterWhile { .. } | HirLuauInliningBody::NumericRepeat { .. } | HirLuauInliningBody::NestedSearch { .. }))
-                    && (result_slots.get(&site) != Some(&(active + 2))
+                    && (result_frames.get(&site).map(|frame| frame.base) != Some(active + 2)
                         || !seen_result_slots.insert(site))
                 {
                     // assert 的 callee/Boolean 占前两槽，循环返回值必须留在原比较左输入槽。
@@ -614,14 +565,14 @@ fn validate_scope(
                             shared_factories: &shared_factories,
                             published_globals: &published_globals,
                             bodies: &bodies,
+                hir,
+                result_frames: &result_frames,
                 constant_controls: &constant_controls,
                             opaque_locals: &opaque_locals,
                 runtime_functions: &opaque_functions.runtime,
                             written_locals: &written_locals,
                 nonconstant_locals: &nonconstant_locals,
                             callable_arguments: &callable_arguments,
-                            scalar_callees: &scalar_callees,
-                            captured_callees: &captured_callees,
                             callees: &callees,
                             occurrences: &occurrences,
                             declared: &declared,
@@ -692,14 +643,14 @@ fn validate_scope(
                     shared_factories: &shared_factories,
                     published_globals: &published_globals,
                     bodies: &bodies,
+                hir,
+                result_frames: &result_frames,
                 constant_controls: &constant_controls,
                     opaque_locals: &opaque_locals,
                 runtime_functions: &opaque_functions.runtime,
                     written_locals: &written_locals,
                 nonconstant_locals: &nonconstant_locals,
                     callable_arguments: &callable_arguments,
-                    scalar_callees: &scalar_callees,
-                    captured_callees: &captured_callees,
                     callees: &callees,
                     occurrences: &occurrences,
                     declared: &declared,
@@ -760,20 +711,20 @@ fn validate_scope(
                     return false;
                 };
                 let site = call.required_luau_inlining.unwrap();
-                if result_slots.get(&site) != Some(&active)
+                if result_frames.get(&site).map(|frame| frame.base) != Some(active)
                     || !seen_result_slots.insert(site)
                     || !(InvocationExpressions {
                         shared_factories: &shared_factories,
                         published_globals: &published_globals,
                         bodies: &bodies,
+                hir,
+                result_frames: &result_frames,
                 constant_controls: &constant_controls,
                         opaque_locals: &opaque_locals,
                 runtime_functions: &opaque_functions.runtime,
                         written_locals: &written_locals,
                 nonconstant_locals: &nonconstant_locals,
                         callable_arguments: &callable_arguments,
-                        scalar_callees: &scalar_callees,
-                        captured_callees: &captured_callees,
                         callees: &callees,
                         occurrences: &occurrences,
                         declared: &declared,
@@ -795,14 +746,14 @@ fn validate_scope(
                         shared_factories: &shared_factories,
                         published_globals: &published_globals,
                         bodies: &bodies,
+                hir,
+                result_frames: &result_frames,
                 constant_controls: &constant_controls,
                         opaque_locals: &opaque_locals,
                 runtime_functions: &opaque_functions.runtime,
                         written_locals: &written_locals,
                 nonconstant_locals: &nonconstant_locals,
                         callable_arguments: &callable_arguments,
-                        scalar_callees: &scalar_callees,
-                        captured_callees: &captured_callees,
                         callees: &callees,
                         occurrences: &occurrences,
                         declared: &declared,
@@ -824,21 +775,21 @@ fn validate_scope(
     seen_occurrences.len() == occurrences.len()
         && callable_arguments.complete()
         && declared.len() == callees.len()
-        && seen_result_slots.len() == result_slots.len()
+        && seen_result_slots.len() == result_frames.len()
 }
 
 struct InvocationExpressions<'a> {
     published_globals: &'a BTreeSet<&'a str>,
     shared_factories: &'a BTreeSet<crate::hir::LocalId>,
     bodies: &'a BTreeMap<crate::hir::LocalId, HirLuauInliningBody>,
+    hir: &'a crate::hir::HirModule,
+    result_frames: &'a BTreeMap<crate::hir::HirSourceSite, crate::hir::HirLuauResultFrame>,
     opaque_locals: &'a BTreeSet<crate::hir::LocalId>,
     runtime_functions: &'a BTreeMap<crate::hir::LocalId, usize>,
     written_locals: &'a BTreeSet<crate::hir::LocalId>,
     nonconstant_locals: &'a BTreeSet<crate::hir::LocalId>,
     constant_controls: &'a constant_control::Models,
     callable_arguments: &'a calling_values::Dependencies<'a>,
-    scalar_callees: &'a BTreeSet<crate::hir::LocalId>,
-    captured_callees: &'a BTreeSet<crate::hir::LocalId>,
     callees: &'a BTreeMap<crate::hir::LocalId, crate::hir::HirProtoRef>,
     occurrences: &'a BTreeMap<crate::hir::HirSourceSite, crate::hir::LocalId>,
     declared: &'a BTreeSet<crate::hir::LocalId>,
@@ -850,7 +801,7 @@ impl InvocationExpressions<'_> {
         &mut self,
         expr: &AstExpr,
         top: usize,
-        slots: &BTreeMap<crate::hir::HirSourceSite, usize>,
+        slots: &BTreeMap<crate::hir::HirSourceSite, crate::hir::HirLuauResultFrame>,
         seen: &mut BTreeSet<crate::hir::HirSourceSite>,
     ) -> bool {
         match expr {
@@ -861,7 +812,7 @@ impl InvocationExpressions<'_> {
                         .get(&site)
                         .and_then(|local| self.bodies.get(local)),
                     Some(HirLuauInliningBody::CapturedIncrementIdentity { .. })
-                ) && slots.get(&site) == Some(&top)
+                ) && slots.get(&site).map(|frame| frame.base) == Some(top)
                     && seen.insert(site)
                     && self.check(expr, top, true)
             }
@@ -903,8 +854,9 @@ impl InvocationExpressions<'_> {
             Some(HirLuauInliningBody::CallingReadPair { .. }) => {
                 self.callable_arguments.arguments(call, self.written_locals)
             }
-            Some(HirLuauInliningBody::LiteralChoice { parameters, .. }) => {
-                call.args.len() == *parameters
+            Some(HirLuauInliningBody::LiteralChoice { .. }) => {
+                let parameters = self.hir.protos[self.callees[callee].index()].params.len();
+                call.args.len() == parameters
                     && call
                         .args
                         .iter()
@@ -913,11 +865,82 @@ impl InvocationExpressions<'_> {
             _ => false,
         };
         arguments
+            && self
+                .result_frames
+                .get(&site)
+                .is_some_and(|frame| frame.width == 2)
+            && call.args.len() == self.hir.protos[self.callees[callee].index()].params.len()
             && top <= 128
             && self.declared.contains(callee)
             && call.callee == AstExpr::Var(AstNameRef::Local(*callee))
             && call.method_key.is_none()
             && self.seen.insert(site)
+    }
+
+    /// 参数准备的编译约束与模板一一对应；通用签名和结果包已由调用入口检查。
+    fn arguments(&self, call: &AstCallExpr, callee: crate::hir::LocalId) -> bool {
+        use HirLuauInliningBody as Body;
+        let args = call.args.as_slice();
+        match self.bodies[&callee] {
+            Body::Identity => {
+                matches!(args, [AstExpr::Number(value)] if value.is_nan())
+                    || matches!(args, [AstExpr::Integer(value)] if (-32768..=32767).contains(value))
+                    || matches!(args, [AstExpr::Boolean(_)])
+            }
+            Body::CapturedIncrementIdentity { .. } | Body::ScalarNotCall { .. } => {
+                matches!(args, [AstExpr::Boolean(_)])
+            }
+            Body::NumericForExit { .. } => numeric_exit::arguments(args),
+            Body::ValueClosureFactory { .. }
+            | Body::SnapshotClosureFactory { .. }
+            | Body::NestedValueClosureFactory { .. } => {
+                matches!(args, [AstExpr::Integer(value)] if (-32768..=32767).contains(value))
+            }
+            Body::EventClosureFactory { .. } => matches!(args, [AstExpr::String(_)]),
+            Body::ConditionalMethod { .. } => {
+                matches!(args, [AstExpr::Var(AstNameRef::Local(local))] if !self.opaque_locals.contains(local))
+            }
+            Body::ValueExpression { .. } => value_expressions::arguments(args, self.written_locals),
+            Body::SeededPredicate { .. } => seeded_predicates::arguments(args, self.written_locals),
+            Body::CallingValue { .. }
+            | Body::CallingSharedValue { .. }
+            | Body::CallingObservedValue { .. } => {
+                self.callable_arguments.arguments(call, self.written_locals)
+            }
+            Body::RepeatPrefix { .. } => args == [AstExpr::Boolean(true), AstExpr::Boolean(true)],
+            Body::GenericLookupWhile { .. } => generic_lookup::arguments(args, self.written_locals),
+            Body::ResetCounter { .. } => reset_counter::arguments(args),
+            Body::CounterRepeat { .. } => counter_repeat::arguments(args),
+            Body::NumericRepeat { .. } => numeric_repeat::arguments(args, self.nonconstant_locals),
+            Body::NestedSearch { .. } => nested_search::arguments(args, self.written_locals),
+            Body::GuardedCounter { .. } => guarded_counter::arguments(args),
+            Body::ConstantControl { .. } => self.constant_controls.inlined(callee, args),
+            Body::GenericCounter { .. } => generic_counter::arguments(args),
+            Body::CounterWhile { .. } => counter_while::inlined_arguments(args),
+            Body::StatefulGenericWhile { .. } => {
+                stateful_generic::inlined_arguments(args, self.written_locals)
+            }
+            Body::RepeatLookup { .. } => {
+                matches!(args, [AstExpr::Boolean(true), AstExpr::TableConstructor(_)])
+            }
+            // 候选拒绝[TargetConstraint]：这些恢复使用固定双结果声明，由 pair 核对完整参数和预留槽。
+            Body::CapturedCallablePair | Body::CallingReadPair { .. } | Body::ArrayFold { .. } => {
+                false
+            }
+            Body::CapturedValue
+            | Body::CapturedAppendTransfer { .. }
+            | Body::CapturedConcatSum
+            | Body::CapturedAddIdentity
+            | Body::LiteralChoice { .. }
+            | Body::ParameterWriteback { .. }
+            | Body::GenericBreak { .. }
+            | Body::TableFactory { .. }
+            | Body::PublishedTableFactory { .. }
+            | Body::ClosureFactory { .. }
+            | Body::PublishedClosureFactory { .. }
+            | Body::UnpackedTable
+            | Body::FrozenTableIndex => true,
+        }
     }
 
     /// 比较与逻辑操作数均为 fixed-one；保守计入表达式的预留结果及 operand 槽，
@@ -934,157 +957,10 @@ impl InvocationExpressions<'_> {
                     && self.declared.contains(callee)
                     && call.callee == AstExpr::Var(AstNameRef::Local(*callee))
                     && call.method_key.is_none()
-                    && call.args.len()
-                        == if let HirLuauInliningBody::ValueExpression { parameters, .. } =
-                            self.bodies[callee]
-                        {
-                            parameters
-                        } else if let HirLuauInliningBody::ConstantControl { parameters, .. } =
-                            self.bodies[callee]
-                        {
-                            parameters
-                        } else if self.captured_callees.contains(callee)
-                            || matches!(
-                                self.bodies[callee],
-                                HirLuauInliningBody::ParameterWriteback { .. }
-                                    | HirLuauInliningBody::CallingValue { .. }
-                                    | HirLuauInliningBody::CallingSharedValue { .. }
-                                    | HirLuauInliningBody::CallingObservedValue { .. }
-                            )
-                        {
-                            3
-                        } else if matches!(
-                            self.bodies[callee],
-                            HirLuauInliningBody::CapturedValue
-                                | HirLuauInliningBody::CapturedAppendTransfer { .. }
-                                | HirLuauInliningBody::TableFactory { .. }
-                                | HirLuauInliningBody::PublishedTableFactory { .. }
-                                | HirLuauInliningBody::ClosureFactory { .. }
-                                | HirLuauInliningBody::PublishedClosureFactory { .. }
-                                | HirLuauInliningBody::GenericBreak { .. }
-                        ) {
-                            0
-                        } else if matches!(
-                            self.bodies[callee],
-                            HirLuauInliningBody::RepeatPrefix { .. }
-                                | HirLuauInliningBody::RepeatLookup { .. }
-                                | HirLuauInliningBody::GenericLookupWhile { .. }
-                                | HirLuauInliningBody::NestedSearch { .. }
-                        ) {
-                            2
-                        } else if matches!(
-                            self.bodies[callee],
-                            HirLuauInliningBody::CounterRepeat { .. }
-                                | HirLuauInliningBody::NumericRepeat { .. }
-                                | HirLuauInliningBody::GuardedCounter { .. }
-                                | HirLuauInliningBody::ResetCounter { .. }
-                        ) {
-                            3
-                        } else if matches!(
-                            self.bodies[callee],
-                            HirLuauInliningBody::CounterWhile { .. }
-                                | HirLuauInliningBody::StatefulGenericWhile { .. }
-                                | HirLuauInliningBody::GenericCounter { .. }
-                        ) {
-                            4
-                        } else {
-                            1
-                        }
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::CapturedIncrementIdentity { .. }
-                    ) || matches!(call.args.as_slice(), [AstExpr::Boolean(_)]))
-                    && (!self.scalar_callees.contains(callee)
-                        || matches!(call.args[0], AstExpr::Boolean(_)))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::NumericForExit { .. }
-                    ) || numeric_exit::arguments(&call.args))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::ValueClosureFactory { .. }
-                            | HirLuauInliningBody::SnapshotClosureFactory { .. }
-                            | HirLuauInliningBody::NestedValueClosureFactory { .. }
-                    ) || matches!(call.args.as_slice(), [AstExpr::Integer(value)] if (-32768..=32767).contains(value)))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::EventClosureFactory { .. }
-                    ) || matches!(call.args.as_slice(), [AstExpr::String(_)]))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::ConditionalMethod { .. }
-                    ) || matches!(call.args.as_slice(), [AstExpr::Var(AstNameRef::Local(local))] if !self.opaque_locals.contains(local)))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::ValueExpression { .. }
-                    ) || value_expressions::arguments(&call.args, self.written_locals))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::SeededPredicate { .. }
-                    ) || seeded_predicates::arguments(&call.args, self.written_locals))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::CallingValue { .. }
-                            | HirLuauInliningBody::CallingSharedValue { .. }
-                            | HirLuauInliningBody::CallingObservedValue { .. }
-                    ) || self.callable_arguments.arguments(call, self.written_locals))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::RepeatPrefix { .. }
-                    ) || call.args.as_slice()
-                        == [AstExpr::Boolean(true), AstExpr::Boolean(true)])
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::GenericLookupWhile { .. }
-                    ) || generic_lookup::arguments(&call.args, self.written_locals))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::ResetCounter { .. }
-                    ) || reset_counter::arguments(&call.args))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::CounterRepeat { .. }
-                    ) || counter_repeat::arguments(&call.args))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::NumericRepeat { .. }
-                    ) || numeric_repeat::arguments(&call.args, self.nonconstant_locals))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::NestedSearch { .. }
-                    ) || nested_search::arguments(&call.args, self.written_locals))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::GuardedCounter { .. }
-                    ) || guarded_counter::arguments(&call.args))
-                    && (if let HirLuauInliningBody::ConstantControl { .. } = self.bodies[callee] {
-                        self.constant_controls.inlined(*callee, &call.args)
-                    } else {
-                        true
-                    })
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::GenericCounter { .. }
-                    ) || generic_counter::arguments(&call.args))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::CounterWhile { .. }
-                    ) || counter_while::inlined_arguments(&call.args))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::StatefulGenericWhile { .. }
-                    ) || stateful_generic::inlined_arguments(&call.args, self.written_locals))
-                    && (!matches!(
-                        self.bodies[callee],
-                        HirLuauInliningBody::RepeatLookup { .. }
-                    ) || matches!(
-                        call.args.as_slice(),
-                        [AstExpr::Boolean(true), AstExpr::TableConstructor(_)]
-                    ))
-                    && (self.bodies[callee] != HirLuauInliningBody::Identity
-                        || matches!(call.args.as_slice(), [AstExpr::Number(value)] if value.is_nan())
-                        || matches!(call.args.as_slice(), [AstExpr::Integer(value)] if (-32768..=32767).contains(value))
-                        || matches!(call.args.as_slice(), [AstExpr::Boolean(_)]))
+                    && call.args.len() == self.hir.protos[self.callees[callee].index()].params.len()
+                    // 结果包的 fixed 宽度由 HIR 帧计划签发；单结果语境不能截断双结果合同。
+                    && self.result_frames.get(&site).is_none_or(|frame| frame.width == 1)
+                    && self.arguments(call, *callee)
                     && call.args.iter().enumerate().all(|(index, arg)| {
                         PlainExpressions::new(self.callees).expr(arg)
                             || self.callable_arguments.inline_argument(call, index)
@@ -1264,145 +1140,184 @@ impl InvocationExpressions<'_> {
     }
 }
 
+/// 先消费前层发布的完整签名，再选择该函数体的编译证明；新增模板必须显式分派。
 fn callee_body(
     func: &AstFunctionExpr,
-    body: HirLuauInliningBody,
-    expected_field: &crate::LuaString,
-    capture: Option<crate::hir::LocalId>,
+    requirement: &crate::hir::HirRequiredLuauInlining,
+    hir: &crate::hir::HirModule,
+    opaque_functions: &opaque::Functions<'_>,
+    constant_controls: &constant_control::Models,
 ) -> bool {
-    if let HirLuauInliningBody::SeededPredicate { template } = body {
-        return seeded_predicates::body(func, template);
-    }
-    if let HirLuauInliningBody::ValueExpression {
-        template,
-        parameters,
-    } = body
+    let Some(proto) = hir.protos.get(requirement.child.index()) else {
+        return false;
+    };
+    if func.function != requirement.child
+        || func.params != proto.params
+        || func.is_vararg
+        || func.named_vararg.is_some()
     {
-        return value_expressions::body(func, template, parameters);
+        return false;
     }
-    if let HirLuauInliningBody::LiteralChoice {
-        template,
-        parameters,
-    } = body
+    // 原闭包没有 upvalue 时，后层不能为它引入捕获；有捕获的合同仍在对应体证明中核对身份。
+    if proto.upvalues.is_empty()
+        && (!func.captured_bindings.is_empty()
+            || !func.captured_params.is_empty()
+            || !func.capture_write_names.is_empty())
     {
-        return literal_choices::body(func, template, parameters);
+        return false;
     }
-    if let HirLuauInliningBody::StatefulGenericWhile {
-        template,
-        initial,
-        increment,
-    } = body
-    {
-        return stateful_generic::body(func, template, initial, increment, expected_field);
-    }
-    if let HirLuauInliningBody::GenericLookupWhile { template, key } = body {
-        return generic_lookup::body(func, template, key, expected_field);
-    }
-    if let HirLuauInliningBody::GenericCounter {
-        template,
-        initial,
-        increment,
-        repeats,
-    } = body
-    {
-        return generic_counter::body(func, template, initial, increment, repeats);
-    }
-    if let HirLuauInliningBody::CounterRepeat {
-        template,
-        initial,
-        increment,
-        limit,
-    } = body
-    {
-        return counter_repeat::body(func, template, initial, increment, limit);
-    }
-    if let HirLuauInliningBody::CounterWhile {
-        template,
-        initial,
-        increment,
-        limit,
-    } = body
-    {
-        return counter_while::body(func, template, initial, increment, limit);
-    }
-    if let HirLuauInliningBody::GenericBreak {
-        template, initial, ..
-    } = body
-    {
-        return generic_break::body(func, template, initial);
-    }
-    if let HirLuauInliningBody::RepeatLookup {
-        template,
-        key,
-        result,
-    } = body
-    {
-        return repeat_lookup::body(func, template, key, result);
-    }
-    if let HirLuauInliningBody::RepeatPrefix { template } = body {
-        return repeat_prefix::body(func, template);
-    }
-    if let HirLuauInliningBody::ConditionalMethod { template } = body {
-        return conditional_methods::body(func, template);
-    }
-    if let HirLuauInliningBody::SnapshotClosureFactory { template } = body {
-        return snapshot_closure_factory(func, template);
-    }
-    if let HirLuauInliningBody::PublishedTableFactory { key } = body {
-        return published_table_factory(func, key, capture);
-    }
-    if let HirLuauInliningBody::PublishedClosureFactory {
-        intermediate,
-        leaf,
-        result,
-    } = body
-    {
-        return published_closure_factory(func, expected_field, intermediate, leaf, result);
-    }
-    if let HirLuauInliningBody::EventClosureFactory {
-        intermediate,
-        result,
-    } = body
-    {
-        return event_closure_factory(func, expected_field, intermediate, result);
-    }
-    if let HirLuauInliningBody::ValueClosureFactory { template } = body {
-        return value_closure_factory_body(func, template);
-    }
-    if let HirLuauInliningBody::NestedValueClosureFactory {
-        intermediate,
-        result,
-    } = body
-    {
-        return nested_value_closure_factory_body(func, intermediate, result);
-    }
-    if let HirLuauInliningBody::CapturedIncrementIdentity { increment } = body {
-        return scopes::increment_identity(func, capture, increment);
-    }
-    if body == HirLuauInliningBody::CapturedValue {
-        let Some(capture) = capture else {
-            return false;
-        };
-        return func.params.is_empty()
-            && !func.is_vararg
-            && func.named_vararg.is_none()
-            && func.captured_bindings == BTreeSet::from([AstBindingRef::Local(capture)])
-            && func.captured_params.is_empty()
-            && func.capture_write_names.is_empty()
-            && matches!(func.body.stmts.as_slice(), [AstStmt::Return(ret)]
-                if ret.values == [AstExpr::Var(AstNameRef::Upvalue(crate::hir::UpvalueId(0)))]);
-    }
-    if body == HirLuauInliningBody::CapturedAddIdentity {
-        return captured_identity_body(func, capture);
-    }
-    if let HirLuauInliningBody::TableFactory { shared } = body {
-        return table_factory_body(func, shared, expected_field);
-    }
-    if let HirLuauInliningBody::ClosureFactory { shared } = body {
-        return closure_factory_body(func, shared, capture);
-    }
-    if body == HirLuauInliningBody::CapturedConcatSum {
-        return captured_concat_body(func, expected_field, capture);
+    let body = requirement.body;
+    let expected_field = &requirement.field;
+    let capture = requirement.capture;
+    use HirLuauInliningBody as Body;
+    match body {
+        Body::CapturedCallablePair => {
+            return returned_calls::body(func, expected_field, opaque_functions);
+        }
+        Body::NumericForExit { template } => {
+            return hir
+                .protos
+                .get(template)
+                .is_some_and(|proto| numeric_exit::body(func, proto, capture));
+        }
+        Body::ConstantControl { .. } => return constant_controls.declaration(requirement.callee),
+        Body::CapturedAppendTransfer { template } => {
+            return hir
+                .protos
+                .get(template)
+                .zip(opaque_functions.capture_layout(func.function))
+                .is_some_and(|(proto, closure)| captured_transfers::body(func, proto, closure));
+        }
+        Body::CallingValue { template }
+        | Body::CallingSharedValue { template }
+        | Body::CallingObservedValue { template }
+        | Body::CallingReadPair { template } => {
+            return hir
+                .protos
+                .get(template)
+                .is_some_and(|proto| calling_values::body(func, proto));
+        }
+        Body::SeededPredicate { template } => return seeded_predicates::body(func, template),
+        Body::ValueExpression { template } => {
+            return value_expressions::body(func, template, proto.params.len());
+        }
+        Body::LiteralChoice { template } => {
+            return literal_choices::body(func, template, proto.params.len());
+        }
+        Body::StatefulGenericWhile {
+            template,
+            initial,
+            increment,
+        } => return stateful_generic::body(func, template, initial, increment, expected_field),
+        Body::GenericLookupWhile { template, key } => {
+            return generic_lookup::body(func, template, key, expected_field);
+        }
+        Body::GenericCounter {
+            template,
+            initial,
+            increment,
+            repeats,
+        } => return generic_counter::body(func, template, initial, increment, repeats),
+        Body::CounterRepeat {
+            template,
+            initial,
+            increment,
+            limit,
+        } => return counter_repeat::body(func, template, initial, increment, limit),
+        Body::CounterWhile {
+            template,
+            initial,
+            increment,
+            limit,
+        } => return counter_while::body(func, template, initial, increment, limit),
+        Body::GenericBreak {
+            template, initial, ..
+        } => return generic_break::body(func, template, initial),
+        Body::RepeatLookup {
+            template,
+            key,
+            result,
+        } => return repeat_lookup::body(func, template, key, result),
+        Body::RepeatPrefix { template } => return repeat_prefix::body(func, template),
+        Body::ConditionalMethod { template } => return conditional_methods::body(func, template),
+        Body::SnapshotClosureFactory { template } => {
+            return snapshot_closure_factory(func, template);
+        }
+        Body::PublishedTableFactory { key } => return published_table_factory(func, key, capture),
+        Body::PublishedClosureFactory {
+            intermediate,
+            leaf,
+            result,
+        } => return published_closure_factory(func, expected_field, intermediate, leaf, result),
+        Body::EventClosureFactory {
+            intermediate,
+            result,
+        } => return event_closure_factory(func, expected_field, intermediate, result),
+        Body::ValueClosureFactory { template } => {
+            return value_closure_factory_body(func, template);
+        }
+        Body::NestedValueClosureFactory {
+            intermediate,
+            result,
+        } => return nested_value_closure_factory_body(func, intermediate, result),
+        Body::CapturedIncrementIdentity { increment } => {
+            return scopes::increment_identity(func, capture, increment);
+        }
+        Body::CapturedAddIdentity => return captured_identity_body(func, capture),
+        Body::TableFactory { shared } => return table_factory_body(func, shared, expected_field),
+        Body::ClosureFactory { shared } => return closure_factory_body(func, shared, capture),
+        Body::CapturedConcatSum => return captured_concat_body(func, expected_field, capture),
+        Body::ResetCounter { template } => {
+            return hir
+                .protos
+                .get(template)
+                .is_some_and(|proto| reset_counter::body(func, proto));
+        }
+        Body::NestedSearch { template } => {
+            return hir
+                .protos
+                .get(template)
+                .is_some_and(|proto| nested_search::body(func, proto));
+        }
+        Body::ArrayFold { template } => {
+            return hir
+                .protos
+                .get(template)
+                .is_some_and(|proto| array_fold::body(func, proto));
+        }
+        Body::GuardedCounter { template } => {
+            return hir
+                .protos
+                .get(template)
+                .is_some_and(|proto| guarded_counter::body(func, proto));
+        }
+        Body::NumericRepeat { template } => {
+            return hir
+                .protos
+                .get(template)
+                .is_some_and(|proto| numeric_repeat::body(func, proto));
+        }
+        Body::ParameterWriteback { template } => {
+            return hir
+                .protos
+                .get(template)
+                .is_some_and(|proto| parameter_writebacks::body(func, proto));
+        }
+        Body::CapturedValue => {
+            let Some(capture) = capture else {
+                return false;
+            };
+            return func.params.is_empty()
+                && func.captured_bindings == BTreeSet::from([AstBindingRef::Local(capture)])
+                && func.captured_params.is_empty()
+                && func.capture_write_names.is_empty()
+                && matches!(func.body.stmts.as_slice(), [AstStmt::Return(ret)]
+                    if ret.values == [AstExpr::Var(AstNameRef::Upvalue(crate::hir::UpvalueId(0)))]);
+        }
+        Body::Identity
+        | Body::UnpackedTable
+        | Body::FrozenTableIndex
+        | Body::ScalarNotCall { .. } => {}
     }
     // pinned Luau 中 UnpackedTable 的 cost=25、stack=4，FrozenTableIndex 的
     // cost=23、stack=5；基础阈值 25 经收益调整均为 28。两种 body 无递归和

@@ -387,14 +387,18 @@ pub(super) fn restore(module: &mut HirModule, promotion: &mut [ProtoPromotionFac
                 field: "".into(),
                 capture: Some(candidate.template.capture),
                 occurrences: Vec::new(),
-                result_frame_slots: BTreeMap::new(),
+                result_frames: BTreeMap::new(),
                 callable_arguments: Default::default(),
                 nil_guards: Default::default(),
             });
         certificate.occurrences.push(candidate.source);
-        certificate
-            .result_frame_slots
-            .insert(candidate.source, candidate.home.slot());
+        certificate.result_frames.insert(
+            candidate.source,
+            crate::hir::HirLuauResultFrame {
+                base: candidate.home.slot(),
+                width: 1,
+            },
+        );
     }
     proto.body.stmts = std::mem::take(&mut proto.body.stmts)
         .into_iter()

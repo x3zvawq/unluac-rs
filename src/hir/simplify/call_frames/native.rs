@@ -3033,8 +3033,15 @@ fn collect_plans(
                 .iter()
                 .map(|entry| entry.unwrap().stmt)
                 .collect::<Vec<_>>();
+            // 构造器候选可前瞻到多个 SETLIST 之后；入口位于窄池前缀不代表
+            // 整个赋值都在前缀内。跨界时从形成候选起就使用逐操作数 RK 证明。
+            let indexed_context = NativeFrameContext {
+                constants_fit_rk: context.constants_fit_rk
+                    && (!prefix_assumption || flat[end].unwrap().id < rk_prefix_end),
+                ..context
+            };
             if let Some(mut plan) = indexed::plan(
-                context,
+                indexed_context,
                 &run,
                 facts,
                 dialect,
@@ -3105,6 +3112,7 @@ fn collect_plans(
                         && matches!(assign.targets.as_slice(), [HirLValue::TableAccess(access)]
                             if matches!(access.base, HirExpr::ParamRef(_) | HirExpr::LocalRef(_))))
             }) {
+                prefix_assumption &= indexed_context.constants_fit_rk;
                 plan.removed = flat[start + plan.start..end]
                     .iter()
                     .map(|entry| entry.unwrap().id)
@@ -8327,13 +8335,14 @@ fn logical_call_result_frame(
     };
     // 首个 CALL 可先 COPY callee 再赋值回同一匿名 Local；整段准备与短路结果
     // 共同组成 initializer。lookup 仍要求声明入口，声明消费及后缀由完整帧预览核对。
-    let prepared_result_initializer = dialect != DecompileDialect::Luau
-        && first == &HirExpr::LocalRef(target)
+    let prepared_result_initializer = first == &HirExpr::LocalRef(target)
         && run.last().is_some_and(|previous| {
-            matches!(scalar_local(previous), Some((written, HirExpr::Call(_))) if written == target)
+            dialect != DecompileDialect::Luau
+                && matches!(scalar_local(previous), Some((written, HirExpr::Call(_))) if written == target)
                 || matches!(previous, HirStmt::LocalDecl(_))
                     && matches!(scalar_local(previous), Some((written, HirExpr::TableAccess(_) | HirExpr::GlobalRef(_))) if written == target)
         });
+    let assignment = assignment && !prepared_result_initializer;
     let lookup_initializer = (matches!(stmt, HirStmt::LocalDecl(_)) || prepared_result_initializer)
         && matches!(first_value, HirExpr::TableAccess(_) | HirExpr::GlobalRef(_));
     let base = if assignment {
@@ -9561,9 +9570,9 @@ fn completed_value_assignment(
     let mut rebuilt = None;
     let mut luau_compound_global = false;
     let (allocation_home, write_homes, unaliased) = match value {
-        HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_) if dialect == DecompileDialect::Luau => {
-            // 原高槽 phi 已持有完整短路值，紧邻 COPY 才写入已有低槽 cell。
-            // 逐叶核对原比较/读取及结果槽，整批 preview 保留写回后的闭包创建位置。
+        HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_) if dialect != DecompileDialect::Luajit => {
+            // 原高槽 phi 已持有完整短路值，紧邻写回才安装到已有目标。
+            // 逐叶核对原操作及结果槽，整批 preview 保留写回后的根和槽复用。
             let mut builder = frame_builder(context, &[], facts, dialect, base.slot())?;
             builder.boolean_frame = Some(base);
             rebuilt = Some(builder.comparison_tree(value, 0, base.slot(), false)?);
@@ -9941,13 +9950,13 @@ fn build_preview(
         dialect,
         &preview.redeclaration_origins,
     )?;
-    validate_constructor_rk(&preview, plans, facts, dialect)?;
+    validate_rk_layout(&preview, plans, facts, dialect)?;
     Ok(preview)
 }
 
-/// 构造器字段名先于 RHS 入池；拆分准备语句的快照不能签发目标 RK 布局。
+/// 构造器字段名和索引赋值的键先于 RHS 入池；拆分准备语句的快照不能签发目标 RK 布局。
 /// 整批只重算一次紧凑预览，失败返回事务起点，由既有撤回协议处理依赖。
-fn validate_constructor_rk(
+fn validate_rk_layout(
     preview: &Preview,
     plans: &[Plan],
     facts: &ProtoPromotionFacts,
@@ -10009,6 +10018,24 @@ fn validate_constructor_rk(
             literals: literals.as_ref(),
             valid: true,
         };
+        if matches!(plan.values.fixed.as_slice(), [HirExpr::TableConstructor(_)])
+            && let Some(access) = &plan.indexed_target
+            && tables::literal_rk(&access.key)
+        {
+            let key_home = facts
+                .native_table_write_layout(access)
+                .map(|layout| layout.key)
+                .or_else(|| {
+                    facts
+                        .native_upvalue_table_write_layout(access)
+                        .map(|layout| layout.key)
+                });
+            check.valid = key_home.is_some_and(|key_home| {
+                literals.as_ref().map_or(Some(true), |literals| {
+                    literals.in_rk(&access.key, Some((&access.sources, false)))
+                }) == Some(key_home.is_none())
+            });
+        }
         for value in &plan.values.fixed {
             crate::hir::visit::visit_expr(value, &mut check);
         }

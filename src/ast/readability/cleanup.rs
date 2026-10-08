@@ -834,19 +834,8 @@ struct BlockBindingFlow {
 
 impl BlockBindingFlow {
     fn new(block: &AstBlock, trailing_condition: Option<&AstExpr>) -> Self {
-        let mut mention_counts = BTreeMap::<AstBindingRef, usize>::new();
-        for stmt in &block.stmts {
-            for binding in binding_mentions_in_stmt(stmt) {
-                *mention_counts.entry(binding).or_default() += 1;
-            }
-        }
-        if let Some(condition) = trailing_condition {
-            for binding in super::binding_flow::binding_mentions_in_expr(condition) {
-                *mention_counts.entry(binding).or_default() += 1;
-            }
-        }
-        let use_index =
-            BindingUseIndex::for_stmts_with_trailing_expr(&block.stmts, trailing_condition);
+        let (use_index, mention_counts) =
+            BindingUseIndex::with_mentions(&block.stmts, trailing_condition);
         Self {
             mention_counts,
             use_index,

@@ -13,6 +13,23 @@ const MUTABLE_GENERIC_KEY_DIALECTS: &[LuaCaseDialect] = &[
 
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_control_flow/loop_46_terminal_arms_shared_condition.lua",
+        &[
+            "early-return",
+            "short-circuit",
+            "shared-tail",
+            "evaluation-order",
+        ],
+        "无正常出口的循环保留非线性 return 臂，正文共享短路节点保持求值顺序及尾部更新。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/branch_33_condition_prefix_scope.lua",
         &["short-circuit", "scope", "single-pass"],
         "完整条件接管 early escape 后保留入口定义的外层作用域。",

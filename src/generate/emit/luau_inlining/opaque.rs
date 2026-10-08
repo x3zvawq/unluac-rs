@@ -65,7 +65,8 @@ impl<'a> Functions<'a> {
                 if locals.contains(&local) {
                     return None;
                 }
-                let (cost, _) = constant_control::runtime_summary(&decl.func)?;
+                let (cost, _) =
+                    constant_control::CostAnalysis::new(&decl.func).runtime_summary()?;
                 (!cost.permits_inline(cost)
                     && !decl.func.is_vararg
                     && decl.func.named_vararg.is_none())

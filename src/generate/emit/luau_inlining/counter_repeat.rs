@@ -23,14 +23,7 @@ pub(super) fn body(
     increment: i64,
     limit: i64,
 ) -> bool {
-    if func.function.index() != template
-        || func.params.len() != 3
-        || func.is_vararg
-        || func.named_vararg.is_some()
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-    {
+    if func.function.index() != template || func.params.len() != 3 {
         return false;
     }
     let [

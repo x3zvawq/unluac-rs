@@ -23,16 +23,6 @@ fn literal(actual: &AstExpr, expected: &HirExpr) -> bool {
 }
 
 pub(super) fn body(func: &AstFunctionExpr, proto: &HirProto) -> bool {
-    if func.function != proto.id
-        || func.params != proto.params
-        || func.is_vararg
-        || func.named_vararg.is_some()
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-    {
-        return false;
-    }
     if let Some(template) = crate::hir::luau_inlining::observed_value_template(proto) {
         return observed_values::body(func, &template);
     }

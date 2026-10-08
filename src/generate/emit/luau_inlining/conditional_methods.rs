@@ -3,14 +3,7 @@
 use super::*;
 
 pub(super) fn body(func: &AstFunctionExpr, template: usize) -> bool {
-    if func.function.index() != template
-        || func.params.len() != 1
-        || func.is_vararg
-        || func.named_vararg.is_some()
-        || !func.captured_bindings.is_empty()
-        || !func.captured_params.is_empty()
-        || !func.capture_write_names.is_empty()
-    {
+    if func.function.index() != template || func.params.len() != 1 {
         return false;
     }
     let [
