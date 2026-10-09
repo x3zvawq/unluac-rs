@@ -2,6 +2,198 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_tables/constructor_32_open_prefix_iterator_reuse.lua",
+        &[
+            "constructor",
+            "setlist",
+            "multi-return",
+            "generic-for",
+            "call-frame",
+            "evaluation-order",
+        ],
+        "开放数组调用前缀与后继长度比较、泛型迭代共同恢复，保留固定字段截断、开放尾返回及槽复用。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_31_generic_loop_nil_owners.lua",
+        &[
+            "generic-for",
+            "nil",
+            "constructor",
+            "setlist",
+            "evaluation-order",
+        ],
+        "generic-for 外的完整 nil 批次保留未使用声明槽，循环内写回与列表构造维持逐轮查询、跳过及对象身份。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_30_eager_short_circuit_prefix.lua",
+        &[
+            "call-frame",
+            "short-circuit",
+            "constructor",
+            "setlist",
+            "evaluation-order",
+            "metamethod",
+        ],
+        "短路后继测试读取此前必达 CALL，原位声明补齐后续坐标数组调用帧，保持查询次数、字段顺序和 nil 元素。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_29_multi_loop_root_lifetime.lua",
+        &[
+            "numeric-for",
+            "generic-for",
+            "nil",
+            "multi-return",
+            "gc-root",
+            "constructor",
+        ],
+        "原 nil 接回数值及泛型循环内多返回写回，条件列表只保存数字，下一迭代 dispatch 仍观察前次低槽对象。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_28_branched_loop_nil_owners.lua",
+        &[
+            "numeric-for",
+            "nil",
+            "identity",
+            "multi-return",
+            "constructor",
+            "setlist",
+        ],
+        "循环外 nil 归属连接分支固定写与多返回低槽 COPY，保持零迭代、各分支计算和列表构造。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_27_loop_indexed_table_suffix.lua",
+        &[
+            "call-frame",
+            "numeric-for",
+            "constructor",
+            "setlist",
+            "indexed-write",
+        ],
+        "循环后的独立列表索引写从原分配槽进入，完整构造事务退休临时声明后交还同槽 CALL。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_26_nil_batch_call_root_retirement.lua",
+        &["call-frame", "nil", "numeric-for", "gc-root", "metamethod"],
+        "未提升的整批 nil 不截断 CALL 帧下界，算术输入对象按原准备覆盖在 dispatch 前退休。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_25_nil_batch_call_prefix.lua",
+        &["call-frame", "nil", "numeric-for", "constructor", "setlist"],
+        "循环前的原 LOADNIL 批次保留后继帧下界，嵌套 CALL 与复用声明共同恢复后续列表。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_24_numeric_loop_root_lifetime.lua",
+        &["constructor", "setlist", "numeric-for", "nil", "gc-root"],
+        "Lua 5.1 循环外声明保留跨迭代对象，弱引用观察各次原 CALL 写回前后的逐项退休。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_23_numeric_loop_nil_owners.lua",
+        &["constructor", "setlist", "numeric-for", "nil", "identity"],
+        "循环前未读 nil 初始化接回每迭代 CALL 写回，保留原声明前缀和四项列表构造。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/constructor_22_upvalue_before_capture.lua",
         &["constructor", "setlist", "upvalue", "capture", "eval-order"],
         "嵌套表字段的上值快照按原定义恢复，后续同槽捕获不改变先前读取及调用顺序。",

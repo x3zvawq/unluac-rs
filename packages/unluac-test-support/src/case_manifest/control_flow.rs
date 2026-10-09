@@ -13,6 +13,96 @@ const MUTABLE_GENERIC_KEY_DIALECTS: &[LuaCaseDialect] = &[
 
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_38_loop_arm_nested_skips.lua",
+        &[
+            "short-circuit",
+            "shared-tail",
+            "numeric-for",
+            "evaluation-order",
+        ],
+        "循环内两臂独占完成到本轮出口，臂内短路跳过不制造单遍围栏，保持逐轮查询与效果顺序。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_37_multi_arm_soft_value_join.lua",
+        &[
+            "phi",
+            "short-circuit",
+            "early-return",
+            "shared-tail",
+            "evaluation-order",
+            "metamethod",
+        ],
+        "多臂选值经外层共享正常出口合流，提前 RETURN 不制造单遍围栏，保持查询次数和坐标重复读取。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_36_shared_tail_early_return.lua",
+        &[
+            "single-pass",
+            "shared-tail",
+            "early-return",
+            "evaluation-order",
+            "metamethod",
+        ],
+        "带条件取值准备的前向跳过共享非线性尾域，保留容量提前返回、进度短路与比较元方法顺序。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_35_common_copy_source_scope.lua",
+        &["phi", "scope", "shared-tail", "effects"],
+        "公共 COPY 尾部不能越过分支内来源声明，观察各路径的选值和调用顺序。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_34_multi_result_condition_prefix.lua",
+        &["short-circuit", "multi-return", "effects", "condition"],
+        "固定多返回调用不能被单值条件吸收，观察第三结果、调用次数和短路路径。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/loop_46_terminal_arms_shared_condition.lua",
         &[
             "early-return",

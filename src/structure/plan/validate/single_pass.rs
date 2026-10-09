@@ -36,8 +36,14 @@ pub(super) fn validate_single_pass_plans(
         let tail = plan.region_for_block(fence.tail).ok_or_else(|| {
             StructureError::invalid(format!("single-pass payload #{index} tail is unowned"))
         })?;
+        let normal_tail = plan.region_for_block(fence.normal_tail).ok_or_else(|| {
+            StructureError::invalid(format!(
+                "single-pass payload #{index} normal tail is unowned"
+            ))
+        })?;
         if !plan.region_contains(fence.region, entry)
             || !plan.region_contains(fence.region, tail)
+            || !plan.region_contains(fence.region, normal_tail)
             || fence.escape_edges.is_empty()
         {
             return Err(StructureError::invalid(format!(
@@ -46,7 +52,7 @@ pub(super) fn validate_single_pass_plans(
         }
         let tail_edge = cfg
             .succs
-            .get(fence.tail.index())
+            .get(fence.normal_tail.index())
             .and_then(|edges| match edges.as_slice() {
                 [edge] => Some(*edge),
                 _ => None,
@@ -78,7 +84,7 @@ pub(super) fn validate_single_pass_plans(
                     "single-pass payload #{index} escape source is unowned"
                 ))
             })?;
-            if edge.from == fence.tail
+            if edge.from == fence.normal_tail
                 || edge.to != fence.continuation
                 || !plan.region_contains(fence.region, source)
                 || !single_pass_escape_plan_matches(plan, fence.region, source, *edge_ref)

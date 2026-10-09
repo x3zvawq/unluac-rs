@@ -13,6 +13,7 @@ pub(super) use copy_assignments::nil::NilAssignmentFrame as NativeNilAssignmentF
 pub(super) use copy_assignments::prepared::PreparedFrame as NativePreparedFrame;
 mod copy_root_retirement;
 mod literal_choices;
+mod loop_initializers;
 mod operand_preparations;
 mod predicate_literals;
 mod short_circuit_frames;
@@ -45,10 +46,17 @@ pub(super) struct HomeSlotKey {
 }
 
 /// 循环头的源码求值槽与原 SSA 值版本；值身份不替代物理根退休证明。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct NativeNumericForHeader {
     pub(super) homes: [HomeSlotKey; 3],
     pub(super) values: [Option<TempId>; 3],
+}
+
+/// 循环声明归属使用已经冻结的头身份；generic-for 的 dispatch 不随初始化树化退休。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum NativeLoopInitializerHeader {
+    Numeric(NativeNumericForHeader),
+    Generic(InstrRef),
 }
 
 /// 原 COPY 两端在当前 HIR 的 binding 投影；不把已合并的目标冒充独立 Def。
@@ -580,6 +588,8 @@ pub(super) struct ProtoPromotionFacts {
     compacted_bindings: BTreeSet<HirBinding>,
     source_proto: Option<crate::hir::common::HirProtoRef>,
     calls: BTreeMap<InstrRef, call_roots::NativeCallFacts>,
+    /// 当前 HIR 快照中的不可变 builtin 按值捕获；模块改写后清除并重新签发。
+    captured_builtin_callees: BTreeSet<UpvalueId>,
     /// 完整 global 协议的固定前缀 Def；按尾 CALL 身份消费，不从当前表达式位置反推。
     global_call_prefixes: BTreeMap<InstrRef, GlobalCallPreparations>,
     /// 单目标声明的原 probe→store；RHS 准备复用 store 已有的 use→Def 证书。
@@ -658,6 +668,8 @@ pub(super) struct ProtoPromotionFacts {
     unobserved_result_ends: BTreeMap<TempId, Vec<TempId>>,
     frame_root_ends_by_call: BTreeMap<InstrRef, Vec<TempId>>,
     numeric_for_headers: BTreeMap<InstrRef, NativeNumericForHeader>,
+    loop_initializers:
+        BTreeMap<NativeLoopInitializerHeader, Vec<loop_initializers::LoopInitializers>>,
     nil_write_temps: BTreeMap<TempId, Vec<TempId>>,
     generic_for_body_frames: BTreeMap<InstrRef, NativeGenericForFrame>,
     method_setup_protocols: Vec<HirMethodSetupProtocol>,
@@ -754,6 +766,13 @@ pub(super) struct NativeGenericForFrame {
 }
 
 impl ProtoPromotionFacts {
+    pub(super) fn set_captured_builtin_callees(&mut self, upvalues: BTreeSet<UpvalueId>) {
+        self.captured_builtin_callees = upvalues;
+    }
+
+    pub(super) fn is_captured_builtin_callee(&self, callee: &HirExpr) -> bool {
+        matches!(callee, HirExpr::UpvalueRef(upvalue) if self.captured_builtin_callees.contains(upvalue))
+    }
     /// 原字面量定义只被这次 TEST 消费；当前条件及发射前缀仍由恢复事务验证。
     pub(super) fn literal_predicate(
         &self,
@@ -1557,6 +1576,66 @@ impl ProtoPromotionFacts {
             .as_deref()
     }
 
+    /// 数值头保留原控制值；泛型头须仍满足原 dispatch 布局，不从 iterator 外形猜身份。
+    pub(super) fn loop_initializer_header(
+        &self,
+        stmt: &HirStmt,
+    ) -> Option<NativeLoopInitializerHeader> {
+        match stmt {
+            HirStmt::NumericFor(for_) => Some(NativeLoopInitializerHeader::Numeric(
+                NativeNumericForHeader {
+                    homes: for_.control_homes,
+                    values: for_.control_values,
+                },
+            )),
+            HirStmt::GenericFor(for_) => {
+                self.generic_for_body_frame(for_)?;
+                Some(NativeLoopInitializerHeader::Generic(
+                    for_.body_frame_source?.instr,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// 循环外 nil 与原低槽固定写/分支 phi 共用声明；不声称旧值有唯一 SSA 身份。
+    /// None 接收者只表示原批次中没有后续写入的 nil 槽，不授权复用其它当前 binding。
+    pub(super) fn loop_initializers(
+        &self,
+        stmt: &HirStmt,
+    ) -> Option<Vec<(TempId, Option<LocalId>)>> {
+        let header = self.loop_initializer_header(stmt)?;
+        let proofs = self.loop_initializers.get(&header)?;
+        proofs
+            .iter()
+            .flat_map(|proof| proof.temps.iter().zip(&proof.owners))
+            .map(|(&initial, (home, versions))| {
+                let home = *home;
+                if versions.is_empty() {
+                    return (self.trusted_temp_home_slot(initial) == Some(home))
+                        .then_some((initial, None));
+                }
+                let mut locals = versions
+                    .iter()
+                    .filter_map(|&temp| self.promoted_local_for_temp(temp))
+                    .collect::<BTreeSet<_>>();
+                let local = locals.pop_first()?;
+                (self.trusted_temp_home_slot(initial) == Some(home)
+                    && locals.is_empty()
+                    && versions
+                        .iter()
+                        .all(|&temp| self.trusted_temp_home_slot(temp) == Some(home))
+                    && self.trusted_local_home_slot(local) == Some(home)
+                    && self
+                        .complete_local_definition_write_homes(local)
+                        .iter()
+                        .copied()
+                        .eq([home]))
+                .then_some((initial, Some(local)))
+            })
+            .collect()
+    }
+
     /// 原 CALL 直接消费的开放 VARARG 包；只持有原包起点，不从最终省略号外形猜槽。
     pub(super) fn call_vararg_tail_home(
         &self,
@@ -2220,6 +2299,21 @@ impl ProtoPromotionFacts {
         .then_some(temp)
     }
 
+    /// 固定结果在原 CALL/FASTCALL 时均未打开引用 cell；协议必须仍属于当前调用。
+    /// 不授权删除结果或 COPY，其逐项 home 和后继写域由完整帧消费者继续核对。
+    pub(super) fn fixed_call_results_reference_unaliased(
+        &self,
+        call: &crate::hir::common::HirCallExpr,
+    ) -> bool {
+        let Some(source) = call.source_site else {
+            return false;
+        };
+        self.source_proto == Some(source.proto)
+            && self.calls.get(&source.instr).is_some_and(|facts| {
+                facts.layout.fastcall == call.fastcall && facts.layout.fixed_results_unaliased
+            })
+    }
+
     /// 完整 FASTCALL 事务使用的原 fallback COPY；不等同于参数根单独退休。
     pub(super) fn fastcall_argument_copies(
         &self,
@@ -2828,6 +2922,23 @@ impl ProtoPromotionFacts {
                 .copied()
                 .eq([result.home]))
         .then_some((result.binding, result.home))
+    }
+
+    /// 当前保留的单值语句写向原物理槽，不承诺 canonical binding 只有一个值版本。
+    /// 仅供声明末端分析逐条核对现存写入；历史 CALL/COPY 写域仍保留，不能用于内联。
+    pub(super) fn operation_local_write_home(
+        &self,
+        source: crate::hir::common::HirSourceSite,
+        local: LocalId,
+    ) -> Option<HomeSlotKey> {
+        if self.source_proto != Some(source.proto) {
+            return None;
+        }
+        let result = self.operation_results.get(&source.instr)?;
+        (self.trusted_temp_home_slot(result.temp) == Some(result.home)
+            && self.trusted_local_home_slot(local) == Some(result.home)
+            && self.promoted_binding_for_temp(result.binding) == Some(HirBinding::Local(local)))
+        .then_some(result.home)
     }
 
     /// 未来相同 home 的 capture 不回溯到这次原操作；仍需消费完整原 home 和事件事务。
@@ -4496,6 +4607,16 @@ impl ProtoPromotionFacts {
             phi_temps,
             &prewrites,
         );
+        let loop_initializers = loop_initializers::collect(
+            proto,
+            cfg,
+            graph,
+            dataflow,
+            plan,
+            slot_epochs,
+            fixed_temps,
+            phi_temps,
+        );
         // 固定多结果的原低槽写回与普通并列赋值共用声明 seed；即使初始 nil 未被读取，
         // 它仍是后续 COPY 和清槽共同覆盖的源码身份，不能留到 AST 才各自物化。
         parallel_target_seeds.extend(
@@ -5799,6 +5920,8 @@ impl ProtoPromotionFacts {
             ),
             conditional_root_endpoints,
             calls,
+            captured_builtin_callees: BTreeSet::new(),
+            loop_initializers,
             global_call_prefixes: BTreeMap::new(),
             global_initializer_writes: BTreeMap::new(),
             return_frames,

@@ -107,6 +107,63 @@ fn callee_is_named(callee: &HirExpr) -> bool {
     }
 }
 
+/// 按值捕获继承父级唯一 builtin 读取；共享 proto 的所有创建点必须一致。
+pub(in crate::hir::simplify) fn refresh_captured_callees(
+    module: &crate::hir::HirModule,
+    promotion: &mut [ProtoPromotionFacts],
+) {
+    use crate::hir::common::{HirClosureExpr, HirModule, HirProtoRef, UpvalueId};
+    use crate::hir::visit::{HirVisitor, visit_stmts};
+    struct Captures<'a> {
+        aliases: &'a CalleeAliases,
+        module: &'a HirModule,
+        known: &'a mut BTreeMap<HirProtoRef, BTreeSet<UpvalueId>>,
+    }
+    impl HirVisitor<'_> for Captures<'_> {
+        fn visit_closure(&mut self, closure: &HirClosureExpr) {
+            let child = &self.module.protos[closure.proto.index()];
+            let accepted = closure
+                .captures
+                .iter()
+                .enumerate()
+                .filter_map(|(index, capture)| {
+                    let upvalue = UpvalueId(index);
+                    (capture.mode == HirCaptureMode::ByValue
+                        && !child.mutable_upvalues.contains(&upvalue)
+                        && matches!(capture.binding, HirBinding::Local(local)
+                        if self.aliases.accepts(&HirExpr::LocalRef(local))))
+                    .then_some(upvalue)
+                })
+                .collect::<BTreeSet<_>>();
+            self.known
+                .entry(closure.proto)
+                .and_modify(|known| {
+                    known.retain(|upvalue| accepted.contains(upvalue));
+                })
+                .or_insert(accepted);
+        }
+    }
+    let mut known = BTreeMap::new();
+    for proto in &module.protos {
+        let mut references = CaptureCollector::new(HirCaptureMode::ByReference);
+        visit_stmts(&proto.body.stmts, &mut references);
+        let aliases = CalleeAliases::collect(proto, &references.bindings.locals);
+        visit_stmts(
+            &proto.body.stmts,
+            &mut Captures {
+                aliases: &aliases,
+                module,
+                known: &mut known,
+            },
+        );
+    }
+    for proto in &module.protos {
+        if let Some(facts) = promotion.get_mut(proto.id.index()) {
+            facts.set_captured_builtin_callees(known.remove(&proto.id).unwrap_or_default());
+        }
+    }
+}
+
 impl FrameBuilder<'_> {
     /// 开放尾参数先求值，fallback 再读取原 callee；固定结果宽度独立核对。
     pub(super) fn fastcall_open(
@@ -210,7 +267,7 @@ impl FrameBuilder<'_> {
             false,
             Some(frame.callee),
         )?;
-        if !context.callee_aliases.accepts(&callee) {
+        if !context.callee_aliases.accepts(&callee) && !facts.is_captured_builtin_callee(&callee) {
             return None;
         }
         self.finish_dispatch(call, before)?;
@@ -393,6 +450,9 @@ impl FrameBuilder<'_> {
                 (CallWidth::Ignore, Some(ResultPack::Ignore)) => true,
                 (CallWidth::Single, Some(ResultPack::Fixed(pack))) => {
                     pack.start.index() == frame.home.slot() && pack.len == 1
+                }
+                (CallWidth::Fixed(width), Some(ResultPack::Fixed(pack))) => {
+                    pack.start.index() == frame.home.slot() && pack.len == width
                 }
                 (CallWidth::Open, Some(ResultPack::Open(start))) => start.index() == slot,
                 _ => false,
@@ -616,7 +676,9 @@ impl FrameBuilder<'_> {
             )
         })?;
         // 保留具名读取或其不可变快照，不能用当前全局值替换保存过的 callee。
-        if !self.native?.callee_aliases.accepts(&callee) {
+        if !self.native?.callee_aliases.accepts(&callee)
+            && !facts.is_captured_builtin_callee(&callee)
+        {
             return None;
         }
         self.finish_dispatch(call, before)?;

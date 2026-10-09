@@ -119,6 +119,20 @@ pub(super) fn restore(proto: &mut HirProto, facts: &mut ProtoPromotionFacts) -> 
         facts,
         mentioned,
         debug,
+        debug_phi_initializers: proto
+            .local_debug_scopes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, scope)| {
+                let local = LocalId(index);
+                let phi = proto.debug_scopes[(*scope)?]?.initializer_phi?;
+                (facts.promoted_local_for_temp(phi) == Some(local)
+                    && facts.trusted_temp_home_slot(phi).is_some()
+                    && facts.trusted_temp_home_slot(phi) == facts.trusted_local_home_slot(local)
+                    && !proto.physical_root_locals.contains(&local))
+                .then_some(local)
+            })
+            .collect(),
         nil_groups: facts
             .nil_write_groups()
             .filter_map(|temps| {
@@ -159,11 +173,62 @@ struct Restore<'a> {
     facts: &'a ProtoPromotionFacts,
     mentioned: BTreeSet<LocalId>,
     debug: BTreeSet<LocalId>,
+    debug_phi_initializers: BTreeSet<LocalId>,
     nil_groups: BTreeSet<Vec<LocalId>>,
     merges: Vec<(LocalId, LocalId)>,
 }
 
 impl Restore<'_> {
+    fn restore_debug_phi_initializer(&self, current: &mut HirStmt, next: &mut HirStmt) -> bool {
+        let (HirStmt::LocalDecl(decl), HirStmt::Assign(assign)) = (current, next) else {
+            return false;
+        };
+        let ([local], [HirLValue::Local(target)], [value], None) = (
+            decl.bindings.as_slice(),
+            assign.targets.as_slice(),
+            assign.values.fixed.as_slice(),
+            &assign.values.tail,
+        ) else {
+            return false;
+        };
+        if local != target
+            || !decl.values.is_empty()
+            || !self.debug_phi_initializers.contains(local)
+            || decl.initializer_merge_transaction.is_some()
+            || decl.generic_for_initializer_producer.is_some()
+            || assign.initializer_merge_transaction.is_some()
+            || assign.generic_for_initializer_producer.is_some()
+            || assign.root_release.is_some()
+            || assign.method_rewrite_transaction.is_some()
+            || assign.parallel_nil_frame.is_some()
+            || assign.is_phi_transfer
+        {
+            return false;
+        }
+        let (HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical)) = value else {
+            return false;
+        };
+        if !matches!(logical.lhs, HirExpr::LocalRef(source) if source != *local)
+            && !matches!(logical.lhs, HirExpr::ParamRef(_))
+            || !matches!(
+                logical.rhs,
+                HirExpr::Nil
+                    | HirExpr::Boolean(_)
+                    | HirExpr::Integer(_)
+                    | HirExpr::Number(_)
+                    | HirExpr::String(_)
+            )
+        {
+            // 候选拒绝[ProofIncomplete:Lifetime]：带求值的短路分支仍需完整帧事务。
+            return false;
+        }
+        // 原 debug scope 的初始化 phi 已归属同一 home/local；空声明是提升控制合流
+        // 所需的壳，不是源码 nil 初值。COPY/字面量选值无观察点，原位恢复初始化
+        // 不提前 CALL、不移除旧根释放，亦不放宽真实空 debug 声明的 scope guard。
+        decl.values = std::mem::take(&mut assign.values);
+        true
+    }
+
     fn owns_empty_table_initializer(&self, bindings: &[LocalId], values: &[HirExpr]) -> bool {
         let ([local], [HirExpr::TableConstructor(table)]) = (bindings, values) else {
             return false;
@@ -190,6 +255,13 @@ impl Restore<'_> {
         let mut bindings = Vec::new();
         let mut changed = false;
         let mut removed = BTreeSet::new();
+        for index in 0..block.stmts.len().saturating_sub(1) {
+            let (left, right) = block.stmts.split_at_mut(index + 1);
+            if self.restore_debug_phi_initializer(&mut left[index], &mut right[0]) {
+                removed.insert(index + 1);
+                changed = true;
+            }
+        }
         for index in 0..block.stmts.len() {
             match &mut block.stmts[index] {
                 HirStmt::LocalDecl(decl)

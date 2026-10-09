@@ -83,17 +83,26 @@ pub(super) fn build_regions(
                 ))
             })?
             .collect::<BTreeSet<_>>();
-        blocks.insert(region.merge);
+        let tail_start = graph_facts.dominator_tree.preorder_index[region.merge.index()]
+            .ok_or_else(|| StructureError::invalid("single-pass tail has no dominator position"))?;
+        let tail_end = graph_facts.dominator_tree.subtree_end[region.merge.index()]
+            .ok_or_else(|| StructureError::invalid("single-pass tail has no dominator end"))?;
+        blocks.extend(
+            graph_facts.dominator_tree.order[tail_start..tail_end]
+                .iter()
+                .copied()
+                .filter(|block| *block != cfg.exit_block && *block != fence.exit),
+        );
         let blocks = reachable_nonempty_blocks(cfg, blocks);
         let valid_tail = matches!(
-            cfg.succs.get(region.merge.index()).map(Vec::as_slice),
+            cfg.succs.get(fence.normal_tail.index()).map(Vec::as_slice),
             Some([edge]) if cfg.edges.get(edge.index()).is_some_and(|edge| edge.to == fence.exit)
         );
         let valid_escapes = !fence.escape_edges.is_empty()
             && fence.escape_edges.iter().all(|edge| {
                 cfg.edges.get(edge.index()).is_some_and(|edge| {
                     blocks.contains(&edge.from)
-                        && edge.from != region.merge
+                        && !graph_facts.dominates(region.merge, edge.from)
                         && edge.to == fence.exit
                 })
             });
@@ -828,6 +837,7 @@ fn materialize_regions(
             region,
             entry: branch.branch.header,
             tail: branch_region.merge,
+            normal_tail: fence.normal_tail,
             continuation: fence.exit,
             escape_edges: fence.escape_edges.iter().copied().collect(),
         });

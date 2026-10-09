@@ -20,3 +20,7 @@ print(
     zero_level_suffix,
     nested_closing_and_suffix
 )
+
+assert("[[\n" == string.char(91, 91, 10))
+assert("mid[[\nend" == string.char(109, 105, 100, 91, 91, 10, 101, 110, 100))
+print("nested-opening-delimiter", "[[\n", "mid[[\nend", "[[\n]=", "[[\n]]")

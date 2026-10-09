@@ -319,11 +319,9 @@ fn arm_allows_direct_copy_sink(
         safe: true,
     };
     visit_block(block, &mut visitor);
-    assert!(
-        visitor.safe,
-        "equal common-copy tails cannot redeclare their LocalId in either arm"
-    );
-    true
+    // 候选拒绝[SemanticBarrier:Scope]：两臂可复用同一 phi 来源 LocalId，但其声明
+    // 仍属于各自 arm；相同 copy 不能越过来源或目标的声明作用域。
+    visitor.safe
 }
 
 struct DirectCopySinkBoundary {

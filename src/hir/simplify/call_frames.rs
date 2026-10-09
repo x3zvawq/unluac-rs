@@ -9,6 +9,7 @@ mod lookups;
 mod native;
 mod parameter_returns;
 mod tables;
+pub(super) use fastcalls::refresh_captured_callees;
 
 pub(super) use native::deferred_lookup_decisions;
 pub(super) use native::expanded::preserve_seeded_predicate_outputs;

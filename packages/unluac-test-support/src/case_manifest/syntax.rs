@@ -286,6 +286,18 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &[LuaCaseConfiguration::new(&[LuaCaseDialect::Luau])],
     ),
     LuaCaseDefinition::new(
+        "tests/case_syntax/separators_03_parenthesized_assignment.lua",
+        &["parse", "semicolon", "field", "index"],
+        "括号开头的字段和索引左值不能接到上一条调用，保留调用次数及原 nil 写入错误。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_syntax/separators_02_repeat_parenthesized_call_separator.lua",
         &["iife", "parse", "repeat", "semicolon"],
         "until条件后的下一条括号IIFE必须由分号分隔，不能被解析成condition调用链。",

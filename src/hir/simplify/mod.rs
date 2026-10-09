@@ -373,6 +373,11 @@ pub(super) fn simplify_hir(
             let before_snapshots = capture_hir_snapshots_if_requested(module, dump_config, name);
 
             let changed = timings.record(name, || {
+                if dialect == DecompileDialect::Luau
+                    && matches!(index, 16 | 17 | 18 | 20 | 21 | 22 | 23)
+                {
+                    call_frames::refresh_captured_callees(module, promotion_facts);
+                }
                 // 空候选 pass 不需要 closure-effects；先判定适用性，避免其它 pass
                 // 改写后为没有建表工作的模块反复重建整模块效果快照。
                 if matches!(index, 3 | 19)
@@ -553,6 +558,11 @@ pub(super) fn simplify_hir(
             // 这些要求仍通过 pass 的 invalidation tags 唤醒 locals；真正改树时才废弃值快照。
             if changed && index != 15 {
                 effect_snapshot = None;
+                if dialect == DecompileDialect::Luau {
+                    for facts in promotion_facts.iter_mut() {
+                        facts.set_captured_builtin_callees(Default::default());
+                    }
+                }
             }
 
             // pass 产生变化时输出 before/after diff

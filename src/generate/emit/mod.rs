@@ -256,7 +256,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_stmt_separator(&self, prev: &crate::ast::AstStmt, next: &crate::ast::AstStmt) -> Doc {
-        if stmt_can_absorb_call_suffix(prev) && stmt_starts_with_parenthesized_call(next) {
+        if stmt_can_absorb_call_suffix(prev) && stmt_starts_with_parenthesis(next) {
             Doc::concat([Doc::text(";"), Doc::line()])
         } else if is_function_stmt(prev) || is_function_stmt(next) {
             Doc::concat([Doc::line(), Doc::line()])
@@ -301,15 +301,27 @@ fn stmt_can_absorb_call_suffix(stmt: &crate::ast::AstStmt) -> bool {
     }
 }
 
-fn stmt_starts_with_parenthesized_call(stmt: &crate::ast::AstStmt) -> bool {
-    let crate::ast::AstStmt::CallStmt(call) = stmt else {
-        return false;
-    };
-    match &call.call {
-        crate::ast::AstCallKind::Call(call) => prefix_expr_starts_with_parenthesis(&call.callee),
-        crate::ast::AstCallKind::MethodCall(call) => {
-            prefix_expr_starts_with_parenthesis(&call.receiver)
-        }
+fn stmt_starts_with_parenthesis(stmt: &crate::ast::AstStmt) -> bool {
+    match stmt {
+        crate::ast::AstStmt::CallStmt(call) => match &call.call {
+            crate::ast::AstCallKind::Call(call) => {
+                prefix_expr_starts_with_parenthesis(&call.callee)
+            }
+            crate::ast::AstCallKind::MethodCall(call) => {
+                prefix_expr_starts_with_parenthesis(&call.receiver)
+            }
+        },
+        // 左值的首个前缀也可能以括号开头；换行不能阻止它接到上一条 CALL 上。
+        crate::ast::AstStmt::Assign(assign) => match assign.targets.first() {
+            Some(crate::ast::AstLValue::FieldAccess(access)) => {
+                prefix_expr_starts_with_parenthesis(&access.base)
+            }
+            Some(crate::ast::AstLValue::IndexAccess(access)) => {
+                prefix_expr_starts_with_parenthesis(&access.base)
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 

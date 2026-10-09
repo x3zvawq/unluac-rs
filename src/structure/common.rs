@@ -260,6 +260,8 @@ impl BranchRegionDomain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinglePassFenceFact {
     pub exit: BlockRef,
+    /// 共享尾域的唯一正常完成块；尾域入口仍是所属 branch region 的 merge。
+    pub normal_tail: BlockRef,
     pub escape_edges: BTreeSet<EdgeRef>,
 }
 

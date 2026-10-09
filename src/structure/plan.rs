@@ -243,7 +243,9 @@ pub struct BranchPlanData {
 pub struct SinglePassPlan {
     pub region: RegionId,
     pub entry: BlockRef,
+    /// 共享尾域入口，可含提前 RETURN；正常完成独立落在 normal_tail。
     pub tail: BlockRef,
+    pub normal_tail: BlockRef,
     pub continuation: BlockRef,
     pub escape_edges: Vec<EdgeRef>,
 }

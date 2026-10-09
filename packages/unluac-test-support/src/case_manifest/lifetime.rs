@@ -2,6 +2,24 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_lifetime/overwrite_10_call_move_independent_result_home.lua",
+        &[
+            "call-result",
+            "move",
+            "gc-root",
+            "multi-return",
+            "overwrite",
+        ],
+        "CALL 结果及低槽 MOVE 目标有独立覆盖端点，后继多返回调用不能丢失任一根 owner。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_lifetime/copy_21_numeric_root_overwrite.lua",
         &["gc", "copy", "numeric-overwrite", "loop", "physical-root"],
         "两个旧根分别在整数与浮点覆盖处退休，跨回边观察首次覆盖后存活、第二次覆盖后释放。",

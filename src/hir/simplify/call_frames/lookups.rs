@@ -1236,7 +1236,7 @@ impl FrameBuilder<'_> {
         input: HomeSlotKey,
     ) -> Option<HirExpr> {
         let (_, result) = self.facts.operation_writeback(binary.source_site?)?;
-        if self.dialect == DecompileDialect::Luau || result.slot() >= input.slot() {
+        if result.slot() >= input.slot() {
             return None;
         }
         self.register_arithmetic_inputs(binary, before, input, result)

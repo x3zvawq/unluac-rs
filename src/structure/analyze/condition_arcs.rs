@@ -333,6 +333,10 @@ pub(super) fn block_has_unabsorbed_effects(
         // 初始化通常在 debug 活动区间开始前；即使未被谓词读取，也必须作为声明发射。
         workspace.source_initializers[index]
             || instr_writes_source_binding(proto, dataflow, InstrRef(index))
+            // 候选拒绝[SemanticBarrier:ValueArity]：依赖某个返回值不代表能把整次
+            // CALL 放入单值谓词；固定多返回必须先发射声明，再读取对应结果。
+            || matches!(&proto.instrs[index], LowInstr::Call(call)
+                if matches!(call.results, crate::transformer::ResultPack::Fixed(range) if range.len > 1))
             // 候选拒绝[SemanticBarrier:EvaluationCount]：谓词依赖闭包只证明
             // producer 被使用，不证明它只被使用一次。条件内没有共享值声明，
             // 吸收多用的 CALL/GETTABLE 或计算会让 HIR 在每个读取处重新求值。

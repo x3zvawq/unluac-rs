@@ -2,6 +2,18 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_calls/results_14_branch_multi_result_prefix.lua",
+        &["call-frame", "multi-return", "branch", "table"],
+        "多返回的空接收声明仍依赖条件输入前缀，表构造与调用帧不得因此错位。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_calls/results_13_writeback_before_callable.lua",
         &["call-frame", "writeback", "closure", "captured-cell"],
         "捕获 cell 的 CALL 写回不吞并后继低槽闭包声明；普通调用读取其返回值，观察 cell 改写、快照身份和两条结果路径。",

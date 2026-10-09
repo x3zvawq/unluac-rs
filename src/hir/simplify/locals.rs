@@ -1855,7 +1855,15 @@ fn collect_plans(
                 .filter(|owner| call_root_lifetimes.owner_is_preserved(*owner))
                 .map(|owner| (owner.root_index(), owner.home()))
         });
+        let collected_root =
+            call_root_lifetimes.is_root(decl_index) || scalar_gc_root_lifetimes.is_root(decl_index);
         let preceding_physical_root_local = preceding_physical_root
+            .filter(|(_, root_home)| {
+                // 候选拒绝[SemanticBarrier:Lifetime]：当前结果若还有独立根终点，不能借
+                // 另一 home 的 owner 接收；当前 home 被覆盖时，MOVE 目标可能仍读取该值。
+                // 两条生命周期须分别物化。
+                !collected_root || home_slot == Some(*root_home)
+            })
             .and_then(|owner| materialized_owner_locals.get(&owner).copied());
         let force_physical_root_local = group_has_physical_root
             || (matches!(stmt.scalar_temp_assignment(), Some((_, HirExpr::Nil)))
@@ -2380,8 +2388,9 @@ fn collect_plans(
             // 捕获 local 的重绑定值，仍按原规则保守提升。
             if touching_stmt_indices.len() == 1 {
                 let use_stmt = &block.stmts[first_touch_index.expect("single touch must exist")];
-                // 未被 temp-inline 消费的闭包仍需在原创建点拥有 binding。仅在循环条件
-                // 出现一次不是一次执行；交给 AST 才物化会使后续 HIR 源码帧缺少这个前缀身份。
+                // 未被 temp-inline 消费的闭包和 CALL 仍需在原求值点拥有 binding。
+                // 短路 RHS 的单次读取不允许把此前必达 CALL 改为条件执行，循环条件
+                // 的单次静态读取也不是一次执行；交给 AST 才物化会让 HIR 后缀缺少前缀身份。
                 // 原有槽的常量也仍是显式 TEST 的输入；不能变成字面量后删掉原检查，
                 // 或让内层 CALL 失去声明前缀。
                 if reusable_local.is_none()
@@ -2391,7 +2400,7 @@ fn collect_plans(
                     && first_touch_index == Some(decl_index + 1)
                     && !matches!(
                         single_temp_assign_value(stmt, root_temp),
-                        Some(HirExpr::Closure(_))
+                        Some(HirExpr::Closure(_) | HirExpr::Call(_))
                     )
                     && !(home_slot.is_some()
                         && matches!(
@@ -2501,8 +2510,6 @@ fn collect_plans(
             ctx.physical_root_locals.insert(old_local);
             current_slot_locals.insert(home, selected_local);
         }
-        let collected_root =
-            call_root_lifetimes.is_root(decl_index) || scalar_gc_root_lifetimes.is_root(decl_index);
         if let Some(home) = home_slot
             && !(preceding_physical_root_local == Some(selected_local)
                 && preceding_physical_root.is_some_and(|(_, root_home)| root_home != home))
@@ -2644,8 +2651,8 @@ fn collect_plans(
                 .and_then(|home| scalar_gc_root_lifetimes.overwrite_pair_for_home(decl_index, home))
                 .map(|pair| (pair.root_index(), pair.home()));
             let preceding_call_root = home_slot
+                // 唯一旧根被当前分支覆盖，不代表分支的其它结果也继承该根身份。
                 .and_then(|home| call_root_lifetimes.overwrite_pair_for_home(decl_index, home))
-                .or_else(|| call_root_lifetimes.unambiguous_overwrite_pair(decl_index))
                 .map(|pair| (pair.root_index(), pair.home()));
             let preceding_physical_root_local = preceding_call_root
                 .or(preceding_lookup_root)

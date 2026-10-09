@@ -86,6 +86,36 @@ pub(super) fn branch_entry_requires_prefix(
         .chain(branch.else_block.as_ref())
         .any(|block| {
             for stmt in &block.stmts {
+                // 多返回的接收者会先提升为空声明，再由 exact tail 赋值；空声明
+                // 没有结束原准备区，不能因此漏掉后面的 CALL 对低槽前缀的依赖。
+                if let HirStmt::LocalDecl(decl) = stmt
+                    && decl.values.is_empty()
+                {
+                    if decl.bindings.is_empty()
+                        || decl.bindings.iter().any(|local| {
+                            facts
+                                .trusted_local_home_slot(*local)
+                                .is_none_or(|target| target.slot() <= home.slot())
+                        })
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+                let values = match stmt {
+                    HirStmt::LocalDecl(decl) => Some(&decl.values),
+                    HirStmt::Assign(assign) => Some(&assign.values),
+                    _ => None,
+                };
+                if let Some(values) = values
+                    && values.fixed.is_empty()
+                    && let Some(tail) = &values.tail
+                    && let crate::hir::common::HirExpr::Call(call) = tail.as_expr()
+                {
+                    return facts
+                        .native_call_layout(call)
+                        .is_some_and(|frame| frame.home.slot() > home.slot());
+                }
                 let (call, target) = match stmt {
                     HirStmt::CallStmt(stmt) => (Some(&stmt.call), None),
                     _ => {

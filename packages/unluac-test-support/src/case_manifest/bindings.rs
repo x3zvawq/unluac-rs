@@ -2,6 +2,18 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_bindings/phi_16_distinct_branch_result_roots.lua",
+        &["phi", "call-root", "branch", "identity"],
+        "分支中的独立结果只能继承匹配 home 的根，循环两条路径分别观察两对象调用。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_bindings/assignment_18_captured_input_snapshot.lua",
         &[
             "parallel-assignment",

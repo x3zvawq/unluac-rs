@@ -90,7 +90,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_literals/string_01_long_bracket_suffix_delimiter.lua",
         &["delimiter", "long-bracket"],
-        "字符串内容后缀不能与closing delimiter跨边界提前闭合。",
+        "长字符串分隔符避开内容后缀的跨界闭合及 Lua 5.1 内容内嵌零级起始分隔符。",
         &[
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),

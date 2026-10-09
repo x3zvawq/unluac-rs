@@ -307,7 +307,10 @@ fn format_long_bracket_string(value: &str) -> String {
 }
 
 fn long_bracket_eqs(value: &str) -> String {
-    for count in 0.. {
+    // Lua 5.1 拒绝零级长字符串内的 `[[`；非零级分隔符在所有支持方言中
+    // 都将它作为原始内容，后续仍须核对结束分隔符和跨界后缀。
+    let minimum = usize::from(value.contains("[["));
+    for count in minimum.. {
         let eqs = "=".repeat(count);
         let mut closing = format!("]{eqs}");
         let overlaps_suffix = value.ends_with(&closing);

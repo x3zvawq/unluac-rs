@@ -1,6 +1,6 @@
 //! 细化 single-pass fence、loop escape merge 与 iteration if/else。
 //!
-//! 本模块依赖已经分类的 branch/loop 候选和支配事实，只把真正跨分支共享的线性 tail
+//! 本模块依赖已经分类的 branch/loop 候选和支配事实，只把真正跨分支共享的 tail
 //! 冻结成 single-pass fence；它不负责基础分支分类，也不会把两臂各自闭合到同一出口的
 //! 普通 `if/else` 改写成合成 `repeat`。例如，嵌套 break 跳过共享 tail 时建立 fence，
 //! 而一臂执行普通语句、另一臂执行 numeric-for 后共同结束时继续保留 `if/else`。
@@ -11,12 +11,12 @@ use super::*;
 
 /// 恢复被编译器消去回边的 `repeat ... until true`。
 ///
-/// 这类区域有一个被多条正常路径共享的线性 tail，同时若干早退路径直接进入 tail
+/// 这类区域有一个被多条正常路径共享的 tail，同时若干早退路径直接进入 tail
 /// 之后的严格合流点。把外层 branch 的 continuation 收到 tail 后，最终 plan 就能用
 /// 一个 single-pass containment owner 承载所有跳过 tail 的 `break`。
 ///
-/// 如果 tail 完全属于 strict `if/else` 的一臂、其余出口完全属于另一臂，那么 tail
-/// 并未被两臂共享；这只是普通分支的两条完成路径，必须保留原 branch continuation。
+/// 如果 tail 完全属于 strict `if/else` 的一臂、其余出口仍各自属于原始两臂，那么 tail
+/// 并未被两臂共享；包括同臂内部跳过 tail 的路径，都应保留原 branch continuation。
 pub(super) fn refine_single_pass_fences(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
@@ -54,6 +54,47 @@ pub(super) fn refine_single_pass_fences(
         .iter()
         .map(|candidate| candidate.header)
         .collect::<BTreeSet<_>>();
+    // 支配子树的正常出口由唯一非函数出口 frontier 确定；按入边来源的 preorder
+    // 索引核对唯一完成边，不为每个共享尾域扫描其全部块或 continuation 的全部前驱。
+    let mut incoming = vec![Vec::new(); cfg.blocks.len()];
+    for (index, edge) in cfg.edges.iter().enumerate() {
+        if edge.to != cfg.exit_block
+            && let Some(position) = graph_facts.dominator_tree.preorder_index[edge.from.index()]
+        {
+            incoming[edge.to.index()].push((position, EdgeRef(index)));
+        }
+    }
+    for edges in &mut incoming {
+        edges.sort_unstable();
+    }
+    let mut tails_by_exit = vec![Vec::new(); cfg.blocks.len()];
+    for &tail in &cfg.reachable_blocks {
+        let mut exits = graph_facts
+            .dominance_frontier_blocks(tail)
+            .filter(|block| *block != cfg.exit_block);
+        let Some(exit) = exits.next() else { continue };
+        if exits.next().is_some() || loop_headers.contains(&tail) {
+            continue;
+        }
+        let (Some(start), Some(end)) = (
+            graph_facts.dominator_tree.preorder_index[tail.index()],
+            graph_facts.dominator_tree.subtree_end[tail.index()],
+        ) else {
+            continue;
+        };
+        let edges = &incoming[exit.index()];
+        let first = edges.partition_point(|(position, _)| *position < start);
+        let last = edges.partition_point(|(position, _)| *position < end);
+        if last != first + 1 {
+            // 候选拒绝[ProofIncomplete]：尾域的多个正常完成边尚未共同签发围栏出口。
+            continue;
+        }
+        let edge = edges[first].1;
+        let normal_tail = cfg.edges[edge.index()].from;
+        if cfg.succs[normal_tail.index()].as_slice() == [edge] {
+            tails_by_exit[exit.index()].push((tail, edge));
+        }
+    }
     let mut fences = BTreeMap::new();
     for (exit_index, candidate_index) in outer_by_exit.into_iter().enumerate() {
         let Some(candidate_index) = candidate_index else {
@@ -64,26 +105,22 @@ pub(super) fn refine_single_pass_fences(
         }
         let exit = BlockRef(exit_index);
         let header = branch_candidates[candidate_index].header;
-        let mut tails = cfg.preds[exit.index()].iter().filter_map(|edge_ref| {
-            let edge = cfg.edges[edge_ref.index()];
-            let tail = edge.from;
-            if !cfg.reachable_blocks.contains(&tail)
-                || !graph_facts.dominates(header, tail)
-                || branch_by_header.contains_key(&tail)
-                || loop_headers.contains(&tail)
-                || cfg.succs[tail.index()].as_slice() != [*edge_ref]
-            {
-                return None;
-            }
-            let incoming = cfg.preds[tail.index()]
-                .iter()
-                .filter(|incoming| {
-                    let source = cfg.edges[incoming.index()].from;
-                    cfg.reachable_blocks.contains(&source) && graph_facts.dominates(header, source)
-                })
-                .count();
-            (incoming >= 2).then_some((tail, *edge_ref))
-        });
+        let mut tails = tails_by_exit[exit.index()]
+            .iter()
+            .filter_map(|&(tail, edge_ref)| {
+                if !cfg.reachable_blocks.contains(&tail) || !graph_facts.dominates(header, tail) {
+                    return None;
+                }
+                let incoming = cfg.preds[tail.index()]
+                    .iter()
+                    .filter(|incoming| {
+                        let source = cfg.edges[incoming.index()].from;
+                        cfg.reachable_blocks.contains(&source)
+                            && graph_facts.dominates(header, source)
+                    })
+                    .count();
+                (incoming >= 2).then_some((tail, edge_ref))
+            });
         let Some((tail, tail_edge)) = tails.next() else {
             continue;
         };
@@ -114,7 +151,7 @@ pub(super) fn refine_single_pass_fences(
             .copied()
             .filter(|edge_ref| {
                 let source = cfg.edges[edge_ref.index()].from;
-                source != tail
+                !graph_facts.dominates(tail, source)
                     && cfg.reachable_blocks.contains(&source)
                     && graph_facts.dominates(header, source)
             })
@@ -190,12 +227,19 @@ pub(super) fn refine_single_pass_fences(
                 branch_candidates[*nested].merge = Some(tail);
             }
         }
-        fences.insert(header, SinglePassFenceFact { exit, escape_edges });
+        fences.insert(
+            header,
+            SinglePassFenceFact {
+                exit,
+                normal_tail: cfg.edges[tail_edge.index()].from,
+                escape_edges,
+            },
+        );
     }
     fences
 }
 
-/// strict `if/else` 的线性 tail 若完全属于一臂，则返回另一臂入口。
+/// 已确认 `if/else` 的 tail 若完全属于一臂，则返回另一臂入口。
 ///
 /// 两臂都不支配 tail 时，它才可能是 single-pass 的共享 tail；两臂都支配则候选边界
 /// 已经歧义。这个查询同时供纯控制分区和 value-result 闭合证明使用。
@@ -207,10 +251,7 @@ fn opposite_if_else_arm_for_owned_tail(
     exit: BlockRef,
 ) -> Option<BlockRef> {
     let else_entry = candidate.else_entry?;
-    if candidate.kind != BranchKind::IfElse
-        || candidate.merge != Some(exit)
-        || graph_facts.nearest_common_postdom(candidate.then_entry, else_entry) != Some(exit)
-    {
+    if candidate.kind != BranchKind::IfElse || candidate.merge != Some(exit) {
         return None;
     }
 
@@ -249,19 +290,27 @@ fn closed_if_else_partitions_tail_and_escapes(
     if graph_facts.dominates(exit, candidate.header) {
         return false;
     }
-    let Some(opposite_arm) =
-        opposite_if_else_arm_for_owned_tail(cfg, graph_facts, candidate, tail, exit)
-    else {
+    if candidate.else_entry.is_none_or(|other| {
+        graph_facts.nearest_common_postdom(candidate.then_entry, other) != Some(exit)
+    }) {
         return false;
-    };
+    }
+    if opposite_if_else_arm_for_owned_tail(cfg, graph_facts, candidate, tail, exit).is_none() {
+        return false;
+    }
+    let else_entry = candidate.else_entry.unwrap();
 
+    // 同臂的嵌套条件也可直接完成到 exit；只要每条边独占属于原始一臂，
+    // 它就是普通分支内的跳过路径，而不是跨两臂共享 tail 的提前 break。
     !escape_edges.is_empty()
-        && escape_edges
-            .iter()
-            .all(|edge| graph_facts.dominates(opposite_arm, cfg.edges[edge.index()].from))
+        && escape_edges.iter().all(|edge| {
+            let source = cfg.edges[edge.index()].from;
+            graph_facts.dominates(candidate.then_entry, source)
+                != graph_facts.dominates(else_entry, source)
+        })
 }
 
-/// value-result 已经证明两臂在严格后支配点闭合时，shared-tail 只是其中一臂的
+/// value-result 已经证明两臂在正常合流点闭合时，shared-tail 只是其中一臂的
 /// 实现形状；改成 single-pass 会把正常分支的结果边误解释成 `break`。
 pub(super) fn closed_if_else_owns_value_result(
     cfg: &Cfg,
@@ -318,7 +367,9 @@ pub(super) fn closed_if_else_owns_value_result(
         return false;
     }
 
-    // 嵌套短路臂会让同一源码臂的多个 leaf 直接进入 strict exit，浅层
+    // 提前 RETURN 可以把严格后支配点推到函数出口；已有 branch owner 的 soft
+    // merge 仍是正常合流。其全部物理入边和结果 phi 须继续由下方闭合证明核对。
+    // 嵌套短路臂会让同一源码臂的多个 leaf 直接进入 normal exit，浅层
     // `result_arm` 因此不再支配每条 escape。此时仍只信任原始 IfElse 两臂的支配归属，
     // 再复用 branch-value 的 phi 闭合证明；任意歧义 predecessor 都保守拒绝。
     let mut then_preds = BTreeSet::new();
