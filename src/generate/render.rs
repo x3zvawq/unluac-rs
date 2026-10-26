@@ -57,9 +57,36 @@ impl Renderer<'_> {
                 };
                 self.render(inner, child_mode, indent);
             }
-            Doc::Alt { flat, broken } => match mode {
+            Doc::Cascade {
+                flat,
+                content,
+                content_width,
+                broken,
+            } => match mode {
                 LayoutMode::Flat => self.render(flat, mode, indent),
-                LayoutMode::Break => self.render(broken, mode, indent),
+                LayoutMode::Break => {
+                    if self.fits_flat(flat) {
+                        self.render(flat, LayoutMode::Flat, indent);
+                    } else {
+                        let content_indent = indent + self.options.indent_width;
+                        let fits = self
+                            .options
+                            .max_line_length
+                            .checked_sub(content_indent)
+                            .is_some_and(|remaining| {
+                                content_width.is_none_or(|width| width <= remaining)
+                            });
+                        if fits {
+                            self.push_text("{");
+                            self.push_line(content_indent);
+                            self.render(content, LayoutMode::Flat, content_indent);
+                            self.push_line(indent);
+                            self.push_text("}");
+                        } else {
+                            self.render(broken, mode, indent);
+                        }
+                    }
+                }
             },
             Doc::Grid { cells } => self.render_grid(cells, indent),
         }
@@ -196,8 +223,8 @@ fn remaining_after_flat(doc: &Doc, remaining: usize) -> Option<usize> {
                 })
         }
         Doc::Indent(inner) | Doc::Group(inner) => remaining_after_flat(inner, remaining),
-        // Alt 只按 flat 侧证明能否平铺；Grid 自带硬换行，不能作为单行内容。
-        Doc::Alt { flat, .. } => remaining_after_flat(flat, remaining),
+        // Cascade 只按 flat 侧证明能否平铺；Grid 自带硬换行，不能作为单行内容。
+        Doc::Cascade { flat, .. } => remaining_after_flat(flat, remaining),
         Doc::Grid { .. } => None,
     }
 }

@@ -63,6 +63,15 @@ impl AlignedCellKind {
     }
 }
 
+/// Flushes an alignment run: every field gets padding up to the widest key of
+/// the run, after which the run is cleared.
+fn flush_alignment_run(pads: &mut [usize], run: &mut Vec<(usize, usize)>, run_max: usize) {
+    for &(index, width) in run.iter() {
+        pads[index] = run_max - width;
+    }
+    run.clear();
+}
+
 impl LogicalOperator {
     const fn precedence(self) -> u8 {
         match self {
@@ -534,7 +543,7 @@ impl<'a> Emitter<'a> {
                 Doc::line(),
                 Doc::text("}"),
             ]),
-            TableStyle::Aligned => self.emit_aligned_table(table, field_docs, function),
+            TableStyle::Aligned => self.emit_aligned_table(table, field_docs, function)?,
             TableStyle::Compact | TableStyle::Balanced => {
                 let separator = Doc::concat([Doc::text(","), Doc::soft_line()]);
                 Doc::group(Doc::concat([
@@ -550,20 +559,19 @@ impl<'a> Emitter<'a> {
         })
     }
 
-    /// Aligned 布局的三选一决策：整体放得下就保持单行（Group 按当前列判断）；
-    /// 否则纯数组且字段全部是同类小字面量时输出空格对齐网格，其余每行一条记录。
-    /// 网格行宽与字符串宽度上限由 `table_align_width` / `table_align_string_width` 控制。
+    /// Aligned 布局的级联决策：整体放得下就保持单行（复测按当前列判断）；
+    /// 否则先尝试把内容平铺进下一行，再退回空格对齐网格（纯同类小字面量数组）
+    /// 或逐行记录。网格行宽与字符串宽度上限由 `table_align_width` /
+    /// `table_align_string_width` 控制。
     fn emit_aligned_table(
         &self,
         table: &AstTableConstructor,
         field_docs: Vec<Doc>,
         function: HirProtoRef,
-    ) -> Doc {
-        let flat = Doc::concat([
-            Doc::text("{ "),
-            Doc::join(field_docs.iter().cloned(), Doc::text(", ")),
-            Doc::text(" }"),
-        ]);
+    ) -> Result<Doc, GenerateError> {
+        let fields_flat = Doc::join(field_docs.iter().cloned(), Doc::text(", "));
+        let content_width = fields_flat.flat_width();
+        let flat = Doc::concat([Doc::text("{ "), fields_flat.clone(), Doc::text(" }")]);
         let broken = match self.aligned_grid_cells(table, function) {
             Some(cells) => Doc::concat([
                 Doc::text("{"),
@@ -572,22 +580,38 @@ impl<'a> Emitter<'a> {
                 Doc::text("}"),
             ]),
             // 字典与非同类字段逐条输出；每条记录都带尾逗号，追加字段不会改写已有行。
-            None => Doc::concat([
-                Doc::text("{"),
-                Doc::indent(Doc::concat([
-                    Doc::line(),
-                    Doc::join(
-                        field_docs
-                            .into_iter()
-                            .map(|field| Doc::concat([field, Doc::text(",")])),
+            // 记录键按 `=` 对齐（`table_align_eq`），单行侧不参与对齐。
+            None => {
+                let pads = self.aligned_record_pads(table, function);
+                let needs_padding = pads.iter().any(|&pad| pad > 0);
+                let lines = if needs_padding {
+                    table
+                        .fields
+                        .iter()
+                        .zip(pads)
+                        .map(|(field, pad)| self.emit_table_field_padded(field, pad, function))
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    field_docs
+                };
+                Doc::concat([
+                    Doc::text("{"),
+                    Doc::indent(Doc::concat([
                         Doc::line(),
-                    ),
-                ])),
-                Doc::line(),
-                Doc::text("}"),
-            ]),
+                        Doc::join(
+                            lines
+                                .into_iter()
+                                .map(|line| Doc::concat([line, Doc::text(",")])),
+                            Doc::line(),
+                        ),
+                    ])),
+                    Doc::line(),
+                    Doc::text("}"),
+                ])
+            }
         };
-        Doc::group(Doc::alt(flat, broken))
+        // 内容侧只带字段本身；花括号与换行由 renderer 在平铺进下一行时合成。
+        Ok(Doc::cascade(flat, fields_flat, content_width, broken))
     }
 
     /// 收集对齐网格的单行单元格文本；返回 `None` 表示该表不具备网格布局资格：
@@ -635,15 +659,28 @@ impl<'a> Emitter<'a> {
         field: &AstTableField,
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
+        self.emit_table_field_padded(field, 0, function)
+    }
+
+    /// `pad` is the extra spaces inserted before ` = ` to align record keys;
+    /// it is non-zero only in the per-line branch of the aligned style when
+    /// `table_align_eq`.
+    fn emit_table_field_padded(
+        &self,
+        field: &AstTableField,
+        pad: usize,
+        function: HirProtoRef,
+    ) -> Result<Doc, GenerateError> {
         match field {
             AstTableField::Array(expr) => self.emit_expr(expr, function, 0, ExprSide::Standalone),
-            AstTableField::Record(record) => self.emit_record_field(record, function),
+            AstTableField::Record(record) => self.emit_record_field(record, pad, function),
         }
     }
 
     fn emit_record_field(
         &self,
         record: &AstRecordField,
+        pad: usize,
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
         let key = match &record.key {
@@ -655,7 +692,75 @@ impl<'a> Emitter<'a> {
             ]),
         };
         let value = self.emit_expr(&record.value, function, 0, ExprSide::Standalone)?;
-        Ok(Doc::concat([key, Doc::text(" = "), value]))
+        if pad > 0 {
+            Ok(Doc::concat([
+                key,
+                Doc::text(" ".repeat(pad)),
+                Doc::text(" = "),
+                value,
+            ]))
+        } else {
+            Ok(Doc::concat([key, Doc::text(" = "), value]))
+        }
+    }
+
+    /// Widths of record keys; `None` means the field cannot be aligned (an array
+    /// field or an unmeasurable key, e.g. a key with a hard line break).
+    fn record_key_width(
+        &self,
+        record: &AstRecordField,
+        function: HirProtoRef,
+    ) -> Option<usize> {
+        match &record.key {
+            AstTableKey::Name(name) => Some(name.chars().count()),
+            AstTableKey::Expr(expr) => {
+                let doc = self
+                    .emit_expr(expr, function, 0, ExprSide::Standalone)
+                    .ok()?;
+                Some(doc.flat_width()? + 2)
+            }
+        }
+    }
+
+    /// Computes the padding before ` = ` for each field of the per-line branch:
+    /// adjacent records are aligned to the widest key of the run while the
+    /// required padding stays within `table_align_eq_max_spaces`. Arrays,
+    /// unmeasurable keys and threshold-violating fields break the run.
+    fn aligned_record_pads(&self, table: &AstTableConstructor, function: HirProtoRef) -> Vec<usize> {
+        let mut pads = vec![0; table.fields.len()];
+        if !self.options.table_align_eq || self.options.table_align_eq_max_spaces == 0 {
+            return pads;
+        }
+        let mut run: Vec<(usize, usize)> = Vec::new();
+        let mut run_min = usize::MAX;
+        let mut run_max = 0usize;
+        for (index, field) in table.fields.iter().enumerate() {
+            let width = match field {
+                AstTableField::Record(record) => self.record_key_width(record, function),
+                AstTableField::Array(_) => None,
+            };
+            let Some(width) = width else {
+                flush_alignment_run(&mut pads, &mut run, run_max);
+                run_min = usize::MAX;
+                run_max = 0;
+                continue;
+            };
+            let new_max = run_max.max(width);
+            let new_min = run_min.min(width);
+            if !run.is_empty()
+                && new_max - new_min > self.options.table_align_eq_max_spaces
+            {
+                flush_alignment_run(&mut pads, &mut run, run_max);
+                run_min = width;
+                run_max = width;
+            } else {
+                run_min = new_min;
+                run_max = new_max;
+            }
+            run.push((index, width));
+        }
+        flush_alignment_run(&mut pads, &mut run, run_max);
+        pads
     }
 
     fn emit_function_expr(&self, func: &AstFunctionExpr) -> Result<Doc, GenerateError> {

@@ -46,6 +46,11 @@ pub struct GenerateOptions {
     /// 优先将已解码字符串作为 UTF-8 文本输出；关闭时保留原字节值。
     pub readable_strings: bool,
     pub table_style: TableStyle,
+    /// Align record keys on `=` in multi-line aligned tables.
+    pub table_align_eq: bool,
+    /// Cap on padding when aligning on `=`: padding longer than this threshold
+    /// breaks the alignment run so that one long key does not stretch every row.
+    pub table_align_eq_max_spaces: usize,
     /// Aligned style only: maximum rendered row width (including indentation) of a
     /// space-aligned table grid. Rows never exceed this budget unless a single cell
     /// alone is wider.
@@ -69,6 +74,8 @@ impl Default for GenerateOptions {
             quote_style: QuoteStyle::MinEscape,
             readable_strings: true,
             table_style: TableStyle::Balanced,
+            table_align_eq: true,
+            table_align_eq_max_spaces: 8,
             table_align_width: 100,
             table_align_string_width: 16,
             comment: true,

@@ -70,6 +70,10 @@ export interface UnluacDecompileOptions {
     tableAlignWidth?: number;
     /** Max rendered width of string literals allowed inside aligned table grids. */
     tableAlignStringWidth?: number;
+    /** Align record keys by `=` in non-single-line aligned tables (default true). */
+    tableAlignEq?: boolean;
+    /** Max padding spaces when aligning record keys by `=` (default 8). */
+    tableAlignEqMaxSpaces?: number;
     luauVectorConstructor?: UnluacLuauVectorConstructor;
     comment?: boolean;
   };

@@ -349,6 +349,19 @@ struct GenerateArgs {
         help_heading = "Generate"
     )]
     table_style: Option<TableStyle>,
+    /// Align record keys by `=` in non-single-line aligned tables
+    /// (default: true).
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = BoolishValueParser::new(),
+        help_heading = "Generate"
+    )]
+    table_align_eq: Option<bool>,
+    /// Max padding spaces when aligning record keys by `=`; a longer key starts
+    /// a new alignment run instead of stretching every row (default: 8).
+    #[arg(long, help_heading = "Generate")]
+    table_align_eq_max_spaces: Option<usize>,
     /// Max rendered row width (including indentation) of `--table-style aligned` grids.
     #[arg(long, help_heading = "Generate")]
     table_align_width: Option<usize>,
@@ -398,6 +411,11 @@ impl GenerateArgs {
         );
         set_if_some(&mut options.generate.number_format, self.number_format);
         set_if_some(&mut options.generate.table_style, self.table_style);
+        set_if_some(&mut options.generate.table_align_eq, self.table_align_eq);
+        set_if_some(
+            &mut options.generate.table_align_eq_max_spaces,
+            self.table_align_eq_max_spaces,
+        );
         set_if_some(
             &mut options.generate.table_align_width,
             self.table_align_width,

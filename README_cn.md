@@ -89,7 +89,65 @@ unluac-cli -s example.lua -D lua5.4
 
 Heuristic 还会使用小型标准库签名表：`os.date` 的实参可提示 `format/time`，`string.sub` 可提示 `text/start_index/end_index`。更具体的字段用途优先，角色冲突时保留通用名。
 
-表构造器通过 `--table-style` 提供四种排版风格。`compact`、`balanced`（默认）与 `expanded` 保持既有行为。`aligned` 风格对每张表三选一：放得下单行的保持单行；否则纯数组且元素全部是同类小字面量（数字、短字符串、布尔、`nil` 或普通名字）时输出空格对齐的网格，值按列上下对齐；其余情况（包括任何字典）每行一条记录，嵌套表按自身缩进套用同样规则。网格由两个参数调节：`--table-align-width` 限制含缩进的行渲染宽度（默认 100），`--table-align-string-width` 限制可进入网格的字符串字面量渲染宽度（默认 16），超宽字符串会让整张表退回逐行布局。多行记录带尾逗号，追加字段不会改写已有行。
+表构造器通过 `--table-style` 提供四种排版风格。`compact`、`balanced`（默认）与 `expanded` 保持既有行为。`aligned` 风格对每张表按顺序尝试四种布局：
+
+1. **单行** — 整个构造器放得下当前行：`local anchors = { 10, 20, 30 }`。
+2. **内容单行** — 否则先尝试把全部内容平铺进花括号内缩进一层的下一行：
+   ```lua
+   local fallback = {
+       alpha = 1, beta = 2, gamma = 3, delta = 4, epsilon = 5, zeta = 6, eta = 7, theta = 8
+   }
+   ```
+3. **对齐网格** — 否则纯数组且元素全部是同类小字面量（数字、短字符串、布尔、`nil` 或普通名字）时，按行输出多个单元格并用空格填充，使值按列上下对齐。
+4. **逐行记录** — 其余情况（任何字典、混合数组、超宽字符串、非字面量元素）；嵌套表按自身缩进套用同样规则。多行记录带尾逗号，追加字段不会改写已有行。
+
+四个参数只作用于 `aligned` 风格：
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `--table-align-width` | 100 | 限制网格行渲染宽度（含缩进）；除非单个单元格自身超宽，行不会超出该预算。 |
+| `--table-align-string-width` | 16 | 限制可进入网格的字符串字面量渲染宽度（含引号）；超宽字符串让整张表退回逐行布局。 |
+| `--table-align-eq` | true | 多行表内按 `=` 对齐记录键：键填充到本对齐系列最宽键的列。`--table-align-eq=false` 保持 `=` 两侧单空格。 |
+| `--table-align-eq-max-spaces` | 8 | 限制 `=` 对齐的填充量：需要更多填充的键会开启新的对齐系列，而不是把所有行都撑开。 |
+
+各参数的具体效果：
+
+```lua
+-- 默认：--table-align-eq 把键对齐到本系列最宽键
+local config = {
+    name    = "unluac",
+    threads = 4,
+    paths   = { "/usr/share/lua/5.1/?.lua", "/usr/local/share/lua/5.1/?.lua" },
+    retries = 3,
+}
+-- --table-align-eq=false：同一张表，无填充
+--     name = "unluac",
+--     threads = 4,
+
+-- --table-align-eq-max-spaces=2：10 字符的键不再撑开短键；
+-- 对齐系列断开，剩余键保持单空格
+local options = {
+    id   = "op",
+    kind = "select",
+    retries = 4,
+    timeout_ms = 1500,
+}
+
+-- --table-align-width=40：网格每行装更少的单元格（8 而不是 15）
+local values = {
+    10, 11, 12, 13, 14, 15, 16, 17,
+    18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 32, 33,
+    34, 35, 36, 37, 38, 39,
+}
+
+-- --table-align-string-width=6：13 字符字符串超过上限，
+-- 整张表退回逐行布局而不是网格
+local labels = {
+    "longstring1",
+    "longstring2",
+}
+```
 
 完整的格式化、命名和解码选项见 `unluac-cli --help`；查看流水线中间结果的方法见[调试手册](./docs/debug.md)。
 

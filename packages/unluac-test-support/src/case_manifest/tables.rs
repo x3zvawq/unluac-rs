@@ -38,6 +38,84 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_tables/layout_04_aligned_content_line.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned table style cascade: a constructor that no longer fits flat keeps its whole content on one indented line between the braces before falling back to one entry per line.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_05_align_width_budget.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-width shrinks the aligned grid per-row budget: a 40-column budget packs two-digit numbers 8 per row instead of the default 15.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_width: Some(40),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_06_string_width_budget.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-string-width caps the string width allowed in a grid: with a cap of 6, over-wide strings fall back to one entry per line while short strings stay gridded.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_string_width: Some(6),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_07_eq_alignment.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-eq (default true) aligns record keys of non-single-line aligned tables by `=` within the padding cap, so values start at the same column.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_eq: Some(true),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_08_eq_max_spaces.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-eq-max-spaces caps `=` alignment padding: with a cap of 2 a long key starts a new alignment run instead of stretching every row.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_eq: Some(true),
+                table_align_eq_max_spaces: Some(2),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_09_eq_disabled.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-eq=false keeps single spaces around `=` in non-single-line aligned tables regardless of key widths.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_eq: Some(false),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/constructor_32_open_prefix_iterator_reuse.lua",
         &[
             "constructor",

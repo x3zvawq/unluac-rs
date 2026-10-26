@@ -1,9 +1,11 @@
 -- aligned style falls back to one entry per line for dictionaries and
 -- for arrays whose strings exceed the aligned string width; every multi-line
 -- entry keeps a trailing comma so appending a field never rewrites earlier lines.
--- unluac: expect-contains [[    name = "unluac",]]
+-- Record keys are aligned by `=` (default table_align_eq), padded to the widest
+-- key of their alignment run.
+-- unluac: expect-contains [[    name    = "unluac",]]
 -- unluac: expect-contains [[    "averylongcolorname6",]]
--- unluac: expect-contains [[    paths = { "/usr/share/lua/5.1/?.lua", "/usr/local/share/lua/5.1/?.lua" },]]
+-- unluac: expect-contains [[    paths   = { "/usr/share/lua/5.1/?.lua", "/usr/local/share/lua/5.1/?.lua" },]]
 local config = {
     name = "unluac",
     threads = 4,

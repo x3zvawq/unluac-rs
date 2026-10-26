@@ -90,7 +90,65 @@ For example: `unluac-cli -i sample.luac -n heuristic`. Heuristic names are reada
 
 Heuristic mode also uses a small standard-library signature table: arguments to `os.date` can suggest `format` and `time`, while `string.sub` suggests `text`, `start_index` and `end_index`. More specific field usage takes priority; conflicting roles keep generic names.
 
-Table constructors support four layout styles via `--table-style`. `compact`, `balanced` (default) and `expanded` keep their existing behavior. The `aligned` style picks one of three layouts per table: tables that fit on one line stay on one line; otherwise an array of small homogeneous elements (numbers, short strings, booleans, `nil`, or plain names) is rendered as a space-aligned grid with the values lined up in columns; everything else — including any dictionary — gets one entry per line, with nested tables following the same rules at their own indentation. Two options tune the grid: `--table-align-width` caps the rendered row width including indentation (default 100), and `--table-align-string-width` caps the rendered width of string literals allowed in a grid (default 16); wider strings make the table fall back to the one-entry-per-line layout. Multi-line entries carry trailing commas so appending a field never rewrites earlier lines.
+Table constructors support four layout styles via `--table-style`. `compact`, `balanced` (default) and `expanded` keep their existing behavior. The `aligned` style picks one of four layouts per table, trying them in order:
+
+1. **Single line** — the whole constructor fits on the current line: `local anchors = { 10, 20, 30 }`.
+2. **Content on one line** — otherwise the content is kept as a single indented line between the braces whenever it fits there:
+   ```lua
+   local fallback = {
+       alpha = 1, beta = 2, gamma = 3, delta = 4, epsilon = 5, zeta = 6, eta = 7, theta = 8
+   }
+   ```
+3. **Aligned grid** — otherwise a pure array of small homogeneous elements (numbers, short strings, booleans, `nil`, or plain names) is printed several cells per row, space-padded so values line up in columns.
+4. **One entry per line** — everything else (any dictionary, mixed arrays, over-wide strings, non-literal elements); nested tables follow the same rules at their own indentation. Multi-line entries carry trailing commas so appending a field never rewrites earlier lines.
+
+Four options tune the `aligned` style (they do not affect the other styles):
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--table-align-width` | 100 | Caps the rendered row width (including indentation) of a grid; rows never exceed it unless a single cell alone is wider. |
+| `--table-align-string-width` | 16 | Caps the rendered width (quotes included) of a string allowed inside a grid; a wider string disqualifies the whole table from grid mode (falls back to one entry per line). |
+| `--table-align-eq` | true | Aligns record keys by `=` in non-single-line tables: keys are padded to the widest key of their alignment run. `--table-align-eq=false` keeps single spaces around `=`. |
+| `--table-align-eq-max-spaces` | 8 | Caps the `=` padding: a key that would need more padding starts a new alignment run instead of stretching every row. |
+
+What the options change, concretely:
+
+```lua
+-- default: --table-align-eq aligns keys to the widest key of the run
+local config = {
+    name    = "unluac",
+    threads = 4,
+    paths   = { "/usr/share/lua/5.1/?.lua", "/usr/local/share/lua/5.1/?.lua" },
+    retries = 3,
+}
+-- --table-align-eq=false: same table, no padding
+--     name = "unluac",
+--     threads = 4,
+
+-- --table-align-eq-max-spaces=2: the 10-char key no longer stretches short keys;
+-- the run breaks and remaining keys keep single spaces
+local options = {
+    id   = "op",
+    kind = "select",
+    retries = 4,
+    timeout_ms = 1500,
+}
+
+-- --table-align-width=40: the grid packs fewer cells per row (8 instead of 15)
+local values = {
+    10, 11, 12, 13, 14, 15, 16, 17,
+    18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 32, 33,
+    34, 35, 36, 37, 38, 39,
+}
+
+-- --table-align-string-width=6: 13-char strings exceed the cap, so the whole
+-- table falls back to one entry per line instead of a grid
+local labels = {
+    "longstring1",
+    "longstring2",
+}
+```
 
 See `unluac-cli --help` for all formatting, naming and decoding options, and the [debugging guide](./docs/debug.md) for pipeline inspection.
 
