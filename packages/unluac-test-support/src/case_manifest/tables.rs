@@ -116,6 +116,31 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_tables/layout_10_drop_index_keys.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-drop-index-keys rewrites contiguous explicit `[1]..[n]` constructor keys as positional entries (grid eligibility included) while gaps, descending keys and mixed positional fields stay untouched.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_drop_index_keys: Some(true),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_11_index_keys_default.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Without --table-drop-index-keys explicit `[1]..[n]` constructor keys stay in the output exactly as the bytecode stored them.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/constructor_32_open_prefix_iterator_reuse.lua",
         &[
             "constructor",

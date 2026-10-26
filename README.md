@@ -110,6 +110,7 @@ Four options tune the `aligned` style (they do not affect the other styles):
 | `--table-align-string-width` | 16 | Caps the rendered width (quotes included) of a string allowed inside a grid; a wider string disqualifies the whole table from grid mode (falls back to one entry per line). |
 | `--table-align-eq` | true | Aligns record keys by `=` in non-single-line tables: keys are padded to the widest key of their alignment run. `--table-align-eq=false` keeps single spaces around `=`. |
 | `--table-align-eq-max-spaces` | 8 | Caps the `=` padding: a key that would need more padding starts a new alignment run instead of stretching every row. |
+| `--table-drop-index-keys` | false | Rewrites contiguous explicit `[1]..[n]` constructor keys as positional array entries (see below). |
 
 What the options change, concretely:
 
@@ -148,6 +149,17 @@ local labels = {
     "longstring1",
     "longstring2",
 }
+
+-- --table-drop-index-keys=true: contiguous explicit index keys become positional
+-- entries; a plain array literal compiles to SETLIST ops without keys, so any
+-- `[1] =` in the output mirrors an explicitly keyed source. The rewrite preserves
+-- evaluation order and per-field side effects; only the unspecified pairs() order
+-- changes (hash part becomes the array part). Gaps, descending keys and tables
+-- that mix positional and keyed fields are left untouched.
+local keyed = { "alpha", "beta" }        -- was: { [1] = "alpha", [2] = "beta" }
+local mixed = { mode = "dlg", "alpha", "beta", tag = 3 }
+                                         -- was: { mode = "dlg", [1] = "alpha", [2] = "beta", tag = 3 }
+local untouched = { [1] = "alpha", [3] = "gamma" }   -- gap: kept as-is
 ```
 
 See `unluac-cli --help` for all formatting, naming and decoding options, and the [debugging guide](./docs/debug.md) for pipeline inspection.

@@ -109,6 +109,7 @@ Heuristic 还会使用小型标准库签名表：`os.date` 的实参可提示 `f
 | `--table-align-string-width` | 16 | 限制可进入网格的字符串字面量渲染宽度（含引号）；超宽字符串让整张表退回逐行布局。 |
 | `--table-align-eq` | true | 多行表内按 `=` 对齐记录键：键填充到本对齐系列最宽键的列。`--table-align-eq=false` 保持 `=` 两侧单空格。 |
 | `--table-align-eq-max-spaces` | 8 | 限制 `=` 对齐的填充量：需要更多填充的键会开启新的对齐系列，而不是把所有行都撑开。 |
+| `--table-drop-index-keys` | false | 把连续的显式 `[1]..[n]` 构造器键改写成位置字段（见下）。 |
 
 各参数的具体效果：
 
@@ -147,6 +148,16 @@ local labels = {
     "longstring1",
     "longstring2",
 }
+
+-- --table-drop-index-keys=true：连续的显式索引键改写为位置字段；
+-- 普通数组字面量编译成不带键的 SETLIST 指令，所以输出里的 `[1] =`
+-- 必然对应显式写键的源码。改写保持求值顺序与逐字段副作用，只有
+-- 未定义的 pairs 顺序变化（哈希部分变成数组部分）。有缺口、乱序、
+-- 或与位置字段混用的表保持原样。
+local keyed = { "alpha", "beta" }        -- 原为：{ [1] = "alpha", [2] = "beta" }
+local mixed = { mode = "dlg", "alpha", "beta", tag = 3 }
+                                         -- 原为：{ mode = "dlg", [1] = "alpha", [2] = "beta", tag = 3 }
+local untouched = { [1] = "alpha", [3] = "gamma" }   -- 有缺口：保持原样
 ```
 
 完整的格式化、命名和解码选项见 `unluac-cli --help`；查看流水线中间结果的方法见[调试手册](./docs/debug.md)。

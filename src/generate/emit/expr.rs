@@ -14,6 +14,7 @@ use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
 
 use super::super::common::TableStyle;
+use crate::value_semantics::table::TableExpression;
 use super::super::error::GenerateError;
 use super::syntax::{
     binary_meta, format_complex_literal, format_integer, format_number, format_string_literal,
@@ -70,6 +71,41 @@ fn flush_alignment_run(pads: &mut [usize], run: &mut Vec<(usize, usize)>, run_ma
         pads[index] = run_max - width;
     }
     run.clear();
+}
+
+/// `--table-drop-index-keys`：把显式写出的连续索引键 `[1]..[n]` 投影成位置字段。
+/// 返回 `None` 表示该构造器没有可安全去掉的键（或键序列不连续/乱序/与位置字段混用），
+/// 调用方应保留原字段。非整数键的记录字段原样保留，字段顺序不变，因此求值顺序
+/// 与逐字段副作用完全一致；唯一的运行时差异是 `pairs` 顺序（哈希部分变成数组部分），
+/// 这在 Lua 中本就不确定。
+fn project_dropped_index_keys(fields: &[AstTableField]) -> Option<Vec<AstTableField>> {
+    let mut projected = Vec::with_capacity(fields.len());
+    let mut next_index = 1i64;
+    let mut converted = 0usize;
+    for field in fields {
+        match field {
+            // 位置字段与显式键混用时无法安全重排，直接放弃投影。
+            AstTableField::Array(_) => return None,
+            AstTableField::Record(record) => {
+                let integer_key = match &record.key {
+                    AstTableKey::Name(_) => None,
+                    AstTableKey::Expr(expr) => expr.table_integer_key(),
+                };
+                match integer_key {
+                    Some(index) if index == next_index => {
+                        projected.push(AstTableField::Array(record.value.clone()));
+                        next_index += 1;
+                        converted += 1;
+                    }
+                    // 缺口、重复或乱序的索引键（如 `[1]` 后跟 `[3]`）语义上不是
+                    // 纯数组，保留原样最稳妥。
+                    Some(_) => return None,
+                    None => projected.push(field.clone()),
+                }
+            }
+        }
+    }
+    (converted > 0).then_some(projected)
 }
 
 impl LogicalOperator {
@@ -528,8 +564,16 @@ impl<'a> Emitter<'a> {
         if table.fields.is_empty() {
             return Ok(Doc::text("{}"));
         }
-        let field_docs = table
-            .fields
+        // `--table-drop-index-keys`：把连续的显式 `[1]..[n]` 键投影成位置字段。
+        // 投影结果同时驱动网格资格判断，因此纯数字的显式键数组也能进入网格。
+        let projected;
+        let fields: &[AstTableField] = if self.options.table_drop_index_keys {
+            projected = project_dropped_index_keys(&table.fields);
+            projected.as_deref().unwrap_or(&table.fields)
+        } else {
+            &table.fields
+        };
+        let field_docs = fields
             .iter()
             .map(|field| self.emit_table_field(field, function))
             .collect::<Result<Vec<_>, _>>()?;
@@ -543,7 +587,7 @@ impl<'a> Emitter<'a> {
                 Doc::line(),
                 Doc::text("}"),
             ]),
-            TableStyle::Aligned => self.emit_aligned_table(table, field_docs, function)?,
+            TableStyle::Aligned => self.emit_aligned_table(fields, field_docs, function)?,
             TableStyle::Compact | TableStyle::Balanced => {
                 let separator = Doc::concat([Doc::text(","), Doc::soft_line()]);
                 Doc::group(Doc::concat([
@@ -565,14 +609,14 @@ impl<'a> Emitter<'a> {
     /// `table_align_string_width` 控制。
     fn emit_aligned_table(
         &self,
-        table: &AstTableConstructor,
+        fields: &[AstTableField],
         field_docs: Vec<Doc>,
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
         let fields_flat = Doc::join(field_docs.iter().cloned(), Doc::text(", "));
         let content_width = fields_flat.flat_width();
         let flat = Doc::concat([Doc::text("{ "), fields_flat.clone(), Doc::text(" }")]);
-        let broken = match self.aligned_grid_cells(table, function) {
+        let broken = match self.aligned_grid_cells(fields, function) {
             Some(cells) => Doc::concat([
                 Doc::text("{"),
                 Doc::indent(Doc::concat([Doc::line(), Doc::grid(cells)])),
@@ -582,11 +626,10 @@ impl<'a> Emitter<'a> {
             // 字典与非同类字段逐条输出；每条记录都带尾逗号，追加字段不会改写已有行。
             // 记录键按 `=` 对齐（`table_align_eq`），单行侧不参与对齐。
             None => {
-                let pads = self.aligned_record_pads(table, function);
+                let pads = self.aligned_record_pads(fields, function);
                 let needs_padding = pads.iter().any(|&pad| pad > 0);
                 let lines = if needs_padding {
-                    table
-                        .fields
+                    fields
                         .iter()
                         .zip(pads)
                         .map(|(field, pad)| self.emit_table_field_padded(field, pad, function))
@@ -619,12 +662,12 @@ impl<'a> Emitter<'a> {
     /// nil/布尔/数字/短字符串/普通名字之一。
     fn aligned_grid_cells(
         &self,
-        table: &AstTableConstructor,
+        fields: &[AstTableField],
         function: HirProtoRef,
     ) -> Option<Vec<String>> {
         let mut class = None;
-        let mut cells = Vec::with_capacity(table.fields.len());
-        for field in &table.fields {
+        let mut cells = Vec::with_capacity(fields.len());
+        for field in fields {
             let AstTableField::Array(expr) = field else {
                 return None;
             };
@@ -726,15 +769,15 @@ impl<'a> Emitter<'a> {
     /// adjacent records are aligned to the widest key of the run while the
     /// required padding stays within `table_align_eq_max_spaces`. Arrays,
     /// unmeasurable keys and threshold-violating fields break the run.
-    fn aligned_record_pads(&self, table: &AstTableConstructor, function: HirProtoRef) -> Vec<usize> {
-        let mut pads = vec![0; table.fields.len()];
+    fn aligned_record_pads(&self, fields: &[AstTableField], function: HirProtoRef) -> Vec<usize> {
+        let mut pads = vec![0; fields.len()];
         if !self.options.table_align_eq || self.options.table_align_eq_max_spaces == 0 {
             return pads;
         }
         let mut run: Vec<(usize, usize)> = Vec::new();
         let mut run_min = usize::MAX;
         let mut run_max = 0usize;
-        for (index, field) in table.fields.iter().enumerate() {
+        for (index, field) in fields.iter().enumerate() {
             let width = match field {
                 AstTableField::Record(record) => self.record_key_width(record, function),
                 AstTableField::Array(_) => None,

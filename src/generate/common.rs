@@ -51,6 +51,11 @@ pub struct GenerateOptions {
     /// Cap on padding when aligning on `=`: padding longer than this threshold
     /// breaks the alignment run so that one long key does not stretch every row.
     pub table_align_eq_max_spaces: usize,
+    /// Fold redundant explicit index keys `[1]..[n]` into positional fields of the
+    /// constructor. The bytecode stores such keys faithfully (the source wrote them
+    /// out explicitly), so the fold is opt-in: it only changes the unspecified
+    /// `pairs` order (the hash part becomes an array).
+    pub table_drop_index_keys: bool,
     /// Aligned style only: maximum rendered row width (including indentation) of a
     /// space-aligned table grid. Rows never exceed this budget unless a single cell
     /// alone is wider.
@@ -76,6 +81,7 @@ impl Default for GenerateOptions {
             table_style: TableStyle::Balanced,
             table_align_eq: true,
             table_align_eq_max_spaces: 8,
+            table_drop_index_keys: false,
             table_align_width: 100,
             table_align_string_width: 16,
             comment: true,
