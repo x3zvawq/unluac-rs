@@ -48,7 +48,7 @@ const COLOR_VALUES: &[&str] = &["auto", "always", "never"];
 const NAMING_MODE_VALUES: &[&str] = &["debug-like", "simple", "heuristic"];
 const QUOTE_STYLE_VALUES: &[&str] = &["prefer-double", "prefer-single", "min-escape"];
 const NUMBER_FORMAT_VALUES: &[&str] = &["decimal", "hex"];
-const TABLE_STYLE_VALUES: &[&str] = &["compact", "balanced", "expanded"];
+const TABLE_STYLE_VALUES: &[&str] = &["compact", "balanced", "aligned", "expanded"];
 const GENERATE_MODE_VALUES: &[&str] = &["strict", "permissive"];
 
 fn known_value_parser<T>(values: &'static [&'static str]) -> impl TypedValueParser<Value = T>
@@ -349,6 +349,12 @@ struct GenerateArgs {
         help_heading = "Generate"
     )]
     table_style: Option<TableStyle>,
+    /// Max rendered row width (including indentation) of `--table-style aligned` grids.
+    #[arg(long, help_heading = "Generate")]
+    table_align_width: Option<usize>,
+    /// Max rendered width of string literals allowed inside `--table-style aligned` grids.
+    #[arg(long, help_heading = "Generate")]
+    table_align_string_width: Option<usize>,
     /// Optional Luau vector library name used with `--luau-vector-constructor`.
     #[arg(long, requires = "luau_vector_constructor", help_heading = "Generate")]
     luau_vector_library: Option<String>,
@@ -392,6 +398,14 @@ impl GenerateArgs {
         );
         set_if_some(&mut options.generate.number_format, self.number_format);
         set_if_some(&mut options.generate.table_style, self.table_style);
+        set_if_some(
+            &mut options.generate.table_align_width,
+            self.table_align_width,
+        );
+        set_if_some(
+            &mut options.generate.table_align_string_width,
+            self.table_align_string_width,
+        );
         if let (Some(constructor), Some(size)) =
             (self.luau_vector_constructor, self.luau_vector_size)
         {

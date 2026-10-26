@@ -33,7 +33,7 @@ export type UnluacStringDecodeMode = 'strict' | 'lossy'
 export type UnluacNamingMode = 'debug-like' | 'simple' | 'heuristic'
 export type UnluacQuoteStyle = 'prefer-double' | 'prefer-single' | 'min-escape'
 export type UnluacNumberFormat = 'decimal' | 'hex'
-export type UnluacTableStyle = 'compact' | 'balanced' | 'expanded'
+export type UnluacTableStyle = 'compact' | 'balanced' | 'aligned' | 'expanded'
 export type UnluacGenerateMode = 'strict' | 'permissive'
 
 export interface LuauVectorConstructor {

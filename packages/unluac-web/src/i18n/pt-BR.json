@@ -161,7 +161,7 @@
       "indentWidth": "Largura da indentação (número de espaços). CLI: --indent-width",
       "maxLineLength": "Comprimento máximo de linha preferido para o código gerado. CLI: --max-line-length",
       "quoteStyle": "Estilo de aspas para strings. prefer-double: preferir \"; prefer-single: preferir '; min-escape: minimizar escapes. CLI: --quote-style",
-      "tableStyle": "Layout do construtor de tabela. compact: linha única; balanced: automático; expanded: uma entrada por linha. CLI: --table-style",
+      "tableStyle": "Layout do construtor de tabela. compact: linha única; balanced: automático; aligned: grade alinhada para arrays pequenos homogêneos; expanded: uma entrada por linha. CLI: --table-style",
       "comment": "Se devem ser emitidos comentários e metadados no código gerado. CLI: --comment"
     },
     "share": {

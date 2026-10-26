@@ -161,7 +161,7 @@
       "indentWidth": "Largeur d'indentation (nombre d'espaces). CLI : --indent-width",
       "maxLineLength": "Longueur maximale de ligne préférée pour le code généré. CLI : --max-line-length",
       "quoteStyle": "Style de guillemets pour les chaînes. prefer-double : préférer \" ; prefer-single : préférer ' ; min-escape : minimiser les échappements. CLI : --quote-style",
-      "tableStyle": "Mise en page du constructeur de table. compact : ligne unique ; balanced : automatique ; expanded : une entrée par ligne. CLI : --table-style",
+      "tableStyle": "Mise en page du constructeur de table. compact : ligne unique ; balanced : automatique ; aligned : grille alignée pour les petits tableaux homogènes ; expanded : une entrée par ligne. CLI : --table-style",
       "comment": "Émettre ou non des commentaires et métadonnées dans le code généré. CLI : --comment"
     },
     "share": {

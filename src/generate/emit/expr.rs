@@ -39,6 +39,30 @@ enum LogicalOperator {
     Or,
 }
 
+/// 对齐网格单元格的类别；一张表要进入网格布局，所有单元格必须同类。
+/// 数字不区分整型/浮点，其余小字面量各自成类；任何其他表达式都没有资格。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlignedCellKind {
+    Nil,
+    Boolean,
+    Number,
+    String,
+    Name,
+}
+
+impl AlignedCellKind {
+    fn of(expr: &AstExpr) -> Option<Self> {
+        match expr {
+            AstExpr::Nil => Some(Self::Nil),
+            AstExpr::Boolean(_) => Some(Self::Boolean),
+            AstExpr::Integer(_) | AstExpr::Number(_) => Some(Self::Number),
+            AstExpr::String(_) => Some(Self::String),
+            AstExpr::Var(_) => Some(Self::Name),
+            _ => None,
+        }
+    }
+}
+
 impl LogicalOperator {
     const fn precedence(self) -> u8 {
         match self {
@@ -503,14 +527,14 @@ impl<'a> Emitter<'a> {
         Ok(match self.options.table_style {
             TableStyle::Expanded => Doc::concat([
                 Doc::text("{"),
-                Doc::line(),
-                Doc::indent(Doc::join(
-                    field_docs,
-                    Doc::concat([Doc::text(","), Doc::line()]),
-                )),
+                Doc::indent(Doc::concat([
+                    Doc::line(),
+                    Doc::join(field_docs, Doc::concat([Doc::text(","), Doc::line()])),
+                ])),
                 Doc::line(),
                 Doc::text("}"),
             ]),
+            TableStyle::Aligned => self.emit_aligned_table(table, field_docs, function),
             TableStyle::Compact | TableStyle::Balanced => {
                 let separator = Doc::concat([Doc::text(","), Doc::soft_line()]);
                 Doc::group(Doc::concat([
@@ -524,6 +548,86 @@ impl<'a> Emitter<'a> {
                 ]))
             }
         })
+    }
+
+    /// Aligned 布局的三选一决策：整体放得下就保持单行（Group 按当前列判断）；
+    /// 否则纯数组且字段全部是同类小字面量时输出空格对齐网格，其余每行一条记录。
+    /// 网格行宽与字符串宽度上限由 `table_align_width` / `table_align_string_width` 控制。
+    fn emit_aligned_table(
+        &self,
+        table: &AstTableConstructor,
+        field_docs: Vec<Doc>,
+        function: HirProtoRef,
+    ) -> Doc {
+        let flat = Doc::concat([
+            Doc::text("{ "),
+            Doc::join(field_docs.iter().cloned(), Doc::text(", ")),
+            Doc::text(" }"),
+        ]);
+        let broken = match self.aligned_grid_cells(table, function) {
+            Some(cells) => Doc::concat([
+                Doc::text("{"),
+                Doc::indent(Doc::concat([Doc::line(), Doc::grid(cells)])),
+                Doc::line(),
+                Doc::text("}"),
+            ]),
+            // 字典与非同类字段逐条输出；每条记录都带尾逗号，追加字段不会改写已有行。
+            None => Doc::concat([
+                Doc::text("{"),
+                Doc::indent(Doc::concat([
+                    Doc::line(),
+                    Doc::join(
+                        field_docs
+                            .into_iter()
+                            .map(|field| Doc::concat([field, Doc::text(",")])),
+                        Doc::line(),
+                    ),
+                ])),
+                Doc::line(),
+                Doc::text("}"),
+            ]),
+        };
+        Doc::group(Doc::alt(flat, broken))
+    }
+
+    /// 收集对齐网格的单行单元格文本；返回 `None` 表示该表不具备网格布局资格：
+    /// 出现记录字段、混入不同类别的小字面量、字符串超过宽度上限，或字段不是
+    /// nil/布尔/数字/短字符串/普通名字之一。
+    fn aligned_grid_cells(
+        &self,
+        table: &AstTableConstructor,
+        function: HirProtoRef,
+    ) -> Option<Vec<String>> {
+        let mut class = None;
+        let mut cells = Vec::with_capacity(table.fields.len());
+        for field in &table.fields {
+            let AstTableField::Array(expr) = field else {
+                return None;
+            };
+            let kind = AlignedCellKind::of(expr)?;
+            match class {
+                Some(existing) if existing != kind => return None,
+                _ => class = Some(kind),
+            }
+            let Doc::Text(text) = self
+                .emit_expr(expr, function, 0, ExprSide::Standalone)
+                .ok()?
+            else {
+                return None;
+            };
+            let text = text.into_owned();
+            // 渲染结果含换行的字符串（长括号形式）会破坏单行网格，视作不合格。
+            if text.contains('\n') || text.contains('\r') {
+                return None;
+            }
+            if kind == AlignedCellKind::String
+                && text.chars().count() > self.options.table_align_string_width
+            {
+                return None;
+            }
+            cells.push(text);
+        }
+        Some(cells)
     }
 
     fn emit_table_field(

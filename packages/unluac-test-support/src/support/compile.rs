@@ -20,6 +20,9 @@ pub(super) fn decompile_options(entry: &LuaCaseManifestEntry) -> DecompileOption
     if let Some(readable) = entry.options.readable_strings {
         options.generate.readable_strings = readable;
     }
+    if let Some(style) = entry.options.table_style {
+        options.generate.table_style = style;
+    }
     // 收敛比较源码本体；来源路径和行号随每轮产物变化。由 Generate 关闭元信息注释，
     // 避免比较器解析文本时误删 Lua 字符串；普通 debug/注释回归仍使用默认输出。
     options.generate.comment = !entry

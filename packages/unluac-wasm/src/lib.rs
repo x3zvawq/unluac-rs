@@ -67,6 +67,8 @@ struct WasmGenerateOptions {
     quote_style: Option<String>,
     readable_strings: Option<bool>,
     table_style: Option<String>,
+    table_align_width: Option<usize>,
+    table_align_string_width: Option<usize>,
     luau_vector_constructor: Option<WasmLuauVectorConstructor>,
     comment: Option<bool>,
 }
@@ -280,6 +282,12 @@ impl WasmGenerateOptions {
         if let Some(value) = self.table_style {
             options.generate.table_style = parse_option("generate.tableStyle", &value)?;
         }
+        if let Some(value) = self.table_align_width {
+            options.generate.table_align_width = value;
+        }
+        if let Some(value) = self.table_align_string_width {
+            options.generate.table_align_string_width = value;
+        }
         if let Some(value) = self.luau_vector_constructor {
             options.generate.luau_vector_constructor = Some(LuauVectorConstructor {
                 library: value.library,
@@ -443,6 +451,7 @@ fn table_style_labels() -> Vec<&'static str> {
     [
         TableStyle::Compact,
         TableStyle::Balanced,
+        TableStyle::Aligned,
         TableStyle::Expanded,
     ]
     .into_iter()

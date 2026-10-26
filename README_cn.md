@@ -89,6 +89,8 @@ unluac-cli -s example.lua -D lua5.4
 
 Heuristic 还会使用小型标准库签名表：`os.date` 的实参可提示 `format/time`，`string.sub` 可提示 `text/start_index/end_index`。更具体的字段用途优先，角色冲突时保留通用名。
 
+表构造器通过 `--table-style` 提供四种排版风格。`compact`、`balanced`（默认）与 `expanded` 保持既有行为。`aligned` 风格对每张表三选一：放得下单行的保持单行；否则纯数组且元素全部是同类小字面量（数字、短字符串、布尔、`nil` 或普通名字）时输出空格对齐的网格，值按列上下对齐；其余情况（包括任何字典）每行一条记录，嵌套表按自身缩进套用同样规则。网格由两个参数调节：`--table-align-width` 限制含缩进的行渲染宽度（默认 100），`--table-align-string-width` 限制可进入网格的字符串字面量渲染宽度（默认 16），超宽字符串会让整张表退回逐行布局。多行记录带尾逗号，追加字段不会改写已有行。
+
 完整的格式化、命名和解码选项见 `unluac-cli --help`；查看流水线中间结果的方法见[调试手册](./docs/debug.md)。
 
 ### Rust 库

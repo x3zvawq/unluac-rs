@@ -7,6 +7,11 @@
 use std::borrow::Cow;
 
 /// Generate 内部使用的轻量文档树。
+///
+/// `Alt` 是 Wadler pretty printing 的 flat-alternative：同一位置的两份内容，
+/// Flat 模式渲染 `flat`，Break 模式渲染 `broken`。`Grid` 只应出现在 `Alt` 的
+/// broken 侧，渲染成按列对齐的表格行；行数与填充由 renderer 结合当前缩进计算，
+/// emitter 只提供单行单元格文本。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Doc {
     Text(Cow<'static, str>),
@@ -16,6 +21,8 @@ pub enum Doc {
     Fill { docs: Vec<Doc>, separator: Box<Doc> },
     Indent(Box<Doc>),
     Group(Box<Doc>),
+    Alt { flat: Box<Doc>, broken: Box<Doc> },
+    Grid { cells: Vec<String> },
 }
 
 impl Doc {
@@ -58,6 +65,20 @@ impl Doc {
             docs: docs.into_iter().collect(),
             separator: Box::new(separator),
         }
+    }
+
+    /// 两份互斥布局：整体放得下时渲染 `flat`，否则渲染 `broken`。
+    /// 宽度测量只看 `flat` 侧，`broken` 侧允许包含硬换行。
+    pub fn alt(flat: Doc, broken: Doc) -> Self {
+        Self::Alt {
+            flat: Box::new(flat),
+            broken: Box::new(broken),
+        }
+    }
+
+    /// 单行单元格文本组成的对齐网格；行布局由 renderer 决定。
+    pub fn grid(cells: Vec<String>) -> Self {
+        Self::Grid { cells }
     }
 
     pub fn join<I>(docs: I, separator: Doc) -> Self

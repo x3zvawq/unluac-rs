@@ -46,6 +46,14 @@ pub struct GenerateOptions {
     /// 优先将已解码字符串作为 UTF-8 文本输出；关闭时保留原字节值。
     pub readable_strings: bool,
     pub table_style: TableStyle,
+    /// Aligned style only: maximum rendered row width (including indentation) of a
+    /// space-aligned table grid. Rows never exceed this budget unless a single cell
+    /// alone is wider.
+    pub table_align_width: usize,
+    /// Aligned style only: maximum rendered width (including quotes) of a string
+    /// literal allowed inside a space-aligned table grid; wider strings make the
+    /// whole table fall back to the one-entry-per-line layout.
+    pub table_align_string_width: usize,
     pub comment: bool,
     /// 把 Luau vector 常量重新表达成源码时使用的宿主构造器。
     pub luau_vector_constructor: Option<LuauVectorConstructor>,
@@ -61,6 +69,8 @@ impl Default for GenerateOptions {
             quote_style: QuoteStyle::MinEscape,
             readable_strings: true,
             table_style: TableStyle::Balanced,
+            table_align_width: 100,
+            table_align_string_width: 16,
             comment: true,
             luau_vector_constructor: None,
         }
@@ -178,11 +188,17 @@ pub enum QuoteStyle {
 }
 
 /// 表构造器布局策略。
+///
+/// `Aligned` 在三种布局之间按表内容自动选择：放得下就保持单行；放不下且全部字段是
+/// 同类小字面量（数字、短字符串、布尔、nil 或普通名字）时输出空格对齐的网格；
+/// 其余情况（包括任何字典）每行一条记录。网格行宽与字符串宽度上限由
+/// `table_align_width` / `table_align_string_width` 控制。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, EnumString, IntoStaticStr)]
 #[strum(serialize_all = "kebab-case")]
 pub enum TableStyle {
     Compact,
     #[default]
     Balanced,
+    Aligned,
     Expanded,
 }

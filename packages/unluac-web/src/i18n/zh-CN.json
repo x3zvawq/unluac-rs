@@ -168,7 +168,7 @@
       "readableStrings": "默认开启：将解码文本输出为 UTF-8，GBK 中文可直接阅读。关闭可保留原字节；输入编码由字符串编码选项指定。CLI: --readable-strings",
       "quoteStyle": "字符串引号风格。prefer-double: 偏好双引号；prefer-single: 偏好单引号；min-escape: 选择最少转义的。CLI: --quote-style",
       "numberFormat": "数字字面量格式。decimal: 普通数字；hex: 尽可能把整数字面量输出为 0x...。CLI: --number-format",
-      "tableStyle": "表构造器排版风格。compact: 紧凑；balanced: 均衡；expanded: 展开。CLI: --table-style",
+      "tableStyle": "表构造器排版风格。compact: 紧凑；balanced: 均衡；aligned: 同类小元素对齐网格；expanded: 展开。CLI: --table-style",
       "luauVectorConstructor": "使用显式构造器和 3D/4D 维度输出 Luau vector 常量。库名可选，构造器名和维度必填。CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size",
       "comment": "是否在生成的代码中输出注释和元信息。CLI: --comment"
     },

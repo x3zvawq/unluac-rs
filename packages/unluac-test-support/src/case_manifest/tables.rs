@@ -2,6 +2,42 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_tables/layout_01_aligned_number_grid.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned table style: a homogeneous numeric array longer than one line is emitted as a space-aligned grid with padded columns; the grid stays valid, behavior-identical Lua 5.1 across recompile rounds.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_02_aligned_dict_fallback.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned table style fallback: dictionaries and arrays holding over-wide strings emit one entry per line with trailing commas, while fitting sub-tables stay on a single line.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_03_aligned_single_line_and_nested.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned table style nesting: tables that fit stay on one line, oversized nested arrays become indented grids, and dictionary records keep trailing commas at their own indentation.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/constructor_32_open_prefix_iterator_reuse.lua",
         &[
             "constructor",

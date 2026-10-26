@@ -6,7 +6,7 @@
 
 use strum_macros::{Display, IntoStaticStr};
 use unluac::ast::NamingMode;
-use unluac::decompile::DecompileDialect;
+use unluac::decompile::{DecompileDialect, TableStyle};
 
 mod bindings;
 mod calls;
@@ -187,6 +187,7 @@ pub(crate) struct LuaCaseOptions {
     pub(crate) naming_mode: Option<NamingMode>,
     pub(crate) string_encoding: Option<&'static str>,
     pub(crate) readable_strings: Option<bool>,
+    pub(crate) table_style: Option<TableStyle>,
     pub(crate) luau_optimization_level: Option<u8>,
     pub(crate) luau_vector: Option<LuauVectorCaseOptions>,
     pub(crate) recompile_rounds: Option<u32>,
@@ -199,6 +200,7 @@ impl LuaCaseOptions {
         naming_mode: None,
         string_encoding: None,
         readable_strings: None,
+        table_style: None,
         luau_optimization_level: None,
         luau_vector: None,
         recompile_rounds: None,
@@ -376,6 +378,7 @@ const LUAU_OPTIMIZED_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     naming_mode: None,
     string_encoding: None,
     readable_strings: None,
+    table_style: None,
     luau_optimization_level: Some(2),
     luau_vector: None,
     recompile_rounds: None,
@@ -390,6 +393,7 @@ const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     naming_mode: None,
     string_encoding: None,
     readable_strings: None,
+    table_style: None,
     luau_optimization_level: Some(2),
     luau_vector: Some(LuauVectorCaseOptions {
         library: Some("vector"),

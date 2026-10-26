@@ -90,6 +90,8 @@ For example: `unluac-cli -i sample.luac -n heuristic`. Heuristic names are reada
 
 Heuristic mode also uses a small standard-library signature table: arguments to `os.date` can suggest `format` and `time`, while `string.sub` suggests `text`, `start_index` and `end_index`. More specific field usage takes priority; conflicting roles keep generic names.
 
+Table constructors support four layout styles via `--table-style`. `compact`, `balanced` (default) and `expanded` keep their existing behavior. The `aligned` style picks one of three layouts per table: tables that fit on one line stay on one line; otherwise an array of small homogeneous elements (numbers, short strings, booleans, `nil`, or plain names) is rendered as a space-aligned grid with the values lined up in columns; everything else — including any dictionary — gets one entry per line, with nested tables following the same rules at their own indentation. Two options tune the grid: `--table-align-width` caps the rendered row width including indentation (default 100), and `--table-align-string-width` caps the rendered width of string literals allowed in a grid (default 16); wider strings make the table fall back to the one-entry-per-line layout. Multi-line entries carry trailing commas so appending a field never rewrites earlier lines.
+
 See `unluac-cli --help` for all formatting, naming and decoding options, and the [debugging guide](./docs/debug.md) for pipeline inspection.
 
 ### Rust
