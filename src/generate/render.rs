@@ -109,7 +109,10 @@ impl Renderer<'_> {
         };
         let max_cell_width = max_cell_width.max(1);
         let stride = max_cell_width + 2;
-        let row_budget = self.options.table_align_width.saturating_sub(indent);
+        let row_budget = self
+            .options
+            .resolved_table_align_width()
+            .saturating_sub(indent);
         // 整行宽度 k*(W+2)-1 ≤ budget（行尾逗号不加尾随填充）。
         let per_row_max = (row_budget.saturating_add(1) / stride).max(1);
         let count = cells.len();

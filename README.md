@@ -106,7 +106,7 @@ Four options tune the `aligned` style (they do not affect the other styles):
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `--table-align-width` | 100 | Caps the rendered row width (including indentation) of a grid; rows never exceed it unless a single cell alone is wider. |
+| `--table-align-width` | follows `--max-line-length` (100 by default) | Caps the rendered row width (including indentation) of a grid; rows never exceed it unless a single cell alone is wider. |
 | `--table-align-string-width` | 16 | Caps the rendered width (quotes included) of a string allowed inside a grid; a wider string disqualifies the whole table from grid mode (falls back to one entry per line). |
 | `--table-align-eq` | true | Aligns record keys by `=` in non-single-line tables: keys are padded to the widest key of their alignment run. `--table-align-eq=false` keeps single spaces around `=`. |
 | `--table-align-eq-max-spaces` | 8 | Caps the `=` padding: a key that would need more padding starts a new alignment run instead of stretching every row. |

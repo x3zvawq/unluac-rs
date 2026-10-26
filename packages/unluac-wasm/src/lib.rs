@@ -286,7 +286,7 @@ impl WasmGenerateOptions {
             options.generate.table_style = parse_option("generate.tableStyle", &value)?;
         }
         if let Some(value) = self.table_align_width {
-            options.generate.table_align_width = value;
+            options.generate.table_align_width = Some(value);
         }
         if let Some(value) = self.table_align_string_width {
             options.generate.table_align_string_width = value;

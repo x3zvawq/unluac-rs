@@ -58,8 +58,9 @@ pub struct GenerateOptions {
     pub table_drop_index_keys: bool,
     /// Aligned style only: maximum rendered row width (including indentation) of a
     /// space-aligned table grid. Rows never exceed this budget unless a single cell
-    /// alone is wider.
-    pub table_align_width: usize,
+    /// alone is wider. When unset (`None`) the grid follows `max_line_length`, so
+    /// the row budget always matches the global line budget unless overridden.
+    pub table_align_width: Option<usize>,
     /// Aligned style only: maximum rendered width (including quotes) of a string
     /// literal allowed inside a space-aligned table grid; wider strings make the
     /// whole table fall back to the one-entry-per-line layout.
@@ -82,11 +83,19 @@ impl Default for GenerateOptions {
             table_align_eq: true,
             table_align_eq_max_spaces: 8,
             table_drop_index_keys: false,
-            table_align_width: 100,
+            table_align_width: None,
             table_align_string_width: 16,
             comment: true,
             luau_vector_constructor: None,
         }
+    }
+}
+
+impl GenerateOptions {
+    /// Row budget for `aligned` grids: `table_align_width` when set, otherwise
+    /// `max_line_length` (the default coupling; see the field docs).
+    pub fn resolved_table_align_width(&self) -> usize {
+        self.table_align_width.unwrap_or(self.max_line_length)
     }
 }
 

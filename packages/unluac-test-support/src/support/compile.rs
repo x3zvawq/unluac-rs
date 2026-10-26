@@ -23,9 +23,10 @@ pub(super) fn decompile_options(entry: &LuaCaseManifestEntry) -> DecompileOption
     if let Some(style) = entry.options.table_style {
         options.generate.table_style = style;
     }
-    if let Some(width) = entry.options.table_align_width {
-        options.generate.table_align_width = width;
+    if let Some(length) = entry.options.max_line_length {
+        options.generate.max_line_length = length;
     }
+    options.generate.table_align_width = entry.options.table_align_width;
     if let Some(width) = entry.options.table_align_string_width {
         options.generate.table_align_string_width = width;
     }

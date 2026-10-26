@@ -371,7 +371,7 @@ struct GenerateArgs {
         help_heading = "Generate"
     )]
     table_drop_index_keys: Option<bool>,
-    /// Max rendered row width (including indentation) of `--table-style aligned` grids.
+    /// Max rendered row width (including indentation) of `--table-style aligned` grids; defaults to `--max-line-length`.
     #[arg(long, help_heading = "Generate")]
     table_align_width: Option<usize>,
     /// Max rendered width of string literals allowed inside `--table-style aligned` grids.
@@ -429,10 +429,7 @@ impl GenerateArgs {
             &mut options.generate.table_drop_index_keys,
             self.table_drop_index_keys,
         );
-        set_if_some(
-            &mut options.generate.table_align_width,
-            self.table_align_width,
-        );
+        options.generate.table_align_width = self.table_align_width;
         set_if_some(
             &mut options.generate.table_align_string_width,
             self.table_align_string_width,

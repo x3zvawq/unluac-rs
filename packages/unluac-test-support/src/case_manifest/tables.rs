@@ -63,6 +63,19 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_tables/layout_12_align_width_default.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-width follows --max-line-length when unset: a 40-column line budget packs the aligned grid 8 two-digit cells per row without an explicit width override.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                max_line_length: Some(40),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/layout_06_string_width_budget.lua",
         &["constructor", "aligned-layout", "readability"],
         "--table-align-string-width caps the string width allowed in a grid: with a cap of 6, over-wide strings fall back to one entry per line while short strings stay gridded.",
