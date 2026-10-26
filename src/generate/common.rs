@@ -48,8 +48,10 @@ pub struct GenerateOptions {
     pub table_style: TableStyle,
     /// Align record keys on `=` in multi-line aligned tables.
     pub table_align_eq: bool,
-    /// Cap on padding when aligning on `=`: padding longer than this threshold
-    /// breaks the alignment run so that one long key does not stretch every row.
+    /// Cap on the number of spaces between a key and `=` when aligning records: a
+    /// run cannot stretch the gap beyond this threshold, otherwise the
+    /// field starts a new run so that one long key does not stretch every row.
+    /// Zero disables the alignment entirely.
     pub table_align_eq_max_spaces: usize,
     /// Fold redundant explicit index keys `[1]..[n]` into positional fields of the
     /// constructor. The bytecode stores such keys faithfully (the source wrote them

@@ -766,9 +766,10 @@ impl<'a> Emitter<'a> {
     }
 
     /// Computes the padding before ` = ` for each field of the per-line branch:
-    /// adjacent records are aligned to the widest key of the run while the
-    /// required padding stays within `table_align_eq_max_spaces`. Arrays,
-    /// unmeasurable keys and threshold-violating fields break the run.
+    /// adjacent records are aligned to the widest key of the run while the total
+    /// number of spaces between a key and `=` (padding plus the mandatory space)
+    /// stays within `table_align_eq_max_spaces`. Arrays, unmeasurable keys and
+    /// fields that exceed the threshold break the run.
     fn aligned_record_pads(&self, fields: &[AstTableField], function: HirProtoRef) -> Vec<usize> {
         let mut pads = vec![0; fields.len()];
         if !self.options.table_align_eq || self.options.table_align_eq_max_spaces == 0 {
@@ -791,7 +792,7 @@ impl<'a> Emitter<'a> {
             let new_max = run_max.max(width);
             let new_min = run_min.min(width);
             if !run.is_empty()
-                && new_max - new_min > self.options.table_align_eq_max_spaces
+                && new_max - new_min + 1 > self.options.table_align_eq_max_spaces
             {
                 flush_alignment_run(&mut pads, &mut run, run_max);
                 run_min = width;

@@ -52,7 +52,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_tables/layout_05_align_width_budget.lua",
         &["constructor", "aligned-layout", "readability"],
-        "--table-align-width shrinks the aligned grid per-row budget: a 40-column budget packs two-digit numbers 8 per row instead of the default 15.",
+        "--table-align-width shrinks the aligned grid per-row budget: a 40-column budget packs two-digit numbers 8 per row instead of the default 19.",
         &[
             LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
                 table_style: Some(TableStyle::Aligned),
@@ -104,7 +104,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_tables/layout_08_eq_max_spaces.lua",
         &["constructor", "aligned-layout", "readability"],
-        "--table-align-eq-max-spaces caps `=` alignment padding: with a cap of 2 a long key starts a new alignment run instead of stretching every row.",
+        "--table-align-eq-max-spaces caps the total spaces between a key and `=`: with a cap of 2 only keys one padding space apart stay aligned, wider gaps start new alignment runs.",
         &[
             LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
                 table_style: Some(TableStyle::Aligned),

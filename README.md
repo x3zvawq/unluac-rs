@@ -99,7 +99,7 @@ Table constructors support four layout styles via `--table-style`. `compact`, `b
        alpha = 1, beta = 2, gamma = 3, delta = 4, epsilon = 5, zeta = 6, eta = 7, theta = 8
    }
    ```
-3. **Aligned grid** — otherwise a pure array of small homogeneous elements (numbers, short strings, booleans, `nil`, or plain names) is printed several cells per row, space-padded so values line up in columns.
+3. **Aligned grid** — otherwise a pure array of small homogeneous elements (numbers, short strings, booleans, `nil`, or plain names) is printed several cells per row, space-padded so values line up in columns: every column starts at a multiple of *widest cell + 2* characters, which keeps cells vertically aligned across rows even when their widths differ.
 4. **One entry per line** — everything else (any dictionary, mixed arrays, over-wide strings, non-literal elements); nested tables follow the same rules at their own indentation. Multi-line entries carry trailing commas so appending a field never rewrites earlier lines.
 
 Four options tune the `aligned` style (they do not affect the other styles):
@@ -109,7 +109,7 @@ Four options tune the `aligned` style (they do not affect the other styles):
 | `--table-align-width` | follows `--max-line-length` (100 by default) | Caps the rendered row width (including indentation) of a grid; rows never exceed it unless a single cell alone is wider. |
 | `--table-align-string-width` | 16 | Caps the rendered width (quotes included) of a string allowed inside a grid; a wider string disqualifies the whole table from grid mode (falls back to one entry per line). |
 | `--table-align-eq` | true | Aligns record keys by `=` in non-single-line tables: keys are padded to the widest key of their alignment run. `--table-align-eq=false` keeps single spaces around `=`. |
-| `--table-align-eq-max-spaces` | 8 | Caps the `=` padding: a key that would need more padding starts a new alignment run instead of stretching every row. |
+| `--table-align-eq-max-spaces` | 8 | Caps the total spaces between a record key and `=` (padding plus the mandatory separator): a key whose gap would exceed the cap starts a new alignment run instead of stretching every row. |
 | `--table-drop-index-keys` | false | Rewrites contiguous explicit `[1]..[n]` constructor keys as positional array entries (see below). |
 
 What the options change, concretely:
@@ -126,29 +126,52 @@ local config = {
 --     name = "unluac",
 --     threads = 4,
 
--- --table-align-eq-max-spaces=2: the 10-char key no longer stretches short keys;
--- the run breaks and remaining keys keep single spaces
-local options = {
-    id   = "op",
-    kind = "select",
-    retries = 4,
-    timeout_ms = 1500,
-}
+-- --table-align-eq-max-spaces=2: same table; the visible gap between a key
+-- and `=` never exceeds 2 spaces, so only keys one padding space apart stay
+-- aligned and every wider key starts a new alignment run
+--     id  = "op",
+--     tag = "v1",
+--     kind = "select",
+--     timeout_ms = 1500,
+--     retries = 4,
+--     label = "worker",
+--     retries_budget = 9,
+--     fallback_mode  = true,
 
--- --table-align-width=40: the grid packs fewer cells per row (8 instead of 15)
+-- --table-align-width (default: follows --max-line-length, 100 here) vs 40:
+-- mixed one- and two-digit numbers make the column padding visible - every
+-- column starts at a multiple of (widest cell + 2) chars, so single-digit
+-- cells carry two spaces while two-digit cells carry one
 local values = {
-    10, 11, 12, 13, 14, 15, 16, 17,
-    18, 19, 20, 21, 22, 23, 24, 25,
-    26, 27, 28, 29, 30, 31, 32, 33,
-    34, 35, 36, 37, 38, 39,
+    7,  42, 5,  91, 3,  28, 64, 12, 80, 56, 9,  47, 31, 75, 2,  60,
+    38, 84, 15, 70, 26, 93, 58, 41, 6,  77, 19, 85, 32, 68, 24, 50,
 }
+-- --table-align-width=40: same table, 8 cells per row
+-- local values = {
+--     7,  42, 5,  91, 3,  28, 64, 12,
+--     80, 56, 9,  47, 31, 75, 2,  60,
+--     38, 84, 15, 70, 26, 93, 58, 41,
+--     6,  77, 19, 85, 32, 68, 24, 50,
+-- }
 
--- --table-align-string-width=6: 13-char strings exceed the cap, so the whole
--- table falls back to one entry per line instead of a grid
+-- --table-align-string-width=6: strings of different lengths; every rendered
+-- width (quotes included) is wider than 6, so the whole table falls back to
+-- one entry per line - with the default cap of 16 the grid stays
 local labels = {
-    "longstring1",
-    "longstring2",
+    "peninsula",   "archipelago", "mountains",   "waterfall",
+    "wilderness",  "undergrowth", "tableland",   "watershed",
 }
+-- --table-align-string-width=6: same table, no grid
+-- local labels = {
+--     "peninsula",
+--     "archipelago",
+--     "mountains",
+--     "waterfall",
+--     "wilderness",
+--     "undergrowth",
+--     "tableland",
+--     "watershed",
+-- }
 
 -- --table-drop-index-keys=true: contiguous explicit index keys become positional
 -- entries; a plain array literal compiles to SETLIST ops without keys, so any
