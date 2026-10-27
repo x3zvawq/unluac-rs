@@ -99,7 +99,7 @@ Table constructors support four layout styles via `--table-style`. `compact`, `b
        alpha = 1, beta = 2, gamma = 3, delta = 4, epsilon = 5, zeta = 6, eta = 7, theta = 8
    }
    ```
-3. **Aligned grid** — otherwise a pure array of small homogeneous elements (numbers, short strings, booleans, `nil`, or plain names) is printed several cells per row, space-padded so values line up in columns: every column starts at a multiple of *widest cell + 2* characters, which keeps cells vertically aligned across rows even when their widths differ.
+3. **Aligned grid** — otherwise a pure array of small homogeneous elements (numbers, short strings, booleans, `nil`, or plain names) is printed several cells per row, space-padded and right-aligned within each column so the trailing commas line up across rows: every column starts at a multiple of *widest cell + 2* characters, which keeps the grid vertically aligned even when cell widths differ.
 4. **One entry per line** — everything else (any dictionary, mixed arrays, over-wide strings, non-literal elements); nested tables follow the same rules at their own indentation. Multi-line entries carry trailing commas so appending a field never rewrites earlier lines.
 
 Four options tune the `aligned` style (they do not affect the other styles):
@@ -139,19 +139,19 @@ local config = {
 --     fallback_mode  = true,
 
 -- --table-align-width (default: follows --max-line-length, 100 here) vs 40:
--- mixed one- and two-digit numbers make the column padding visible - every
--- column starts at a multiple of (widest cell + 2) chars, so single-digit
--- cells carry two spaces while two-digit cells carry one
+-- mixed one- and two-digit numbers make the alignment visible - cells are
+-- right-aligned within their column, so every trailing comma lands on the
+-- same column across all rows
 local values = {
-    7,  42, 5,  91, 3,  28, 64, 12, 80, 56, 9,  47, 31, 75, 2,  60,
-    38, 84, 15, 70, 26, 93, 58, 41, 6,  77, 19, 85, 32, 68, 24, 50,
+     7, 42,  5, 91,  3, 28, 64, 12, 80, 56,  9, 47, 31, 75,  2, 60,
+    38, 84, 15, 70, 26, 93, 58, 41,  6, 77, 19, 85, 32, 68, 24, 50,
 }
 -- --table-align-width=40: same table, 8 cells per row
 -- local values = {
---     7,  42, 5,  91, 3,  28, 64, 12,
---     80, 56, 9,  47, 31, 75, 2,  60,
+--      7, 42,  5, 91,  3, 28, 64, 12,
+--     80, 56,  9, 47, 31, 75,  2, 60,
 --     38, 84, 15, 70, 26, 93, 58, 41,
---     6,  77, 19, 85, 32, 68, 24, 50,
+--      6, 77, 19, 85, 32, 68, 24, 50,
 -- }
 
 -- --table-align-string-width=6: strings of different lengths; every rendered

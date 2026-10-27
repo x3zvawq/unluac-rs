@@ -144,19 +144,20 @@ impl Renderer<'_> {
         }
     }
 
-    /// 输出一行网格：单元格渲染为 `值,`，随后的填充空格让下一格落在下一列起点；
-    /// 列对齐只相对本行首个单元格计算，与缩进无关。
+    /// 输出一行网格：单元格右对齐（填充空格位于值之前），让每格行尾逗号落在
+    /// 相同的列起点上，相邻行的逗号因此垂直对齐；首格之前同样补填充。
     fn push_grid_row<'a, I>(&mut self, cells: &mut I, per_row: usize, max_cell_width: usize)
     where
         I: Iterator<Item = &'a String>,
     {
-        let mut previous_width = 0usize;
         for (index, cell) in cells.by_ref().take(per_row).enumerate() {
             if index > 0 {
-                let padding = max_cell_width + 1 - previous_width;
-                self.push_text(&" ".repeat(padding));
+                self.push_text(" ");
             }
-            previous_width = cell.chars().count();
+            // Right-align the cell so its trailing comma lands on the same
+            // column in every row of the grid.
+            let padding = max_cell_width - cell.chars().count();
+            self.push_text(&" ".repeat(padding));
             self.push_text(cell);
             self.push_text(",");
         }
