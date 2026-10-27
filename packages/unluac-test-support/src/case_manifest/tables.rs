@@ -89,6 +89,18 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_tables/layout_14_function_fields_expand.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned tables holding function values always expand one entry per line: function bodies carry hard line breaks, so the packed content line would glue later fields onto the broken function lines (the `end }, [2] = {` shape).",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/layout_06_string_width_budget.lua",
         &["constructor", "aligned-layout", "readability"],
         "--table-align-string-width caps the string width allowed in a grid: with a cap of 6, over-wide strings fall back to one entry per line while short strings stay gridded.",

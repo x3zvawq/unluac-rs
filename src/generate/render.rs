@@ -82,10 +82,15 @@ impl Renderer<'_> {
                         self.render(flat, LayoutMode::Flat, indent);
                     } else {
                         let content_indent = indent + self.options.indent_width;
+                        // A `None` content width marks content that contains
+                        // hard line breaks (e.g. inline function bodies); it
+                        // can never participate in the single-line content
+                        // fallback, because rendering it flat would pack the
+                        // following fields onto the broken function's lines.
                         let fits = budget
                             .checked_sub(content_indent)
                             .is_some_and(|remaining| {
-                                content_width.is_none_or(|width| width <= remaining)
+                                content_width.is_some_and(|width| width <= remaining)
                             });
                         if fits {
                             self.push_text("{");
