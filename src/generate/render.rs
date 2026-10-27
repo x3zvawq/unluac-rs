@@ -65,13 +65,24 @@ impl Renderer<'_> {
             } => match mode {
                 LayoutMode::Flat => self.render(flat, mode, indent),
                 LayoutMode::Break => {
-                    if self.fits_flat(flat) {
+                    // Aligned tables budget every candidate row (the flat
+                    // one-liner and the content line) by `table_align_width`,
+                    // capped by the global line limit. When the option is
+                    // unset the resolved width equals `max_line_length`, so
+                    // the default behavior is unchanged.
+                    let budget = self
+                        .options
+                        .max_line_length
+                        .min(self.options.resolved_table_align_width());
+                    let fits_flat = budget
+                        .checked_sub(self.column)
+                        .and_then(|remaining| remaining_after_flat(flat, remaining))
+                        .is_some();
+                    if fits_flat {
                         self.render(flat, LayoutMode::Flat, indent);
                     } else {
                         let content_indent = indent + self.options.indent_width;
-                        let fits = self
-                            .options
-                            .max_line_length
+                        let fits = budget
                             .checked_sub(content_indent)
                             .is_some_and(|remaining| {
                                 content_width.is_none_or(|width| width <= remaining)

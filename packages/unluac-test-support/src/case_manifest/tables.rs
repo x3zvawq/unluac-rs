@@ -76,6 +76,19 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_tables/layout_13_align_width_row_budget.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-width budgets every aligned-table row, not only grid rows: flat one-liners and packed content lines that exceed the table width stay expanded one entry per line even though they fit the global line budget.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_width: Some(40),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/layout_06_string_width_budget.lua",
         &["constructor", "aligned-layout", "readability"],
         "--table-align-string-width caps the string width allowed in a grid: with a cap of 6, over-wide strings fall back to one entry per line while short strings stay gridded.",
