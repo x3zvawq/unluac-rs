@@ -92,88 +92,23 @@ Heuristic 还会使用小型标准库签名表：`os.date` 的实参可提示 `f
 表构造器通过 `--table-style` 提供四种排版风格。`compact`、`balanced`（默认）与 `expanded` 保持既有行为。`aligned` 风格对每张表按顺序尝试四种布局：
 
 1. **单行** — 整个构造器放得下当前行：`local anchors = { 10, 20, 30 }`。
-2. **内容单行** — 否则先尝试把全部内容平铺进花括号内缩进一层的下一行：
-   ```lua
-   local fallback = {
-       alpha = 1, beta = 2, gamma = 3, delta = 4, epsilon = 5, zeta = 6, eta = 7, theta = 8
-   }
-   ```
-3. **对齐网格** — 否则纯数组且元素全部是同类小字面量（数字、短字符串、布尔、`nil` 或普通名字）时，按行输出多个单元格并用空格填充、单元格在列内右对齐，使行尾逗号跨行对齐：每列起点都对齐在「最宽单元格 + 2」字符的倍数上，即使各列宽度不同，跨行也保持垂直对齐。
+2. **内容单行** — 否则先尝试把全部内容平铺进花括号内缩进一层的下一行。
+3. **对齐网格** — 否则纯数组且元素全部是同类小字面量（数字、短字符串、布尔、`nil` 或普通名字）时，按行输出多个单元格并用空格填充列；默认数字右对齐，其余原语左对齐。
 4. **逐行记录** — 其余情况（任何字典、混合数组、超宽字符串、非字面量元素）；嵌套表按自身缩进套用同样规则。多行记录带尾逗号，追加字段不会改写已有行。
 
-四个参数只作用于 `aligned` 风格：
+只作用于 `aligned` 风格的参数：
 
 | 参数 | 默认 | 作用 |
 | --- | --- | --- |
-| `--table-align-width` | 跟随 `--max-line-length`（默认 100） | 限制 aligned 表格所有候选行（网格行、单行形式、压缩内容行）的渲染宽度（含缩进）；除非单个单元格自身超宽，行不会超出该预算。 |
-| `--table-align-string-width` | 16 | 限制可进入网格的字符串字面量渲染宽度（含引号）；超宽字符串让整张表退回逐行布局。 |
-| `--table-align-eq` | true | 多行表内按 `=` 对齐记录键：键填充到本对齐系列最宽键的列。`--table-align-eq=false` 保持 `=` 两侧单空格。 |
-| `--table-align-eq-max-spaces` | 8 | 限制键与 `=` 之间的总空格数（填充加固定分隔空格）：间隙会超过上限的键开启新的对齐系列，而不是把所有行都撑开。 |
-| `--table-drop-index-keys` | false | 把连续的显式 `[1]..[n]` 构造器键改写成位置字段（见下）。 |
+| `--table-align-width` | 跟随 `--max-line-length`（默认 100） | 限制 aligned 表格所有候选行的渲染宽度。 |
+| `--table-align-string-width` | 16 | 限制可进入网格的字符串渲染宽度；超宽字符串让整张表退回逐行布局。 |
+| `--table-align-cells` | `auto` | 网格单元格水平对齐：`auto` 数字右对齐、其余原语左对齐；`left`/`right` 对所有类别强制同一方向。 |
+| `--table-align-eq` | true | 多行表内按 `=` 对齐记录键。 |
+| `--table-align-eq-max-spaces` | 8 | 限制键与 `=` 之间的空格数；更宽的键开启新的对齐系列。 |
+| `--table-drop-index-keys` | false | 把连续的显式 `[1]..[n]` 构造器键改写成位置字段。 |
 
-各参数的具体效果：
-
-```lua
--- 默认：--table-align-eq 把键对齐到本系列最宽键
-local config = {
-    name    = "unluac",
-    threads = 4,
-    paths   = { "/usr/share/lua/5.1/?.lua", "/usr/local/share/lua/5.1/?.lua" },
-    retries = 3,
-}
--- --table-align-eq=false：同一张表，无填充
---     name = "unluac",
---     threads = 4,
-
--- --table-align-eq-max-spaces=2：同一张表；键与 `=` 之间的可见空格
--- 不超过 2 个，只有相差一个填充空格的键保持对齐，更宽的键开启新的对齐系列
---     id  = "op",
---     tag = "v1",
---     kind = "select",
---     timeout_ms = 1500,
---     retries = 4,
---     label = "worker",
---     retries_budget = 9,
---     fallback_mode  = true,
-
--- --table-align-width（默认跟随 --max-line-length，此处为 100）与 40 对比：
--- 混合一位数与两位数可以看到对齐效果——单元格在列内右对齐，
--- 行尾逗号落在所有行相同的列上
--- local values = {
---      7, 42,  5, 91,  3, 28, 64, 12, 80, 56,  9, 47, 31, 75,  2, 60,
---     38, 84, 15, 70, 26, 93, 58, 41,  6, 77, 19, 85, 32, 68, 24, 50,
--- }
--- --table-align-width=40：同一张表，每行 8 个单元格
--- local values = {
---      7, 42,  5, 91,  3, 28, 64, 12,
---     80, 56,  9, 47, 31, 75,  2, 60,
---     38, 84, 15, 70, 26, 93, 58, 41,
---      6, 77, 19, 85, 32, 68, 24, 50,
--- }
-
--- --table-align-string-width=6：不同长度的字符串；所有渲染宽度（含引号）
--- 都超过 6，整张表退回逐行布局——默认上限 16 时保持网格
--- local labels = {
---     "peninsula",
---     "archipelago",
---     "mountains",
---     "waterfall",
---     "wilderness",
---     "undergrowth",
---     "tableland",
---     "watershed",
--- }
-
--- --table-drop-index-keys=true：连续的显式索引键改写为位置字段；
--- 普通数组字面量编译成不带键的 SETLIST 指令，所以输出里的 `[1] =`
--- 必然对应显式写键的源码。改写保持求值顺序与逐字段副作用，只有
--- 未定义的 pairs 顺序变化（哈希部分变成数组部分）。有缺口、乱序、
--- 或与位置字段混用的表保持原样。
-local keyed = { "alpha", "beta" }        -- 原为：{ [1] = "alpha", [2] = "beta" }
-local mixed = { mode = "dlg", "alpha", "beta", tag = 3 }
-                                         -- 原为：{ mode = "dlg", [1] = "alpha", [2] = "beta", tag = 3 }
-local untouched = { [1] = "alpha", [3] = "gamma" }   -- 有缺口：保持原样
-```
+网格准入规则（哪些原语参与对齐及原因）与完整示例见英文文档
+[Aligned table layout](./docs/table-alignment.md)。
 
 完整的格式化、命名和解码选项见 `unluac-cli --help`；查看流水线中间结果的方法见[调试手册](./docs/debug.md)。
 

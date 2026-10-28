@@ -93,97 +93,23 @@ Heuristic mode also uses a small standard-library signature table: arguments to 
 Table constructors support four layout styles via `--table-style`. `compact`, `balanced` (default) and `expanded` keep their existing behavior. The `aligned` style picks one of four layouts per table, trying them in order:
 
 1. **Single line** — the whole constructor fits on the current line: `local anchors = { 10, 20, 30 }`.
-2. **Content on one line** — otherwise the content is kept as a single indented line between the braces whenever it fits there:
-   ```lua
-   local fallback = {
-       alpha = 1, beta = 2, gamma = 3, delta = 4, epsilon = 5, zeta = 6, eta = 7, theta = 8
-   }
-   ```
-3. **Aligned grid** — otherwise a pure array of small homogeneous elements (numbers, short strings, booleans, `nil`, or plain names) is printed several cells per row, space-padded and right-aligned within each column so the trailing commas line up across rows: every column starts at a multiple of *widest cell + 2* characters, which keeps the grid vertically aligned even when cell widths differ.
+2. **Content on one line** — otherwise the content is kept as a single indented line between the braces whenever it fits there.
+3. **Aligned grid** — otherwise a pure array of small homogeneous primitives (numbers, short strings, booleans, `nil`, or plain names) is printed several cells per row with space-padded columns; numbers right-align by default, the other primitives left-align.
 4. **One entry per line** — everything else (any dictionary, mixed arrays, over-wide strings, non-literal elements); nested tables follow the same rules at their own indentation. Multi-line entries carry trailing commas so appending a field never rewrites earlier lines.
 
-Four options tune the `aligned` style (they do not affect the other styles):
+Options tuning the `aligned` style (they do not affect the other styles):
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `--table-align-width` | follows `--max-line-length` (100 by default) | Caps the rendered row width (including indentation) of every aligned-table row: grid rows, the flat one-liner and the packed content line. Rows never exceed it unless a single cell alone is wider. |
-| `--table-align-string-width` | 16 | Caps the rendered width (quotes included) of a string allowed inside a grid; a wider string disqualifies the whole table from grid mode (falls back to one entry per line). |
-| `--table-align-eq` | true | Aligns record keys by `=` in non-single-line tables: keys are padded to the widest key of their alignment run. `--table-align-eq=false` keeps single spaces around `=`. |
-| `--table-align-eq-max-spaces` | 8 | Caps the total spaces between a record key and `=` (padding plus the mandatory separator): a key whose gap would exceed the cap starts a new alignment run instead of stretching every row. |
-| `--table-drop-index-keys` | false | Rewrites contiguous explicit `[1]..[n]` constructor keys as positional array entries (see below). |
+| `--table-align-width` | follows `--max-line-length` (100 by default) | Caps the rendered row width of every aligned-table row. |
+| `--table-align-string-width` | 16 | Caps the rendered width of a string allowed inside a grid; wider strings fall back to one entry per line. |
+| `--table-align-cells` | `auto` | Grid cell alignment: `auto` right-aligns numbers, left-aligns other primitives; `left`/`right` force one direction. |
+| `--table-align-eq` | true | Aligns record keys by `=` in non-single-line tables. |
+| `--table-align-eq-max-spaces` | 8 | Caps the spaces between a record key and `=`; wider keys start a new alignment run. |
+| `--table-drop-index-keys` | false | Rewrites contiguous explicit `[1]..[n]` constructor keys as positional array entries. |
 
-What the options change, concretely:
-
-```lua
--- default: --table-align-eq aligns keys to the widest key of the run
-local config = {
-    name    = "unluac",
-    threads = 4,
-    paths   = { "/usr/share/lua/5.1/?.lua", "/usr/local/share/lua/5.1/?.lua" },
-    retries = 3,
-}
--- --table-align-eq=false: same table, no padding
---     name = "unluac",
---     threads = 4,
-
--- --table-align-eq-max-spaces=2: same table; the visible gap between a key
--- and `=` never exceeds 2 spaces, so only keys one padding space apart stay
--- aligned and every wider key starts a new alignment run
---     id  = "op",
---     tag = "v1",
---     kind = "select",
---     timeout_ms = 1500,
---     retries = 4,
---     label = "worker",
---     retries_budget = 9,
---     fallback_mode  = true,
-
--- --table-align-width (default: follows --max-line-length, 100 here) vs 40:
--- mixed one- and two-digit numbers make the alignment visible - cells are
--- right-aligned within their column, so every trailing comma lands on the
--- same column across all rows
-local values = {
-     7, 42,  5, 91,  3, 28, 64, 12, 80, 56,  9, 47, 31, 75,  2, 60,
-    38, 84, 15, 70, 26, 93, 58, 41,  6, 77, 19, 85, 32, 68, 24, 50,
-}
--- --table-align-width=40: same table, 8 cells per row
--- local values = {
---      7, 42,  5, 91,  3, 28, 64, 12,
---     80, 56,  9, 47, 31, 75,  2, 60,
---     38, 84, 15, 70, 26, 93, 58, 41,
---      6, 77, 19, 85, 32, 68, 24, 50,
--- }
-
--- --table-align-string-width=6: strings of different lengths; every rendered
--- width (quotes included) is wider than 6, so the whole table falls back to
--- one entry per line - with the default cap of 16 the grid stays
-local labels = {
-    "peninsula",   "archipelago", "mountains",   "waterfall",
-    "wilderness",  "undergrowth", "tableland",   "watershed",
-}
--- --table-align-string-width=6: same table, no grid
--- local labels = {
---     "peninsula",
---     "archipelago",
---     "mountains",
---     "waterfall",
---     "wilderness",
---     "undergrowth",
---     "tableland",
---     "watershed",
--- }
-
--- --table-drop-index-keys=true: contiguous explicit index keys become positional
--- entries; a plain array literal compiles to SETLIST ops without keys, so any
--- `[1] =` in the output mirrors an explicitly keyed source. The rewrite preserves
--- evaluation order and per-field side effects; only the unspecified pairs() order
--- changes (hash part becomes the array part). Gaps, descending keys and tables
--- that mix positional and keyed fields are left untouched.
-local keyed = { "alpha", "beta" }        -- was: { [1] = "alpha", [2] = "beta" }
-local mixed = { mode = "dlg", "alpha", "beta", tag = 3 }
-                                         -- was: { mode = "dlg", [1] = "alpha", [2] = "beta", tag = 3 }
-local untouched = { [1] = "alpha", [3] = "gamma" }   -- gap: kept as-is
-```
+Details, the grid qualification rules (which primitives align and why) and full
+examples live in [Aligned table layout](./docs/table-alignment.md).
 
 See `unluac-cli --help` for all formatting, naming and decoding options, and the [debugging guide](./docs/debug.md) for pipeline inspection.
 
