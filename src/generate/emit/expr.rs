@@ -13,7 +13,7 @@ use crate::generate::LuauVectorSize;
 use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
 
-use super::super::common::TableStyle;
+use super::super::common::{TableStyle, TableCellAlign};
 use crate::value_semantics::table::TableExpression;
 use super::super::error::GenerateError;
 use super::syntax::{
@@ -617,12 +617,22 @@ impl<'a> Emitter<'a> {
         let content_width = fields_flat.flat_width();
         let flat = Doc::concat([Doc::text("{ "), fields_flat.clone(), Doc::text(" }")]);
         let broken = match self.aligned_grid_cells(fields, function) {
-            Some(cells) => Doc::concat([
-                Doc::text("{"),
-                Doc::indent(Doc::concat([Doc::line(), Doc::grid(cells)])),
-                Doc::line(),
-                Doc::text("}"),
-            ]),
+            Some((cells, cell_kind)) => {
+                // Resolve the horizontal direction once per grid: `Auto` picks
+                // per kind (numbers right, every other primitive left) while
+                // `Left`/`Right` force one direction for all kinds.
+                let align_right = match self.options.table_align_cells {
+                    TableCellAlign::Auto => cell_kind == AlignedCellKind::Number,
+                    TableCellAlign::Left => false,
+                    TableCellAlign::Right => true,
+                };
+                Doc::concat([
+                    Doc::text("{"),
+                    Doc::indent(Doc::concat([Doc::line(), Doc::grid(cells, align_right)])),
+                    Doc::line(),
+                    Doc::text("}"),
+                ])
+            }
             // 字典与非同类字段逐条输出；每条记录都带尾逗号，追加字段不会改写已有行。
             // 记录键按 `=` 对齐（`table_align_eq`），单行侧不参与对齐。
             None => {
@@ -659,12 +669,13 @@ impl<'a> Emitter<'a> {
 
     /// 收集对齐网格的单行单元格文本；返回 `None` 表示该表不具备网格布局资格：
     /// 出现记录字段、混入不同类别的小字面量、字符串超过宽度上限，或字段不是
-    /// nil/布尔/数字/短字符串/普通名字之一。
+    /// nil/布尔/数字/短字符串/普通名字之一。同时返回单元格类别，供
+    /// `table_align_cells = auto` 按类别挑选对齐方向。
     fn aligned_grid_cells(
         &self,
         fields: &[AstTableField],
         function: HirProtoRef,
-    ) -> Option<Vec<String>> {
+    ) -> Option<(Vec<String>, AlignedCellKind)> {
         let mut class = None;
         let mut cells = Vec::with_capacity(fields.len());
         for field in fields {
@@ -694,7 +705,8 @@ impl<'a> Emitter<'a> {
             }
             cells.push(text);
         }
-        Some(cells)
+        let class = class?;
+        Some((cells, class))
     }
 
     fn emit_table_field(

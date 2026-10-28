@@ -30,6 +30,9 @@ pub(super) fn decompile_options(entry: &LuaCaseManifestEntry) -> DecompileOption
     if let Some(width) = entry.options.table_align_string_width {
         options.generate.table_align_string_width = width;
     }
+    if let Some(align) = entry.options.table_align_cells {
+        options.generate.table_align_cells = align;
+    }
     if let Some(enabled) = entry.options.table_align_eq {
         options.generate.table_align_eq = enabled;
     }

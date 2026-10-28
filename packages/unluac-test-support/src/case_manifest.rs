@@ -7,6 +7,7 @@
 use strum_macros::{Display, IntoStaticStr};
 use unluac::ast::NamingMode;
 use unluac::decompile::{DecompileDialect, TableStyle};
+use unluac::generate::TableCellAlign;
 
 mod bindings;
 mod calls;
@@ -188,6 +189,7 @@ pub(crate) struct LuaCaseOptions {
     pub(crate) string_encoding: Option<&'static str>,
     pub(crate) readable_strings: Option<bool>,
     pub(crate) table_style: Option<TableStyle>,
+    pub(crate) table_align_cells: Option<TableCellAlign>,
     pub(crate) max_line_length: Option<usize>,
     pub(crate) table_align_width: Option<usize>,
     pub(crate) table_align_string_width: Option<usize>,
@@ -207,6 +209,7 @@ impl LuaCaseOptions {
         string_encoding: None,
         readable_strings: None,
         table_style: None,
+        table_align_cells: None,
         max_line_length: None,
         table_align_width: None,
         table_align_string_width: None,
@@ -391,6 +394,7 @@ const LUAU_OPTIMIZED_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     string_encoding: None,
     readable_strings: None,
     table_style: None,
+    table_align_cells: None,
     max_line_length: None,
     table_align_width: None,
     table_align_string_width: None,
@@ -412,6 +416,7 @@ const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     string_encoding: None,
     readable_strings: None,
     table_style: None,
+    table_align_cells: None,
     max_line_length: None,
     table_align_width: None,
     table_align_string_width: None,

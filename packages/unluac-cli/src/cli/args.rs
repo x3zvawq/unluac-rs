@@ -17,6 +17,7 @@ use unluac::decompile::{
     GenerateMode, LuauVectorConstructor, LuauVectorSize, NamingMode, NumberFormat, ProtoDepth,
     QuoteStyle, TableStyle,
 };
+use unluac::generate::TableCellAlign;
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
 use super::{CliError, CliOptions, OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE};
@@ -49,6 +50,7 @@ const NAMING_MODE_VALUES: &[&str] = &["debug-like", "simple", "heuristic"];
 const QUOTE_STYLE_VALUES: &[&str] = &["prefer-double", "prefer-single", "min-escape"];
 const NUMBER_FORMAT_VALUES: &[&str] = &["decimal", "hex"];
 const TABLE_STYLE_VALUES: &[&str] = &["compact", "balanced", "aligned", "expanded"];
+const TABLE_ALIGN_CELLS_VALUES: &[&str] = &["auto", "left", "right"];
 const GENERATE_MODE_VALUES: &[&str] = &["strict", "permissive"];
 
 fn known_value_parser<T>(values: &'static [&'static str]) -> impl TypedValueParser<Value = T>
@@ -377,6 +379,16 @@ struct GenerateArgs {
     /// Max rendered width of string literals allowed inside `--table-style aligned` grids.
     #[arg(long, help_heading = "Generate")]
     table_align_string_width: Option<usize>,
+    /// Horizontal alignment of `--table-style aligned` grid cells. `auto` picks per
+    /// cell kind: numbers right-align (digits and commas line up), strings, names,
+    /// booleans and nil left-align (word-like values share a left edge). `left`/`right`
+    /// force one direction for all kinds.
+    #[arg(
+        long,
+        value_parser = known_value_parser::<TableCellAlign>(TABLE_ALIGN_CELLS_VALUES),
+        help_heading = "Generate"
+    )]
+    table_align_cells: Option<TableCellAlign>,
     /// Optional Luau vector library name used with `--luau-vector-constructor`.
     #[arg(long, requires = "luau_vector_constructor", help_heading = "Generate")]
     luau_vector_library: Option<String>,
@@ -433,6 +445,10 @@ impl GenerateArgs {
         set_if_some(
             &mut options.generate.table_align_string_width,
             self.table_align_string_width,
+        );
+        set_if_some(
+            &mut options.generate.table_align_cells,
+            self.table_align_cells,
         );
         if let (Some(constructor), Some(size)) =
             (self.luau_vector_constructor, self.luau_vector_size)

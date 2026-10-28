@@ -27,7 +27,12 @@ pub enum Doc {
         content_width: Option<usize>,
         broken: Box<Doc>,
     },
-    Grid { cells: Vec<String> },
+    /// Horizontal cell alignment of the grid, resolved by the emit layer from
+    /// `table_align_cells` and the grid's cell kind (`true` = right-align: the
+    /// padding goes before each cell so trailing commas land on a shared column;
+    /// `false` = left-align: the padding goes after each cell so values share a
+    /// common left edge).
+    Grid { cells: Vec<String>, align_right: bool },
 }
 
 impl Doc {
@@ -114,8 +119,11 @@ impl Doc {
     }
 
     /// 单行单元格文本组成的对齐网格；行布局由 renderer 决定。
-    pub fn grid(cells: Vec<String>) -> Self {
-        Self::Grid { cells }
+    pub fn grid(cells: Vec<String>, align_right: bool) -> Self {
+        Self::Grid {
+            cells,
+            align_right,
+        }
     }
 
     pub fn join<I>(docs: I, separator: Doc) -> Self

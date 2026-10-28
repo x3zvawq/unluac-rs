@@ -101,6 +101,56 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_tables/layout_15_cells_align_left_default.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-cells auto (the default) left-aligns string grids: word-like values share a common left edge, while number grids keep right-aligned columns.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_16_cells_align_right_override.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-cells=right forces padding before every cell so trailing commas land on one shared column in all grids, string grids included.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_cells: Some(TableCellAlign::Right),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_17_cells_align_left_numbers.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-cells=left forces number grids left: values start on a shared left edge instead of right-aligning within their column, row budget unchanged.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_cells: Some(TableCellAlign::Left),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_18_cells_align_other_primitives.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned grids cover every small primitive kind (numbers, strings, booleans, nil, plain names); under auto only numbers right-align, booleans and names left-align like strings.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/layout_06_string_width_budget.lua",
         &["constructor", "aligned-layout", "readability"],
         "--table-align-string-width caps the string width allowed in a grid: with a cap of 6, over-wide strings fall back to one entry per line while short strings stay gridded.",

@@ -71,6 +71,7 @@ struct WasmGenerateOptions {
     table_align_string_width: Option<usize>,
     table_align_eq: Option<bool>,
     table_align_eq_max_spaces: Option<usize>,
+    table_align_cells: Option<String>,
     table_drop_index_keys: Option<bool>,
     luau_vector_constructor: Option<WasmLuauVectorConstructor>,
     comment: Option<bool>,
@@ -296,6 +297,10 @@ impl WasmGenerateOptions {
         }
         if let Some(value) = self.table_align_eq_max_spaces {
             options.generate.table_align_eq_max_spaces = value;
+        }
+        if let Some(value) = self.table_align_cells {
+            options.generate.table_align_cells =
+                parse_option("generate.tableAlignCells", &value)?;
         }
         if let Some(value) = self.table_drop_index_keys {
             options.generate.table_drop_index_keys = value;

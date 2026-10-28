@@ -67,6 +67,12 @@ pub struct GenerateOptions {
     /// literal allowed inside a space-aligned table grid; wider strings make the
     /// whole table fall back to the one-entry-per-line layout.
     pub table_align_string_width: usize,
+    /// Aligned style only: horizontal alignment of grid cells. `Auto` picks the
+    /// direction per cell kind: numbers right-align so digits and trailing commas
+    /// line up, every other primitive (strings, names, booleans, nil) left-aligns
+    /// so word-like values share a common left edge. `Left`/`Right` force one
+    /// direction for all kinds.
+    pub table_align_cells: TableCellAlign,
     pub comment: bool,
     /// 把 Luau vector 常量重新表达成源码时使用的宿主构造器。
     pub luau_vector_constructor: Option<LuauVectorConstructor>,
@@ -87,6 +93,7 @@ impl Default for GenerateOptions {
             table_drop_index_keys: false,
             table_align_width: None,
             table_align_string_width: 16,
+            table_align_cells: TableCellAlign::Auto,
             comment: true,
             luau_vector_constructor: None,
         }
@@ -225,4 +232,21 @@ pub enum TableStyle {
     Balanced,
     Aligned,
     Expanded,
+}
+
+/// Horizontal alignment of cells inside an `aligned` grid.
+///
+/// Grids are homogeneous (every cell has the same kind), so `Auto` resolves the
+/// direction once per grid from that kind: numbers right-align (digits of mixed
+/// magnitude stay comparable and trailing commas line up), while strings, names,
+/// booleans and nil left-align (word-like values share a common left edge, which
+/// reads better for text). nil grids are alignment-invariant (all cells render as
+/// `nil`), the direction only decides where the separator padding goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, EnumString, IntoStaticStr)]
+#[strum(serialize_all = "kebab-case")]
+pub enum TableCellAlign {
+    #[default]
+    Auto,
+    Left,
+    Right,
 }
