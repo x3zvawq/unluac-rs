@@ -13,6 +13,22 @@ const MUTABLE_GENERIC_KEY_DIALECTS: &[LuaCaseDialect] = &[
 
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_39_generic_for_arm_pair_header_merge.lua",
+        &["generic-for", "if-else", "loop-backedge", "goto-free"],
+        "generic-for 体内 if/elseif 两臂都自然回到 header 时按源码合流分类，不要求 goto/label。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/branch_38_loop_arm_nested_skips.lua",
         &[
             "short-circuit",
