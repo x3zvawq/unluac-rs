@@ -10,8 +10,6 @@ permissions:
 
 env:
   NODE_VERSION: "24"
-  WASM_PACK_VERSION: "0.14.0"
-  WASM_BINDGEN_CLI_VERSION: "0.2.115"
 
 jobs:
   prepare:
@@ -62,45 +60,32 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Restore vendored Lua toolchain cache
+        id: lua-toolchain-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: lua/build
+          key: ubuntu-24.04-${{ runner.arch }}-lua-toolchains-v2-${{ hashFiles('xtask/src/toolchain.rs', 'lua/patches/luau/**') }}
+
       - name: Install Linux Lua build dependencies
-        if: runner.os == 'Linux'
+        if: steps.lua-toolchain-cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libreadline-dev
-
-      - name: Restore vendored Lua toolchain cache
-        id: lua-toolchain-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            lua/sources
-            lua/build
-          key: ${{ runner.os }}-lua-toolchains-${{ hashFiles('xtask/Cargo.toml', 'xtask/src/toolchain.rs', '.cargo/config.toml') }}
 
       - name: Build vendored Lua toolchains
         if: steps.lua-toolchain-cache.outputs.cache-hit != 'true'
         run: cargo lua init all
 
-      - name: Restore wasm tool cache
-        id: wasm-tool-cache
-        uses: actions/cache@v4
+      - name: Save vendored Lua toolchain cache
+        if: steps.lua-toolchain-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
         with:
-          path: |
-            ~/.cargo/bin/wasm-pack
-            ~/.cargo/bin/wasm-bindgen
-            ~/.cargo/bin/wasm-bindgen-test-runner
-            ~/.cargo/bin/wasm2es6js
-            ~/.cargo/.crates2.json
-            ~/.cargo/.crates.toml
-          key: ${{ runner.os }}-wasm-tools-wasm-pack-${{ env.WASM_PACK_VERSION }}-wasm-bindgen-${{ env.WASM_BINDGEN_CLI_VERSION }}
+          path: lua/build
+          key: ${{ steps.lua-toolchain-cache.outputs.cache-primary-key }}
 
-      - name: Install wasm-pack
-        if: steps.wasm-tool-cache.outputs.cache-hit != 'true'
-        run: cargo install wasm-pack --version ${{ env.WASM_PACK_VERSION }} --locked
-
-      - name: Install wasm-bindgen CLI
-        if: steps.wasm-tool-cache.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version ${{ env.WASM_BINDGEN_CLI_VERSION }} --locked
+      - name: Setup WASM tools
+        uses: ./.github/actions/setup-wasm-tools
 
       - name: Check synced package versions
         run: node .github/scripts/sync_versions.mjs --check
@@ -113,13 +98,22 @@ jobs:
       - name: Dry-run crate publish
         run: cargo publish -p unluac --locked --dry-run
 
-      - name: Dry-run npm pack
+      - name: Build and pack npm release
         working-directory: packages/unluac-js
         run: |
-          npm install
+          npm ci
           npm run build
+          mkdir -p "${RUNNER_TEMP}/release-package"
+          cp dist/unluac_wasm_bg.wasm "${RUNNER_TEMP}/release-package/unluac_wasm_bg.wasm"
           cd dist
-          npm pack --pack-destination "${RUNNER_TEMP}"
+          npm pack --pack-destination "${RUNNER_TEMP}/release-package"
+
+      - name: Upload verified npm and WASM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-wasm-${{ needs.prepare.outputs.version }}
+          path: ${{ runner.temp }}/release-package/
+          if-no-files-found: error
 
   build-cli:
     name: Build CLI (${{ matrix.platform }})
@@ -190,34 +184,9 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
-          cache: npm
-          cache-dependency-path: packages/unluac-js/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Restore wasm tool cache
-        id: wasm-tool-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/wasm-pack
-            ~/.cargo/bin/wasm-bindgen
-            ~/.cargo/bin/wasm-bindgen-test-runner
-            ~/.cargo/bin/wasm2es6js
-            ~/.cargo/.crates2.json
-            ~/.cargo/.crates.toml
-          key: ${{ runner.os }}-wasm-tools-wasm-pack-${{ env.WASM_PACK_VERSION }}-wasm-bindgen-${{ env.WASM_BINDGEN_CLI_VERSION }}
-
-      - name: Install wasm-pack
-        if: steps.wasm-tool-cache.outputs.cache-hit != 'true'
-        run: cargo install wasm-pack --version ${{ env.WASM_PACK_VERSION }} --locked
-
-      - name: Install wasm-bindgen CLI
-        if: steps.wasm-tool-cache.outputs.cache-hit != 'true'
-        run: cargo install wasm-bindgen-cli --version ${{ env.WASM_BINDGEN_CLI_VERSION }} --locked
 
       - name: Check synced package versions
         run: node .github/scripts/sync_versions.mjs --check
@@ -242,18 +211,17 @@ jobs:
             echo "crate_published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install npm dependencies
-        working-directory: packages/unluac-js
-        run: npm install
-
-      - name: Build npm package
-        working-directory: packages/unluac-js
-        run: npm run build
+      - name: Download verified npm and WASM package
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-wasm-${{ needs.prepare.outputs.version }}
+          path: ${{ runner.temp }}/release-package
 
       - name: Publish npm package
         if: steps.release-state.outputs.npm_published != 'true'
-        working-directory: packages/unluac-js
-        run: npm publish ./dist --access public
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: npm publish "${RUNNER_TEMP}/release-package/unluac-js-${VERSION}.tgz" --access public
 
       - name: Publish Rust crate
         if: steps.release-state.outputs.crate_published != 'true'
@@ -291,7 +259,7 @@ jobs:
       - name: Add wasm release asset
         shell: bash
         run: |
-          cp packages/unluac-js/.wasm-build/unluac_wasm_bg.wasm "${{ runner.temp }}/release-assets/unluac_wasm_bg.wasm"
+          cp "${RUNNER_TEMP}/release-package/unluac_wasm_bg.wasm" "${RUNNER_TEMP}/release-assets/unluac_wasm_bg.wasm"
 
       - name: Create or update GitHub release
         env:
