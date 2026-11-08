@@ -106,7 +106,7 @@ Options tuning the `aligned` style (they do not affect the other styles):
 | `--table-align-cells` | `auto` | Grid cell alignment: `auto` right-aligns numbers, left-aligns other primitives; `left`/`right` force one direction. |
 | `--table-align-eq` | true | Aligns record keys by `=` in non-single-line tables. |
 | `--table-align-eq-max-spaces` | 8 | Caps the spaces between a record key and `=`; wider keys start a new alignment run. |
-| `--table-drop-index-keys` | false | Rewrites contiguous explicit `[1]..[n]` constructor keys as positional array entries. |
+| `--table-drop-index-keys` | false | Omits contiguous `[1]..[n]` keys in safe PUC scalar constructors; dynamic values, nil holes and unsupported layouts keep their keys. |
 
 Details, the grid qualification rules (which primitives align and why) and full
 examples live in [Aligned table layout](./docs/table-alignment.md).

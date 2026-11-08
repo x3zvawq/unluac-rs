@@ -3,7 +3,7 @@
 //! 消费缩进和行宽选项，保持 emitter 已确定的语法结构。
 
 use super::common::GenerateOptions;
-use super::doc::Doc;
+use super::doc::{AlignedTable, AlignedTableField, Doc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutMode {
@@ -57,128 +57,114 @@ impl Renderer<'_> {
                 };
                 self.render(inner, child_mode, indent);
             }
-            Doc::Cascade {
-                flat,
-                content,
-                content_width,
-                broken,
-            } => match mode {
-                LayoutMode::Flat => self.render(flat, mode, indent),
-                LayoutMode::Break => {
-                    // Aligned tables budget every candidate row (the flat
-                    // one-liner and the content line) by `table_align_width`,
-                    // capped by the global line limit. When the option is
-                    // unset the resolved width equals `max_line_length`, so
-                    // the default behavior is unchanged.
-                    let budget = self
-                        .options
-                        .max_line_length
-                        .min(self.options.resolved_table_align_width());
-                    let fits_flat = budget
-                        .checked_sub(self.column)
-                        .and_then(|remaining| remaining_after_flat(flat, remaining))
-                        .is_some();
-                    if fits_flat {
-                        self.render(flat, LayoutMode::Flat, indent);
-                    } else {
-                        let content_indent = indent + self.options.indent_width;
-                        // A `None` content width marks content that contains
-                        // hard line breaks (e.g. inline function bodies); it
-                        // can never participate in the single-line content
-                        // fallback, because rendering it flat would pack the
-                        // following fields onto the broken function's lines.
-                        let fits = budget
-                            .checked_sub(content_indent)
-                            .is_some_and(|remaining| {
-                                content_width.is_some_and(|width| width <= remaining)
-                            });
-                        if fits {
-                            self.push_text("{");
-                            self.push_line(content_indent);
-                            self.render(content, LayoutMode::Flat, content_indent);
-                            self.push_line(indent);
-                            self.push_text("}");
-                        } else {
-                            self.render(broken, mode, indent);
-                        }
-                    }
-                }
-            },
-            Doc::Grid {
-                cells,
-                align_right,
-            } => self.render_grid(cells, *align_right, indent),
+            Doc::AlignedTable(table) => self.render_aligned_table(table, indent),
         }
     }
 
     fn fits_flat(&self, doc: &Doc) -> bool {
-        self.options
-            .max_line_length
-            .checked_sub(self.column)
-            .and_then(|remaining| remaining_after_flat(doc, remaining))
-            .is_some()
+        flat_end(
+            doc,
+            self.column,
+            self.options.max_line_length,
+            self.options.resolved_table_align_width(),
+        )
+        .is_some()
     }
 
-    /// 把单元格文本渲染成列对齐的表格：所有行共用统一的列宽（按最宽单元格计），
-    /// 值按列起点垂直对齐。行预算是 `table_align_width` 减去行首缩进；行数取整列数，
-    /// 并向均匀分布收敛，避免末行只剩一个孤立单元格。
-    fn render_grid(&mut self, cells: &[String], align_right: bool, indent: usize) {
-        let Some(max_cell_width) = cells.iter().map(|cell| cell.chars().count()).max() else {
+    fn render_aligned_table(&mut self, table: &AlignedTable, indent: usize) {
+        let budget = self.options.resolved_table_align_width();
+        if table
+            .content_width
+            .is_some_and(|width| self.column + width + 4 <= budget)
+        {
+            self.push_text("{ ");
+            self.render_table_content(&table.fields, indent);
+            self.push_text(" }");
             return;
-        };
-        let max_cell_width = max_cell_width.max(1);
+        }
+        let content_indent = indent + self.options.indent_width;
+        self.push_text("{");
+        self.push_line(content_indent);
+        if table
+            .content_width
+            .is_some_and(|width| content_indent + width <= budget)
+        {
+            self.render_table_content(&table.fields, content_indent);
+        } else if let Some(align_right) = table.grid_align {
+            self.render_grid(&table.fields, align_right, content_indent);
+        } else {
+            for (index, field) in table.fields.iter().enumerate() {
+                if index > 0 {
+                    self.push_line(content_indent);
+                }
+                self.render_table_field(field, LayoutMode::Break, content_indent);
+                self.push_text(",");
+            }
+        }
+        self.push_line(indent);
+        self.push_text("}");
+    }
+
+    fn render_table_content(&mut self, fields: &[AlignedTableField], indent: usize) {
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                self.push_text(", ");
+            }
+            self.render_table_field(field, LayoutMode::Flat, indent);
+        }
+    }
+
+    fn render_table_field(&mut self, field: &AlignedTableField, mode: LayoutMode, indent: usize) {
+        if let Some(key) = &field.key {
+            self.render(key, mode, indent);
+            if mode == LayoutMode::Break {
+                self.push_text(&" ".repeat(field.padding));
+            }
+            self.push_text(" = ");
+        }
+        self.render(&field.value, mode, indent);
+    }
+
+    fn render_grid(&mut self, fields: &[AlignedTableField], align_right: bool, indent: usize) {
+        let cells = fields
+            .iter()
+            .map(|field| {
+                let Doc::Text(text) = &field.value else {
+                    unreachable!("grid eligibility requires Text fields");
+                };
+                (text.as_ref(), text.chars().count())
+            })
+            .collect::<Vec<_>>();
+        let max_cell_width = cells
+            .iter()
+            .map(|(_, width)| *width)
+            .max()
+            .expect("nonempty table")
+            .max(1);
         let stride = max_cell_width + 2;
         let row_budget = self
             .options
             .resolved_table_align_width()
             .saturating_sub(indent);
-        // 整行宽度 k*(W+2)-1 ≤ budget（行尾逗号不加尾随填充）。
         let per_row_max = (row_budget.saturating_add(1) / stride).max(1);
-        let count = cells.len();
-        // 行数向上取整后再均分行内单元格，避免末行只剩一个孤立单元格。
-        let full_rows = count.div_ceil(per_row_max).max(1);
-        let per_row = count.div_ceil(full_rows).max(1);
-
-        let mut cells = cells.iter();
-        self.push_grid_row(&mut cells, per_row, max_cell_width, align_right);
-        for _ in 1..full_rows {
-            self.push_line(indent);
-            self.push_grid_row(&mut cells, per_row, max_cell_width, align_right);
-        }
-    }
-
-    /// 输出一行网格：右对齐时填充位于值之前，行尾逗号落在相同列起点，相邻行的
-    /// 逗号垂直对齐；左对齐时填充位于值+逗号之后，值共享同一左缘，适合词形
-    /// 内容（字符串、名字、关键字）。两种方向的列步进一致（最宽格 + 2）。
-    fn push_grid_row<'a, I>(
-        &mut self,
-        cells: &mut I,
-        per_row: usize,
-        max_cell_width: usize,
-        align_right: bool,
-    ) where
-        I: Iterator<Item = &'a String>,
-    {
-        for (index, cell) in cells.by_ref().take(per_row).enumerate() {
-            if index > 0 {
-                self.push_text(" ");
+        let rows = cells.len().div_ceil(per_row_max);
+        let per_row = cells.len().div_ceil(rows);
+        for (row_index, row) in cells.chunks(per_row).enumerate() {
+            if row_index > 0 {
+                self.push_line(indent);
             }
-            if align_right {
-                // Right-align the cell so its trailing comma lands on the same
-                // column in every row of the grid.
-                let padding = max_cell_width - cell.chars().count();
-                self.push_text(&" ".repeat(padding));
-                self.push_text(cell);
+            for (column, (text, width)) in row.iter().enumerate() {
+                if column > 0 {
+                    self.push_text(" ");
+                }
+                if align_right {
+                    self.push_text(&" ".repeat(max_cell_width - width));
+                }
+                self.push_text(text);
                 self.push_text(",");
-            } else {
-                // Left-align the cell so every value starts on a shared left
-                // edge; the padding after the comma keeps the next column on
-                // the same stride as the right-aligned layout. Trailing
-                // padding at end of line is trimmed by `push_line`.
-                self.push_text(cell);
-                self.push_text(",");
-                let padding = max_cell_width - cell.chars().count();
-                self.push_text(&" ".repeat(padding));
+                if !align_right && column + 1 < row.len() {
+                    self.push_text(&" ".repeat(max_cell_width - width));
+                }
             }
         }
     }
@@ -213,11 +199,10 @@ impl Renderer<'_> {
     }
 
     fn fits_flat_pair(&self, lhs: &Doc, rhs: &Doc) -> bool {
-        self.options
-            .max_line_length
-            .checked_sub(self.column)
-            .and_then(|remaining| remaining_after_flat(lhs, remaining))
-            .and_then(|remaining| remaining_after_flat(rhs, remaining))
+        let limit = self.options.max_line_length;
+        let table_limit = self.options.resolved_table_align_width();
+        flat_end(lhs, self.column, limit, table_limit)
+            .and_then(|column| flat_end(rhs, column, limit, table_limit))
             .is_some()
     }
 
@@ -239,32 +224,34 @@ impl Renderer<'_> {
     }
 }
 
-/// 只证明能否平铺；超出剩余字符预算后无需测量未访问的后缀。
-fn remaining_after_flat(doc: &Doc, remaining: usize) -> Option<usize> {
+/// 预算内的单行结束列；对齐表消费缓存，父 Group 的 Flat 决策也必须满足表宽约束。
+fn flat_end(doc: &Doc, column: usize, limit: usize, table_limit: usize) -> Option<usize> {
+    let advance = |width: usize, limit: usize| {
+        let end = column.checked_add(width)?;
+        (end <= limit).then_some(end)
+    };
     match doc {
         Doc::Text(text) => text
             .chars()
-            .try_fold(remaining, |remaining, _| remaining.checked_sub(1)),
+            .try_fold(column, |column, _| (column < limit).then_some(column + 1)),
         Doc::Line => None,
-        Doc::SoftLine => remaining.checked_sub(1),
-        Doc::Concat(parts) => parts.iter().try_fold(remaining, |remaining, part| {
-            remaining_after_flat(part, remaining)
+        Doc::SoftLine => advance(1, limit),
+        Doc::Concat(parts) => parts.iter().try_fold(column, |column, part| {
+            flat_end(part, column, limit, table_limit)
         }),
         Doc::Fill { docs, separator } => {
             docs.iter()
                 .enumerate()
-                .try_fold(remaining, |remaining, (index, doc)| {
-                    let remaining = if index == 0 {
-                        remaining
+                .try_fold(column, |column, (index, doc)| {
+                    let column = if index == 0 {
+                        column
                     } else {
-                        remaining_after_flat(separator, remaining)?
+                        flat_end(separator, column, limit, table_limit)?
                     };
-                    remaining_after_flat(doc, remaining)
+                    flat_end(doc, column, limit, table_limit)
                 })
         }
-        Doc::Indent(inner) | Doc::Group(inner) => remaining_after_flat(inner, remaining),
-        // Cascade 只按 flat 侧证明能否平铺；Grid 自带硬换行，不能作为单行内容。
-        Doc::Cascade { flat, .. } => remaining_after_flat(flat, remaining),
-        Doc::Grid { .. } => None,
+        Doc::Indent(inner) | Doc::Group(inner) => flat_end(inner, column, limit, table_limit),
+        Doc::AlignedTable(table) => advance(table.content_width? + 4, limit.min(table_limit)),
     }
 }
