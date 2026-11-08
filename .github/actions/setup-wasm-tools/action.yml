@@ -1,0 +1,50 @@
+name: Setup WASM tools
+description: Install pinned wasm-pack for Linux x64 and cache its matching bindgen and wasm-opt tools
+
+runs:
+  using: composite
+  steps:
+    - name: Configure tool versions and paths
+      id: versions
+      shell: bash
+      run: |
+        echo "pack=0.14.0" >> "$GITHUB_OUTPUT"
+        python3 - <<'PY'
+        import os
+        import tomllib
+
+        with open("Cargo.lock", "rb") as source:
+            packages = tomllib.load(source)["package"]
+        version = next(package["version"] for package in packages if package["name"] == "wasm-bindgen")
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write(f"bindgen={version}\n")
+        PY
+        echo "WASM_PACK_CACHE=${RUNNER_TOOL_CACHE}/unluac-wasm-tools/cache" >> "$GITHUB_ENV"
+        echo "${RUNNER_TOOL_CACHE}/unluac-wasm-tools/bin" >> "$GITHUB_PATH"
+
+    - name: Restore WASM tools
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/unluac-wasm-tools
+        key: ubuntu-24.04-${{ runner.arch }}-wasm-tools-v2-pack-${{ steps.versions.outputs.pack }}-bindgen-${{ steps.versions.outputs.bindgen }}
+
+    - name: Install wasm-pack binary
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        WASM_PACK_VERSION: ${{ steps.versions.outputs.pack }}
+      run: |
+        ARCHIVE="${RUNNER_TEMP}/wasm-pack.tar.gz"
+        PACKAGE="wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl"
+        curl --fail --silent --show-error --location --retry 3 \
+          "https://github.com/wasm-bindgen/wasm-pack/releases/download/v${WASM_PACK_VERSION}/${PACKAGE}.tar.gz" \
+          --output "$ARCHIVE"
+        echo "278a8d668085821f4d1a637bd864f1713f872b0ae3a118c77562a308c0abfe8d  ${ARCHIVE}" | sha256sum --check
+        mkdir -p "${RUNNER_TOOL_CACHE}/unluac-wasm-tools/bin"
+        tar -xzf "$ARCHIVE" --strip-components=1 \
+          -C "${RUNNER_TOOL_CACHE}/unluac-wasm-tools/bin" "${PACKAGE}/wasm-pack"
+
+    - name: Verify wasm-pack
+      shell: bash
+      run: wasm-pack --version
