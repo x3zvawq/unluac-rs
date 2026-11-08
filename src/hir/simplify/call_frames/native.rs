@@ -2183,7 +2183,7 @@ fn collect_plans(
                         || (matches!(binary.lhs, HirExpr::Unary(_) | HirExpr::Binary(_))
                             || matches!(binary.rhs, HirExpr::Unary(_) | HirExpr::Binary(_))
                             || index.checked_sub(1).and_then(|previous| flat[previous])
-                                .is_some_and(|previous| matches!(scalar_local(previous.stmt), Some((_, HirExpr::Binary(_))))
+                                .is_some_and(|previous| matches!(scalar_local(previous.stmt), Some((_, HirExpr::Unary(_) | HirExpr::Binary(_))))
                                     && following_operation_input(previous.stmt, stmt, facts)))
                             && binary
                                 .source_site
@@ -8538,7 +8538,7 @@ fn logical_call_results_unaliased<'a>(
     true
 }
 
-/// 下一运算的原输入 Def 属于本次高槽结果；这里只保留候选边界，完整帧仍签发提交证明。
+/// 下一运算的原输入 Def 属于本次结果；这里只保留候选边界，完整帧仍签发提交证明。
 fn following_operation_input(stmt: &HirStmt, next: &HirStmt, facts: &ProtoPromotionFacts) -> bool {
     let Some((_, value)) = scalar_local(stmt) else {
         return false;
@@ -8614,11 +8614,13 @@ fn following_operation_input(stmt: &HirStmt, next: &HirStmt, facts: &ProtoPromot
     let HirExpr::Binary(binary) = value else {
         return false;
     };
+    // 同槽覆盖也可能是同一个 initializer 的下一步，例如 `local x = -width / 2`。
+    // 原 use→Def 仍在下方配对；这里只有候选边界，声明、根和事件由完整帧验证。
     let arithmetic = is_scalar_binary_operation(binary.op)
         && binary
             .source_site
             .and_then(|source| facts.operation_result_home(source))
-            .is_some_and(|output| output.slot() < home.slot());
+            .is_some_and(|output| output.slot() <= home.slot());
     // 比较的 Boolean 写回也拥有 CALL 输入准备；其结果可原位覆盖输入槽。
     // 仅保留完整帧候选窗口，实际重放仍须通过比较、原事件和声明前缀证明。
     let comparison = facts
