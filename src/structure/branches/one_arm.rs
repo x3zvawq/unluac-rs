@@ -291,7 +291,22 @@ pub(super) fn classify_loop_exit_bounded_one_arm_branch(
             invert_hint: false,
         }),
         _ if enters_continue_pad => None,
-        _ => classify_loop_bounded_one_arm_branch(branch_index, header, then_entry, else_entry),
+        _ => classify_loop_bounded_one_arm_branch(branch_index, header, then_entry, else_entry)
+            .or_else(|| {
+                // 两臂都不局部汇入对方、却都回到本轮 header：header 就是源码层
+                // if/else 在循环体内的合流边界，两臂的正常结束都等价于本轮迭代
+                // 完成；与无出口循环的 header-merge 分类一致。否则 then 臂的
+                // 回边会被当成非 tail backedge，迫使不支持 goto/continue 的
+                // 方言把另一臂留成 sibling 尾部并要求不可表达的显式跳转。
+                (then_continues && else_continues).then_some(BranchCandidate {
+                    header,
+                    then_entry,
+                    else_entry: Some(else_entry),
+                    merge: Some(owner.header),
+                    kind: BranchKind::IfElse,
+                    invert_hint: false,
+                })
+            }),
     }
 }
 
