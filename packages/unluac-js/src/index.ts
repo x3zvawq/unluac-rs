@@ -74,7 +74,7 @@ export interface UnluacDecompileOptions {
     tableAlignEq?: boolean;
     /** Max padding spaces when aligning record keys by `=` (default 8). */
     tableAlignEqMaxSpaces?: number;
-    /** Rewrite redundant explicit `[1]..[n]` constructor keys as positional entries (default false). */
+    /** Omit contiguous `[1]..[n]` keys in safe PUC scalar constructors (default false). */
     tableDropIndexKeys?: boolean;
     luauVectorConstructor?: UnluacLuauVectorConstructor;
     comment?: boolean;

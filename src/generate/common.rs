@@ -53,15 +53,11 @@ pub struct GenerateOptions {
     /// field starts a new run so that one long key does not stretch every row.
     /// Zero disables the alignment entirely.
     pub table_align_eq_max_spaces: usize,
-    /// Fold redundant explicit index keys `[1]..[n]` into positional fields of the
-    /// constructor. The bytecode stores such keys faithfully (the source wrote them
-    /// out explicitly), so the fold is opt-in: it only changes the unspecified
-    /// `pairs` order (the hash part becomes an array).
+    /// 省略 PUC 连续整数键的安全标量初始化：非 nil 字面量、静态无碰撞键。
+    /// 动态值、nil 洞、混合位置字段及其它 VM 分配协议保留原键；默认关闭。
     pub table_drop_index_keys: bool,
-    /// Aligned style only: maximum rendered row width (including indentation) of a
-    /// space-aligned table grid. Rows never exceed this budget unless a single cell
-    /// alone is wider. When unset (`None`) the grid follows `max_line_length`, so
-    /// the row budget always matches the global line budget unless overridden.
+    /// 对齐表的行宽（含缩进），与 `max_line_length` 取较小值。None 沿用全局值；
+    /// 不可分割的单个字段仍可能超过预算。
     pub table_align_width: Option<usize>,
     /// Aligned style only: maximum rendered width (including quotes) of a string
     /// literal allowed inside a space-aligned table grid; wider strings make the
@@ -101,10 +97,11 @@ impl Default for GenerateOptions {
 }
 
 impl GenerateOptions {
-    /// Row budget for `aligned` grids: `table_align_width` when set, otherwise
-    /// `max_line_length` (the default coupling; see the field docs).
+    /// 对齐表的行预算始终受全局行宽限制；未指定表宽时直接沿用全局值。
     pub fn resolved_table_align_width(&self) -> usize {
-        self.table_align_width.unwrap_or(self.max_line_length)
+        self.table_align_width
+            .unwrap_or(self.max_line_length)
+            .min(self.max_line_length)
     }
 }
 
@@ -220,10 +217,8 @@ pub enum QuoteStyle {
 
 /// 表构造器布局策略。
 ///
-/// `Aligned` 在三种布局之间按表内容自动选择：放得下就保持单行；放不下且全部字段是
-/// 同类小字面量（数字、短字符串、布尔、nil 或普通名字）时输出空格对齐的网格；
-/// 其余情况（包括任何字典）每行一条记录。网格行宽与字符串宽度上限由
-/// `table_align_width` / `table_align_string_width` 控制。
+/// `Aligned` 依次选择完整单行、缩进内容行、同类标量网格或逐字段布局。
+/// 每种布局共用字段内容与行预算；网格和等号对齐由对应选项控制。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, EnumString, IntoStaticStr)]
 #[strum(serialize_all = "kebab-case")]
 pub enum TableStyle {

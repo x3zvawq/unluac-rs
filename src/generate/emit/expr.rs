@@ -10,11 +10,10 @@ use crate::ast::{
 };
 use crate::decompile::DecompileDialect;
 use crate::generate::LuauVectorSize;
-use crate::generate::doc::Doc;
+use crate::generate::doc::{AlignedTable, AlignedTableField, Doc};
 use crate::hir::HirProtoRef;
 
-use super::super::common::{TableStyle, TableCellAlign};
-use crate::value_semantics::table::TableExpression;
+use super::super::common::{TableCellAlign, TableStyle};
 use super::super::error::GenerateError;
 use super::syntax::{
     binary_meta, format_complex_literal, format_integer, format_number, format_string_literal,
@@ -24,6 +23,7 @@ use super::{
     Assoc, Emitter, ExprSide, PREC_AND, PREC_COMPARE, PREC_LITERAL, PREC_OR, PREC_PREFIX,
     PREC_UNARY,
 };
+use crate::value_semantics::table::TableExpression;
 
 fn numeric_literal(rendered: String) -> (Doc, u8, Assoc) {
     let precedence = if rendered.starts_with('-') {
@@ -64,48 +64,72 @@ impl AlignedCellKind {
     }
 }
 
-/// Flushes an alignment run: every field gets padding up to the widest key of
-/// the run, after which the run is cleared.
-fn flush_alignment_run(pads: &mut [usize], run: &mut Vec<(usize, usize)>, run_max: usize) {
-    for &(index, width) in run.iter() {
-        pads[index] = run_max - width;
+/// 静态、非 nil 标量没有字段求值事件，且连续数组不存在可变的长度边界。
+fn inert_table_value(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Boolean(_) | AstExpr::Integer(_) | AstExpr::String(_) => true,
+        AstExpr::Number(value) => value.is_finite(),
+        AstExpr::SingleValue(value) => inert_table_value(value),
+        _ => false,
     }
-    run.clear();
 }
 
-/// `--table-drop-index-keys`：把显式写出的连续索引键 `[1]..[n]` 投影成位置字段。
-/// 返回 `None` 表示该构造器没有可安全去掉的键（或键序列不连续/乱序/与位置字段混用），
-/// 调用方应保留原字段。非整数键的记录字段原样保留，字段顺序不变，因此求值顺序
-/// 与逐字段副作用完全一致；唯一的运行时差异是 `pairs` 顺序（哈希部分变成数组部分），
-/// 这在 Lua 中本就不确定。
-fn project_dropped_index_keys(fields: &[AstTableField]) -> Option<Vec<AstTableField>> {
-    let mut projected = Vec::with_capacity(fields.len());
+/// 只省略能够证明没有求值、批写观察和整数键碰撞的显式索引；不复制或改写 AST。
+fn can_drop_index_keys(table: &AstTableConstructor) -> bool {
+    if !matches!(
+        table.allocation,
+        crate::hir::HirTableAllocation::PucBatched(_)
+    ) {
+        // 候选拒绝[ProofIncomplete]：Indexed/Template/Luau 的预分配、模板和原操作要求
+        // 尚无投影证明；不能把 PUC 的无事件标量初始化结论推广到这些协议。
+        return false;
+    }
     let mut next_index = 1i64;
-    let mut converted = 0usize;
-    for field in fields {
-        match field {
-            // 位置字段与显式键混用时无法安全重排，直接放弃投影。
-            AstTableField::Array(_) => return None,
-            AstTableField::Record(record) => {
-                let integer_key = match &record.key {
-                    AstTableKey::Name(_) => None,
-                    AstTableKey::Expr(expr) => expr.table_integer_key(),
-                };
-                match integer_key {
-                    Some(index) if index == next_index => {
-                        projected.push(AstTableField::Array(record.value.clone()));
-                        next_index += 1;
-                        converted += 1;
-                    }
-                    // 缺口、重复或乱序的索引键（如 `[1]` 后跟 `[3]`）语义上不是
-                    // 纯数组，保留原样最稳妥。
-                    Some(_) => return None,
-                    None => projected.push(field.clone()),
-                }
+    for field in &table.fields {
+        let AstTableField::Record(record) = field else {
+            return false;
+        };
+        if !inert_table_value(&record.value) {
+            // 候选拒绝[ProofIncomplete]：动态值、nil 洞和分配可能观察批写或长度边界；
+            // 尾部 CALL/VARARG 还会由单值字段变成开放多返回，不能原样省略键。
+            return false;
+        }
+        let AstTableKey::Expr(key) = &record.key else {
+            continue;
+        };
+        if let Some(index) = key.table_integer_key() {
+            if index != next_index {
+                return false;
             }
+            next_index += 1;
+        } else if !matches!(key, AstExpr::String(_) | AstExpr::Boolean(_))
+            && !matches!(key, AstExpr::Number(value) if value.is_finite() && value.fract() != 0.0)
+        {
+            // 候选拒绝[ProofIncomplete]：动态键可能覆盖数组索引，延后的 SETLIST
+            // 与原 record 写回会选择不同的最终值；这里只接受静态非整数键。
+            return false;
         }
     }
-    (converted > 0).then_some(projected)
+    next_index > 1
+}
+
+#[derive(Clone, Copy)]
+enum TableFieldView<'a> {
+    Array(&'a AstExpr),
+    Record(&'a AstRecordField),
+}
+
+fn table_field_view(field: &AstTableField, drop_keys: bool) -> TableFieldView<'_> {
+    match field {
+        AstTableField::Array(value) => TableFieldView::Array(value),
+        AstTableField::Record(record)
+            if drop_keys
+                && matches!(&record.key, AstTableKey::Expr(key) if key.table_integer_key().is_some()) =>
+        {
+            TableFieldView::Array(&record.value)
+        }
+        AstTableField::Record(record) => TableFieldView::Record(record),
+    }
 }
 
 impl LogicalOperator {
@@ -564,18 +588,14 @@ impl<'a> Emitter<'a> {
         if table.fields.is_empty() {
             return Ok(Doc::text("{}"));
         }
-        // `--table-drop-index-keys`：把连续的显式 `[1]..[n]` 键投影成位置字段。
-        // 投影结果同时驱动网格资格判断，因此纯数字的显式键数组也能进入网格。
-        let projected;
-        let fields: &[AstTableField] = if self.options.table_drop_index_keys {
-            projected = project_dropped_index_keys(&table.fields);
-            projected.as_deref().unwrap_or(&table.fields)
-        } else {
-            &table.fields
-        };
-        let field_docs = fields
+        let drop_keys = self.options.table_drop_index_keys && can_drop_index_keys(table);
+        if self.options.table_style == TableStyle::Aligned {
+            return self.emit_aligned_table(&table.fields, drop_keys, function);
+        }
+        let field_docs = table
+            .fields
             .iter()
-            .map(|field| self.emit_table_field(field, function))
+            .map(|field| self.emit_table_field(table_field_view(field, drop_keys), function))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(match self.options.table_style {
             TableStyle::Expanded => Doc::concat([
@@ -587,7 +607,7 @@ impl<'a> Emitter<'a> {
                 Doc::line(),
                 Doc::text("}"),
             ]),
-            TableStyle::Aligned => self.emit_aligned_table(fields, field_docs, function)?,
+            TableStyle::Aligned => unreachable!("aligned tables use their own layout node"),
             TableStyle::Compact | TableStyle::Balanced => {
                 let separator = Doc::concat([Doc::text(","), Doc::soft_line()]);
                 Doc::group(Doc::concat([
@@ -603,220 +623,123 @@ impl<'a> Emitter<'a> {
         })
     }
 
-    /// Aligned 布局的级联决策：整体放得下就保持单行（复测按当前列判断）；
-    /// 否则先尝试把内容平铺进下一行，再退回空格对齐网格（纯同类小字面量数组）
-    /// 或逐行记录。网格行宽与字符串宽度上限由 `table_align_width` /
-    /// `table_align_string_width` 控制。
     fn emit_aligned_table(
         &self,
         fields: &[AstTableField],
-        field_docs: Vec<Doc>,
+        drop_keys: bool,
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
-        let fields_flat = Doc::join(field_docs.iter().cloned(), Doc::text(", "));
-        let content_width = fields_flat.flat_width();
-        let flat = Doc::concat([Doc::text("{ "), fields_flat.clone(), Doc::text(" }")]);
-        let broken = match self.aligned_grid_cells(fields, function) {
-            Some((cells, cell_kind)) => {
-                // Resolve the horizontal direction once per grid: `Auto` picks
-                // per kind (numbers right, every other primitive left) while
-                // `Left`/`Right` force one direction for all kinds.
-                let align_right = match self.options.table_align_cells {
-                    TableCellAlign::Auto => cell_kind == AlignedCellKind::Number,
-                    TableCellAlign::Left => false,
-                    TableCellAlign::Right => true,
-                };
-                Doc::concat([
-                    Doc::text("{"),
-                    Doc::indent(Doc::concat([Doc::line(), Doc::grid(cells, align_right)])),
-                    Doc::line(),
-                    Doc::text("}"),
-                ])
-            }
-            // 字典与非同类字段逐条输出；每条记录都带尾逗号，追加字段不会改写已有行。
-            // 记录键按 `=` 对齐（`table_align_eq`），单行侧不参与对齐。
-            None => {
-                let pads = self.aligned_record_pads(fields, function);
-                let needs_padding = pads.iter().any(|&pad| pad > 0);
-                let lines = if needs_padding {
-                    fields
-                        .iter()
-                        .zip(pads)
-                        .map(|(field, pad)| self.emit_table_field_padded(field, pad, function))
-                        .collect::<Result<Vec<_>, _>>()?
-                } else {
-                    field_docs
-                };
-                Doc::concat([
-                    Doc::text("{"),
-                    Doc::indent(Doc::concat([
-                        Doc::line(),
-                        Doc::join(
-                            lines
-                                .into_iter()
-                                .map(|line| Doc::concat([line, Doc::text(",")])),
-                            Doc::line(),
-                        ),
-                    ])),
-                    Doc::line(),
-                    Doc::text("}"),
-                ])
-            }
-        };
-        // 内容侧只带字段本身；花括号与换行由 renderer 在平铺进下一行时合成。
-        Ok(Doc::cascade(flat, fields_flat, content_width, broken))
-    }
-
-    /// 收集对齐网格的单行单元格文本；返回 `None` 表示该表不具备网格布局资格：
-    /// 出现记录字段、混入不同类别的小字面量、字符串超过宽度上限，或字段不是
-    /// nil/布尔/数字/短字符串/普通名字之一。同时返回单元格类别，供
-    /// `table_align_cells = auto` 按类别挑选对齐方向。
-    fn aligned_grid_cells(
-        &self,
-        fields: &[AstTableField],
-        function: HirProtoRef,
-    ) -> Option<(Vec<String>, AlignedCellKind)> {
-        let mut class = None;
-        let mut cells = Vec::with_capacity(fields.len());
+        let mut docs = Vec::with_capacity(fields.len());
+        let mut grid_kind = None;
+        let mut grid_eligible = true;
         for field in fields {
-            let AstTableField::Array(expr) = field else {
-                return None;
+            let view = table_field_view(field, drop_keys);
+            let (key, value) = match view {
+                TableFieldView::Array(value) => (None, value),
+                TableFieldView::Record(record) => (
+                    Some(self.emit_table_key(&record.key, function)?),
+                    &record.value,
+                ),
             };
-            let kind = AlignedCellKind::of(expr)?;
-            match class {
-                Some(existing) if existing != kind => return None,
-                _ => class = Some(kind),
+            let key_width = key.as_ref().and_then(Doc::flat_width);
+            let value_doc = self.emit_expr(value, function, 0, ExprSide::Standalone)?;
+            if grid_eligible {
+                let kind = AlignedCellKind::of(value);
+                grid_eligible = key.is_none()
+                    && kind.is_some()
+                    && (grid_kind.is_none() || grid_kind == kind)
+                    && matches!(&value_doc, Doc::Text(text)
+                        if !text.contains(['\n', '\r'])
+                            && (kind != Some(AlignedCellKind::String)
+                                || text.chars().count() <= self.options.table_align_string_width));
+                grid_kind = kind;
             }
-            let Doc::Text(text) = self
-                .emit_expr(expr, function, 0, ExprSide::Standalone)
-                .ok()?
-            else {
-                return None;
-            };
-            let text = text.into_owned();
-            // 渲染结果含换行的字符串（长括号形式）会破坏单行网格，视作不合格。
-            if text.contains('\n') || text.contains('\r') {
-                return None;
-            }
-            if kind == AlignedCellKind::String
-                && text.chars().count() > self.options.table_align_string_width
-            {
-                return None;
-            }
-            cells.push(text);
+            docs.push(AlignedTableField {
+                key,
+                value: value_doc,
+                key_width,
+                padding: 0,
+            });
         }
-        let class = class?;
-        Some((cells, class))
+        self.align_record_fields(&mut docs);
+        let content_width = docs
+            .iter()
+            .enumerate()
+            .try_fold(0, |width, (index, field)| {
+                Some(width + if index == 0 { 0 } else { 2 } + field.flat_width()?)
+            });
+        let grid_align = grid_eligible.then_some(match self.options.table_align_cells {
+            TableCellAlign::Auto => grid_kind == Some(AlignedCellKind::Number),
+            TableCellAlign::Left => false,
+            TableCellAlign::Right => true,
+        });
+        Ok(Doc::AlignedTable(Box::new(AlignedTable {
+            fields: docs,
+            content_width,
+            grid_align,
+        })))
     }
 
     fn emit_table_field(
         &self,
-        field: &AstTableField,
-        function: HirProtoRef,
-    ) -> Result<Doc, GenerateError> {
-        self.emit_table_field_padded(field, 0, function)
-    }
-
-    /// `pad` is the extra spaces inserted before ` = ` to align record keys;
-    /// it is non-zero only in the per-line branch of the aligned style when
-    /// `table_align_eq`.
-    fn emit_table_field_padded(
-        &self,
-        field: &AstTableField,
-        pad: usize,
+        field: TableFieldView<'_>,
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
         match field {
-            AstTableField::Array(expr) => self.emit_expr(expr, function, 0, ExprSide::Standalone),
-            AstTableField::Record(record) => self.emit_record_field(record, pad, function),
+            TableFieldView::Array(value) => {
+                self.emit_expr(value, function, 0, ExprSide::Standalone)
+            }
+            TableFieldView::Record(record) => Ok(Doc::concat([
+                self.emit_table_key(&record.key, function)?,
+                Doc::text(" = "),
+                self.emit_expr(&record.value, function, 0, ExprSide::Standalone)?,
+            ])),
         }
     }
 
-    fn emit_record_field(
+    fn emit_table_key(
         &self,
-        record: &AstRecordField,
-        pad: usize,
+        key: &AstTableKey,
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
-        let key = match &record.key {
+        Ok(match key {
             AstTableKey::Name(name) => Doc::text(name.clone()),
             AstTableKey::Expr(expr) => Doc::concat([
                 Doc::text("["),
                 self.emit_expr(expr, function, 0, ExprSide::Standalone)?,
                 Doc::text("]"),
             ]),
-        };
-        let value = self.emit_expr(&record.value, function, 0, ExprSide::Standalone)?;
-        if pad > 0 {
-            Ok(Doc::concat([
-                key,
-                Doc::text(" ".repeat(pad)),
-                Doc::text(" = "),
-                value,
-            ]))
-        } else {
-            Ok(Doc::concat([key, Doc::text(" = "), value]))
-        }
+        })
     }
 
-    /// Widths of record keys; `None` means the field cannot be aligned (an array
-    /// field or an unmeasurable key, e.g. a key with a hard line break).
-    fn record_key_width(
-        &self,
-        record: &AstRecordField,
-        function: HirProtoRef,
-    ) -> Option<usize> {
-        match &record.key {
-            AstTableKey::Name(name) => Some(name.chars().count()),
-            AstTableKey::Expr(expr) => {
-                let doc = self
-                    .emit_expr(expr, function, 0, ExprSide::Standalone)
-                    .ok()?;
-                Some(doc.flat_width()? + 2)
-            }
-        }
-    }
-
-    /// Computes the padding before ` = ` for each field of the per-line branch:
-    /// adjacent records are aligned to the widest key of the run while the total
-    /// number of spaces between a key and `=` (padding plus the mandatory space)
-    /// stays within `table_align_eq_max_spaces`. Arrays, unmeasurable keys and
-    /// fields that exceed the threshold break the run.
-    fn aligned_record_pads(&self, fields: &[AstTableField], function: HirProtoRef) -> Vec<usize> {
-        let mut pads = vec![0; fields.len()];
+    /// 每个字段只归属一个相邻对齐段，宽度已在 emit 时测量，提交填充总计线性。
+    fn align_record_fields(&self, fields: &mut [AlignedTableField]) {
         if !self.options.table_align_eq || self.options.table_align_eq_max_spaces == 0 {
-            return pads;
+            return;
         }
-        let mut run: Vec<(usize, usize)> = Vec::new();
-        let mut run_min = usize::MAX;
-        let mut run_max = 0usize;
-        for (index, field) in fields.iter().enumerate() {
-            let width = match field {
-                AstTableField::Record(record) => self.record_key_width(record, function),
-                AstTableField::Array(_) => None,
-            };
-            let Some(width) = width else {
-                flush_alignment_run(&mut pads, &mut run, run_max);
-                run_min = usize::MAX;
-                run_max = 0;
+        let mut start = 0;
+        while start < fields.len() {
+            let Some(mut min) = fields[start].key_width else {
+                start += 1;
                 continue;
             };
-            let new_max = run_max.max(width);
-            let new_min = run_min.min(width);
-            if !run.is_empty()
-                && new_max - new_min + 1 > self.options.table_align_eq_max_spaces
-            {
-                flush_alignment_run(&mut pads, &mut run, run_max);
-                run_min = width;
-                run_max = width;
-            } else {
-                run_min = new_min;
-                run_max = new_max;
+            let mut max = min;
+            let mut end = start + 1;
+            while let Some(Some(width)) = fields.get(end).map(|field| field.key_width) {
+                let new_min = min.min(width);
+                let new_max = max.max(width);
+                if new_max - new_min + 1 > self.options.table_align_eq_max_spaces {
+                    break;
+                }
+                min = new_min;
+                max = new_max;
+                end += 1;
             }
-            run.push((index, width));
+            for field in &mut fields[start..end] {
+                field.padding = max - field.key_width.expect("alignment run has measured keys");
+            }
+            start = end;
         }
-        flush_alignment_run(&mut pads, &mut run, run_max);
-        pads
     }
 
     fn emit_function_expr(&self, func: &AstFunctionExpr) -> Result<Doc, GenerateError> {

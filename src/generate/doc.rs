@@ -7,11 +7,6 @@
 use std::borrow::Cow;
 
 /// Generate 内部使用的轻量文档树。
-///
-/// `Cascade` 是表格布局的三段式级联：Flat 模式渲染 `flat`；Break 模式先复测
-/// `flat` 是否仍在当前列放得下，再尝试把内容平铺进缩进一层后的下一行
-/// （`content_width` 预先量好，`None` 表示内容含硬换行、永远放不下），
-/// 最后才渲染 `broken`。`Grid` 只应出现在 `broken` 侧，渲染成按列对齐的表格行。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Doc {
     Text(Cow<'static, str>),
@@ -21,18 +16,36 @@ pub enum Doc {
     Fill { docs: Vec<Doc>, separator: Box<Doc> },
     Indent(Box<Doc>),
     Group(Box<Doc>),
-    Cascade {
-        flat: Box<Doc>,
-        content: Box<Doc>,
-        content_width: Option<usize>,
-        broken: Box<Doc>,
-    },
-    /// Horizontal cell alignment of the grid, resolved by the emit layer from
-    /// `table_align_cells` and the grid's cell kind (`true` = right-align: the
-    /// padding goes before each cell so trailing commas land on a shared column;
-    /// `false` = left-align: the padding goes after each cell so values share a
-    /// common left edge).
-    Grid { cells: Vec<String>, align_right: bool },
+    AlignedTable(Box<AlignedTable>),
+}
+
+/// 四种布局共享一份字段树；嵌套表的单行宽度自底向上缓存，不复制子树。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlignedTable {
+    pub fields: Vec<AlignedTableField>,
+    pub content_width: Option<usize>,
+    /// Some 仅用于已验证为单行 Text 的同类数组字段，bool 表示右对齐。
+    pub grid_align: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlignedTableField {
+    pub key: Option<Doc>,
+    pub value: Doc,
+    pub key_width: Option<usize>,
+    /// 仅逐字段布局在等号前使用，单行布局始终只用一个空格。
+    pub padding: usize,
+}
+
+impl AlignedTableField {
+    pub fn flat_width(&self) -> Option<usize> {
+        let key = if self.key.is_some() {
+            self.key_width? + 3
+        } else {
+            0
+        };
+        Some(key + self.value.flat_width()?)
+    }
 }
 
 impl Doc {
@@ -77,52 +90,23 @@ impl Doc {
         }
     }
 
-    /// 表格级联：Flat 模式渲染 `flat`；Break 模式先复测 `flat`，再尝试
-    /// `content`（内容平铺在下一行），最后渲染 `broken`。`content_width`
-    /// 是内容侧的平铺宽度，供 renderer 做行宽预算判断。
-    pub fn cascade(flat: Doc, content: Doc, content_width: Option<usize>, broken: Doc) -> Self {
-        Self::Cascade {
-            flat: Box::new(flat),
-            content: Box::new(content),
-            content_width,
-            broken: Box::new(broken),
-        }
-    }
-
-    /// 文档平铺在单行时的精确宽度；含硬换行（`Line`/`Grid`）时返回 `None`。
-    /// 与 renderer 的预算探测不同，这里不短路，给出的是完整宽度。
+    /// 表字段的单行宽度；嵌套对齐表只读取缓存，硬换行没有单行宽度。
     pub(crate) fn flat_width(&self) -> Option<usize> {
         match self {
-            Self::Text(text) => Some(text.chars().count()),
-            Self::Line => None,
+            Self::Text(text) if !text.contains(['\n', '\r']) => Some(text.chars().count()),
+            Self::Text(_) | Self::Line => None,
             Self::SoftLine => Some(1),
             Self::Concat(parts) => parts
                 .iter()
-                .try_fold(0usize, |total, part| {
-                    part.flat_width().map(|width| total + width)
-                }),
-            Self::Fill { docs, separator } => docs
-                .iter()
-                .enumerate()
-                .try_fold::<_, _, Option<usize>>(0usize, |total, (index, doc)| {
-                    let total = if index == 0 {
-                        Some(total)
-                    } else {
-                        separator.flat_width().map(|width| total + width)
-                    }?;
-                    doc.flat_width().map(|width| total + width)
-                }),
+                .try_fold(0, |total, part| Some(total + part.flat_width()?)),
+            Self::Fill { docs, separator } => {
+                let separator_width = separator.flat_width()?;
+                docs.iter().enumerate().try_fold(0, |total, (index, doc)| {
+                    Some(total + if index == 0 { 0 } else { separator_width } + doc.flat_width()?)
+                })
+            }
             Self::Indent(inner) | Self::Group(inner) => inner.flat_width(),
-            Self::Cascade { flat, .. } => flat.flat_width(),
-            Self::Grid { .. } => None,
-        }
-    }
-
-    /// 单行单元格文本组成的对齐网格；行布局由 renderer 决定。
-    pub fn grid(cells: Vec<String>, align_right: bool) -> Self {
-        Self::Grid {
-            cells,
-            align_right,
+            Self::AlignedTable(table) => table.content_width.map(|width| width + 4),
         }
     }
 

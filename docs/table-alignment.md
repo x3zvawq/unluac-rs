@@ -5,8 +5,7 @@ related values line up vertically. This page documents how the layout is
 chosen, which values qualify, every option that tunes it, and what the output
 looks like. The CLI quick reference in the README is a summary of this page.
 
-All examples below are real `unluac-cli` outputs (Lua 5.1, default options
-unless stated otherwise).
+Examples use Lua 5.1 and default options unless stated otherwise.
 
 ## Layout cascade
 
@@ -63,7 +62,7 @@ obey the same row budget from `--table-align-width`.
 | Value | Behavior |
 | --- | --- |
 | `auto` (default) | Numbers right-align, every other primitive left-aligns. |
-| `right` | All kinds right-align (the layout string grids had before the per-kind default existed). |
+| `right` | All kinds right-align. |
 | `left` | All kinds left-align. |
 
 Rationale: for numbers, right alignment keeps mixed one- and two-digit values
@@ -71,10 +70,6 @@ comparable and lines up the trailing commas, which reads well in a column of
 data. For strings, names and keywords, left alignment gives every value the
 same starting column, which reads like a word list; padding before a quote
 only pushes the text away from where the eye starts reading.
-
-Per-kind flags beyond this single option were considered and rejected: nil
-grids are alignment-invariant, and boolean/name grids are rare enough that the
-global override covers them without extra CLI knobs.
 
 ```lua
 -- auto (default): strings left, padding sits after each comma
@@ -106,16 +101,16 @@ local values = {
 
 ## Options reference
 
-All options below only affect the `aligned` style; other styles ignore them.
+Alignment options affect only `aligned`. `--table-drop-index-keys` applies before layout selection and therefore also affects the other styles.
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `--table-align-width` | follows `--max-line-length` (100 by default) | Caps the rendered row width (including indentation) of every aligned-table row: grid rows, the flat one-liner and the packed content line. Rows never exceed it unless a single cell alone is wider. |
+| `--table-align-width` | follows `--max-line-length` (100 by default) | Caps the rendered row width (including indentation), together with `--max-line-length`: the smaller limit governs grids, full single lines and packed content lines. An indivisible field may exceed the budget. |
 | `--table-align-string-width` | 16 | Caps the rendered width (quotes included) of a string allowed inside a grid; a wider string disqualifies the whole table from grid mode (falls back to one entry per line). |
 | `--table-align-cells` | `auto` | Horizontal alignment of grid cells. `auto`: numbers right, all other primitives left. `left`/`right` force one direction for every kind. |
 | `--table-align-eq` | true | Aligns record keys by `=` in non-single-line tables: keys are padded to the widest key of their alignment run. `--table-align-eq=false` keeps single spaces around `=`. |
 | `--table-align-eq-max-spaces` | 8 | Caps the total spaces between a record key and `=` (padding plus the mandatory separator): a key whose gap would exceed the cap starts a new alignment run instead of stretching every row. |
-| `--table-drop-index-keys` | false | Rewrites contiguous explicit `[1]..[n]` constructor keys as positional array entries (see below). |
+| `--table-drop-index-keys` | false | Omits continuous `[1]..[n]` keys only in safe PUC scalar constructors (see below). |
 
 ## Examples
 
@@ -186,15 +181,24 @@ local labels = {
 
 ### Explicit index keys (`--table-drop-index-keys`)
 
+This opt-in syntax projection applies to Lua 5.1–5.5 PUC batched constructors.
+The numeric keys must occur as `[1]`, `[2]`, … in order, with no existing
+positional fields. Every value must be a non-nil string, boolean or finite
+number literal. Other fields may have static string, boolean or finite
+non-integer numeric keys; they cannot overlap the array indices.
+
+Calls (including a final multi-return call), varargs, variable reads, nested
+allocations, nil values, dynamic keys, missing/repeated/out-of-order integer
+keys and LuaJIT/Luau allocation protocols leave the entire constructor unchanged.
+The static subset has no field-evaluation events, no overlapping writes and no
+holes in the resulting array. This keeps scalar values and the array length
+while permitting a different hash/array representation and unspecified `pairs`
+iteration order. The default keeps all explicit keys.
+
 ```lua
--- --table-drop-index-keys=true: contiguous explicit index keys become positional
--- entries; a plain array literal compiles to SETLIST ops without keys, so any
--- `[1] =` in the output mirrors an explicitly keyed source. The rewrite preserves
--- evaluation order and per-field side effects; only the unspecified pairs() order
--- changes (hash part becomes the array part). Gaps, descending keys and tables
--- that mix positional and keyed fields are left untouched.
-local keyed = { "alpha", "beta" }        -- was: { [1] = "alpha", [2] = "beta" }
+local keyed = { "alpha", "beta" } -- was: { [1] = "alpha", [2] = "beta" }
 local mixed = { mode = "dlg", "alpha", "beta", tag = 3 }
-                                         -- was: { mode = "dlg", [1] = "alpha", [2] = "beta", tag = 3 }
-local untouched = { [1] = "alpha", [3] = "gamma" }   -- gap: kept as-is
+local sparse = { [1] = "alpha", [3] = "gamma" } -- gap: unchanged
+local dynamic = { [1] = f() }                  -- single return: unchanged
+local collision = { [1] = 7, [key] = 9 }       -- dynamic key: unchanged
 ```

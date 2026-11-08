@@ -105,7 +105,7 @@ Heuristic 还会使用小型标准库签名表：`os.date` 的实参可提示 `f
 | `--table-align-cells` | `auto` | 网格单元格水平对齐：`auto` 数字右对齐、其余原语左对齐；`left`/`right` 对所有类别强制同一方向。 |
 | `--table-align-eq` | true | 多行表内按 `=` 对齐记录键。 |
 | `--table-align-eq-max-spaces` | 8 | 限制键与 `=` 之间的空格数；更宽的键开启新的对齐系列。 |
-| `--table-drop-index-keys` | false | 把连续的显式 `[1]..[n]` 构造器键改写成位置字段。 |
+| `--table-drop-index-keys` | false | 仅在 PUC 无事件标量初始化中省略连续 `[1]..[n]` 键；动态值、nil 洞和不支持的分配布局保留原键。 |
 
 网格准入规则（哪些原语参与对齐及原因）与完整示例见英文文档
 [Aligned table layout](./docs/table-alignment.md)。

@@ -364,8 +364,8 @@ struct GenerateArgs {
     /// a new alignment run instead of stretching every row (default: 8).
     #[arg(long, help_heading = "Generate")]
     table_align_eq_max_spaces: Option<usize>,
-    /// Rewrite redundant explicit `[1]..[n]` constructor keys as positional array
-    /// entries (default: false).
+    /// Omit contiguous `[1]..[n]` keys in proven-safe PUC scalar constructors;
+    /// dynamic/nil values and unsupported allocation layouts keep their keys (default: false).
     #[arg(
         long,
         value_name = "BOOL",
