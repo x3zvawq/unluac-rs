@@ -89,6 +89,27 @@ unluac-cli -s example.lua -D lua5.4
 
 Heuristic 还会使用小型标准库签名表：`os.date` 的实参可提示 `format/time`，`string.sub` 可提示 `text/start_index/end_index`。更具体的字段用途优先，角色冲突时保留通用名。
 
+表构造器通过 `--table-style` 提供四种排版风格。`compact`、`balanced`（默认）与 `expanded` 保持既有行为。`aligned` 风格对每张表按顺序尝试四种布局：
+
+1. **单行** — 整个构造器放得下当前行：`local anchors = { 10, 20, 30 }`。
+2. **内容单行** — 否则先尝试把全部内容平铺进花括号内缩进一层的下一行。
+3. **对齐网格** — 否则纯数组且元素全部是同类小字面量（数字、短字符串、布尔、`nil` 或普通名字）时，按行输出多个单元格并用空格填充列；默认数字右对齐，其余原语左对齐。
+4. **逐行记录** — 其余情况（任何字典、混合数组、超宽字符串、非字面量元素）；嵌套表按自身缩进套用同样规则。多行记录带尾逗号，追加字段不会改写已有行。
+
+只作用于 `aligned` 风格的参数：
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `--table-align-width` | 跟随 `--max-line-length`（默认 100） | 限制 aligned 表格所有候选行的渲染宽度。 |
+| `--table-align-string-width` | 16 | 限制可进入网格的字符串渲染宽度；超宽字符串让整张表退回逐行布局。 |
+| `--table-align-cells` | `auto` | 网格单元格水平对齐：`auto` 数字右对齐、其余原语左对齐；`left`/`right` 对所有类别强制同一方向。 |
+| `--table-align-eq` | true | 多行表内按 `=` 对齐记录键。 |
+| `--table-align-eq-max-spaces` | 8 | 限制键与 `=` 之间的空格数；更宽的键开启新的对齐系列。 |
+| `--table-drop-index-keys` | false | 把连续的显式 `[1]..[n]` 构造器键改写成位置字段。 |
+
+网格准入规则（哪些原语参与对齐及原因）与完整示例见英文文档
+[Aligned table layout](./docs/table-alignment.md)。
+
 完整的格式化、命名和解码选项见 `unluac-cli --help`；查看流水线中间结果的方法见[调试手册](./docs/debug.md)。
 
 ### Rust 库

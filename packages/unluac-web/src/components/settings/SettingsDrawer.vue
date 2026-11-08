@@ -193,6 +193,7 @@ const numberFormatOptions = [
 const tableStyleOptions = [
   { label: 'compact', value: 'compact' },
   { label: 'balanced', value: 'balanced' },
+  { label: 'aligned', value: 'aligned' },
   { label: 'expanded', value: 'expanded' },
 ]
 </script>

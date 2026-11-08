@@ -2,6 +2,233 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_tables/layout_01_aligned_number_grid.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned table style: a homogeneous numeric array longer than one line is emitted as a space-aligned grid with padded columns; the grid stays valid, behavior-identical Lua 5.1 across recompile rounds.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_02_aligned_dict_fallback.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned table style fallback: dictionaries and arrays holding over-wide strings emit one entry per line with trailing commas, while fitting sub-tables stay on a single line.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_03_aligned_single_line_and_nested.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned table style nesting: tables that fit stay on one line, oversized nested arrays become indented grids, and dictionary records keep trailing commas at their own indentation.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_04_aligned_content_line.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned table style cascade: a constructor that no longer fits flat keeps its whole content on one indented line between the braces before falling back to one entry per line.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_05_align_width_budget.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-width shrinks the aligned grid per-row budget: a 40-column budget packs two-digit numbers 8 per row instead of the default 19.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_width: Some(40),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_12_align_width_default.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-width follows --max-line-length when unset: a 40-column line budget packs the aligned grid 8 two-digit cells per row without an explicit width override.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                max_line_length: Some(40),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_13_align_width_row_budget.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-width budgets every aligned-table row, not only grid rows: flat one-liners and packed content lines that exceed the table width stay expanded one entry per line even though they fit the global line budget.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_width: Some(40),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_14_function_fields_expand.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned tables holding function values always expand one entry per line: function bodies carry hard line breaks, so the packed content line would glue later fields onto the broken function lines (the `end }, [2] = {` shape).",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_15_cells_align_left_default.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-cells auto (the default) left-aligns string grids: word-like values share a common left edge, while number grids keep right-aligned columns.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_16_cells_align_right_override.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-cells=right forces padding before every cell so trailing commas land on one shared column in all grids, string grids included.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_cells: Some(TableCellAlign::Right),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_17_cells_align_left_numbers.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-cells=left forces number grids left: values start on a shared left edge instead of right-aligning within their column, row budget unchanged.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_cells: Some(TableCellAlign::Left),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_18_cells_align_other_primitives.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Aligned grids cover every small primitive kind (numbers, strings, booleans, nil, plain names); under auto only numbers right-align, booleans and names left-align like strings.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_06_string_width_budget.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-string-width caps the string width allowed in a grid: with a cap of 6, over-wide strings fall back to one entry per line while short strings stay gridded.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_string_width: Some(6),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_07_eq_alignment.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-eq (default true) aligns record keys of non-single-line aligned tables by `=` within the padding cap, so values start at the same column.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_eq: Some(true),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_08_eq_max_spaces.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-eq-max-spaces caps the total spaces between a key and `=`: with a cap of 2 only keys one padding space apart stay aligned, wider gaps start new alignment runs.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_eq: Some(true),
+                table_align_eq_max_spaces: Some(2),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_09_eq_disabled.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-align-eq=false keeps single spaces around `=` in non-single-line aligned tables regardless of key widths.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_align_eq: Some(false),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_10_drop_index_keys.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "--table-drop-index-keys rewrites contiguous explicit `[1]..[n]` constructor keys as positional entries (grid eligibility included) while gaps, descending keys and mixed positional fields stay untouched.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                table_drop_index_keys: Some(true),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/layout_11_index_keys_default.lua",
+        &["constructor", "aligned-layout", "readability"],
+        "Without --table-drop-index-keys explicit `[1]..[n]` constructor keys stay in the output exactly as the bytecode stored them.",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua51]).with_options(LuaCaseOptions {
+                table_style: Some(TableStyle::Aligned),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/constructor_32_open_prefix_iterator_reuse.lua",
         &[
             "constructor",

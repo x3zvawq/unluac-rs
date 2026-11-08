@@ -161,7 +161,7 @@
       "indentWidth": "Einrückbreite (Anzahl der Leerzeichen). CLI: --indent-width",
       "maxLineLength": "Bevorzugte maximale Zeilenlänge für generierten Code. CLI: --max-line-length",
       "quoteStyle": "Anführungszeichen-Stil für Strings. prefer-double: \" bevorzugen; prefer-single: ' bevorzugen; min-escape: Escapes minimieren. CLI: --quote-style",
-      "tableStyle": "Layout des Tabellenkonstruktors. compact: einzeilig; balanced: automatisch; expanded: ein Eintrag pro Zeile. CLI: --table-style",
+      "tableStyle": "Layout des Tabellenkonstruktors. compact: einzeilig; balanced: automatisch; aligned: ausgerichtetes Raster fuer kleine homogene Arrays; expanded: ein Eintrag pro Zeile. CLI: --table-style",
       "comment": "Ob Kommentare und Metadaten im generierten Code ausgegeben werden. CLI: --comment"
     },
     "share": {
