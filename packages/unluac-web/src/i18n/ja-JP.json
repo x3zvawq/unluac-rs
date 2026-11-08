@@ -161,7 +161,7 @@
       "indentWidth": "インデント幅（スペース数）。CLI: --indent-width",
       "maxLineLength": "生成コードの推奨最大行長。CLI: --max-line-length",
       "quoteStyle": "文字列の引用符スタイル。prefer-double: \" を優先；prefer-single: ' を優先；min-escape: エスケープを最小化。CLI: --quote-style",
-      "tableStyle": "テーブルコンストラクタのレイアウト。compact: 単一行；balanced: 自動；expanded: 1エントリ1行。CLI: --table-style",
+      "tableStyle": "テーブルコンストラクタのレイアウト。compact: 単一行；balanced: 自動；aligned: 同種小要素の整列グリッド；expanded: 1エントリ1行。CLI: --table-style",
       "comment": "生成コードにコメントやメタデータを出力するかどうか。CLI: --comment"
     },
     "share": {

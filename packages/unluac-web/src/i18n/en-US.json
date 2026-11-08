@@ -168,7 +168,7 @@
       "readableStrings": "Enabled by default: emit decoded text as UTF-8. Disable to preserve original bytes. The string encoding setting specifies the input encoding. CLI: --readable-strings",
       "quoteStyle": "String quote style. prefer-double: prefer \"; prefer-single: prefer '; min-escape: minimize escapes. CLI: --quote-style",
       "numberFormat": "Number literal style. decimal: regular numbers; hex: emit integer literals as 0x... when possible. CLI: --number-format",
-      "tableStyle": "Table constructor layout. compact: single line; balanced: auto; expanded: one entry per line. CLI: --table-style",
+      "tableStyle": "Table constructor layout. compact: single line; balanced: auto; aligned: space-aligned grid for small homogeneous arrays; expanded: one entry per line. CLI: --table-style",
       "luauVectorConstructor": "Render Luau vector constants with an explicit constructor and 3D/4D size. The library is optional; constructor and size are required. CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size",
       "comment": "Whether to emit comments and metadata in generated code. CLI: --comment"
     },

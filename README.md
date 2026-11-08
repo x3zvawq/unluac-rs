@@ -90,6 +90,27 @@ For example: `unluac-cli -i sample.luac -n heuristic`. Heuristic names are reada
 
 Heuristic mode also uses a small standard-library signature table: arguments to `os.date` can suggest `format` and `time`, while `string.sub` suggests `text`, `start_index` and `end_index`. More specific field usage takes priority; conflicting roles keep generic names.
 
+Table constructors support four layout styles via `--table-style`. `compact`, `balanced` (default) and `expanded` keep their existing behavior. The `aligned` style picks one of four layouts per table, trying them in order:
+
+1. **Single line** — the whole constructor fits on the current line: `local anchors = { 10, 20, 30 }`.
+2. **Content on one line** — otherwise the content is kept as a single indented line between the braces whenever it fits there.
+3. **Aligned grid** — otherwise a pure array of small homogeneous primitives (numbers, short strings, booleans, `nil`, or plain names) is printed several cells per row with space-padded columns; numbers right-align by default, the other primitives left-align.
+4. **One entry per line** — everything else (any dictionary, mixed arrays, over-wide strings, non-literal elements); nested tables follow the same rules at their own indentation. Multi-line entries carry trailing commas so appending a field never rewrites earlier lines.
+
+Options tuning the `aligned` style (they do not affect the other styles):
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--table-align-width` | follows `--max-line-length` (100 by default) | Caps the rendered row width of every aligned-table row. |
+| `--table-align-string-width` | 16 | Caps the rendered width of a string allowed inside a grid; wider strings fall back to one entry per line. |
+| `--table-align-cells` | `auto` | Grid cell alignment: `auto` right-aligns numbers, left-aligns other primitives; `left`/`right` force one direction. |
+| `--table-align-eq` | true | Aligns record keys by `=` in non-single-line tables. |
+| `--table-align-eq-max-spaces` | 8 | Caps the spaces between a record key and `=`; wider keys start a new alignment run. |
+| `--table-drop-index-keys` | false | Rewrites contiguous explicit `[1]..[n]` constructor keys as positional array entries. |
+
+Details, the grid qualification rules (which primitives align and why) and full
+examples live in [Aligned table layout](./docs/table-alignment.md).
+
 See `unluac-cli --help` for all formatting, naming and decoding options, and the [debugging guide](./docs/debug.md) for pipeline inspection.
 
 ### Rust

@@ -29,7 +29,7 @@ export type UnluacNamingMode = "debug-like" | "simple" | "heuristic";
 export type UnluacGenerateMode = "strict" | "permissive";
 export type UnluacQuoteStyle = "prefer-double" | "prefer-single" | "min-escape";
 export type UnluacNumberFormat = "decimal" | "hex";
-export type UnluacTableStyle = "compact" | "balanced" | "expanded";
+export type UnluacTableStyle = "compact" | "balanced" | "aligned" | "expanded";
 
 export interface UnluacLuauVectorConstructor {
   library?: string;
@@ -66,6 +66,16 @@ export interface UnluacDecompileOptions {
     /** Decode literals to readable UTF-8 (default true); false preserves original bytes. */
     readableStrings?: boolean;
     tableStyle?: UnluacTableStyle;
+    /** Max rendered row width (including indentation) of aligned table grids. */
+    tableAlignWidth?: number;
+    /** Max rendered width of string literals allowed inside aligned table grids. */
+    tableAlignStringWidth?: number;
+    /** Align record keys by `=` in non-single-line aligned tables (default true). */
+    tableAlignEq?: boolean;
+    /** Max padding spaces when aligning record keys by `=` (default 8). */
+    tableAlignEqMaxSpaces?: number;
+    /** Rewrite redundant explicit `[1]..[n]` constructor keys as positional entries (default false). */
+    tableDropIndexKeys?: boolean;
     luauVectorConstructor?: UnluacLuauVectorConstructor;
     comment?: boolean;
   };

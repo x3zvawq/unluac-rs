@@ -161,7 +161,7 @@
       "indentWidth": "Ширина отступа (количество пробелов). CLI: --indent-width",
       "maxLineLength": "Предпочтительная максимальная длина строки для сгенерированного кода. CLI: --max-line-length",
       "quoteStyle": "Стиль кавычек для строк. prefer-double: предпочитать \"; prefer-single: предпочитать '; min-escape: минимизировать экранирование. CLI: --quote-style",
-      "tableStyle": "Макет конструктора таблиц. compact: одна строка; balanced: автоматически; expanded: одна запись на строку. CLI: --table-style",
+      "tableStyle": "Макет конструктора таблиц. compact: одна строка; balanced: автоматически; aligned: выровненная сетка для небольших однородных массивов; expanded: одна запись на строку. CLI: --table-style",
       "comment": "Выводить ли комментарии и метаданные в сгенерированном коде. CLI: --comment"
     },
     "share": {

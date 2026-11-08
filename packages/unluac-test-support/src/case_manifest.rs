@@ -6,7 +6,8 @@
 
 use strum_macros::{Display, IntoStaticStr};
 use unluac::ast::NamingMode;
-use unluac::decompile::DecompileDialect;
+use unluac::decompile::{DecompileDialect, TableStyle};
+use unluac::generate::TableCellAlign;
 
 mod bindings;
 mod calls;
@@ -187,6 +188,14 @@ pub(crate) struct LuaCaseOptions {
     pub(crate) naming_mode: Option<NamingMode>,
     pub(crate) string_encoding: Option<&'static str>,
     pub(crate) readable_strings: Option<bool>,
+    pub(crate) table_style: Option<TableStyle>,
+    pub(crate) table_align_cells: Option<TableCellAlign>,
+    pub(crate) max_line_length: Option<usize>,
+    pub(crate) table_align_width: Option<usize>,
+    pub(crate) table_align_string_width: Option<usize>,
+    pub(crate) table_align_eq: Option<bool>,
+    pub(crate) table_align_eq_max_spaces: Option<usize>,
+    pub(crate) table_drop_index_keys: Option<bool>,
     pub(crate) luau_optimization_level: Option<u8>,
     pub(crate) luau_vector: Option<LuauVectorCaseOptions>,
     pub(crate) recompile_rounds: Option<u32>,
@@ -199,6 +208,14 @@ impl LuaCaseOptions {
         naming_mode: None,
         string_encoding: None,
         readable_strings: None,
+        table_style: None,
+        table_align_cells: None,
+        max_line_length: None,
+        table_align_width: None,
+        table_align_string_width: None,
+        table_align_eq: None,
+        table_align_eq_max_spaces: None,
+        table_drop_index_keys: None,
         luau_optimization_level: None,
         luau_vector: None,
         recompile_rounds: None,
@@ -376,6 +393,14 @@ const LUAU_OPTIMIZED_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     naming_mode: None,
     string_encoding: None,
     readable_strings: None,
+    table_style: None,
+    table_align_cells: None,
+    max_line_length: None,
+    table_align_width: None,
+    table_align_string_width: None,
+    table_align_eq: None,
+    table_align_eq_max_spaces: None,
+    table_drop_index_keys: None,
     luau_optimization_level: Some(2),
     luau_vector: None,
     recompile_rounds: None,
@@ -390,6 +415,14 @@ const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     naming_mode: None,
     string_encoding: None,
     readable_strings: None,
+    table_style: None,
+    table_align_cells: None,
+    max_line_length: None,
+    table_align_width: None,
+    table_align_string_width: None,
+    table_align_eq: None,
+    table_align_eq_max_spaces: None,
+    table_drop_index_keys: None,
     luau_optimization_level: Some(2),
     luau_vector: Some(LuauVectorCaseOptions {
         library: Some("vector"),

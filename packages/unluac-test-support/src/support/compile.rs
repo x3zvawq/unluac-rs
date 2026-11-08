@@ -20,6 +20,28 @@ pub(super) fn decompile_options(entry: &LuaCaseManifestEntry) -> DecompileOption
     if let Some(readable) = entry.options.readable_strings {
         options.generate.readable_strings = readable;
     }
+    if let Some(style) = entry.options.table_style {
+        options.generate.table_style = style;
+    }
+    if let Some(length) = entry.options.max_line_length {
+        options.generate.max_line_length = length;
+    }
+    options.generate.table_align_width = entry.options.table_align_width;
+    if let Some(width) = entry.options.table_align_string_width {
+        options.generate.table_align_string_width = width;
+    }
+    if let Some(align) = entry.options.table_align_cells {
+        options.generate.table_align_cells = align;
+    }
+    if let Some(enabled) = entry.options.table_align_eq {
+        options.generate.table_align_eq = enabled;
+    }
+    if let Some(spaces) = entry.options.table_align_eq_max_spaces {
+        options.generate.table_align_eq_max_spaces = spaces;
+    }
+    if let Some(drop_keys) = entry.options.table_drop_index_keys {
+        options.generate.table_drop_index_keys = drop_keys;
+    }
     // 收敛比较源码本体；来源路径和行号随每轮产物变化。由 Generate 关闭元信息注释，
     // 避免比较器解析文本时误删 Lua 字符串；普通 debug/注释回归仍使用默认输出。
     options.generate.comment = !entry

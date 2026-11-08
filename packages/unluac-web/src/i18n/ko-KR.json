@@ -161,7 +161,7 @@
       "indentWidth": "들여쓰기 너비 (공백 수). CLI: --indent-width",
       "maxLineLength": "생성 코드의 기본 최대 줄 길이. CLI: --max-line-length",
       "quoteStyle": "문자열 따옴표 스타일. prefer-double: \"를 선호; prefer-single: '를 선호; min-escape: 이스케이프 최소화. CLI: --quote-style",
-      "tableStyle": "테이블 생성자 레이아웃. compact: 한 줄; balanced: 자동; expanded: 항목당 한 줄. CLI: --table-style",
+      "tableStyle": "테이블 생성자 레이아웃. compact: 한 줄; balanced: 자동; aligned: 동종 소요소 정렬 그리드; expanded: 항목당 한 줄. CLI: --table-style",
       "comment": "생성된 코드에 주석과 메타데이터를 출력할지 여부. CLI: --comment"
     },
     "share": {

@@ -163,7 +163,7 @@
       "maxLineLength": "產生程式碼的首選最大行寬。CLI: --max-line-length",
       "readableStrings": "預設開啟：將解碼文字輸出為 UTF-8，GBK 中文可直接閱讀。關閉可保留原始位元組；輸入編碼由字串編碼選項指定。CLI: --readable-strings",
       "quoteStyle": "字串引號風格。prefer-double: 偏好雙引號；prefer-single: 偏好單引號；min-escape: 選擇最少跳脫的。CLI: --quote-style",
-      "tableStyle": "表建構器排版風格。compact: 緊湊；balanced: 均衡；expanded: 展開。CLI: --table-style",
+      "tableStyle": "表建構器排版風格。compact: 緊湊；balanced: 均衡；aligned: 同類小元素對齊網格；expanded: 展開。CLI: --table-style",
       "comment": "是否在產生的程式碼中輸出註解和中繼資訊。CLI: --comment"
     },
     "share": {
