@@ -34,7 +34,10 @@ export type UnluacNamingMode = 'debug-like' | 'simple' | 'heuristic'
 export type UnluacQuoteStyle = 'prefer-double' | 'prefer-single' | 'min-escape'
 export type UnluacNumberFormat = 'decimal' | 'hex'
 export type UnluacTableStyle = 'compact' | 'balanced' | 'aligned' | 'expanded'
+export type UnluacTableCellAlign = 'auto' | 'left' | 'right'
+export type UnluacCommentStyle = 'none' | 'minimal' | 'full'
 export type UnluacGenerateMode = 'strict' | 'permissive'
+export type SettingsPresetId = 'readable' | 'exact' | 'ai'
 
 export interface LuauVectorConstructor {
   library: string | null
@@ -68,8 +71,14 @@ export interface DecompileOptions {
     quoteStyle: UnluacQuoteStyle
     readableStrings: boolean
     tableStyle: UnluacTableStyle
+    tableAlignWidth: number | null
+    tableAlignStringWidth: number
+    tableAlignEq: boolean
+    tableAlignEqMaxSpaces: number
+    tableAlignCells: UnluacTableCellAlign
+    tableDropIndexKeys: boolean
     luauVectorConstructor: LuauVectorConstructor | null
-    comment: boolean
+    comment: UnluacCommentStyle
   }
 }
 
@@ -139,7 +148,9 @@ export type EdgeKind =
 
 export interface RichDecompileResult {
   source: string
+  dialect?: Exclude<UnluacDialect, 'auto'>
   kind: 'source' | 'diagnostic-pseudocode'
+  failedProtos?: number[]
   /** 完整 proto 树的先序数组，ID 等于索引，根为 0。 */
   protos: ProtoMeta[]
   /** 与 protos 平行，protoId 等于索引。 */
@@ -151,6 +162,8 @@ export interface ProtoMeta {
   name: string | null
   lineStart: number
   lineEnd: number
+  generatedLineStart?: number
+  generatedLineEnd?: number
   numParams: number
   isVararg: boolean
   numUpvalues: number

@@ -44,7 +44,9 @@
       "removeFolder": "Удалить папку"
     },
     "sourceTag": "Исходник",
-    "fileDialect": "Изменить диалект Lua этого файла"
+    "fileDialect": "Изменить диалект Lua этого файла",
+    "clearWorkspace": "Очистить область",
+    "clearWorkspaceConfirm": "Удалить все файлы из рабочей области?"
   },
   "codeView": {
     "placeholder": "Выберите файл для декомпиляции",
@@ -57,7 +59,11 @@
     "modified": "Изменено",
     "modifiedHint": "Содержимое было отредактировано вручную и отличается от исходного результата декомпиляции",
     "restore": "Восстановить оригинал",
-    "restoreConfirm": "Отменить изменения и восстановить исходный результат декомпиляции?"
+    "restoreConfirm": "Отменить изменения и восстановить исходный результат декомпиляции?",
+    "copyForAi": "Копировать для ИИ",
+    "copyForAiHint": "Скопировать компактный блок Markdown Lua для анализа ИИ",
+    "copiedForAi": "Скопировано для ИИ",
+    "downloadAllZip": "Скачать все (.zip)"
   },
   "tabs": {
     "code": "Исходный код",
@@ -86,13 +92,17 @@
       "vararg": "Переменные аргументы",
       "upvalues": "Замыкания",
       "constants": "Константы",
-      "instructions": "Инструкции"
+      "instructions": "Инструкции",
+      "jumpToSource": "Перейти к строке кода"
     },
     "constants": {
       "title": "Константы",
       "empty": "Нет констант",
       "type": "Тип",
-      "value": "Значение"
+      "value": "Значение",
+      "searchPlaceholder": "Фильтр констант…",
+      "filterAll": "Все",
+      "clickToCopy": "Нажмите, чтобы скопировать"
     },
     "cfgViewer": {
       "proto": "Proto",
@@ -103,6 +113,11 @@
       "bytecode": "Байткод",
       "focusHint": "Фокус на {block} (соседство {hops} переходов). Дважды щёлкните другой блок для переключения.",
       "clearFocus": "Показать все"
+    },
+    "outline": {
+      "graphView": "Граф",
+      "listView": "Список",
+      "searchPlaceholder": "Поиск функций или констант…"
     }
   },
   "settings": {
@@ -114,7 +129,8 @@
       "readability": "Читаемость",
       "naming": "Именование",
       "generate": "Генерация",
-      "about": "О программе"
+      "about": "О программе",
+      "advanced": "Advanced"
     },
     "parse": {
       "title": "Параметры парсинга",
@@ -142,7 +158,23 @@
       "maxLineLength": "Макс. длина строки",
       "quoteStyle": "Стиль кавычек",
       "tableStyle": "Стиль таблиц",
-      "comment": "Выводить комментарии"
+      "comment": "Выводить комментарии",
+      "commentOptions": {
+        "minimal": "Минимальные (по умолчанию)",
+        "full": "Полные (со статистикой proto)",
+        "none": "Выключены"
+      },
+      "tableDropIndexKeys": "Опускать последовательные ключи",
+      "tableAlignEq": "Выравнивать = в таблицах",
+      "tableAlignEqMaxSpaces": "Макс. пробелов перед =",
+      "tableAlignCells": "Выравнивание ячеек таблиц",
+      "tableAlignWidth": "Макс. ширина выровненной таблицы",
+      "tableAlignStringWidth": "Макс. ширина строки в сетке",
+      "readableStrings": "Readable Strings",
+      "numberFormat": "Number Format",
+      "luauVectorConstructor": "Luau Vector Constructor",
+      "luauVectorLibrary": "Optional library",
+      "luauVectorConstructorName": "Constructor"
     },
     "tips": {
       "dialect": "Применяется только к новым файлам. Нажмите на метку версии файла, чтобы изменить его диалект.",
@@ -162,7 +194,16 @@
       "maxLineLength": "Предпочтительная максимальная длина строки для сгенерированного кода. CLI: --max-line-length",
       "quoteStyle": "Стиль кавычек для строк. prefer-double: предпочитать \"; prefer-single: предпочитать '; min-escape: минимизировать экранирование. CLI: --quote-style",
       "tableStyle": "Макет конструктора таблиц. compact: одна строка; balanced: автоматически; aligned: выровненная сетка для небольших однородных массивов; expanded: одна запись на строку. CLI: --table-style",
-      "comment": "Выводить ли комментарии и метаданные в сгенерированном коде. CLI: --comment"
+      "comment": "Подробность комментариев. minimal: заголовок и строки; full: статистика proto; none: без комментариев. CLI: --comment",
+      "tableDropIndexKeys": "Опускать безопасные ключи [1] = ..., [2] = ... в PUC Lua. CLI: --table-drop-index-keys",
+      "tableAlignEq": "Выравнивать `=` в многострочных таблицах стиля aligned. CLI: --table-align-eq",
+      "tableAlignEqMaxSpaces": "Максимум пробелов перед `=` (0 отключает). CLI: --table-align-eq-max-spaces",
+      "tableAlignCells": "Выравнивание ячеек сетки aligned (auto: числа вправо, остальное влево). CLI: --table-align-cells",
+      "tableAlignWidth": "Макс. ширина строки для aligned-таблиц. CLI: --table-align-width",
+      "tableAlignStringWidth": "Макс. ширина строкового литерала в сетке aligned. CLI: --table-align-string-width",
+      "readableStrings": "Enabled by default: emit decoded text as UTF-8. Disable to preserve original bytes. The string encoding setting specifies the input encoding. CLI: --readable-strings",
+      "numberFormat": "Number literal style. decimal: regular numbers; hex: emit integer literals as 0x... when possible. CLI: --number-format",
+      "luauVectorConstructor": "Render Luau vector constants with an explicit constructor and 3D/4D size. The library is optional; constructor and size are required. CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size"
     },
     "share": {
       "button": "Копировать ссылку",
@@ -193,13 +234,32 @@
         }
       }
     },
-    "importDialect": "Диалект по умолчанию для новых файлов"
+    "importDialect": "Диалект по умолчанию для новых файлов",
+    "presets": {
+      "title": "Профили",
+      "hint": "Быстро применяет набор параметров вывода без сброса диалекта и кодировки.",
+      "readable": {
+        "label": "Для чтения",
+        "description": "Эвристические имена, минимум комментариев, выровненные таблицы."
+      },
+      "exact": {
+        "label": "Точный",
+        "description": "Строгий режим, исходные байты строк, нумерованные имена, полные комментарии."
+      },
+      "ai": {
+        "label": "Для ИИ",
+        "description": "Эвристические имена, минимум комментариев и компактные таблицы."
+      }
+    }
   },
   "diff": {
     "left": "Левая",
     "right": "Правая",
     "selectFile": "Выбрать файл",
-    "hint": "Выберите два декомпилированных файла для сравнения"
+    "hint": "Выберите два декомпилированных файла для сравнения",
+    "openHint": "Сравнить файлы или правки",
+    "editsVsOriginal": "Правки vs Оригинал",
+    "compareFiles": "Сравнить файлы"
   },
   "workspace": {
     "local": "Локальная обработка",
@@ -219,5 +279,26 @@
     "analysis": "Структура",
     "wrapLines": "Перенос строк",
     "settingsHint": "Настройки применяются автоматически. Каждый файл сохраняет свой диалект Lua."
+  },
+  "globalSearch": {
+    "title": "Поиск по всем файлам",
+    "open": "Поиск по файлам",
+    "openHint": "Поиск по всем файлам (Ctrl/Cmd+Shift+F)",
+    "placeholder": "Поиск по декомпилированному коду и константам…",
+    "caseSensitive": "С учётом регистра",
+    "regex": "Регулярное выражение",
+    "invalidRegex": "Некорректное регулярное выражение",
+    "summary": "{matches} совпадений в {files} файлах",
+    "truncated": "Показана часть результатов",
+    "noSearchableFiles": "Нет декомпилированных файлов для поиска",
+    "hint": "Введите запрос для поиска по {count} файлам (↑/↓ выбор, Enter переход)",
+    "noResults": "Совпадений не найдено",
+    "constantBadge": "конст."
+  },
+  "statusBar": {
+    "lines": "строк",
+    "diagnostic": "Диагностика",
+    "failedProtos": "{count} прот. с ошибкой",
+    "diagnosticHint": "Перейти к первой диагностике"
   }
 }

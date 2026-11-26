@@ -1,14 +1,14 @@
 <script setup lang="ts">
+import logoUrl from '@logo'
 import { computed, inject, type ShallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
-import logoUrl from '@logo'
 import productEnglish from '@/content/product.en.html?raw'
 import productChinese from '@/content/product.zh.html?raw'
 import { site } from '@/content/site'
 
 const { t, locale } = useI18n()
-const productOverview = computed(() => locale.value === 'zh-CN' ? productChinese : productEnglish)
-const productLanguage = computed(() => locale.value === 'zh-CN' ? 'zh-CN' : 'en')
+const productOverview = computed(() => (locale.value === 'zh-CN' ? productChinese : productEnglish))
+const productLanguage = computed(() => (locale.value === 'zh-CN' ? 'zh-CN' : 'en'))
 const actions = inject<ShallowRef<Record<string, (() => void) | undefined>>>('shortcutActions')!
 </script>
 

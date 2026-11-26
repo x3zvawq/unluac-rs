@@ -1,102 +1,63 @@
-# Web 开发与验证
+# unluac-web
 
-在仓库中准备好 Rust、`wasm-pack` 和 Node.js 24 后，从此目录启动：
+`unluac-rs` 的浏览器端工作区（Vue 3 + TypeScript + Pinia + Naive UI + CodeMirror 6 + WebAssembly）。
 
-```sh
+## 本地开发
+
+前置环境：Rust（含 `wasm32-unknown-unknown` target）、`wasm-pack` 与 Node.js 24+。
+
+```bash
 npm ci
-npm run dev
+npm run dev      # 启动本地开发服务器（自动编译并同步 WASM）
+npm run build    # 构建 WASM + Vite 生产包 + vue-tsc 类型检查
+npm run preview  # 本地预览生产构建
 ```
 
-生产构建和本地预览：
+> `plugins/vite-plugin-wasm-build.ts` 会在启动与构建时自动编译 `packages/unluac-wasm` 并复制到 `src/wasm/`（已加入 `.gitignore`，无需手动提交）。
 
-```sh
-npm run build
-npm run preview
-```
+## 工作区功能概览
 
-页面与 favicon 共享仓库根目录的 `logo.svg`，Vite 会将它作为同一个带内容标识的资源发布。
-主题颜色集中在 `src/styles/main.css` 与 `App.vue` 的 Naive UI 主题配置。新增界面文案需同步
-`src/i18n/` 的语言资源；动画应遵守 `prefers-reduced-motion`。
+- **多文件 / 文件夹导入与打包导出**：支持整页拖拽或文件/目录选择器，基于魔数嗅探自动跳过非字节码文件并识别 7 种 Lua 方言；每个文件独立保存方言设置与 IndexedDB 缓存，支持一键本地打包下载 `.zip`（零第三方依赖）。
+- **跨文件全文搜索（`Ctrl/Cmd + Shift + F`）**：同时搜索所有已反编译源码与常量池，支持大小写/正则开关和键盘上下跳转，点击直接定位到目标文件与行号。
+- **场景预设与完整设置**：设置抽屉顶部提供「推荐阅读 / 精确还原 / 给 AI 分析」三个一键预设，并开放完整的命名、注释（`minimal` / `full` / `none`）和表格对齐选项，支持一键导出分享链接与对应 CLI 参数。
+- **IDE 级源码编辑、对比与 AI 复制**：定制深色/浅色编辑器主题与 28px 底部状态栏（方言、输出状态、行数、proto 数、反编译耗时）；内置 CodeMirror 6 编辑器、`DiffViewer`（对比本地编辑与原始输出，或任意两文件对比）以及「复制给 AI」一键生成精简 Markdown 代码块。
+- **结构分析面板**：按需拉取 `decompileRich` 数据，提供**函数大纲（ProtoOutline）/ 调用树（ProtoGraph）双视图切换**（点击函数直接跳转高亮源码区间）、带实时过滤与一键复制的**常量表（ConstantsPanel）**以及**控制流图（CfgViewer，支持 Low-IR / 原始字节码切换）**。
 
-工作区支持整页拖入、文件搜索、独立方言标签、源码编辑与下载，以及可折叠的结构分析。
-移动端在文件列表与源码之间切换，保持同一个文件面板实例；结构分析默认收起，常量与图视图
-分开显示以保留阅读空间。文件历史保存原始字节与方言，手动编辑需下载保存。
+## 测试与检查
 
-## 回归验证
+```bash
+# Node 单元测试（覆盖 7 方言真实 WASM、二进制嗅探、ZIP 生成、Worker 调度/缓存、设置预设、全文搜索与 AI 复制）
+npm test
 
-`npm run build` 构建当前核心的 WASM、同步 glue 和引擎身份，再执行 Vite 与 Vue 类型检查。
-需要仓库 Rust 工具链与 `wasm-pack`。`npm test` 使用 Node 24 和现有 TypeScript/Vue
-依赖，直接加载生产模块验证 Worker 请求、取消、缓存、文件代次与持久化；真实 WASM 测试
-还需要先完成 build，并按仓库测试协议初始化 `lua/build` 下的官方 Lua 工具链。
+# 代码格式与 lint 检查
+npm run check
 
-`npm run test:browser` 使用 Playwright 验证生产构建中的导入、混合方言、搜索、设置隔离、
-结构分析、编辑撤销、导出和移动端布局。先完成 `npm run build` 并准备 Lua 5.1 / 5.4 编译器：
-
-```sh
+# Playwright 端到端浏览器测试（需先执行 npm run build 并准备好 lua/build 下编译器）
 npx playwright install chromium
 npm run test:browser
 ```
 
-测试自动启动本地预览服务，截图和失败追踪写入仓库 `tmp/web-ui-tests/`。
-可设置 `PLAYWRIGHT_CHANNEL=msedge` 使用本机 Edge，或设置 `WEB_TEST_URL` 验证正在运行的开发服务。
+浏览器测试的截图和失败追踪会保存在仓库根目录的 `tmp/web-ui-tests/` 下；可设置 `PLAYWRIGHT_CHANNEL=msedge` 使用本机 Edge，或通过 `WEB_TEST_URL` 指向正在运行的开发服务。
 
-## 搜索与公开内容
+## 目录结构速查
 
-`plugins/vite-plugin-seo.ts` 在开发与构建时将 `src/content/product.en.html` 写入首页原始 HTML。
-这份正文也由 Vue 欢迎页使用；简体中文界面使用对应的 `product.zh.html`。无需 JavaScript
-即可阅读产品介绍、使用方式和常见问题，正常工作区不会为爬虫提供不同的隐藏内容。
-空工作区只显示产品内容，首个文件识别请求才创建 Worker 并加载 WASM；历史文件恢复时仍按需处理。
-产品正文来自仓库内的静态 HTML，不能将上传内容或外部输入传给这里的 `v-html`。
+- `src/components/layout/`：`AppHeader`、`FilePanel`、`MainContent`、`WelcomeView`
+- `src/components/editor/`：`CodeViewer`（CodeMirror 6 + 定制主题 + 行/区间高亮 + 复制给 AI）、`DiffViewer`（编辑对比与双文件对比）
+- `src/components/search/`：`GlobalSearchModal`（跨文件全文与常量搜索）
+- `src/components/settings/`：`SettingsDrawer`（场景预设、完整选项、分享链接与 CLI 参数生成）
+- `src/components/analysis/`：`ProtoOutline`（函数大纲）、`ProtoGraph`（调用树）、`CfgViewer`（控制流图）、`ConstantsPanel`（常量过滤与复制）
+- `src/stores/`：`files.ts`（文件历史与标签状态）、`settings.ts`（选项持久化与预设）
+- `src/utils/`：`binarySniff.ts`、`editorTheme.ts`、`zip.ts`、`aiSnippet.ts`、`workspaceSearch.ts`、`keyboard.ts`、`dialects.ts`
+- `src/workers/decompile.worker.ts`：WASM 后台反编译 Worker（空工作区不启动，首个文件请求时才按需初始化）
+- `src/i18n/`：10 套界面语言包（新增文案需同步维护）
+- `src/content/`：首页无 JS 可读的产品介绍 HTML（`product.en.html` / `product.zh.html`）与站点元数据（`site.ts`）
 
-标题、摘要、canonical、Open Graph、Twitter Card 与 JSON-LD 的公开身份集中在
-`src/content/site.ts`。JSON-LD 描述 `WebSite` 与 `SoftwareSourceCode`，不包含虚构评分。
-当前只有一个公开页面 URL；浏览器内切换界面语言不会生成独立语言页面，因此不声明虚假的
-`hreflang` 页面。`robots.txt` 与 sitemap 允许发现首页；不为参数分享链接重复创建索引条目，
-也不使用每次构建都刷新的假 `lastmod`。
+修改 Logo 或品牌文案后，可重新生成分享卡片图 `public/social-card.png`：
 
-`public/social-card.png` 是 1200×630 的分享预览图。修改 Logo 或品牌文案后，在安装
-Playwright 浏览器的开发环境中重新生成并提交图片：
-
-```sh
+```bash
 node scripts/generate-social-card.mjs
 ```
 
-浏览器回归同时检查禁用 JavaScript 的内容与链接、metadata、结构化数据、sitemap、分享图，
-以及静态正文与 Vue 页面正文的一致性。
+## 部署（Vercel）
 
-### Google Search Console
-
-代码满足抓取条件并不代表 Google 已经收录。首次接入时：
-
-1. 在 [Search Console](https://search.google.com/search-console/welcome) 添加资源并完成所有权验证。
-   域名验证需要将 Google 实际提供的 TXT 记录加入 DNS；URL 前缀验证也可将提供的 HTML
-   验证文件原样放到 `public/` 后发布。验证码来自账户，不能在仓库中预先编造。
-2. 发布新版后，提交 `https://unluac.x3zvawq.com/sitemap.xml`。
-3. 用“网址检查”检查 `https://unluac.x3zvawq.com/`，执行实时测试，确认可抓取后请求编入索引。
-   后续依据该工具显示的具体原因处理问题；重复请求并不会加快抓取，也不能保证收录或排名。
-
-Google 的 [JavaScript SEO 说明](https://developers.google.com/search/docs/crawling-indexing/javascript/javascript-seo-basics)
-解释了预渲染的作用；[重新抓取说明](https://developers.google.com/search/docs/crawling-indexing/ask-google-to-recrawl)
-说明了网址检查、sitemap 与收录边界。
-
-## Vercel 发布
-
-`.github/workflows/deploy-web.yml` 负责安装 Rust/WASM 工具链、构建 `dist`，再通过 Actions
-上传到 Vercel。`vercel.json` 的空 `buildCommand` 表示 Vercel 消费已构建产物。
-
-`git.deploymentEnabled: false` 关闭同一仓库的 Vercel Git 自动部署，避免从没有 `dist` 的新
-checkout 再启动另一条构建路径；它不关闭 Actions/API 发布。配置含义见
-[Vercel 官方说明](https://vercel.com/docs/project-configuration/git-configuration#git.deploymentenabled)。
-Vercel 项目的 Root Directory 应指向 `packages/unluac-web`，以便 Git 集成读取这份配置。
-若仍出现额外失败部署，检查它的触发来源、项目 Root Directory 和实际构建日志；不要将其他
-项目或不同触发器的失败混同为 Actions 构建失败。
-
-## 文件与结果的状态边界
-
-文件方言属于 `FileEntry`，随历史记录保存；导入时从全局默认值取得初始选择，Auto 由核心
-Parser 识别后冻结。全局默认方言变化不使旧结果失效，单文件标签修改只重跑该文件。
-非方言选项仍触发已有文件重跑，新的结果代次冻结对应参数；rich 分析使用同一个快照。
-
-Worker requestId 与文件 ID、结果 revision 各自承担不同职责。请求 ID 贯穿消息协议，文件 ID
-用于归属/取消，revision 验证跨识别、缓存等待和反编译的提交有效性。缓存 key 从实际发布的
-WASM 字节、输入文件和参数快照生成一次，写回复用该 key；引擎变化不能命中旧结果。
+线上的构建与发布由 `.github/workflows/deploy-web.yml` 统一完成：Actions 中先编译 Rust/WASM 与前端 `dist`，再上传至 Vercel。`vercel.json` 刻意关闭了 Vercel 自身的 Git 自动构建（避免缺 Rust 工具链报错），Vercel 项目的 Root Directory 设为 `packages/unluac-web` 即可。

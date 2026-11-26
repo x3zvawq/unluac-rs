@@ -44,7 +44,9 @@
       "removeFolder": "Remove Folder"
     },
     "sourceTag": "Source",
-    "fileDialect": "Change this file’s Lua dialect"
+    "fileDialect": "Change this file’s Lua dialect",
+    "clearWorkspace": "Clear Workspace",
+    "clearWorkspaceConfirm": "Remove all files from the workspace?"
   },
   "codeView": {
     "placeholder": "Select a file to start decompiling",
@@ -57,7 +59,11 @@
     "modified": "Modified",
     "modifiedHint": "Content has been manually edited and differs from the original decompiled result",
     "restore": "Restore Original",
-    "restoreConfirm": "Discard edits and restore the original decompiled result?"
+    "restoreConfirm": "Discard edits and restore the original decompiled result?",
+    "copyForAi": "Copy for AI",
+    "copyForAiHint": "Copy as a compact Markdown Lua block for AI assistants",
+    "copiedForAi": "Copied for AI",
+    "downloadAllZip": "Download All (.zip)"
   },
   "tabs": {
     "code": "Source",
@@ -86,13 +92,17 @@
       "vararg": "Vararg",
       "upvalues": "Upvalues",
       "constants": "Constants",
-      "instructions": "Instructions"
+      "instructions": "Instructions",
+      "jumpToSource": "Jump to source line"
     },
     "constants": {
       "title": "Constants",
       "empty": "No constants",
       "type": "Type",
-      "value": "Value"
+      "value": "Value",
+      "searchPlaceholder": "Filter constants…",
+      "filterAll": "All",
+      "clickToCopy": "Click to copy value"
     },
     "cfgViewer": {
       "proto": "Proto",
@@ -103,6 +113,11 @@
       "bytecode": "Bytecode",
       "focusHint": "Focused on {block} ({hops}-hop neighborhood). Double-click another block to re-focus.",
       "clearFocus": "Show All"
+    },
+    "outline": {
+      "graphView": "Graph",
+      "listView": "Outline",
+      "searchPlaceholder": "Filter functions or constants…"
     }
   },
   "settings": {
@@ -148,7 +163,18 @@
       "luauVectorConstructor": "Luau Vector Constructor",
       "luauVectorLibrary": "Optional library",
       "luauVectorConstructorName": "Constructor",
-      "comment": "Emit Comments"
+      "comment": "Emit Comments",
+      "commentOptions": {
+        "minimal": "Minimal (default)",
+        "full": "Full (with proto stats)",
+        "none": "None"
+      },
+      "tableDropIndexKeys": "Drop Sequential Index Keys",
+      "tableAlignEq": "Align Record Equals",
+      "tableAlignEqMaxSpaces": "Max Spaces Before Equals",
+      "tableAlignCells": "Table Cell Alignment",
+      "tableAlignWidth": "Aligned Table Max Width",
+      "tableAlignStringWidth": "Aligned Table Max String Width"
     },
     "tips": {
       "dialect": "Applies only to newly imported files. Click a file’s version tag to change its dialect.",
@@ -170,7 +196,13 @@
       "numberFormat": "Number literal style. decimal: regular numbers; hex: emit integer literals as 0x... when possible. CLI: --number-format",
       "tableStyle": "Table constructor layout. compact: single line; balanced: auto; aligned: space-aligned grid for small homogeneous arrays; expanded: one entry per line. CLI: --table-style",
       "luauVectorConstructor": "Render Luau vector constants with an explicit constructor and 3D/4D size. The library is optional; constructor and size are required. CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size",
-      "comment": "Whether to emit comments and metadata in generated code. CLI: --comment"
+      "comment": "Comment verbosity. minimal: header and source line numbers; full: per-proto metadata stats; none: omit comments. CLI: --comment",
+      "tableDropIndexKeys": "Omit safe sequential [1] = ..., [2] = ... integer keys in PUC Lua table initializers. CLI: --table-drop-index-keys",
+      "tableAlignEq": "Align `=` across adjacent keys in multi-line aligned record tables. CLI: --table-align-eq",
+      "tableAlignEqMaxSpaces": "Maximum padding spaces before `=` when aligning record keys (0 disables). CLI: --table-align-eq-max-spaces",
+      "tableAlignCells": "Cell alignment for aligned grids: auto right-aligns numbers and left-aligns other primitives. CLI: --table-align-cells",
+      "tableAlignWidth": "Maximum line width for aligned tables (empty inherits Max Line Length). CLI: --table-align-width",
+      "tableAlignStringWidth": "Maximum rendered string literal width allowed inside an aligned grid. CLI: --table-align-string-width"
     },
     "share": {
       "button": "Copy Share URL",
@@ -201,13 +233,32 @@
         }
       }
     },
-    "importDialect": "Default dialect for new files"
+    "importDialect": "Default dialect for new files",
+    "presets": {
+      "title": "Presets",
+      "hint": "Apply a common output profile without changing dialect or string encoding.",
+      "readable": {
+        "label": "Readable",
+        "description": "Heuristic names, minimal comments, aligned tables, and clean array keys."
+      },
+      "exact": {
+        "label": "Exact",
+        "description": "Strict parse/generate, raw byte strings, numbered names, and full comments."
+      },
+      "ai": {
+        "label": "For AI",
+        "description": "Heuristic names, minimal comments, and compact tables to save tokens."
+      }
+    }
   },
   "diff": {
     "left": "Left",
     "right": "Right",
     "selectFile": "Select file",
-    "hint": "Select two decompiled files to compare"
+    "hint": "Select two decompiled files to compare",
+    "openHint": "Compare files or edits",
+    "editsVsOriginal": "Edits vs Original",
+    "compareFiles": "Compare Files"
   },
   "workspace": {
     "local": "Runs locally",
@@ -227,5 +278,26 @@
     "analysis": "Structure",
     "wrapLines": "Wrap lines",
     "settingsHint": "Changes apply automatically. Each file keeps its own Lua dialect."
+  },
+  "globalSearch": {
+    "title": "Search Across Files",
+    "open": "Search Across Files",
+    "openHint": "Search across all files (Ctrl/Cmd+Shift+F)",
+    "placeholder": "Search decompiled source and constants…",
+    "caseSensitive": "Match Case",
+    "regex": "Use Regular Expression",
+    "invalidRegex": "Invalid regular expression",
+    "summary": "{matches} matches in {files} files",
+    "truncated": "Results truncated",
+    "noSearchableFiles": "No decompiled files available to search",
+    "hint": "Type to search across {count} files (↑/↓ to navigate, Enter to jump)",
+    "noResults": "No matches found",
+    "constantBadge": "const"
+  },
+  "statusBar": {
+    "lines": "lines",
+    "diagnostic": "Diagnostic",
+    "failedProtos": "{count} failed proto(s)",
+    "diagnosticHint": "Jump to first diagnostic location"
   }
 }

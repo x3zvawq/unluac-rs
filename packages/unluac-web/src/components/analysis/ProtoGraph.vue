@@ -3,15 +3,7 @@
  * Proto 引用图组件。
  *
  * 将反编译结果中的 proto 树以有向图形式展示。
- * 每个 proto 渲染为节点（显示 id、名称、行号、参数签名），
- * 父子关系渲染为有向边。
- *
- * 布局算法：消费后端先序身份，按深度分层，
- * 不依赖 dagre，因为 proto 关系是严格的树结构。
- *
- * 性能优化：
- * - only-render-visible-elements：视口外节点/边不渲染 DOM
- * - 缩放感知降级：zoom < 0.5 时节点只显示名称，省略详细信息
+ * 单击节点进入该 proto 的 CFG 视图；点击节点右上角的行号跳转按钮直接定位到源码。
  */
 
 // biome-ignore lint/correctness/noUnusedImports: used in template
@@ -33,6 +25,7 @@ import type { ProtoMeta } from '@/types/decompiler'
 
 const props = defineProps<{
   protos: ProtoMeta[]
+  failedProtos?: number[]
 }>()
 
 const emit = defineEmits<{
@@ -43,28 +36,42 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const { fitView, viewport } = useVueFlow()
 
-/** zoom 低于此阈值时节点简化为只显示名称 */
 const ZOOM_DETAIL_THRESHOLD = 0.5
+const NODE_WIDTH = 232
+const NODE_HEIGHT = 118
+const H_GAP = 36
+const V_GAP = 56
 
-const NODE_WIDTH = 220
-const NODE_HEIGHT = 120
-const H_GAP = 40
-const V_GAP = 60
-
-/** 按深度层级分配的色板（HSL，从蓝到绿到橙渐变） */
 const DEPTH_COLORS = [
-  '#6366f1', // 0 - indigo  (根)
+  '#14b8a6', // 0 - teal (root)
   '#3b82f6', // 1 - blue
-  '#0ea5e9', // 2 - sky
-  '#14b8a6', // 3 - teal
-  '#22c55e', // 4 - green
-  '#eab308', // 5 - yellow
+  '#6366f1', // 2 - indigo
+  '#8b5cf6', // 3 - violet
+  '#ec4899', // 4 - pink
+  '#f59e0b', // 5 - amber
   '#f97316', // 6 - orange
   '#ef4444', // 7+ - red
 ]
 
+const failedSet = computed(() => new Set(props.failedProtos ?? []))
+
 function depthColor(depth: number): string {
   return DEPTH_COLORS[Math.min(depth, DEPTH_COLORS.length - 1)]
+}
+
+function protoDisplayName(proto: ProtoMeta): string {
+  if (proto.name) return proto.name
+  return proto.id === 0 ? `${t('analysis.protoGraph.root')} #0` : `Proto #${proto.id}`
+}
+
+function protoLineRange(proto: ProtoMeta): [number, number] | null {
+  if (proto.generatedLineStart && proto.generatedLineStart > 0) {
+    return [proto.generatedLineStart, proto.generatedLineEnd ?? proto.generatedLineStart]
+  }
+  if (proto.lineStart > 0) {
+    return [proto.lineStart, proto.lineEnd || proto.lineStart]
+  }
+  return null
 }
 
 interface TreeLayoutResult {
@@ -72,26 +79,20 @@ interface TreeLayoutResult {
   depths: Map<number, number>
 }
 
-/**
- * 层次树布局：同层节点等间距水平排列。
- * 同时记录每个节点的深度，用于颜色编码。
- */
 function computeTreeLayout(protos: ProtoMeta[]): TreeLayoutResult {
   const positions = new Map<number, { x: number; y: number }>()
   const depths = new Map<number, number>()
   if (protos.length === 0) return { positions, depths }
 
-  // rich.protos 是完整先序树：根为 0，父节点先于孩子；同层顺序与 BFS 一致。
   const layers: number[][] = []
   depths.set(0, 0)
   for (const proto of protos) {
-    const depth = depths.get(proto.id)!
+    const depth = depths.get(proto.id) ?? 0
     layers[depth] ??= []
     layers[depth].push(proto.id)
     for (const childId of proto.children) depths.set(childId, depth + 1)
   }
 
-  // 计算位置和深度
   for (let layer = 0; layer < layers.length; layer++) {
     const ids = layers[layer]
     const totalWidth = ids.length * NODE_WIDTH + (ids.length - 1) * H_GAP
@@ -132,7 +133,7 @@ const graphData = computed(() => {
       source: String(proto.id),
       target: String(childId),
       animated: false,
-      style: { stroke: depthColor(parentDepth) },
+      style: { stroke: depthColor(parentDepth), strokeWidth: 1.5, opacity: 0.7 },
     }))
   })
 
@@ -142,7 +143,6 @@ const graphData = computed(() => {
 watch(
   () => graphData.value,
   () => {
-    // 数据变化后自动 fitView
     setTimeout(() => fitView({ padding: 0.2 }), 50)
   },
 )
@@ -151,46 +151,92 @@ function onNodeClick({ node }: NodeMouseEvent) {
   emit('select-proto', Number(node.id))
 }
 
-function onNodeDoubleClick({ node }: NodeMouseEvent) {
-  emit('jump-to-source', Number(node.id))
-}
-
-/**
- * 自定义 proto 节点渲染函数。
- * 使用 render function 避免为单一用途创建独立 SFC。
- */
 function ProtoNode(nodeProps: { data: { proto: ProtoMeta; depth: number } }) {
   const { proto, depth } = nodeProps.data
-  const color = depthColor(depth)
-  const name = proto.name ?? `${t('analysis.protoGraph.root')} #${proto.id}`
+  const isFailed = failedSet.value.has(proto.id)
+  const color = isFailed ? '#ef4444' : depthColor(depth)
+  const name = protoDisplayName(proto)
   const isDetailView = viewport.value.zoom >= ZOOM_DETAIL_THRESHOLD
-  const lineInfo =
-    proto.lineStart > 0
-      ? `${t('analysis.protoGraph.lines')} ${proto.lineStart}-${proto.lineEnd}`
-      : ''
+  const range = protoLineRange(proto)
+  const lineText = range
+    ? range[0] === range[1]
+      ? `L${range[0]}`
+      : `L${range[0]}-${range[1]}`
+    : ''
 
   return h(
     'div',
     {
-      class:
-        'rounded-lg border bg-white px-3 py-2 shadow-sm transition-colors hover:shadow-md dark:bg-gray-800 cursor-pointer text-xs',
-      style: { borderColor: color, borderLeftWidth: '3px' },
+      class: 'proto-node-card cursor-pointer rounded-lg border px-3 py-2 text-xs transition-all',
+      style: {
+        borderColor: isFailed ? '#ef4444' : 'var(--app-border)',
+        borderLeftColor: color,
+        borderLeftWidth: '3px',
+        background: 'var(--app-bg)',
+        color: 'var(--app-text)',
+      },
     },
     [
-      h('div', { class: 'font-semibold text-sm truncate mb-1', style: { color } }, name),
-      // 仅在 zoom >= 阈值时渲染详细信息
+      h('div', { class: 'mb-1 flex items-center gap-1.5' }, [
+        h(
+          'span',
+          {
+            class: 'min-w-0 flex-1 truncate font-mono text-[12px] font-semibold',
+            style: { color },
+            title: `${name} (#${proto.id})`,
+          },
+          name,
+        ),
+        range
+          ? h(
+              'button',
+              {
+                type: 'button',
+                class:
+                  'proto-jump-btn shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] transition-colors',
+                title: t('analysis.protoGraph.jumpToSource'),
+                onClick: (e: MouseEvent) => {
+                  e.stopPropagation()
+                  emit('jump-to-source', proto.id)
+                },
+              },
+              lineText,
+            )
+          : null,
+      ]),
       ...(isDetailView
         ? [
-            lineInfo ? h('div', { class: 'text-gray-500 dark:text-gray-400' }, lineInfo) : null,
-            h('div', { class: 'text-gray-500 dark:text-gray-400' }, [
-              `${t('analysis.protoGraph.params')}: ${proto.numParams}`,
-              proto.isVararg ? ` (${t('analysis.protoGraph.vararg')})` : '',
-            ]),
-            h('div', { class: 'text-gray-500 dark:text-gray-400 flex gap-2' }, [
-              h('span', null, `↑${proto.numUpvalues}`),
-              h('span', null, `C${proto.numConstants}`),
-              h('span', null, `I${proto.numInstructions}`),
-            ]),
+            h(
+              'div',
+              {
+                class: 'flex items-center gap-2 text-[11px]',
+                style: { color: 'var(--app-text-secondary)' },
+              },
+              [
+                h('span', null, `#${proto.id}`),
+                h(
+                  'span',
+                  null,
+                  `${t('analysis.protoGraph.params')}: ${proto.numParams}${proto.isVararg ? '+' : ''}`,
+                ),
+              ],
+            ),
+            h(
+              'div',
+              {
+                class: 'mt-1 flex items-center gap-2.5 font-mono text-[10px]',
+                style: { color: 'var(--app-text-dim)' },
+              },
+              [
+                h('span', { title: t('analysis.protoGraph.upvalues') }, `↑${proto.numUpvalues}`),
+                h('span', { title: t('analysis.protoGraph.constants') }, `K${proto.numConstants}`),
+                h(
+                  'span',
+                  { title: t('analysis.protoGraph.instructions') },
+                  `I${proto.numInstructions}`,
+                ),
+              ],
+            ),
           ]
         : []),
     ],
@@ -209,12 +255,11 @@ function ProtoNode(nodeProps: { data: { proto: ProtoMeta; depth: number } }) {
       only-render-visible-elements
       fit-view-on-init
       @node-click="onNodeClick"
-      @node-double-click="onNodeDoubleClick"
     >
       <template #node-proto="nodeProps">
         <ProtoNode :data="nodeProps.data" />
       </template>
-      <Background />
+      <Background :gap="20" :size="1" />
       <Controls />
       <MiniMap />
     </VueFlow>

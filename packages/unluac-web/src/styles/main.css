@@ -89,28 +89,218 @@ html, body, #app {
  * 样式在组件首次挂载前不存在，导致 ProtoGraph 里的
  * MiniMap/Controls 在未访问 CFG 时显示为白色。
  */
-.dark .vue-flow__controls {
-  background: #1f2937;
-  border-color: #374151;
-  box-shadow: 0 1px 4px rgb(0 0 0 / 0.4);
+.vue-flow {
+  background: var(--app-bg-alt);
 }
-.dark .vue-flow__controls-button {
-  background: #1f2937;
-  fill: #d1d5db;
-  border-bottom-color: #374151;
+.vue-flow__background pattern circle {
+  fill: color-mix(in srgb, var(--app-text-dim) 32%, transparent);
 }
-.dark .vue-flow__controls-button:hover {
-  background: #374151;
+.vue-flow__controls {
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: var(--app-shadow);
 }
-.dark .vue-flow__minimap {
-  background: #1f2937;
+.vue-flow__controls-button {
+  background: var(--app-bg);
+  fill: var(--app-text-secondary);
+  border-bottom-color: var(--app-border);
 }
-.dark .vue-flow__minimap-mask {
-  fill: rgb(17 24 39 / 0.7);
+.vue-flow__controls-button:hover {
+  background: var(--app-bg-hover);
+  fill: var(--app-text);
 }
-.dark .vue-flow__minimap-node {
-  fill: #6b7280;
-  stroke: #4b5563;
+.vue-flow__minimap {
+  background: var(--app-bg);
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.vue-flow__minimap-mask {
+  fill: color-mix(in srgb, var(--app-canvas) 65%, transparent);
+}
+.vue-flow__minimap-node {
+  fill: color-mix(in srgb, var(--app-accent) 45%, var(--app-border));
+  stroke: var(--app-border);
+}
+
+/* Harmonized diff merge colors */
+.cm-mergeView .cm-changedLine {
+  background: rgba(20, 125, 105, 0.08);
+}
+.dark .cm-mergeView .cm-changedLine {
+  background: rgba(131, 232, 207, 0.08);
+}
+.cm-mergeView .cm-changedText {
+  background: rgba(20, 125, 105, 0.22);
+  border-radius: 2px;
+}
+.dark .cm-mergeView .cm-changedText {
+  background: rgba(131, 232, 207, 0.24);
+}
+.cm-mergeView .cm-deletedChunk {
+  background: rgba(239, 68, 68, 0.08);
+}
+.cm-mergeView .cm-deletedChunk .cm-changedText {
+  background: rgba(239, 68, 68, 0.22);
+}
+
+/* Analysis node cards, outline list, constants pills & segmented toggle */
+.proto-node-card {
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--app-text) 6%, transparent);
+}
+.proto-node-card:hover {
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--app-accent) 18%, transparent);
+  transform: translateY(-1px);
+}
+.proto-jump-btn {
+  background: var(--app-accent-soft);
+  color: var(--app-accent);
+  border: 1px solid color-mix(in srgb, var(--app-accent) 28%, transparent);
+}
+.proto-jump-btn:hover {
+  background: var(--app-accent);
+  color: var(--app-bg);
+}
+.outline-row {
+  cursor: pointer;
+  color: var(--app-text);
+  border-radius: 6px;
+  margin: 1px 6px;
+  transition: background 120ms ease;
+}
+.outline-row:hover {
+  background: var(--app-bg-hover);
+}
+.outline-row.active {
+  background: var(--app-selected);
+}
+.outline-cfg-btn {
+  background: var(--app-bg-alt);
+  color: var(--app-text-secondary);
+  border: 1px solid var(--app-border);
+  transition: border-color 120ms, color 120ms, background 120ms;
+}
+.outline-cfg-btn:hover {
+  border-color: var(--app-accent);
+  color: var(--app-accent);
+  background: var(--app-accent-soft);
+}
+.const-filter-pill {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  color: var(--app-text-secondary);
+  background: var(--app-bg-alt);
+  border: 1px solid var(--app-border);
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.const-filter-pill:hover {
+  color: var(--app-text);
+  border-color: var(--app-text-dim);
+}
+.const-filter-pill.active {
+  background: var(--app-accent-soft);
+  color: var(--app-accent);
+  border-color: color-mix(in srgb, var(--app-accent) 40%, transparent);
+  font-weight: 600;
+}
+.const-row:hover {
+  background: var(--app-bg-hover);
+}
+.segmented-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--app-bg);
+  border: 1px solid var(--app-border);
+}
+.segmented-btn {
+  padding: 2px 9px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--app-text-secondary);
+  transition: background 120ms, color 120ms;
+}
+.segmented-btn:hover {
+  color: var(--app-text);
+}
+.segmented-btn.active {
+  background: var(--app-accent-soft);
+  color: var(--app-accent);
+  font-weight: 600;
+}
+
+/* Bottom 28px IDE Status Bar */
+.ide-status-bar {
+  height: 28px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 12px;
+  border-top: 1px solid var(--app-border);
+  background: var(--app-bg-alt);
+  color: var(--app-text-secondary);
+  font-size: 11px;
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 5px;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 10px;
+  color: var(--app-text-secondary);
+  background: var(--app-bg);
+  border: 1px solid var(--app-border);
+  transition: border-color 120ms, color 120ms, background 120ms;
+}
+.status-pill:hover {
+  border-color: var(--app-accent);
+  color: var(--app-text);
+}
+.status-pill-accent {
+  color: var(--app-accent);
+  font-weight: 600;
+}
+.status-diag-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+.dark .status-diag-pill {
+  color: #fcd34d;
+  background: rgba(245, 158, 11, 0.16);
+}
+.status-preset-pill {
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 5px;
+  font-size: 10px;
+  color: var(--app-text-dim);
+  transition: background 120ms, color 120ms;
+}
+.status-preset-pill:hover {
+  background: var(--app-bg-hover);
+  color: var(--app-text);
+}
+.status-preset-pill.active {
+  background: var(--app-accent-soft);
+  color: var(--app-accent);
+  font-weight: 600;
 }
 
 /* Shared surfaces keep the file browser, editor and analysis visually connected. */

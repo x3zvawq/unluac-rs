@@ -8,8 +8,8 @@ import { NaiveUiResolver } from 'unplugin-vue-components/resolvers'
 import Components from 'unplugin-vue-components/vite'
 import { defineConfig } from 'vite'
 import packageJson from './package.json'
-import { wasmBuildPlugin } from './plugins/vite-plugin-wasm-build'
 import { seoPlugin } from './plugins/vite-plugin-seo'
+import { wasmBuildPlugin } from './plugins/vite-plugin-wasm-build'
 
 export default defineConfig({
   plugins: [

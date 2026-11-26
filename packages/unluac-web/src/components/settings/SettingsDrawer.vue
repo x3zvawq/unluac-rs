@@ -13,6 +13,7 @@ import { computed, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { generateShareUrl } from '@/composables/useShareUrl'
 import { defaultOptions, useSettingsStore } from '@/stores/settings'
+import type { SettingsPresetId } from '@/types/decompiler'
 
 defineProps<{
   show: boolean
@@ -43,9 +44,22 @@ const luauVectorLibrary = computed({
   },
 })
 
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand('copy')
+    document.body.removeChild(textarea)
+  }
+}
+
 function copyShareUrl() {
   const url = generateShareUrl()
-  navigator.clipboard.writeText(url).then(() => {
+  void copyText(url).then(() => {
     copied.value = true
     setTimeout(() => {
       copied.value = false
@@ -55,7 +69,7 @@ function copyShareUrl() {
 
 function copyCliArgs() {
   const args = buildCliArgs()
-  navigator.clipboard.writeText(args).then(() => {
+  void copyText(args).then(() => {
     cliCopied.value = true
     setTimeout(() => {
       cliCopied.value = false
@@ -72,30 +86,6 @@ function buildCliArgs(): string {
   pushOption(args, '--decode-mode', options.parse.stringDecodeMode, defaults.parse.stringDecodeMode)
   pushOption(args, '--parse-mode', options.parse.mode, defaults.parse.mode)
   if (options.parse.ignoreDebug) args.push('--ignore-debug')
-  pushOption(
-    args,
-    '--return-inline-max-complexity',
-    options.readability.returnInlineMaxComplexity,
-    defaults.readability.returnInlineMaxComplexity,
-  )
-  pushOption(
-    args,
-    '--index-inline-max-complexity',
-    options.readability.indexInlineMaxComplexity,
-    defaults.readability.indexInlineMaxComplexity,
-  )
-  pushOption(
-    args,
-    '--args-inline-max-complexity',
-    options.readability.argsInlineMaxComplexity,
-    defaults.readability.argsInlineMaxComplexity,
-  )
-  pushOption(
-    args,
-    '--access-base-inline-max-complexity',
-    options.readability.accessBaseInlineMaxComplexity,
-    defaults.readability.accessBaseInlineMaxComplexity,
-  )
   pushOption(args, '--naming-mode', options.naming.mode, defaults.naming.mode)
   pushOption(
     args,
@@ -113,8 +103,41 @@ function buildCliArgs(): string {
   )
   pushOption(args, '--number-format', options.generate.numberFormat, defaults.generate.numberFormat)
   pushOption(args, '--quote-style', options.generate.quoteStyle, defaults.generate.quoteStyle)
-  pushOption(args, '--readable-strings', options.generate.readableStrings, defaults.generate.readableStrings)
+  pushOption(
+    args,
+    '--readable-strings',
+    options.generate.readableStrings,
+    defaults.generate.readableStrings,
+  )
   pushOption(args, '--table-style', options.generate.tableStyle, defaults.generate.tableStyle)
+  if (options.generate.tableAlignWidth !== null) {
+    args.push('--table-align-width', String(options.generate.tableAlignWidth))
+  }
+  pushOption(
+    args,
+    '--table-align-string-width',
+    options.generate.tableAlignStringWidth,
+    defaults.generate.tableAlignStringWidth,
+  )
+  pushOption(
+    args,
+    '--table-align-eq',
+    options.generate.tableAlignEq,
+    defaults.generate.tableAlignEq,
+  )
+  pushOption(
+    args,
+    '--table-align-eq-max-spaces',
+    options.generate.tableAlignEqMaxSpaces,
+    defaults.generate.tableAlignEqMaxSpaces,
+  )
+  pushOption(
+    args,
+    '--table-align-cells',
+    options.generate.tableAlignCells,
+    defaults.generate.tableAlignCells,
+  )
+  if (options.generate.tableDropIndexKeys) args.push('--table-drop-index-keys')
   if (options.generate.luauVectorConstructor) {
     if (options.generate.luauVectorConstructor.library) {
       args.push('--luau-vector-library', shellQuote(options.generate.luauVectorConstructor.library))
@@ -196,6 +219,41 @@ const tableStyleOptions = [
   { label: 'aligned', value: 'aligned' },
   { label: 'expanded', value: 'expanded' },
 ]
+
+const tableAlignCellsOptions = [
+  { label: 'auto', value: 'auto' },
+  { label: 'left', value: 'left' },
+  { label: 'right', value: 'right' },
+]
+
+const commentStyleOptions = computed(() => [
+  { label: t('settings.generate.commentOptions.minimal'), value: 'minimal' },
+  { label: t('settings.generate.commentOptions.full'), value: 'full' },
+  { label: t('settings.generate.commentOptions.none'), value: 'none' },
+])
+
+const presetItems = computed<{ id: SettingsPresetId; label: string; description: string }[]>(() => [
+  {
+    id: 'readable',
+    label: t('settings.presets.readable.label'),
+    description: t('settings.presets.readable.description'),
+  },
+  {
+    id: 'exact',
+    label: t('settings.presets.exact.label'),
+    description: t('settings.presets.exact.description'),
+  },
+  {
+    id: 'ai',
+    label: t('settings.presets.ai.label'),
+    description: t('settings.presets.ai.description'),
+  },
+])
+
+const activePresetDescription = computed(() => {
+  const current = presetItems.value.find((item) => item.id === settings.activePreset)
+  return current?.description ?? t('settings.presets.hint')
+})
 </script>
 
 <template>
@@ -206,6 +264,27 @@ const tableStyleOptions = [
         <!-- General Tab -->
         <NTabPane :name="t('settings.tabs.general')" :tab="t('settings.tabs.general')">
           <NSpace vertical :size="22" class="pt-5">
+            <div
+              class="rounded-lg border p-3"
+              style="border-color: var(--app-border); background: var(--app-bg-alt)"
+            >
+              <div class="mb-2 text-xs font-semibold uppercase tracking-wide" style="color: var(--app-text-secondary)">
+                {{ t('settings.presets.title') }}
+              </div>
+              <div class="grid grid-cols-3 gap-2">
+                <NButton
+                  v-for="preset in presetItems"
+                  :key="preset.id"
+                  size="small"
+                  :type="settings.activePreset === preset.id ? 'primary' : 'default'"
+                  :secondary="settings.activePreset !== preset.id"
+                  @click="settings.applyPreset(preset.id)"
+                >
+                  {{ preset.label }}
+                </NButton>
+              </div>
+              <p class="setting-hint mt-2 mb-0">{{ activePresetDescription }}</p>
+            </div>
             <div>
               <div class="mb-1 flex items-center gap-1">
                 <label class="text-sm font-medium">{{ t('settings.importDialect') }}</label>
@@ -271,8 +350,8 @@ const tableStyleOptions = [
                 size="small"
               />
             </div>
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-1">
+            <div>
+              <div class="mb-1 flex items-center gap-1">
                 <label class="text-sm">{{ t('settings.generate.comment') }}</label>
                 <NTooltip>
                   <template #trigger>
@@ -281,7 +360,11 @@ const tableStyleOptions = [
                   {{ t('settings.tips.comment') }}
                 </NTooltip>
               </div>
-              <NSwitch v-model:value="settings.options.generate.comment" size="small" />
+              <NSelect
+                v-model:value="settings.options.generate.comment"
+                :options="commentStyleOptions"
+                size="small"
+              />
             </div>
           </NSpace>
         </NTabPane>
@@ -344,74 +427,6 @@ const tableStyleOptions = [
                 </NTooltip>
               </div>
               <NSwitch v-model:value="settings.options.naming.debugLikeIncludeFunction" size="small" />
-            </div>
-            <div>
-              <div class="mb-1 flex items-center gap-1">
-                <label class="text-sm">{{ t('settings.readability.returnInlineMaxComplexity') }}</label>
-                <NTooltip>
-                  <template #trigger>
-                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
-                  </template>
-                  {{ t('settings.tips.returnInlineMaxComplexity') }}
-                </NTooltip>
-              </div>
-              <NInputNumber
-                v-model:value="settings.options.readability.returnInlineMaxComplexity"
-                :min="1"
-                :max="50"
-                size="small"
-              />
-            </div>
-            <div>
-              <div class="mb-1 flex items-center gap-1">
-                <label class="text-sm">{{ t('settings.readability.indexInlineMaxComplexity') }}</label>
-                <NTooltip>
-                  <template #trigger>
-                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
-                  </template>
-                  {{ t('settings.tips.indexInlineMaxComplexity') }}
-                </NTooltip>
-              </div>
-              <NInputNumber
-                v-model:value="settings.options.readability.indexInlineMaxComplexity"
-                :min="1"
-                :max="50"
-                size="small"
-              />
-            </div>
-            <div>
-              <div class="mb-1 flex items-center gap-1">
-                <label class="text-sm">{{ t('settings.readability.argsInlineMaxComplexity') }}</label>
-                <NTooltip>
-                  <template #trigger>
-                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
-                  </template>
-                  {{ t('settings.tips.argsInlineMaxComplexity') }}
-                </NTooltip>
-              </div>
-              <NInputNumber
-                v-model:value="settings.options.readability.argsInlineMaxComplexity"
-                :min="1"
-                :max="50"
-                size="small"
-              />
-            </div>
-            <div>
-              <div class="mb-1 flex items-center gap-1">
-                <label class="text-sm">{{ t('settings.readability.accessBaseInlineMaxComplexity') }}</label>
-                <NTooltip>
-                  <template #trigger>
-                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
-                  </template>
-                  {{ t('settings.tips.accessBaseInlineMaxComplexity') }}
-                </NTooltip>
-              </div>
-              <NInputNumber
-                v-model:value="settings.options.readability.accessBaseInlineMaxComplexity"
-                :min="1"
-                :max="50"
-                size="small"
-              />
             </div>
             <div>
               <div class="mb-1 flex items-center gap-1">
@@ -502,6 +517,99 @@ const tableStyleOptions = [
               <NSelect
                 v-model:value="settings.options.generate.tableStyle"
                 :options="tableStyleOptions"
+                size="small"
+              />
+            </div>
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.generate.tableDropIndexKeys') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.tableDropIndexKeys') }}
+                </NTooltip>
+              </div>
+              <NSwitch v-model:value="settings.options.generate.tableDropIndexKeys" size="small" />
+            </div>
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.generate.tableAlignEq') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.tableAlignEq') }}
+                </NTooltip>
+              </div>
+              <NSwitch v-model:value="settings.options.generate.tableAlignEq" size="small" />
+            </div>
+            <div>
+              <div class="mb-1 flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.generate.tableAlignEqMaxSpaces') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.tableAlignEqMaxSpaces') }}
+                </NTooltip>
+              </div>
+              <NInputNumber
+                v-model:value="settings.options.generate.tableAlignEqMaxSpaces"
+                :min="0"
+                :max="32"
+                size="small"
+              />
+            </div>
+            <div>
+              <div class="mb-1 flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.generate.tableAlignCells') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.tableAlignCells') }}
+                </NTooltip>
+              </div>
+              <NSelect
+                v-model:value="settings.options.generate.tableAlignCells"
+                :options="tableAlignCellsOptions"
+                size="small"
+              />
+            </div>
+            <div>
+              <div class="mb-1 flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.generate.tableAlignWidth') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.tableAlignWidth') }}
+                </NTooltip>
+              </div>
+              <NInputNumber
+                v-model:value="settings.options.generate.tableAlignWidth"
+                :min="20"
+                :max="240"
+                clearable
+                :placeholder="String(settings.options.generate.maxLineLength)"
+                size="small"
+              />
+            </div>
+            <div>
+              <div class="mb-1 flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.generate.tableAlignStringWidth') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.tableAlignStringWidth') }}
+                </NTooltip>
+              </div>
+              <NInputNumber
+                v-model:value="settings.options.generate.tableAlignStringWidth"
+                :min="4"
+                :max="120"
                 size="small"
               />
             </div>

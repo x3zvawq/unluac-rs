@@ -7,9 +7,9 @@
  * 右键菜单提供"移除目录"操作。
  */
 
-import type { UnluacDialect } from '@/types/decompiler'
 import { computed, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
+import type { UnluacDialect } from '@/types/decompiler'
 
 const { t } = useI18n()
 

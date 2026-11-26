@@ -6,9 +6,9 @@
  * 不持有业务状态，通过 composable 和 emit 与外部交互。
  */
 
+import logoUrl from '@logo'
 import { defineAsyncComponent, inject, type ShallowRef, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
-import logoUrl from '@logo'
 import { useTheme } from '@/composables/useTheme'
 
 const { t, locale } = useI18n()
@@ -23,7 +23,9 @@ const emit = defineEmits<{
 const isMobile = inject<ShallowRef<boolean>>('isMobile')!
 
 const showSettings = shallowRef(false)
-const SettingsDrawer = defineAsyncComponent(() => import('@/components/settings/SettingsDrawer.vue'))
+const SettingsDrawer = defineAsyncComponent(
+  () => import('@/components/settings/SettingsDrawer.vue'),
+)
 
 // 注册快捷键回调
 const shortcutActions =

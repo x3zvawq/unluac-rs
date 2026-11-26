@@ -1,9 +1,25 @@
 /** 输入识别与反编译都调用同一 WASM；每个响应携带原请求身份。 */
 import type { WorkerRequest, WorkerResponse } from '@/types/decompiler'
-import initWasm, { detectDialect, decompile, decompileRich } from '@/wasm/unluac_wasm.js'
+import initWasm, { decompile, decompileRich, detectDialect } from '@/wasm/unluac_wasm.js'
 import wasmUrl from '@/wasm/unluac_wasm_bg.wasm?url'
 
-const initialized = initWasm({ module_or_path: wasmUrl })
+let initPromise: Promise<unknown> | null = null
+
+function ensureInitialized(): Promise<unknown> {
+  if (!initPromise) {
+    initPromise = initWasm({ module_or_path: wasmUrl })
+      .then((exports) => {
+        self.postMessage({ type: 'ready' } satisfies WorkerResponse)
+        return exports
+      })
+      .catch((error) => {
+        // 失败时清空缓存 Promise，允许后续请求重新尝试加载 WASM
+        initPromise = null
+        throw error
+      })
+  }
+  return initPromise
+}
 
 function extractErrorMessage(error: unknown): string {
   if (typeof error === 'object' && error !== null && 'message' in error)
@@ -14,7 +30,7 @@ function extractErrorMessage(error: unknown): string {
 self.onmessage = async ({ data: msg }: MessageEvent<WorkerRequest>) => {
   let response: WorkerResponse
   try {
-    await initialized
+    await ensureInitialized()
     const value =
       msg.type === 'detect'
         ? detectDialect(msg.bytes)
@@ -28,8 +44,5 @@ self.onmessage = async ({ data: msg }: MessageEvent<WorkerRequest>) => {
   self.postMessage(response)
 }
 
-// 失败由各请求返回；预热失败不留下未处理的 Promise rejection。
-initialized.then(
-  () => self.postMessage({ type: 'ready' } satisfies WorkerResponse),
-  () => {},
-)
+// 预热 WASM；失败时静默复位，实际错误在首次请求时返回
+ensureInitialized().catch(() => {})

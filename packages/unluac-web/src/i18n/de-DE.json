@@ -44,7 +44,9 @@
       "removeFolder": "Ordner entfernen"
     },
     "sourceTag": "Quelltext",
-    "fileDialect": "Lua-Dialekt dieser Datei ändern"
+    "fileDialect": "Lua-Dialekt dieser Datei ändern",
+    "clearWorkspace": "Arbeitsbereich leeren",
+    "clearWorkspaceConfirm": "Alle Dateien aus dem Arbeitsbereich entfernen?"
   },
   "codeView": {
     "placeholder": "Datei zum Dekompilieren auswählen",
@@ -57,7 +59,11 @@
     "modified": "Bearbeitet",
     "modifiedHint": "Der Inhalt wurde manuell bearbeitet und weicht vom ursprünglichen Dekompilierungsergebnis ab",
     "restore": "Original wiederherstellen",
-    "restoreConfirm": "Änderungen verwerfen und das ursprüngliche Dekompilierungsergebnis wiederherstellen?"
+    "restoreConfirm": "Änderungen verwerfen und das ursprüngliche Dekompilierungsergebnis wiederherstellen?",
+    "copyForAi": "Für KI kopieren",
+    "copyForAiHint": "Als kompakten Markdown-Lua-Block für KI-Assistenten kopieren",
+    "copiedForAi": "Für KI kopiert",
+    "downloadAllZip": "Alle herunterladen (.zip)"
   },
   "tabs": {
     "code": "Quellcode",
@@ -86,13 +92,17 @@
       "vararg": "Variable Argumente",
       "upvalues": "Upvalues",
       "constants": "Konstanten",
-      "instructions": "Anweisungen"
+      "instructions": "Anweisungen",
+      "jumpToSource": "Zur Quellzeile springen"
     },
     "constants": {
       "title": "Konstanten",
       "empty": "Keine Konstanten",
       "type": "Typ",
-      "value": "Wert"
+      "value": "Wert",
+      "searchPlaceholder": "Konstanten filtern…",
+      "filterAll": "Alle",
+      "clickToCopy": "Klicken zum Kopieren"
     },
     "cfgViewer": {
       "proto": "Proto",
@@ -103,6 +113,11 @@
       "bytecode": "Bytecode",
       "focusHint": "Fokus auf {block} ({hops}-Hop-Nachbarschaft). Doppelklick auf einen anderen Block zum Wechseln.",
       "clearFocus": "Alle anzeigen"
+    },
+    "outline": {
+      "graphView": "Graph",
+      "listView": "Gliederung",
+      "searchPlaceholder": "Funktionen oder Konstanten filtern…"
     }
   },
   "settings": {
@@ -143,7 +158,23 @@
       "maxLineLength": "Max. Zeilenlänge",
       "quoteStyle": "Anführungszeichen-Stil",
       "tableStyle": "Tabellen-Stil",
-      "comment": "Kommentare ausgeben"
+      "comment": "Kommentare ausgeben",
+      "commentOptions": {
+        "minimal": "Minimal (Standard)",
+        "full": "Vollständig (mit Proto-Stats)",
+        "none": "Aus"
+      },
+      "tableDropIndexKeys": "Sequenzielle Index-Keys weglassen",
+      "tableAlignEq": "= in Tabellen ausrichten",
+      "tableAlignEqMaxSpaces": "Max. Leerzeichen vor =",
+      "tableAlignCells": "Zellenausrichtung",
+      "tableAlignWidth": "Max. Breite ausgerichteter Tabellen",
+      "tableAlignStringWidth": "Max. String-Breite im Raster",
+      "readableStrings": "Readable Strings",
+      "numberFormat": "Number Format",
+      "luauVectorConstructor": "Luau Vector Constructor",
+      "luauVectorLibrary": "Optional library",
+      "luauVectorConstructorName": "Constructor"
     },
     "tips": {
       "dialect": "Gilt nur für neu importierte Dateien. Klicken Sie auf die Versionsmarkierung einer Datei, um ihren Dialekt zu ändern.",
@@ -162,7 +193,16 @@
       "maxLineLength": "Bevorzugte maximale Zeilenlänge für generierten Code. CLI: --max-line-length",
       "quoteStyle": "Anführungszeichen-Stil für Strings. prefer-double: \" bevorzugen; prefer-single: ' bevorzugen; min-escape: Escapes minimieren. CLI: --quote-style",
       "tableStyle": "Layout des Tabellenkonstruktors. compact: einzeilig; balanced: automatisch; aligned: ausgerichtetes Raster fuer kleine homogene Arrays; expanded: ein Eintrag pro Zeile. CLI: --table-style",
-      "comment": "Ob Kommentare und Metadaten im generierten Code ausgegeben werden. CLI: --comment"
+      "comment": "Kommentarstufe. minimal: Kopfzeile & Zeilennummern; full: Proto-Statistiken; none: keine Kommentare. CLI: --comment",
+      "tableDropIndexKeys": "Lässt sichere [1] = ..., [2] = ... Schlüssel in PUC Lua weg. CLI: --table-drop-index-keys",
+      "tableAlignEq": "Richtet `=` in mehrzeiligen aligned-Tabellen aus. CLI: --table-align-eq",
+      "tableAlignEqMaxSpaces": "Maximale Leerzeichen vor `=` (0 deaktiviert). CLI: --table-align-eq-max-spaces",
+      "tableAlignCells": "Zellenausrichtung in aligned-Rastern (auto: Zahlen rechts). CLI: --table-align-cells",
+      "tableAlignWidth": "Maximale Zeilenbreite für aligned-Tabellen. CLI: --table-align-width",
+      "tableAlignStringWidth": "Maximale gerenderte String-Breite im aligned-Raster. CLI: --table-align-string-width",
+      "readableStrings": "Enabled by default: emit decoded text as UTF-8. Disable to preserve original bytes. The string encoding setting specifies the input encoding. CLI: --readable-strings",
+      "numberFormat": "Number literal style. decimal: regular numbers; hex: emit integer literals as 0x... when possible. CLI: --number-format",
+      "luauVectorConstructor": "Render Luau vector constants with an explicit constructor and 3D/4D size. The library is optional; constructor and size are required. CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size"
     },
     "share": {
       "button": "Link kopieren",
@@ -193,13 +233,32 @@
         }
       }
     },
-    "importDialect": "Standarddialekt für neue Dateien"
+    "importDialect": "Standarddialekt für neue Dateien",
+    "presets": {
+      "title": "Vorlagen",
+      "hint": "Wendet ein Ausgabeprofil an, ohne Dialekt oder Zeichenkodierung zu ändern.",
+      "readable": {
+        "label": "Lesbar",
+        "description": "Heuristische Namen, minimale Kommentare, ausgerichtete Tabellen."
+      },
+      "exact": {
+        "label": "Exakt",
+        "description": "Strikter Modus, Rohbyte-Strings, nummerierte Namen, volle Kommentare."
+      },
+      "ai": {
+        "label": "Für KI",
+        "description": "Heuristische Namen, minimale Kommentare und kompakte Tabellen für weniger Tokens."
+      }
+    }
   },
   "diff": {
     "left": "Links",
     "right": "Rechts",
     "selectFile": "Datei auswählen",
-    "hint": "Zwei dekompilierte Dateien zum Vergleichen auswählen"
+    "hint": "Zwei dekompilierte Dateien zum Vergleichen auswählen",
+    "openHint": "Dateien oder Änderungen vergleichen",
+    "editsVsOriginal": "Bearbeitet vs Original",
+    "compareFiles": "Dateien vergleichen"
   },
   "workspace": {
     "local": "Lokal ausgeführt",
@@ -219,5 +278,26 @@
     "analysis": "Struktur",
     "wrapLines": "Zeilenumbruch",
     "settingsHint": "Änderungen gelten sofort. Jede Datei behält ihren Lua-Dialekt."
+  },
+  "globalSearch": {
+    "title": "In allen Dateien suchen",
+    "open": "Dateien durchsuchen",
+    "openHint": "In allen Dateien suchen (Ctrl/Cmd+Shift+F)",
+    "placeholder": "Dekompilierter Code und Konstanten durchsuchen…",
+    "caseSensitive": "Groß-/Kleinschreibung",
+    "regex": "Regulärer Ausdruck",
+    "invalidRegex": "Ungültiger regulärer Ausdruck",
+    "summary": "{matches} Treffer in {files} Dateien",
+    "truncated": "Ergebnisse gekürzt",
+    "noSearchableFiles": "Keine dekompilierten Dateien zum Durchsuchen",
+    "hint": "Suchbegriff für {count} Dateien eingeben (↑/↓ wählen, Enter springen)",
+    "noResults": "Keine Treffer gefunden",
+    "constantBadge": "Konst."
+  },
+  "statusBar": {
+    "lines": "Zeilen",
+    "diagnostic": "Diagnose",
+    "failedProtos": "{count} Proto(s) fehlgeschlagen",
+    "diagnosticHint": "Zur ersten Diagnose springen"
   }
 }

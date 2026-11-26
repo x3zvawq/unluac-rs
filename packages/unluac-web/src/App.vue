@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { darkTheme, lightTheme, type GlobalThemeOverrides } from 'naive-ui'
-import { computed, provide, shallowRef, useTemplateRef } from 'vue'
+import { darkTheme, type GlobalThemeOverrides, lightTheme } from 'naive-ui'
+import { computed, defineAsyncComponent, provide, shallowRef, useTemplateRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import FilePanel from '@/components/layout/FilePanel.vue'
 import { useDecompiler } from '@/composables/useDecompiler'
@@ -8,16 +8,46 @@ import { useIsMobile } from '@/composables/useMediaQuery'
 import { useResizable } from '@/composables/useResizable'
 import { useShortcuts } from '@/composables/useShortcuts'
 import { useTheme } from '@/composables/useTheme'
+import { useFilesStore } from '@/stores/files'
+import type { WorkspaceSearchMatch } from '@/utils/workspaceSearch'
+
+const GlobalSearchModal = defineAsyncComponent(
+  () => import('@/components/search/GlobalSearchModal.vue'),
+)
 
 const { isDark } = useTheme()
 const decompiler = useDecompiler()
 const isMobile = useIsMobile()
+const filesStore = useFilesStore()
 const showMobileFiles = shallowRef(false)
+const showGlobalSearch = shallowRef(false)
 const filePanel = useTemplateRef('filePanel')
 const { t } = useI18n()
 
 provide('decompiler', decompiler)
 provide('isMobile', isMobile)
+
+export interface LineJumpTarget {
+  fileId: string
+  from: number
+  to: number
+  seq: number
+}
+
+let jumpSeq = 0
+const highlightLineRange = shallowRef<LineJumpTarget | null>(null)
+provide('highlightLineRange', highlightLineRange)
+
+function jumpToFileLine(fileId: string, from: number, to = from) {
+  showMobileFiles.value = false
+  filesStore.selectFile(fileId)
+  highlightLineRange.value = { fileId, from, to, seq: ++jumpSeq }
+}
+provide('jumpToFileLine', jumpToFileLine)
+
+function handleGlobalSearchSelect(match: WorkspaceSearchMatch) {
+  jumpToFileLine(match.fileId, Math.max(1, match.line))
+}
 
 const naiveTheme = computed(() => (isDark.value ? darkTheme : lightTheme))
 const themeOverrides = computed<GlobalThemeOverrides>(() => ({
@@ -55,7 +85,13 @@ const shortcutActions = shallowRef<{
   openFolder?: () => void
   downloadCurrent?: () => void
   openSettings?: () => void
-}>({})
+  openGlobalSearch?: () => void
+  openCompare?: (targetFileId?: string) => void
+}>({
+  openGlobalSearch: () => {
+    showGlobalSearch.value = true
+  },
+})
 
 provide('shortcutActions', shortcutActions)
 
@@ -63,6 +99,9 @@ useShortcuts({
   openFile: () => shortcutActions.value.openFile?.(),
   downloadCurrent: () => shortcutActions.value.downloadCurrent?.(),
   openSettings: () => shortcutActions.value.openSettings?.(),
+  openGlobalSearch: () => {
+    showGlobalSearch.value = true
+  },
 })
 </script>
 
@@ -85,6 +124,11 @@ useShortcuts({
               />
               <MainContent v-show="!isMobile || !showMobileFiles" />
             </div>
+            <GlobalSearchModal
+              v-if="showGlobalSearch"
+              v-model:show="showGlobalSearch"
+              @select="handleGlobalSearchSelect"
+            />
             <Transition name="drop">
               <div v-if="filePanel?.isDragging" class="drop-overlay">
                 <div><i-mdi-tray-arrow-down class="mx-auto mb-4 text-4xl" />{{ t('filePanel.dropHint') }}</div>

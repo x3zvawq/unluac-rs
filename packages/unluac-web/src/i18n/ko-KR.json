@@ -44,7 +44,9 @@
       "removeFolder": "폴더 제거"
     },
     "sourceTag": "소스",
-    "fileDialect": "이 파일의 Lua 방언 변경"
+    "fileDialect": "이 파일의 Lua 방언 변경",
+    "clearWorkspace": "작업 공간 비우기",
+    "clearWorkspaceConfirm": "작업 공간의 모든 파일을 제거하시겠습니까?"
   },
   "codeView": {
     "placeholder": "디컴파일할 파일을 선택하세요",
@@ -57,7 +59,11 @@
     "modified": "수정됨",
     "modifiedHint": "내용이 수동으로 편집되어 원래 디컴파일 결과와 다릅니다",
     "restore": "원래대로 복원",
-    "restoreConfirm": "편집을 취소하고 원래 디컴파일 결과로 복원하시겠습니까?"
+    "restoreConfirm": "편집을 취소하고 원래 디컴파일 결과로 복원하시겠습니까?",
+    "copyForAi": "AI용 복사",
+    "copyForAiHint": "AI 분석에 적합한 간결한 Markdown 코드 블록으로 복사",
+    "copiedForAi": "AI용 복사됨",
+    "downloadAllZip": "모두 다운로드 (.zip)"
   },
   "tabs": {
     "code": "소스",
@@ -86,13 +92,17 @@
       "vararg": "가변 인수",
       "upvalues": "업밸류",
       "constants": "상수",
-      "instructions": "명령어"
+      "instructions": "명령어",
+      "jumpToSource": "소스 줄로 이동"
     },
     "constants": {
       "title": "상수",
       "empty": "상수 없음",
       "type": "타입",
-      "value": "값"
+      "value": "값",
+      "searchPlaceholder": "상수 필터…",
+      "filterAll": "전체",
+      "clickToCopy": "클릭하여 값 복사"
     },
     "cfgViewer": {
       "proto": "Proto",
@@ -103,6 +113,11 @@
       "bytecode": "바이트코드",
       "focusHint": "{block}에 포커스 중 ({hops}홉 이웃). 다른 블록을 더블 클릭하면 전환됩니다.",
       "clearFocus": "전체 표시"
+    },
+    "outline": {
+      "graphView": "그래프",
+      "listView": "개요",
+      "searchPlaceholder": "함수 또는 상수 검색…"
     }
   },
   "settings": {
@@ -114,7 +129,8 @@
       "readability": "가독성",
       "naming": "명명",
       "generate": "생성",
-      "about": "정보"
+      "about": "정보",
+      "advanced": "Advanced"
     },
     "parse": {
       "title": "파싱 옵션",
@@ -142,7 +158,23 @@
       "maxLineLength": "최대 줄 길이",
       "quoteStyle": "따옴표 스타일",
       "tableStyle": "테이블 스타일",
-      "comment": "주석 출력"
+      "comment": "주석 출력",
+      "commentOptions": {
+        "minimal": "최소 (기본값)",
+        "full": "전체 (proto 통계 포함)",
+        "none": "없음"
+      },
+      "tableDropIndexKeys": "순차 정수 키 생략",
+      "tableAlignEq": "레코드 = 기호 정렬",
+      "tableAlignEqMaxSpaces": "= 정렬 최대 공백 수",
+      "tableAlignCells": "테이블 셀 정렬",
+      "tableAlignWidth": "정렬 테이블 최대 줄 너비",
+      "tableAlignStringWidth": "정렬 테이블 최대 문자열 너비",
+      "readableStrings": "Readable Strings",
+      "numberFormat": "Number Format",
+      "luauVectorConstructor": "Luau Vector Constructor",
+      "luauVectorLibrary": "Optional library",
+      "luauVectorConstructorName": "Constructor"
     },
     "tips": {
       "dialect": "새로 가져오는 파일에만 적용됩니다. 파일의 버전 태그를 클릭하여 개별 방언을 변경하세요.",
@@ -162,7 +194,16 @@
       "maxLineLength": "생성 코드의 기본 최대 줄 길이. CLI: --max-line-length",
       "quoteStyle": "문자열 따옴표 스타일. prefer-double: \"를 선호; prefer-single: '를 선호; min-escape: 이스케이프 최소화. CLI: --quote-style",
       "tableStyle": "테이블 생성자 레이아웃. compact: 한 줄; balanced: 자동; aligned: 동종 소요소 정렬 그리드; expanded: 항목당 한 줄. CLI: --table-style",
-      "comment": "생성된 코드에 주석과 메타데이터를 출력할지 여부. CLI: --comment"
+      "comment": "주석 상세 수준. minimal: 헤더와 줄 번호만; full: 함수별 proto 통계 포함; none: 생략. CLI: --comment",
+      "tableDropIndexKeys": "PUC Lua 안전한 순차 [1] = ... 정수 키를 생략합니다. CLI: --table-drop-index-keys",
+      "tableAlignEq": "aligned 스타일 여러 줄 레코드 테이블에서 = 위치를 맞춥니다. CLI: --table-align-eq",
+      "tableAlignEqMaxSpaces": "= 정렬 시 허용할 최대 공백 수 (0이면 비활성화). CLI: --table-align-eq-max-spaces",
+      "tableAlignCells": "aligned 그리드 셀 정렬 방향 (auto: 숫자 오른쪽, 기타 왼쪽). CLI: --table-align-cells",
+      "tableAlignWidth": "aligned 테이블 최대 줄 너비 (비우면 최대 줄 길이 상속). CLI: --table-align-width",
+      "tableAlignStringWidth": "aligned 그리드 내 허용되는 최대 문자열 리터럴 너비. CLI: --table-align-string-width",
+      "readableStrings": "Enabled by default: emit decoded text as UTF-8. Disable to preserve original bytes. The string encoding setting specifies the input encoding. CLI: --readable-strings",
+      "numberFormat": "Number literal style. decimal: regular numbers; hex: emit integer literals as 0x... when possible. CLI: --number-format",
+      "luauVectorConstructor": "Render Luau vector constants with an explicit constructor and 3D/4D size. The library is optional; constructor and size are required. CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size"
     },
     "share": {
       "button": "공유 링크 복사",
@@ -193,13 +234,32 @@
         }
       }
     },
-    "importDialect": "새 파일의 기본 방언"
+    "importDialect": "새 파일의 기본 방언",
+    "presets": {
+      "title": "프리셋",
+      "hint": "방언과 문자열 인코딩을 유지한 채 자주 쓰는 출력 설정을 적용합니다.",
+      "readable": {
+        "label": "가독성 우선",
+        "description": "휴리스틱 이름, 최소 주석, 정렬 테이블, 순차 키 생략."
+      },
+      "exact": {
+        "label": "정확한 복원",
+        "description": "엄격 파싱/생성, 원본 바이트 문자열, 번호 이름, 전체 주석."
+      },
+      "ai": {
+        "label": "AI 분석용",
+        "description": "휴리스틱 이름, 최소 주석, 간결한 테이블로 토큰 절약."
+      }
+    }
   },
   "diff": {
     "left": "왼쪽",
     "right": "오른쪽",
     "selectFile": "파일 선택",
-    "hint": "비교할 디컴파일된 파일 2개를 선택하세요"
+    "hint": "비교할 디컴파일된 파일 2개를 선택하세요",
+    "openHint": "파일 또는 편집 내용 비교",
+    "editsVsOriginal": "편집 vs 원본",
+    "compareFiles": "파일 비교"
   },
   "workspace": {
     "local": "로컬 실행",
@@ -219,5 +279,26 @@
     "analysis": "구조 분석",
     "wrapLines": "자동 줄 바꿈",
     "settingsHint": "설정은 자동 적용됩니다. Lua 방언은 파일별로 유지됩니다."
+  },
+  "globalSearch": {
+    "title": "전체 파일 검색",
+    "open": "전체 파일 검색",
+    "openHint": "모든 파일에서 검색 (Ctrl/Cmd+Shift+F)",
+    "placeholder": "디컴파일된 소스 및 상수 검색…",
+    "caseSensitive": "대소문자 구분",
+    "regex": "정규 표현식 사용",
+    "invalidRegex": "잘못된 정규 표현식",
+    "summary": "{files}개 파일에서 {matches}건 일치",
+    "truncated": "결과가 많아 일부만 표시됨",
+    "noSearchableFiles": "검색할 수 있는 디컴파일 파일이 없습니다",
+    "hint": "키워드를 입력해 {count}개 파일 검색 (↑/↓ 이동, Enter 점프)",
+    "noResults": "일치하는 결과 없음",
+    "constantBadge": "상수"
+  },
+  "statusBar": {
+    "lines": "줄",
+    "diagnostic": "진단 포함",
+    "failedProtos": "{count}개 함수 폴백",
+    "diagnosticHint": "첫 번째 진단 위치로 이동"
   }
 }

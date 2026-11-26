@@ -44,7 +44,9 @@
       "removeFolder": "フォルダを削除"
     },
     "sourceTag": "ソース",
-    "fileDialect": "このファイルの Lua 方言を変更"
+    "fileDialect": "このファイルの Lua 方言を変更",
+    "clearWorkspace": "ワークスペースをクリア",
+    "clearWorkspaceConfirm": "ワークスペースからすべてのファイルを削除しますか？"
   },
   "codeView": {
     "placeholder": "デコンパイルするファイルを選択してください",
@@ -57,7 +59,11 @@
     "modified": "編集済み",
     "modifiedHint": "内容が手動で編集され、元のデコンパイル結果と異なります",
     "restore": "元に戻す",
-    "restoreConfirm": "編集を破棄して元のデコンパイル結果に戻しますか？"
+    "restoreConfirm": "編集を破棄して元のデコンパイル結果に戻しますか？",
+    "copyForAi": "AI 用にコピー",
+    "copyForAiHint": "AI 向けの簡潔な Markdown コードブロックとしてコピー",
+    "copiedForAi": "AI 用にコピーしました",
+    "downloadAllZip": "すべてダウンロード (.zip)"
   },
   "tabs": {
     "code": "ソース",
@@ -86,13 +92,17 @@
       "vararg": "可変長引数",
       "upvalues": "上位値",
       "constants": "定数",
-      "instructions": "命令"
+      "instructions": "命令",
+      "jumpToSource": "ソース行へ移動"
     },
     "constants": {
       "title": "定数",
       "empty": "定数なし",
       "type": "タイプ",
-      "value": "値"
+      "value": "値",
+      "searchPlaceholder": "定数をフィルター…",
+      "filterAll": "すべて",
+      "clickToCopy": "クリックして値をコピー"
     },
     "cfgViewer": {
       "proto": "Proto",
@@ -103,6 +113,11 @@
       "bytecode": "バイトコード",
       "focusHint": "{block} にフォーカス中（{hops} ホップ近傍）。他のブロックをダブルクリックで切替。",
       "clearFocus": "すべて表示"
+    },
+    "outline": {
+      "graphView": "グラフ",
+      "listView": "アウトライン",
+      "searchPlaceholder": "関数や定数を検索…"
     }
   },
   "settings": {
@@ -143,7 +158,23 @@
       "maxLineLength": "最大行長",
       "quoteStyle": "引用符スタイル",
       "tableStyle": "テーブルスタイル",
-      "comment": "コメント出力"
+      "comment": "コメント出力",
+      "commentOptions": {
+        "minimal": "最小（既定）",
+        "full": "完全（proto 統計付き）",
+        "none": "なし"
+      },
+      "tableDropIndexKeys": "安全な連番整数キーを省略",
+      "tableAlignEq": "レコードの = を揃える",
+      "tableAlignEqMaxSpaces": "= 整列の最大空白数",
+      "tableAlignCells": "テーブルセルの揃え方",
+      "tableAlignWidth": "整列テーブルの最大行幅",
+      "tableAlignStringWidth": "整列テーブルの最大文字列幅",
+      "readableStrings": "Readable Strings",
+      "numberFormat": "Number Format",
+      "luauVectorConstructor": "Luau Vector Constructor",
+      "luauVectorLibrary": "Optional library",
+      "luauVectorConstructorName": "Constructor"
     },
     "tips": {
       "dialect": "新しく読み込むファイルにのみ適用します。ファイルのバージョンタグから個別に変更できます。",
@@ -162,7 +193,16 @@
       "maxLineLength": "生成コードの推奨最大行長。CLI: --max-line-length",
       "quoteStyle": "文字列の引用符スタイル。prefer-double: \" を優先；prefer-single: ' を優先；min-escape: エスケープを最小化。CLI: --quote-style",
       "tableStyle": "テーブルコンストラクタのレイアウト。compact: 単一行；balanced: 自動；aligned: 同種小要素の整列グリッド；expanded: 1エントリ1行。CLI: --table-style",
-      "comment": "生成コードにコメントやメタデータを出力するかどうか。CLI: --comment"
+      "comment": "コメントの詳細度。minimal: ヘッダと行番号のみ；full: 各関数の proto 統計付き；none: 出力しない。CLI: --comment",
+      "tableDropIndexKeys": "PUC Lua の安全な連番 [1] = ... キーを省略します。CLI: --table-drop-index-keys",
+      "tableAlignEq": "aligned スタイルの複数行レコードで = を縦揃えします。CLI: --table-align-eq",
+      "tableAlignEqMaxSpaces": "= 整列時に挿入する最大空白数（0 で無効）。CLI: --table-align-eq-max-spaces",
+      "tableAlignCells": "aligned グリッドのセル配置（auto は数値右揃え、その他左揃え）。CLI: --table-align-cells",
+      "tableAlignWidth": "aligned テーブルの行幅上限（空欄時は最大行幅を使用）。CLI: --table-align-width",
+      "tableAlignStringWidth": "aligned グリッド内で許容する文字列リテラルの最大幅。CLI: --table-align-string-width",
+      "readableStrings": "Enabled by default: emit decoded text as UTF-8. Disable to preserve original bytes. The string encoding setting specifies the input encoding. CLI: --readable-strings",
+      "numberFormat": "Number literal style. decimal: regular numbers; hex: emit integer literals as 0x... when possible. CLI: --number-format",
+      "luauVectorConstructor": "Render Luau vector constants with an explicit constructor and 3D/4D size. The library is optional; constructor and size are required. CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size"
     },
     "share": {
       "button": "共有リンクをコピー",
@@ -193,13 +233,32 @@
         }
       }
     },
-    "importDialect": "新規ファイルの既定の方言"
+    "importDialect": "新規ファイルの既定の方言",
+    "presets": {
+      "title": "プリセット",
+      "hint": "方言や文字コードを維持したまま定番の出力設定を適用します。",
+      "readable": {
+        "label": "読みやすさ重視",
+        "description": "ヒューリスティック命名、最小コメント、整列テーブル、連番キー省略。"
+      },
+      "exact": {
+        "label": "厳密復元",
+        "description": "厳格解析/生成、生バイト文字列、番号命名、完全コメント。"
+      },
+      "ai": {
+        "label": "AI 分析向け",
+        "description": "ヒューリスティック命名、最小コメント、コンパクトテーブルでトークン削減。"
+      }
+    }
   },
   "diff": {
     "left": "左",
     "right": "右",
     "selectFile": "ファイルを選択",
-    "hint": "比較するデコンパイル済みファイルを2つ選択してください"
+    "hint": "比較するデコンパイル済みファイルを2つ選択してください",
+    "openHint": "ファイルや編集内容を比較",
+    "editsVsOriginal": "編集 vs 元コード",
+    "compareFiles": "ファイル比較"
   },
   "workspace": {
     "local": "ローカルで実行",
@@ -219,5 +278,26 @@
     "analysis": "構造解析",
     "wrapLines": "行の折り返し",
     "settingsHint": "設定は自動で適用されます。Lua 方言はファイルごとに保持されます。"
+  },
+  "globalSearch": {
+    "title": "ファイル横断検索",
+    "open": "ファイル横断検索",
+    "openHint": "すべてのファイルを検索 (Ctrl/Cmd+Shift+F)",
+    "placeholder": "逆コンパイル済みソースと定数を検索…",
+    "caseSensitive": "大文字・小文字を区別",
+    "regex": "正規表現を使用",
+    "invalidRegex": "無効な正規表現",
+    "summary": "{files} ファイルで {matches} 件一致",
+    "truncated": "結果が多いため一部省略されました",
+    "noSearchableFiles": "検索可能なファイルがありません",
+    "hint": "キーワードを入力して {count} ファイルを検索（↑/↓ 選択、Enter で移動）",
+    "noResults": "一致する結果がありません",
+    "constantBadge": "定数"
+  },
+  "statusBar": {
+    "lines": "行",
+    "diagnostic": "診断あり",
+    "failedProtos": "{count} 件の関数がフォールバック",
+    "diagnosticHint": "最初の診断箇所へ移動"
   }
 }

@@ -2,6 +2,7 @@
 import { useFilesStore } from '@/stores/files'
 import { useSettingsStore } from '@/stores/settings'
 import type { UnluacDialect } from '@/types/decompiler'
+import { looksLikeBinaryFile } from '@/utils/binarySniff'
 import { createCacheKey, getCached, setCache } from './useDecompileCache'
 import type { useDecompiler } from './useDecompiler'
 
@@ -9,9 +10,9 @@ export function useFileDecompile(decompiler: ReturnType<typeof useDecompiler>) {
   const files = useFilesStore()
   const settings = useSettingsStore()
 
-  async function decompileFile(id: string) {
+  async function decompileFile(id: string, opts: { preserveEdited?: boolean } = {}) {
     decompiler.cancel(id)
-    const file = files.beginDecompile(id, settings.options)
+    const file = files.beginDecompile(id, settings.options, opts)
     if (!file) return
     const options = file.resultOptions!
     const current = () => files.isCurrent(id, file.revision)
@@ -19,6 +20,15 @@ export function useFileDecompile(decompiler: ReturnType<typeof useDecompiler>) {
       const detected = await decompiler.detectDialect(id, new Uint8Array(file.bytes))
       if (!current()) return
       if (detected === null) {
+        if (looksLikeBinaryFile(file.bytes)) {
+          files.updateFileStatus(
+            id,
+            'error',
+            undefined,
+            'Unsupported or encrypted binary file (not valid Lua, LuaJIT, or Luau bytecode).',
+          )
+          return
+        }
         const encoding = options.parse.stringEncoding
         const text = new TextDecoder(encoding === 'auto' ? 'utf-8' : encoding).decode(file.bytes)
         files.updateFileStatus(id, 'skipped', text)

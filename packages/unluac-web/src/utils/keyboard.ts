@@ -2,9 +2,9 @@
  * document 级快捷键的目标判定。
  *
  * 这个文件把“键盘事件是否应该交还给局部控件”做成单一事实源。
- * web 界面里既有 App 级快捷键，也有 FilePanel 级 Delete/Arrow
- * 操作；如果每个监听器各自判断，很容易漏掉 CodeMirror 搜索框、
- * contenteditable 或表单控件，导致输入时误触全局动作。
+ * 区分普通单键导航（ArrowUp/Down/Delete，编辑区内必须拦截）
+ * 与带 Ctrl/Cmd 修饰符的全局动作（Ctrl/Cmd+S/O/, 在代码编辑器内仍应生效，
+ * 仅在普通表单控件如搜索输入框内让位）。
  */
 
 const LOCAL_KEYBOARD_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'])
@@ -12,6 +12,7 @@ const LOCAL_KEYBOARD_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'])
 interface KeyboardElementLike {
   tagName?: string
   isContentEditable?: boolean
+  classList?: { contains(name: string): boolean }
   parentElement?: KeyboardElementLike | null
 }
 
@@ -29,4 +30,26 @@ export function shouldIgnoreDocumentShortcutTarget(target: EventTarget | null): 
     element = element.parentElement ?? null
   }
   return false
+}
+
+/**
+ * 修饰键全局快捷键（Ctrl/Cmd+S/O/,）的目标判定：
+ * 允许在 CodeMirror 代码编辑区（`.cm-content`）内触发，但在原生表单输入控件中放行。
+ */
+export function shouldIgnoreModifierShortcutTarget(target: EventTarget | null): boolean {
+  let element = toKeyboardElementLike(target)
+  let inCodeMirrorEditor = false
+  let sawContentEditable = false
+  while (element) {
+    const tagName = element.tagName?.toUpperCase()
+    if (tagName && LOCAL_KEYBOARD_TAGS.has(tagName)) return true
+    if (element.classList?.contains('cm-content')) {
+      inCodeMirrorEditor = true
+    }
+    if (element.isContentEditable) {
+      sawContentEditable = true
+    }
+    element = element.parentElement ?? null
+  }
+  return sawContentEditable && !inCodeMirrorEditor
 }

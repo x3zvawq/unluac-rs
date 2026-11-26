@@ -44,7 +44,9 @@
       "removeFolder": "移除目录"
     },
     "sourceTag": "源码",
-    "fileDialect": "修改此文件的 Lua 方言"
+    "fileDialect": "修改此文件的 Lua 方言",
+    "clearWorkspace": "清空工作区",
+    "clearWorkspaceConfirm": "确定要移除工作区中的全部文件吗？"
   },
   "codeView": {
     "placeholder": "选择一个文件开始反编译",
@@ -57,7 +59,11 @@
     "modified": "已修改",
     "modifiedHint": "当前内容已被手动编辑，与原始反编译结果不同",
     "restore": "恢复原始结果",
-    "restoreConfirm": "确定要放弃编辑并恢复为原始反编译结果吗？"
+    "restoreConfirm": "确定要放弃编辑并恢复为原始反编译结果吗？",
+    "copyForAi": "复制给 AI",
+    "copyForAiHint": "复制为精简 Markdown 代码块（适合发给 AI 分析）",
+    "copiedForAi": "已复制给 AI",
+    "downloadAllZip": "打包下载全部 (.zip)"
   },
   "tabs": {
     "code": "源码",
@@ -86,13 +92,17 @@
       "vararg": "变长参数",
       "upvalues": "上值",
       "constants": "常量",
-      "instructions": "指令"
+      "instructions": "指令",
+      "jumpToSource": "跳转到源码行"
     },
     "constants": {
       "title": "常量",
       "empty": "暂无常量",
       "type": "类型",
-      "value": "值"
+      "value": "值",
+      "searchPlaceholder": "过滤常量…",
+      "filterAll": "全部",
+      "clickToCopy": "点击复制常量值"
     },
     "cfgViewer": {
       "proto": "Proto",
@@ -103,6 +113,11 @@
       "bytecode": "字节码",
       "focusHint": "已聚焦 {block}（{hops} 跳邻域）。双击其他块可切换聚焦。",
       "clearFocus": "显示全部"
+    },
+    "outline": {
+      "graphView": "关系图",
+      "listView": "大纲",
+      "searchPlaceholder": "搜索函数名或常量…"
     }
   },
   "settings": {
@@ -134,7 +149,7 @@
     "naming": {
       "title": "命名选项",
       "mode": "命名模式",
-      "debugLikeIncludeFunction": "debug-like 包含函数名"
+      "debugLikeIncludeFunction": "debug-like 包含函数编号"
     },
     "generate": {
       "title": "生成选项",
@@ -148,7 +163,18 @@
       "luauVectorConstructor": "Luau Vector 构造器",
       "luauVectorLibrary": "可选库名",
       "luauVectorConstructorName": "构造器名",
-      "comment": "生成注释"
+      "comment": "生成注释",
+      "commentOptions": {
+        "minimal": "精简（默认）",
+        "full": "完整（含 proto 统计）",
+        "none": "关闭"
+      },
+      "tableDropIndexKeys": "省略安全顺序整数键",
+      "tableAlignEq": "对齐记录表的等号",
+      "tableAlignEqMaxSpaces": "等号对齐最大空格数",
+      "tableAlignCells": "对齐表单元格方向",
+      "tableAlignWidth": "对齐表最大行宽",
+      "tableAlignStringWidth": "对齐表最大字符串宽度"
     },
     "tips": {
       "dialect": "只影响新导入的文件。点击文件的版本标签可单独修改方言。",
@@ -170,7 +196,13 @@
       "numberFormat": "数字字面量格式。decimal: 普通数字；hex: 尽可能把整数字面量输出为 0x...。CLI: --number-format",
       "tableStyle": "表构造器排版风格。compact: 紧凑；balanced: 均衡；aligned: 同类小元素对齐网格；expanded: 展开。CLI: --table-style",
       "luauVectorConstructor": "使用显式构造器和 3D/4D 维度输出 Luau vector 常量。库名可选，构造器名和维度必填。CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size",
-      "comment": "是否在生成的代码中输出注释和元信息。CLI: --comment"
+      "comment": "注释详细程度。minimal: 精简文件头与源码行号；full: 附带每个函数的 proto 统计；none: 关闭全部注释。CLI: --comment",
+      "tableDropIndexKeys": "在 PUC Lua 安全标量初始化中省略连续 [1] = ..., [2] = ... 整数键。CLI: --table-drop-index-keys",
+      "tableAlignEq": "在 aligned 风格的多行记录表中对齐键后的等号。CLI: --table-align-eq",
+      "tableAlignEqMaxSpaces": "等号对齐允许补齐的最大空格数（0 表示关闭）。CLI: --table-align-eq-max-spaces",
+      "tableAlignCells": "aligned 网格单元的对齐方向：auto 按数字右对齐、其他左对齐。CLI: --table-align-cells",
+      "tableAlignWidth": "aligned 表的行宽上限（留空则沿用最大行宽）。CLI: --table-align-width",
+      "tableAlignStringWidth": "aligned 网格中允许的单个字符串最大渲染宽度。CLI: --table-align-string-width"
     },
     "share": {
       "button": "复制分享链接",
@@ -201,13 +233,32 @@
         }
       }
     },
-    "importDialect": "新文件默认方言"
+    "importDialect": "新文件默认方言",
+    "presets": {
+      "title": "场景预设",
+      "hint": "一键切换常用输出配置，不影响字符串编码与方言选择。",
+      "readable": {
+        "label": "推荐阅读",
+        "description": "启发式命名、精简注释、对齐表结构并省去冗余顺序键。"
+      },
+      "exact": {
+        "label": "精确还原",
+        "description": "严格解析/生成、保留原字节字符串、编号命名与完整注释。"
+      },
+      "ai": {
+        "label": "给 AI 分析",
+        "description": "启发式命名、精简注释、紧凑表结构，最大化节省 Token。"
+      }
+    }
   },
   "diff": {
     "left": "左侧",
     "right": "右侧",
     "selectFile": "选择文件",
-    "hint": "选择两个已反编译的文件进行对比"
+    "hint": "选择两个已反编译的文件进行对比",
+    "openHint": "对比文件或本地修改",
+    "editsVsOriginal": "本地修改 vs 原始",
+    "compareFiles": "双文件对比"
   },
   "workspace": {
     "local": "本地运行",
@@ -227,5 +278,26 @@
     "analysis": "结构分析",
     "wrapLines": "自动换行",
     "settingsHint": "设置自动生效，每个文件独立保留自己的 Lua 方言。"
+  },
+  "globalSearch": {
+    "title": "跨文件全文搜索",
+    "open": "跨文件搜索",
+    "openHint": "跨文件全文搜索 (Ctrl/Cmd+Shift+F)",
+    "placeholder": "搜索所有已反编译源码与常量…",
+    "caseSensitive": "区分大小写",
+    "regex": "正则表达式",
+    "invalidRegex": "正则表达式无效",
+    "summary": "共 {matches} 处命中，分布在 {files} 个文件",
+    "truncated": "结果过多，已截断显示",
+    "noSearchableFiles": "暂无已反编译的可搜索文件",
+    "hint": "输入关键词搜索当前工作区中的 {count} 个文件（↑/↓ 切换，Enter 跳转）",
+    "noResults": "未找到匹配结果",
+    "constantBadge": "常量"
+  },
+  "statusBar": {
+    "lines": "行",
+    "diagnostic": "含诊断占位",
+    "failedProtos": "{count} 个函数降级",
+    "diagnosticHint": "跳转到首个诊断位置"
   }
 }

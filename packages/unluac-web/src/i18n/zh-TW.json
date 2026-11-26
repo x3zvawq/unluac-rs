@@ -44,7 +44,9 @@
       "removeFolder": "移除目錄"
     },
     "sourceTag": "原始碼",
-    "fileDialect": "修改此檔案的 Lua 方言"
+    "fileDialect": "修改此檔案的 Lua 方言",
+    "clearWorkspace": "清空工作區",
+    "clearWorkspaceConfirm": "確定要移除工作區中的全部檔案嗎？"
   },
   "codeView": {
     "placeholder": "選擇一個檔案開始反編譯",
@@ -57,7 +59,11 @@
     "modified": "已修改",
     "modifiedHint": "目前內容已被手動編輯，與原始反編譯結果不同",
     "restore": "恢復原始結果",
-    "restoreConfirm": "確定要放棄編輯並恢復為原始反編譯結果嗎？"
+    "restoreConfirm": "確定要放棄編輯並恢復為原始反編譯結果嗎？",
+    "copyForAi": "複製給 AI",
+    "copyForAiHint": "複製為精簡 Markdown 程式碼區塊（適合交給 AI 分析）",
+    "copiedForAi": "已複製給 AI",
+    "downloadAllZip": "打包下載全部 (.zip)"
   },
   "tabs": {
     "code": "原始碼",
@@ -86,13 +92,17 @@
       "vararg": "變長參數",
       "upvalues": "上值",
       "constants": "常數",
-      "instructions": "指令"
+      "instructions": "指令",
+      "jumpToSource": "跳轉到原始碼行"
     },
     "constants": {
       "title": "常數",
       "empty": "暫無常數",
       "type": "類型",
-      "value": "值"
+      "value": "值",
+      "searchPlaceholder": "篩選常數…",
+      "filterAll": "全部",
+      "clickToCopy": "點擊複製常數值"
     },
     "cfgViewer": {
       "proto": "Proto",
@@ -103,6 +113,11 @@
       "bytecode": "位元組碼",
       "focusHint": "已聚焦 {block}（{hops} 跳鄰域）。雙擊其他區塊可切換聚焦。",
       "clearFocus": "顯示全部"
+    },
+    "outline": {
+      "graphView": "關聯圖",
+      "listView": "大綱",
+      "searchPlaceholder": "搜尋函式名或常數…"
     }
   },
   "settings": {
@@ -144,7 +159,22 @@
       "readableStrings": "可讀字串",
       "quoteStyle": "引號風格",
       "tableStyle": "表建構器風格",
-      "comment": "產生註解"
+      "comment": "產生註解",
+      "commentOptions": {
+        "minimal": "精簡（預設）",
+        "full": "完整（含 proto 統計）",
+        "none": "關閉"
+      },
+      "tableDropIndexKeys": "省略安全順序整數鍵",
+      "tableAlignEq": "對齊記錄表的等號",
+      "tableAlignEqMaxSpaces": "等號對齊最大空白數",
+      "tableAlignCells": "對齊表格儲存格方向",
+      "tableAlignWidth": "對齊表格最大行寬",
+      "tableAlignStringWidth": "對齊表格最大字串寬度",
+      "numberFormat": "Number Format",
+      "luauVectorConstructor": "Luau Vector Constructor",
+      "luauVectorLibrary": "Optional library",
+      "luauVectorConstructorName": "Constructor"
     },
     "tips": {
       "dialect": "只影響新匯入的檔案。點擊檔案的版本標籤可單獨修改方言。",
@@ -164,7 +194,15 @@
       "readableStrings": "預設開啟：將解碼文字輸出為 UTF-8，GBK 中文可直接閱讀。關閉可保留原始位元組；輸入編碼由字串編碼選項指定。CLI: --readable-strings",
       "quoteStyle": "字串引號風格。prefer-double: 偏好雙引號；prefer-single: 偏好單引號；min-escape: 選擇最少跳脫的。CLI: --quote-style",
       "tableStyle": "表建構器排版風格。compact: 緊湊；balanced: 均衡；aligned: 同類小元素對齊網格；expanded: 展開。CLI: --table-style",
-      "comment": "是否在產生的程式碼中輸出註解和中繼資訊。CLI: --comment"
+      "comment": "註解詳細程度。minimal: 精簡標頭與行號；full: 附加每個函式的 proto 統計；none: 關閉所有註解。CLI: --comment",
+      "tableDropIndexKeys": "在 PUC Lua 安全純量初始化中省略連續 [1] = ..., [2] = ... 鍵。CLI: --table-drop-index-keys",
+      "tableAlignEq": "在 aligned 風格的多行記錄表中對齊等號。CLI: --table-align-eq",
+      "tableAlignEqMaxSpaces": "等號對齊允許補齊的最大空白數（0 表示停用）。CLI: --table-align-eq-max-spaces",
+      "tableAlignCells": "aligned 格線儲存格對齊方向：auto 數字靠右、其餘靠左。CLI: --table-align-cells",
+      "tableAlignWidth": "aligned 表格的行寬上限（留空則沿用最大行寬）。CLI: --table-align-width",
+      "tableAlignStringWidth": "aligned 格線允許的單一字串最大渲染寬度。CLI: --table-align-string-width",
+      "numberFormat": "Number literal style. decimal: regular numbers; hex: emit integer literals as 0x... when possible. CLI: --number-format",
+      "luauVectorConstructor": "Render Luau vector constants with an explicit constructor and 3D/4D size. The library is optional; constructor and size are required. CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size"
     },
     "share": {
       "button": "複製分享連結",
@@ -195,13 +233,32 @@
         }
       }
     },
-    "importDialect": "新檔案預設方言"
+    "importDialect": "新檔案預設方言",
+    "presets": {
+      "title": "場景預設",
+      "hint": "一鍵切換常用輸出組態，不影響字串編碼與方言設定。",
+      "readable": {
+        "label": "推薦閱讀",
+        "description": "啟發式命名、精簡註解、對齊表格並省略冗餘順序鍵。"
+      },
+      "exact": {
+        "label": "精確還原",
+        "description": "嚴格解析/產生、保留原位元組字串、編號命名與完整註解。"
+      },
+      "ai": {
+        "label": "給 AI 分析",
+        "description": "啟發式命名、精簡註解、緊湊表格，最大化節省 Token。"
+      }
+    }
   },
   "diff": {
     "left": "左側",
     "right": "右側",
     "selectFile": "選擇檔案",
-    "hint": "選擇兩個已反編譯的檔案進行比較"
+    "hint": "選擇兩個已反編譯的檔案進行比較",
+    "openHint": "對比檔案或本地修改",
+    "editsVsOriginal": "本地修改 vs 原始",
+    "compareFiles": "雙檔案對比"
   },
   "workspace": {
     "local": "本機執行",
@@ -221,5 +278,26 @@
     "analysis": "結構分析",
     "wrapLines": "自動換行",
     "settingsHint": "設定自動生效，每個檔案獨立保留自己的 Lua 方言。"
+  },
+  "globalSearch": {
+    "title": "跨檔案全文搜尋",
+    "open": "跨檔案搜尋",
+    "openHint": "跨檔案全文搜尋 (Ctrl/Cmd+Shift+F)",
+    "placeholder": "搜尋所有已反編譯原始碼與常數…",
+    "caseSensitive": "區分大小寫",
+    "regex": "正規表示式",
+    "invalidRegex": "正規表示式無效",
+    "summary": "共 {matches} 處符合，分布於 {files} 個檔案",
+    "truncated": "結果過多，已截斷顯示",
+    "noSearchableFiles": "尚無已反編譯的可搜尋檔案",
+    "hint": "輸入關鍵字搜尋工作區內的 {count} 個檔案（↑/↓ 切換，Enter 跳轉）",
+    "noResults": "找不到符合結果",
+    "constantBadge": "常數"
+  },
+  "statusBar": {
+    "lines": "行",
+    "diagnostic": "含診斷佔位",
+    "failedProtos": "{count} 個函式降級",
+    "diagnosticHint": "跳轉到首個診斷位置"
   }
 }

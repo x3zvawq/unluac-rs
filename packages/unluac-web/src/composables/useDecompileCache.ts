@@ -19,6 +19,29 @@ const DB_VERSION = 1
 const STORE_NAME = 'results'
 
 let dbPromise: Promise<IDBDatabase> | null = null
+let stalePruned = false
+
+function pruneStaleEngineEntries(db: IDBDatabase) {
+  if (stalePruned) return
+  stalePruned = true
+  try {
+    const tx = db.transaction(STORE_NAME, 'readwrite')
+    const store = tx.objectStore(STORE_NAME)
+    if (typeof store.openCursor !== 'function') return
+    const prefix = `${WASM_ENGINE_ID}:`
+    const cursorReq = store.openCursor()
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result
+      if (!cursor) return
+      if (typeof cursor.key === 'string' && !cursor.key.startsWith(prefix)) {
+        cursor.delete()
+      }
+      cursor.continue()
+    }
+  } catch {
+    // 清理旧引擎缓存为 best-effort，失败静默忽略
+  }
+}
 
 function openDB(): Promise<IDBDatabase> {
   if (!dbPromise) {
@@ -30,8 +53,14 @@ function openDB(): Promise<IDBDatabase> {
           db.createObjectStore(STORE_NAME)
         }
       }
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
+      request.onsuccess = () => {
+        pruneStaleEngineEntries(request.result)
+        resolve(request.result)
+      }
+      request.onerror = () => {
+        dbPromise = null
+        reject(request.error)
+      }
     })
   }
   return dbPromise

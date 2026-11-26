@@ -44,7 +44,9 @@
       "removeFolder": "Eliminar carpeta"
     },
     "sourceTag": "Código fuente",
-    "fileDialect": "Cambiar el dialecto Lua de este archivo"
+    "fileDialect": "Cambiar el dialecto Lua de este archivo",
+    "clearWorkspace": "Vaciar espacio",
+    "clearWorkspaceConfirm": "¿Eliminar todos los archivos del espacio de trabajo?"
   },
   "codeView": {
     "placeholder": "Selecciona un archivo para descompilar",
@@ -57,7 +59,11 @@
     "modified": "Modificado",
     "modifiedHint": "El contenido ha sido editado manualmente y difiere del resultado de descompilación original",
     "restore": "Restaurar original",
-    "restoreConfirm": "¿Descartar las ediciones y restaurar el resultado de descompilación original?"
+    "restoreConfirm": "¿Descartar las ediciones y restaurar el resultado de descompilación original?",
+    "copyForAi": "Copiar para IA",
+    "copyForAiHint": "Copiar como bloque Markdown Lua compacto para asistentes de IA",
+    "copiedForAi": "Copiado para IA",
+    "downloadAllZip": "Descargar todo (.zip)"
   },
   "tabs": {
     "code": "Fuente",
@@ -86,13 +92,17 @@
       "vararg": "Argumentos variables",
       "upvalues": "Upvalues",
       "constants": "Constantes",
-      "instructions": "Instrucciones"
+      "instructions": "Instrucciones",
+      "jumpToSource": "Ir a la línea de código"
     },
     "constants": {
       "title": "Constantes",
       "empty": "Sin constantes",
       "type": "Tipo",
-      "value": "Valor"
+      "value": "Valor",
+      "searchPlaceholder": "Filtrar constantes…",
+      "filterAll": "Todo",
+      "clickToCopy": "Clic para copiar"
     },
     "cfgViewer": {
       "proto": "Proto",
@@ -103,6 +113,11 @@
       "bytecode": "Bytecode",
       "focusHint": "Enfocado en {block} (vecindario de {hops} saltos). Doble clic en otro bloque para cambiar.",
       "clearFocus": "Mostrar todo"
+    },
+    "outline": {
+      "graphView": "Grafo",
+      "listView": "Esquema",
+      "searchPlaceholder": "Filtrar funciones o constantes…"
     }
   },
   "settings": {
@@ -114,7 +129,8 @@
       "readability": "Legibilidad",
       "naming": "Nombrado",
       "generate": "Generación",
-      "about": "Acerca de"
+      "about": "Acerca de",
+      "advanced": "Advanced"
     },
     "parse": {
       "title": "Opciones de análisis",
@@ -142,7 +158,23 @@
       "maxLineLength": "Longitud máxima de línea",
       "quoteStyle": "Estilo de comillas",
       "tableStyle": "Estilo de tabla",
-      "comment": "Emitir comentarios"
+      "comment": "Emitir comentarios",
+      "commentOptions": {
+        "minimal": "Mínimo (predeterminado)",
+        "full": "Completo (con stats de proto)",
+        "none": "Ninguno"
+      },
+      "tableDropIndexKeys": "Omitir claves numéricas secuenciales",
+      "tableAlignEq": "Alinear = en registros",
+      "tableAlignEqMaxSpaces": "Máx. espacios antes de =",
+      "tableAlignCells": "Alineación de celdas",
+      "tableAlignWidth": "Ancho máx. de tabla alineada",
+      "tableAlignStringWidth": "Ancho máx. de cadena en cuadrícula",
+      "readableStrings": "Readable Strings",
+      "numberFormat": "Number Format",
+      "luauVectorConstructor": "Luau Vector Constructor",
+      "luauVectorLibrary": "Optional library",
+      "luauVectorConstructorName": "Constructor"
     },
     "tips": {
       "dialect": "Solo se aplica a los archivos nuevos. Pulse la etiqueta de versión de un archivo para cambiar su dialecto.",
@@ -162,7 +194,16 @@
       "maxLineLength": "Longitud máxima de línea preferida para el código generado. CLI: --max-line-length",
       "quoteStyle": "Estilo de comillas para cadenas. prefer-double: preferir \"; prefer-single: preferir '; min-escape: minimizar escapes. CLI: --quote-style",
       "tableStyle": "Diseño del constructor de tablas. compact: línea única; balanced: automático; aligned: cuadrícula alineada para matrices pequeñas homogéneas; expanded: una entrada por línea. CLI: --table-style",
-      "comment": "Si se emiten comentarios y metadatos en el código generado. CLI: --comment"
+      "comment": "Nivel de comentarios. minimal: cabecera y líneas; full: estadísticas proto; none: sin comentarios. CLI: --comment",
+      "tableDropIndexKeys": "Omite claves secuenciales seguras [1] = ..., [2] = ... en PUC Lua. CLI: --table-drop-index-keys",
+      "tableAlignEq": "Alinea `=` entre claves adyacentes en tablas aligned. CLI: --table-align-eq",
+      "tableAlignEqMaxSpaces": "Máximo de espacios antes de `=` (0 desactiva). CLI: --table-align-eq-max-spaces",
+      "tableAlignCells": "Alineación de celdas en cuadrículas aligned (auto: números a la derecha). CLI: --table-align-cells",
+      "tableAlignWidth": "Ancho máximo para tablas aligned (vacío hereda longitud máx.). CLI: --table-align-width",
+      "tableAlignStringWidth": "Ancho máximo de literal de cadena permitido en cuadrículas aligned. CLI: --table-align-string-width",
+      "readableStrings": "Enabled by default: emit decoded text as UTF-8. Disable to preserve original bytes. The string encoding setting specifies the input encoding. CLI: --readable-strings",
+      "numberFormat": "Number literal style. decimal: regular numbers; hex: emit integer literals as 0x... when possible. CLI: --number-format",
+      "luauVectorConstructor": "Render Luau vector constants with an explicit constructor and 3D/4D size. The library is optional; constructor and size are required. CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size"
     },
     "share": {
       "button": "Copiar enlace",
@@ -193,13 +234,32 @@
         }
       }
     },
-    "importDialect": "Dialecto predeterminado para archivos nuevos"
+    "importDialect": "Dialecto predeterminado para archivos nuevos",
+    "presets": {
+      "title": "Perfiles",
+      "hint": "Aplica una configuración común sin cambiar el dialecto ni la codificación.",
+      "readable": {
+        "label": "Lectura",
+        "description": "Nombres heurísticos, comentarios mínimos, tablas alineadas y claves limpias."
+      },
+      "exact": {
+        "label": "Exacto",
+        "description": "Modo estricto, cadenas con bytes originales, nombres numerados y comentarios completos."
+      },
+      "ai": {
+        "label": "Para IA",
+        "description": "Nombres heurísticos, comentarios mínimos y tablas compactas para ahorrar tokens."
+      }
+    }
   },
   "diff": {
     "left": "Izquierda",
     "right": "Derecha",
     "selectFile": "Seleccionar archivo",
-    "hint": "Selecciona dos archivos descompilados para comparar"
+    "hint": "Selecciona dos archivos descompilados para comparar",
+    "openHint": "Comparar archivos o cambios",
+    "editsVsOriginal": "Cambios vs Original",
+    "compareFiles": "Comparar archivos"
   },
   "workspace": {
     "local": "Ejecución local",
@@ -219,5 +279,26 @@
     "analysis": "Estructura",
     "wrapLines": "Ajustar líneas",
     "settingsHint": "Los cambios se aplican automáticamente. Cada archivo conserva su dialecto Lua."
+  },
+  "globalSearch": {
+    "title": "Buscar en todos los archivos",
+    "open": "Buscar en archivos",
+    "openHint": "Buscar en todos los archivos (Ctrl/Cmd+Shift+F)",
+    "placeholder": "Buscar en código descompilado y constantes…",
+    "caseSensitive": "Distinguir mayúsculas",
+    "regex": "Expresión regular",
+    "invalidRegex": "Expresión regular no válida",
+    "summary": "{matches} coincidencias en {files} archivos",
+    "truncated": "Resultados truncados",
+    "noSearchableFiles": "No hay archivos descompilados para buscar",
+    "hint": "Escribe para buscar en {count} archivos (↑/↓ navegar, Enter ir)",
+    "noResults": "Sin resultados",
+    "constantBadge": "const"
+  },
+  "statusBar": {
+    "lines": "líneas",
+    "diagnostic": "Diagnóstico",
+    "failedProtos": "{count} proto(s) con fallo",
+    "diagnosticHint": "Ir al primer diagnóstico"
   }
 }

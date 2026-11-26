@@ -6,8 +6,9 @@
  * 不持有状态，纯展示组件，所有操作通过 emit 通知父组件。
  */
 
-import { computed, shallowRef } from 'vue'
+import { computed, inject, type ShallowRef, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useFilesStore } from '@/stores/files'
 import type { FileEntry, UnluacDialect } from '@/types/decompiler'
 import { dialectOptions } from '@/utils/dialects'
 
@@ -24,6 +25,11 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const filesStore = useFilesStore()
+const shortcutActions = inject<ShallowRef<Record<string, ((...args: any[]) => void) | undefined>>>(
+  'shortcutActions',
+  shallowRef({}),
+)
 const dialectLabel = computed(
   () => dialectOptions.find((option) => option.value === props.file.dialect)?.label,
 )
@@ -33,8 +39,19 @@ const showContextMenu = shallowRef(false)
 const contextMenuX = shallowRef(0)
 const contextMenuY = shallowRef(0)
 
+const canCompare = computed(
+  () =>
+    props.file.result !== undefined &&
+    filesStore.files.filter((f) => f.result !== undefined).length >= 2,
+)
+
 const contextMenuOptions = computed(() => [
   { label: t('filePanel.contextMenu.recompile'), key: 'recompile' },
+  {
+    label: t('filePanel.contextMenu.compare'),
+    key: 'compare',
+    disabled: !canCompare.value,
+  },
   {
     label: t('filePanel.contextMenu.download'),
     key: 'download',
@@ -54,6 +71,9 @@ function handleContextAction(key: string) {
   switch (key) {
     case 'recompile':
       emit('recompile')
+      break
+    case 'compare':
+      shortcutActions.value.openCompare?.(props.file.id)
       break
     case 'download':
       downloadResult()

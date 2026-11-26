@@ -2,19 +2,13 @@
 /**
  * 代码查看/编辑组件。
  *
- * 职责：使用 CodeMirror 6 展示反编译后的 Lua 源码，允许用户编辑。
- * - 可编辑模式，修改后存入 editedResult
- * - 支持深色/浅色主题
- * - 提供复制、下载等工具栏操作
- * - 修改后在工具栏显示黄色警告标记和 Refresh 恢复按钮
- *
- * 选择 CodeMirror 6 而非 Monaco 的原因：
- * - 体积小约 10 倍（~130KB vs ~2MB gzip）
- * - 移动端表现更好
+ * 职责：使用定制融合主题的 CodeMirror 6 展示并编辑反编译后的 Lua 源码，
+ * 搭配顶部工具栏（AI 片段复制、Diff 对比、ZIP 打包导出）与底部 28px IDE 状态栏
+ * （方言热切换、预设一键切换、诊断状态徽章、行列体积统计、全局搜索入口）。
  */
 
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
-import { defaultHighlightStyle, StreamLanguage, syntaxHighlighting } from '@codemirror/language'
+import { StreamLanguage } from '@codemirror/language'
 import { lua } from '@codemirror/legacy-modes/mode/lua'
 import { highlightSelectionMatches, search, searchKeymap } from '@codemirror/search'
 import {
@@ -25,12 +19,12 @@ import {
   StateEffect,
   StateField,
 } from '@codemirror/state'
-import { oneDark } from '@codemirror/theme-one-dark'
 import {
   Decoration,
   type DecorationSet,
   EditorView,
   highlightActiveLine,
+  highlightActiveLineGutter,
   keymap,
   lineNumbers,
 } from '@codemirror/view'
@@ -46,26 +40,39 @@ import {
   watch,
 } from 'vue'
 import { useI18n } from 'vue-i18n'
+import type { useDecompiler } from '@/composables/useDecompiler'
+import { useFileDecompile } from '@/composables/useFileDecompile'
 import { useTheme } from '@/composables/useTheme'
 import { useFilesStore } from '@/stores/files'
+import { useSettingsStore } from '@/stores/settings'
+import type { SettingsPresetId, UnluacDialect } from '@/types/decompiler'
+import { formatCodeForAi } from '@/utils/aiSnippet'
+import { dialectOptions } from '@/utils/dialects'
+import { createUnluacEditorTheme } from '@/utils/editorTheme'
+import { buildZip, resolveLuaExportPaths } from '@/utils/zip'
+
+const emit = defineEmits<{
+  'open-diff': []
+}>()
 
 const { t } = useI18n()
 const filesStore = useFilesStore()
+const settingsStore = useSettingsStore()
+const decompiler = inject<ReturnType<typeof useDecompiler>>('decompiler')!
+const { changeDialect } = useFileDecompile(decompiler)
 const { isDark } = useTheme()
 const dialog = useDialog()
 
-/**
- * 行范围高亮 —— 由外部（MainContent）通过 provide/inject 传入。
- * 格式 { from: 行号, to: 行号 }（1-based），null 表示清除高亮。
- */
-const highlightRange = inject<ShallowRef<{ from: number; to: number } | null>>(
-  'highlightLineRange',
-  shallowRef(null),
+const highlightRange = inject<
+  ShallowRef<{ fileId: string; from: number; to: number; seq: number } | null>
+>('highlightLineRange', shallowRef(null))
+const jumpToFileLine = inject<((fileId: string, from: number, to?: number) => void) | null>(
+  'jumpToFileLine',
+  null,
 )
 
 // ── CodeMirror 行高亮 StateField ──
 const setHighlightEffect = StateEffect.define<{ from: number; to: number } | null>()
-
 const highlightLineMark = Decoration.line({ class: 'cm-highlighted-line' })
 
 const highlightField: Extension = StateField.define<DecorationSet>({
@@ -90,33 +97,26 @@ const highlightField: Extension = StateField.define<DecorationSet>({
   provide: (f) => EditorView.decorations.from(f),
 })
 
-/** 高亮行的背景色样式 */
-const highlightLineTheme = EditorView.baseTheme({
-  '.cm-highlighted-line': {
-    backgroundColor: 'rgba(99, 102, 241, 0.12)',
-  },
-})
-
 // 注册快捷键回调
 const shortcutActions =
-  inject<ShallowRef<Record<string, (() => void) | undefined>>>('shortcutActions')!
+  inject<ShallowRef<Record<string, ((...args: any[]) => void) | undefined>>>('shortcutActions')!
 shortcutActions.value = { ...shortcutActions.value, downloadCurrent: () => downloadFile() }
 
 const editorContainer = useTemplateRef<HTMLDivElement>('editorContainer')
 let editorView: EditorView | null = null
 
 const copied = shallowRef(false)
+const copiedAi = shallowRef(false)
 const wrapLines = shallowRef(false)
 const wrapCompartment = new Compartment()
+const themeCompartment = new Compartment()
 
 const selectedFile = computed(() => filesStore.selectedFile)
 
 const showPlaceholder = computed(
   () => !selectedFile.value || selectedFile.value.status === 'pending',
 )
-
 const showError = computed(() => selectedFile.value?.status === 'error')
-
 const showCode = computed(
   () =>
     (selectedFile.value?.status === 'success' || selectedFile.value?.status === 'skipped') &&
@@ -126,67 +126,78 @@ const showCode = computed(
 const codeContent = computed(() => {
   const file = selectedFile.value
   if (!file) return ''
-  // 如果有手动编辑结果则展示编辑版本
   return file.editedResult ?? file.result ?? ''
 })
 
-/** 当前文件是否被用户修改过 */
 const isModified = computed(() => selectedFile.value?.editedResult !== undefined)
 
-/**
- * 内部标记：正在由程序替换文档内容（文件切换 / 恢复原始版本），
- * 此时 updateListener 不应将变更写入 editedResult。
- */
+const exportableFiles = computed(() =>
+  filesStore.files.filter(
+    (f) => (f.status === 'success' || f.status === 'skipped') && f.result !== undefined,
+  ),
+)
+
+const canOpenDiff = computed(() => isModified.value || exportableFiles.value.length >= 2)
+
+const lineCount = computed(() => {
+  const text = codeContent.value
+  if (!text) return 0
+  let count = 1
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) count++
+  }
+  return count
+})
+
+const formattedSize = computed(() => {
+  const bytes = selectedFile.value?.size ?? 0
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+})
+
+const dialectMenu = dialectOptions.map(({ label, value }) => ({ label, key: value }))
+const currentDialectLabel = computed(() => {
+  const file = selectedFile.value
+  if (!file) return ''
+  if (file.status === 'skipped') return t('filePanel.sourceTag')
+  return dialectOptions.find((o) => o.value === file.dialect)?.label ?? file.dialect
+})
+
+const failedProtos = computed(() => selectedFile.value?.richResult?.failedProtos ?? [])
+const hasDiagnostics = computed(
+  () =>
+    selectedFile.value?.richResult?.kind === 'diagnostic-pseudocode' ||
+    failedProtos.value.length > 0,
+)
+
+const presetItems = computed<{ id: SettingsPresetId; label: string }[]>(() => [
+  { id: 'readable', label: t('settings.presets.readable.label') },
+  { id: 'exact', label: t('settings.presets.exact.label') },
+  { id: 'ai', label: t('settings.presets.ai.label') },
+])
+
 let programmaticUpdate = false
 
-/** 用 Compartment 管理主题扩展，切换时只重配置而非重建编辑器 */
-const themeCompartment = new Compartment()
-
-function themeExtension(dark: boolean): Extension {
-  return dark ? oneDark : syntaxHighlighting(defaultHighlightStyle)
-}
-
 function createExtensions(dark: boolean) {
-  const extensions = [
+  return [
     lineNumbers(),
     history(),
     keymap.of([...defaultKeymap, ...historyKeymap]),
     wrapCompartment.of(wrapLines.value ? EditorView.lineWrapping : []),
     highlightActiveLine(),
+    highlightActiveLineGutter(),
     highlightSelectionMatches(),
     search(),
     keymap.of(searchKeymap),
     StreamLanguage.define(lua),
     highlightField,
-    highlightLineTheme,
-    EditorView.theme({
-      '&': {
-        height: '100%',
-        backgroundColor: 'var(--app-bg)',
-        color: 'var(--app-text)',
-        fontSize: '13px',
-      },
-      '.cm-content': {
-        padding: '16px 0',
-        fontFamily: '"Cascadia Code", "SFMono-Regular", Consolas, monospace',
-        lineHeight: '1.75',
-      },
-      '.cm-gutters': {
-        backgroundColor: 'var(--app-bg)',
-        color: 'var(--app-text-dim)',
-        border: 'none',
-      },
-      '.cm-lineNumbers .cm-gutterElement': { padding: '0 14px' },
-      '.cm-scroller': { overflow: 'auto' },
-    }),
-    themeCompartment.of(themeExtension(dark)),
-    // 用户编辑时将变更存入 editedResult
+    themeCompartment.of(createUnluacEditorTheme(dark)),
     EditorView.updateListener.of((update) => {
       if (!update.docChanged || programmaticUpdate) return
       const fileId = selectedFile.value?.id
       if (!fileId) return
       const newText = update.state.doc.toString()
-      // 如果编辑后的内容与原始结果一致，清除 editedResult
       if (newText === selectedFile.value?.result) {
         filesStore.clearEditedResult(fileId)
       } else {
@@ -194,12 +205,28 @@ function createExtensions(dark: boolean) {
       }
     }),
   ]
-  return extensions
+}
+
+function applyHighlight(range: { fileId: string; from: number; to: number; seq: number } | null) {
+  if (!editorView) return
+  if (!range || range.fileId !== selectedFile.value?.id || editorView.state.doc.lines === 0) {
+    editorView.dispatch({ effects: setHighlightEffect.of(null) })
+    return
+  }
+  const maxLine = editorView.state.doc.lines
+  const from = Math.max(1, Math.min(range.from, maxLine))
+  const to = Math.max(from, Math.min(range.to, maxLine))
+  const line = editorView.state.doc.line(from)
+  editorView.dispatch({
+    effects: [
+      setHighlightEffect.of({ from, to }),
+      EditorView.scrollIntoView(line.from, { y: 'center' }),
+    ],
+  })
 }
 
 function initEditor() {
   if (!editorContainer.value) return
-
   editorView = new EditorView({
     state: EditorState.create({
       doc: codeContent.value,
@@ -207,15 +234,16 @@ function initEditor() {
     }),
     parent: editorContainer.value,
   })
+  applyHighlight(highlightRange.value)
 }
 
-// 文件切换需要新的撤销栈，避免撤销操作把上一个文件的源码带入当前文件。
 watch(
   () => selectedFile.value?.id,
   () => {
     editorView?.setState(
       EditorState.create({ doc: codeContent.value, extensions: createExtensions(isDark.value) }),
     )
+    applyHighlight(highlightRange.value)
   },
 )
 
@@ -225,10 +253,8 @@ watch(wrapLines, (wrap) =>
   }),
 )
 
-// 代码内容变化时更新编辑器（文件切换触发）
 watch(codeContent, (newCode) => {
   if (!editorView) return
-  // 如果编辑器当前内容已经一致则跳过
   if (editorView.state.doc.toString() === newCode) return
   programmaticUpdate = true
   editorView.dispatch({
@@ -239,26 +265,18 @@ watch(codeContent, (newCode) => {
     },
   })
   programmaticUpdate = false
+  applyHighlight(highlightRange.value)
 })
 
-// 主题变化时通过 Compartment 热切换，保留滚动位置和编辑状态
 watch(isDark, (dark) => {
   if (!editorView) return
   editorView.dispatch({
-    effects: themeCompartment.reconfigure(themeExtension(dark)),
+    effects: themeCompartment.reconfigure(createUnluacEditorTheme(dark)),
   })
 })
 
-// 外部高亮行范围变化时更新编辑器装饰 + 滚动到目标行
 watch(highlightRange, (range) => {
-  if (!editorView) return
-  editorView.dispatch({ effects: setHighlightEffect.of(range) })
-  if (range) {
-    const line = editorView.state.doc.line(Math.min(range.from, editorView.state.doc.lines))
-    editorView.dispatch({
-      effects: EditorView.scrollIntoView(line.from, { y: 'start', yMargin: 40 }),
-    })
-  }
+  applyHighlight(range)
 })
 
 onMounted(() => {
@@ -270,48 +288,57 @@ onUnmounted(() => {
   editorView = null
 })
 
-async function copyToClipboard() {
-  if (!codeContent.value) return
+async function writeClipboardText(text: string) {
   try {
-    await navigator.clipboard.writeText(codeContent.value)
-    copied.value = true
-    setTimeout(() => {
-      copied.value = false
-    }, 2000)
+    await navigator.clipboard.writeText(text)
   } catch {
-    // fallback
     const textarea = document.createElement('textarea')
-    textarea.value = codeContent.value
+    textarea.value = text
     document.body.appendChild(textarea)
     textarea.select()
     document.execCommand('copy')
     document.body.removeChild(textarea)
-    copied.value = true
-    setTimeout(() => {
-      copied.value = false
-    }, 2000)
   }
 }
 
-function downloadFile() {
+async function copyToClipboard() {
   if (!codeContent.value) return
-  // 下载当前展示的内容（可能是编辑后的）
+  await writeClipboardText(codeContent.value)
+  copiedAi.value = false
+  copied.value = true
+  setTimeout(() => {
+    copied.value = false
+  }, 2000)
+}
+
+async function copyForAi() {
+  const file = selectedFile.value
+  if (!file || !codeContent.value) return
+  const payload = formatCodeForAi(file, codeContent.value)
+  await writeClipboardText(payload)
+  copied.value = false
+  copiedAi.value = true
+  setTimeout(() => {
+    copiedAi.value = false
+  }, 2000)
+}
+
+function downloadFile() {
+  if (!codeContent.value || !selectedFile.value) return
   const blob = new Blob([codeContent.value], { type: 'text/x-lua' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = `${selectedFile.value!.name.replace(/\.[^.]+$/, '')}.lua`
+  a.download = `${selectedFile.value.name.replace(/\.[^.]+$/, '')}.lua`
   a.click()
   URL.revokeObjectURL(url)
 }
 
-function downloadAll() {
-  const successFiles = filesStore.files.filter((f) => f.status === 'success' && f.result)
-  if (successFiles.length === 0) return
-
-  // 单文件直接下载
-  if (successFiles.length === 1) {
-    const file = successFiles[0]
+function downloadAllZip() {
+  const targets = exportableFiles.value
+  if (targets.length === 0) return
+  if (targets.length === 1) {
+    const file = targets[0]
     const blob = new Blob([file.editedResult ?? file.result!], { type: 'text/x-lua' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -322,19 +349,22 @@ function downloadAll() {
     return
   }
 
-  // 多文件：逐个下载（后续可替换为 zip 打包）
-  for (const file of successFiles) {
-    const blob = new Blob([file.editedResult ?? file.result!], { type: 'text/x-lua' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${file.name.replace(/\.[^.]+$/, '')}.lua`
-    a.click()
-    URL.revokeObjectURL(url)
-  }
+  const paths = resolveLuaExportPaths(targets.map((f) => f.relativePath))
+  const zipBytes = buildZip(
+    targets.map((file, idx) => ({
+      path: paths[idx],
+      content: file.editedResult ?? file.result!,
+    })),
+  )
+  const blob = new Blob([zipBytes as unknown as BlobPart], { type: 'application/zip' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = 'unluac-workspace.zip'
+  a.click()
+  URL.revokeObjectURL(url)
 }
 
-/** 恢复原始反编译结果（二次确认） */
 function restoreOriginal() {
   const fileId = selectedFile.value?.id
   if (!fileId) return
@@ -347,6 +377,22 @@ function restoreOriginal() {
     },
   })
 }
+
+function jumpToFirstDiagnostic() {
+  const file = selectedFile.value
+  const rich = file?.richResult
+  if (!file || !rich) return
+  const firstId = failedProtos.value[0]
+  if (firstId !== undefined) {
+    const proto = rich.protos[firstId]
+    const line = proto?.generatedLineStart || proto?.lineStart || 1
+    const end = proto?.generatedLineEnd || proto?.lineEnd || line
+    jumpToFileLine?.(file.id, line, end)
+    return
+  }
+  const idx = codeContent.value.split('\n').findIndex((l) => l.includes('[unluac error]'))
+  if (idx >= 0) jumpToFileLine?.(file.id, idx + 1)
+}
 </script>
 
 <template>
@@ -357,12 +403,53 @@ function restoreOriginal() {
       class="code-toolbar"
       style="border-bottom: 1px solid var(--app-border)"
     >
-      <span class="flex-1 truncate text-sm" style="color: var(--app-text-secondary)">
+      <span class="flex-1 truncate text-sm font-medium" style="color: var(--app-text-secondary)">
         {{ t('tabs.code') }} <span class="code-file-path">/ {{ selectedFile?.relativePath }}</span>
       </span>
 
-      <NButton quaternary size="small" :aria-label="t('workspace.wrapLines')" :title="t('workspace.wrapLines')" :aria-pressed="wrapLines" @click="wrapLines = !wrapLines"><template #icon><i-mdi-wrap /></template></NButton>
-      <span v-if="copied" class="copy-feedback" role="status">{{ t('codeView.copied') }}</span>
+      <NTooltip>
+        <template #trigger>
+          <NButton
+            quaternary
+            size="small"
+            :aria-label="t('globalSearch.open')"
+            @click="shortcutActions.openGlobalSearch?.()"
+          >
+            <template #icon><i-mdi-file-search-outline /></template>
+          </NButton>
+        </template>
+        {{ t('globalSearch.openHint') }}
+      </NTooltip>
+
+      <NTooltip v-if="canOpenDiff">
+        <template #trigger>
+          <NButton
+            quaternary
+            size="small"
+            :aria-label="t('tabs.diff')"
+            @click="emit('open-diff')"
+          >
+            <template #icon><i-mdi-file-compare /></template>
+          </NButton>
+        </template>
+        {{ t('diff.openHint') }}
+      </NTooltip>
+
+      <NButton
+        quaternary
+        size="small"
+        :aria-label="t('workspace.wrapLines')"
+        :title="t('workspace.wrapLines')"
+        :aria-pressed="wrapLines"
+        @click="wrapLines = !wrapLines"
+      >
+        <template #icon><i-mdi-wrap /></template>
+      </NButton>
+
+      <span v-if="copied || copiedAi" class="copy-feedback" role="status">
+        {{ copiedAi ? t('codeView.copiedForAi') : t('codeView.copied') }}
+      </span>
+
       <!-- 已修改警告 -->
       <NTooltip v-if="isModified">
         <template #trigger>
@@ -386,6 +473,19 @@ function restoreOriginal() {
           </NButton>
         </template>
         {{ t('codeView.restore') }}
+      </NTooltip>
+
+      <NTooltip>
+        <template #trigger>
+          <NButton quaternary size="small" :aria-label="t('codeView.copyForAi')" @click="copyForAi">
+            <template #icon>
+              <NIcon>
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16z"/></svg>
+              </NIcon>
+            </template>
+          </NButton>
+        </template>
+        {{ copiedAi ? t('codeView.copiedForAi') : t('codeView.copyForAiHint') }}
       </NTooltip>
 
       <NTooltip>
@@ -414,59 +514,94 @@ function restoreOriginal() {
         {{ t('codeView.download') }}
       </NTooltip>
 
-      <NTooltip v-if="filesStore.files.filter(f => f.status === 'success').length > 1">
+      <NTooltip v-if="exportableFiles.length > 1">
         <template #trigger>
-          <NButton quaternary size="small" :aria-label="t('codeView.downloadAll')" @click="downloadAll">
-            <template #icon>
-              <NIcon>
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/><line x1="3" y1="21" x2="21" y2="21"/></svg>
-              </NIcon>
-            </template>
+          <NButton quaternary size="small" :aria-label="t('codeView.downloadAll')" @click="downloadAllZip">
+            <template #icon><i-mdi-folder-zip-outline /></template>
           </NButton>
         </template>
-        {{ t('codeView.downloadAll') }}
+        {{ t('codeView.downloadAllZip') }}
       </NTooltip>
     </div>
 
     <!-- 编辑器区域 -->
     <div class="relative min-h-0 flex-1">
-      <!-- 占位符 -->
-      <div
-        v-if="showPlaceholder"
-        class="flex h-full items-center justify-center"
-      >
+      <div v-if="showPlaceholder" class="flex h-full items-center justify-center">
         <NEmpty :description="t('codeView.placeholder')" />
       </div>
 
-      <!-- 错误展示 -->
-      <div
-        v-else-if="showError"
-        class="flex h-full items-center justify-center p-8"
-      >
+      <div v-else-if="showError" class="flex h-full items-center justify-center p-8">
         <NAlert type="error" :title="t('codeView.error')">
           {{ selectedFile?.error }}
         </NAlert>
       </div>
 
-      <!-- CodeMirror -->
-      <div
-        v-show="showCode"
-        ref="editorContainer"
-        class="h-full"
-      />
+      <div v-show="showCode" ref="editorContainer" class="h-full" />
 
-      <!-- 加载中 -->
       <div
         v-if="selectedFile?.status === 'processing'"
         class="flex h-full items-center justify-center"
       >
-        <div class="flex items-center gap-2 text-sm text-gray-500">
+        <div class="flex items-center gap-2 text-sm" style="color: var(--app-text-secondary)">
           <svg class="h-4 w-4 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
             <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
           </svg>
           {{ t('filePanel.status.processing') }}…
         </div>
+      </div>
+    </div>
+
+    <!-- 底部 28px IDE 状态栏 -->
+    <div v-if="showCode && selectedFile" class="ide-status-bar">
+      <div class="flex min-w-0 items-center gap-2">
+        <NDropdown
+          v-if="selectedFile.status === 'success'"
+          trigger="click"
+          :options="dialectMenu"
+          @select="(value: UnluacDialect) => changeDialect(selectedFile!.id, value)"
+        >
+          <button type="button" class="status-pill status-pill-accent" :title="t('filePanel.fileDialect')">
+            {{ currentDialectLabel }}
+          </button>
+        </NDropdown>
+        <span v-else class="status-pill">{{ currentDialectLabel }}</span>
+
+        <button
+          v-if="hasDiagnostics"
+          type="button"
+          class="status-diag-pill"
+          :title="t('statusBar.diagnosticHint')"
+          @click="jumpToFirstDiagnostic"
+        >
+          ⚠ {{ failedProtos.length > 0 ? t('statusBar.failedProtos', { count: failedProtos.length }) : t('statusBar.diagnostic') }}
+        </button>
+
+        <div class="hidden items-center gap-1 md:flex">
+          <button
+            v-for="preset in presetItems"
+            :key="preset.id"
+            type="button"
+            class="status-preset-pill"
+            :class="{ active: settingsStore.activePreset === preset.id }"
+            @click="settingsStore.applyPreset(preset.id)"
+          >
+            {{ preset.label }}
+          </button>
+        </div>
+      </div>
+
+      <div class="flex shrink-0 items-center gap-2.5">
+        <span class="hidden tabular-nums sm:inline">{{ lineCount }} {{ t('statusBar.lines') }} · {{ formattedSize }}</span>
+        <span class="hidden uppercase sm:inline">{{ settingsStore.options.parse.stringEncoding }}</span>
+        <button
+          type="button"
+          class="status-pill"
+          :title="t('globalSearch.openHint')"
+          @click="shortcutActions.openGlobalSearch?.()"
+        >
+          ⌘⇧F
+        </button>
       </div>
     </div>
   </div>

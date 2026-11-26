@@ -2,29 +2,29 @@
 /**
  * 对比查看组件。
  *
- * 使用 @codemirror/merge 提供两个反编译结果的并排 diff 视图。
- * 用户从顶部下拉框选择左右文件，组件自动展示差异。
- * 支持深色/浅色主题切换。
+ * 支持两种模式：
+ * 1. 「已修改 vs 原始结果」：对比当前文件的手动编辑与原始反编译源码；
+ * 2. 「双文件对比」：对比工作区内任意两个已反编译/源码文件。
  */
 
 import { StreamLanguage } from '@codemirror/language'
 import { lua } from '@codemirror/legacy-modes/mode/lua'
 import { MergeView } from '@codemirror/merge'
 import { EditorState } from '@codemirror/state'
-import { oneDark } from '@codemirror/theme-one-dark'
 import { EditorView, lineNumbers } from '@codemirror/view'
-import {
-  computed,
-  inject,
-  onUnmounted,
-  type ShallowRef,
-  shallowRef,
-  useTemplateRef,
-  watch,
-} from 'vue'
+import { computed, onUnmounted, shallowRef, useTemplateRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useTheme } from '@/composables/useTheme'
 import { useFilesStore } from '@/stores/files'
+import { createUnluacEditorTheme } from '@/utils/editorTheme'
+
+const props = defineProps<{
+  initialRightFileId?: string | null
+}>()
+
+const emit = defineEmits<{
+  close: []
+}>()
 
 const { t } = useI18n()
 const filesStore = useFilesStore()
@@ -33,60 +33,51 @@ const { isDark } = useTheme()
 const containerRef = useTemplateRef<HTMLDivElement>('diffContainer')
 let mergeViewInstance: MergeView | null = null
 
-/** 左右选中的文件 id */
+const diffMode = shallowRef<'files' | 'edits'>('files')
 const leftFileId = shallowRef<string | null>(null)
 const rightFileId = shallowRef<string | null>(null)
 
-/**
- * 外部触发对比时的目标文件 id（由 MainContent provide）。
- * 收到后设为右侧文件。
- */
-const compareTargetId = inject<ShallowRef<string | null>>('compareTargetId', shallowRef(null))
+const selectedFile = computed(() => filesStore.selectedFile)
+const selectedHasEdits = computed(() => selectedFile.value?.editedResult !== undefined)
 
-watch(
-  compareTargetId,
-  (id) => {
-    if (id) rightFileId.value = id
-  },
-  { immediate: true },
-)
-
-/** 可选文件列表 —— 只列出已反编译成功的文件 */
 const fileOptions = computed(() =>
   filesStore.files
-    .filter((f) => f.status === 'success' && f.result)
-    .map((f) => ({ label: f.name, value: f.id })),
+    .filter((f) => (f.status === 'success' || f.status === 'skipped') && f.result !== undefined)
+    .map((f) => ({ label: f.relativePath, value: f.id })),
 )
 
-const leftContent = computed(
-  () => filesStore.files.find((f) => f.id === leftFileId.value)?.result ?? '',
-)
-const rightContent = computed(
-  () => filesStore.files.find((f) => f.id === rightFileId.value)?.result ?? '',
-)
+const leftContent = computed(() => {
+  if (diffMode.value === 'edits') return selectedFile.value?.result ?? ''
+  const f = filesStore.files.find((item) => item.id === leftFileId.value)
+  return f ? (f.editedResult ?? f.result ?? '') : ''
+})
 
-/** 两侧都选中有效文件时才渲染 diff */
-const canDiff = computed(
-  () =>
-    leftFileId.value !== null &&
-    rightFileId.value !== null &&
-    leftContent.value !== '' &&
-    rightContent.value !== '',
-)
+const rightContent = computed(() => {
+  if (diffMode.value === 'edits') return selectedFile.value?.editedResult ?? ''
+  const f = filesStore.files.find((item) => item.id === rightFileId.value)
+  return f ? (f.editedResult ?? f.result ?? '') : ''
+})
+
+const canDiff = computed(() => {
+  if (diffMode.value === 'edits') {
+    return selectedHasEdits.value && selectedFile.value?.result !== undefined
+  }
+  return leftFileId.value !== null && rightFileId.value !== null
+})
 
 function createExtensions(dark: boolean) {
-  const exts = [
+  return [
     EditorView.editable.of(false),
     EditorState.readOnly.of(true),
     lineNumbers(),
     StreamLanguage.define(lua),
-    EditorView.theme({
-      '&': { height: '100%' },
-      '.cm-scroller': { overflow: 'auto' },
-    }),
+    createUnluacEditorTheme(dark),
   ]
-  if (dark) exts.push(oneDark)
-  return exts
+}
+
+function destroyMergeView() {
+  mergeViewInstance?.destroy()
+  mergeViewInstance = null
 }
 
 function buildMergeView() {
@@ -102,31 +93,38 @@ function buildMergeView() {
   })
 }
 
-function destroyMergeView() {
-  mergeViewInstance?.destroy()
-  mergeViewInstance = null
-}
-
-// 文件选择或内容变化时重建 diff
-watch([leftFileId, rightFileId], () => {
-  buildMergeView()
-})
-
-// 主题变化时重建
-watch(isDark, () => {
-  if (canDiff.value) buildMergeView()
-})
-
-// 当前选中的文件变化时，自动设定为左侧（方便快速对比）
 watch(
-  () => filesStore.selectedFileId,
-  (id) => {
-    if (id && filesStore.files.find((f) => f.id === id)?.status === 'success') {
-      leftFileId.value = id
+  [() => props.initialRightFileId, () => filesStore.selectedFileId, fileOptions],
+  ([targetRight, selectedId, opts]) => {
+    if (targetRight) {
+      diffMode.value = 'files'
+      rightFileId.value = targetRight
+      const other =
+        selectedId && selectedId !== targetRight
+          ? selectedId
+          : (opts.find((o) => o.value !== targetRight)?.value ?? targetRight)
+      leftFileId.value = other
+      return
+    }
+    if (selectedHasEdits.value && opts.length < 2) {
+      diffMode.value = 'edits'
+      return
+    }
+    if (!leftFileId.value && selectedId && opts.some((o) => o.value === selectedId)) {
+      leftFileId.value = selectedId
+    }
+    if (!rightFileId.value && opts.length >= 2) {
+      rightFileId.value = opts.find((o) => o.value !== leftFileId.value)?.value ?? opts[0].value
+    } else if (selectedHasEdits.value && !rightFileId.value) {
+      diffMode.value = 'edits'
     }
   },
   { immediate: true },
 )
+
+watch([diffMode, leftContent, rightContent, isDark], () => {
+  buildMergeView()
+})
 
 onUnmounted(() => {
   destroyMergeView()
@@ -135,49 +133,80 @@ onUnmounted(() => {
 
 <template>
   <div class="flex h-full flex-col">
-    <!-- 文件选择器栏 -->
     <div
-      class="flex shrink-0 items-center gap-3 border-b border-gray-200 px-3 py-1.5 dark:border-gray-700"
+      class="code-toolbar gap-2"
+      style="border-bottom: 1px solid var(--app-border); background: var(--app-bg-alt)"
     >
-      <div class="flex items-center gap-1.5">
-        <span class="text-xs text-gray-500 dark:text-gray-400">{{ t('diff.left') }}:</span>
-        <NSelect
-          :value="leftFileId"
-          :options="fileOptions"
-          size="tiny"
-          class="w-44"
-          clearable
-          :placeholder="t('diff.selectFile')"
-          @update:value="(v: string | null) => (leftFileId = v)"
-        />
+      <div class="segmented-toggle">
+        <button
+          v-if="selectedHasEdits"
+          type="button"
+          class="segmented-btn"
+          :class="{ active: diffMode === 'edits' }"
+          @click="diffMode = 'edits'"
+        >
+          {{ t('diff.editsVsOriginal') }}
+        </button>
+        <button
+          type="button"
+          class="segmented-btn"
+          :class="{ active: diffMode === 'files' }"
+          @click="diffMode = 'files'"
+        >
+          {{ t('diff.compareFiles') }}
+        </button>
       </div>
-      <span class="text-xs text-gray-400">↔</span>
-      <div class="flex items-center gap-1.5">
-        <span class="text-xs text-gray-500 dark:text-gray-400">{{ t('diff.right') }}:</span>
-        <NSelect
-          :value="rightFileId"
-          :options="fileOptions"
-          size="tiny"
-          class="w-44"
-          clearable
-          :placeholder="t('diff.selectFile')"
-          @update:value="(v: string | null) => (rightFileId = v)"
-        />
-      </div>
+
+      <template v-if="diffMode === 'files'">
+        <div class="flex items-center gap-1.5">
+          <span class="text-xs" style="color: var(--app-text-secondary)">{{ t('diff.left') }}:</span>
+          <NSelect
+            :value="leftFileId"
+            :options="fileOptions"
+            size="tiny"
+            class="w-44"
+            clearable
+            :placeholder="t('diff.selectFile')"
+            @update:value="(v: string | null) => (leftFileId = v)"
+          />
+        </div>
+        <span class="text-xs" style="color: var(--app-text-dim)">↔</span>
+        <div class="flex items-center gap-1.5">
+          <span class="text-xs" style="color: var(--app-text-secondary)">{{ t('diff.right') }}:</span>
+          <NSelect
+            :value="rightFileId"
+            :options="fileOptions"
+            size="tiny"
+            class="w-44"
+            clearable
+            :placeholder="t('diff.selectFile')"
+            @update:value="(v: string | null) => (rightFileId = v)"
+          />
+        </div>
+      </template>
+      <span v-else class="text-xs" style="color: var(--app-text-secondary)">
+        {{ selectedFile?.relativePath }}
+      </span>
+
+      <NButton
+        quaternary
+        size="tiny"
+        class="ml-auto"
+        :aria-label="t('tabs.contextMenu.close')"
+        @click="emit('close')"
+      >
+        <template #icon><i-mdi-close /></template>
+      </NButton>
     </div>
 
-    <!-- Diff 视图 -->
     <div class="relative min-h-0 flex-1">
-      <div
-        v-if="!canDiff"
-        class="flex h-full items-center justify-center"
-      >
+      <div v-if="!canDiff" class="flex h-full items-center justify-center">
         <NEmpty :description="t('diff.hint')" />
       </div>
       <div
         v-show="canDiff"
         ref="diffContainer"
-        class="h-full w-full overflow-hidden text-sm [&_.cm-mergeView]:h-full"
+        class="h-full w-full overflow-hidden text-sm [&_.cm-mergeView]:h-full [&_.cm-mergeViewEditors]:h-full"
       />
     </div>
   </div>

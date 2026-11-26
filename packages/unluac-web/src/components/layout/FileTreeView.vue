@@ -8,9 +8,8 @@
  * 如果所有文件都在根目录（无嵌套），则退化为普通扁平列表。
  */
 
-import type { UnluacDialect } from '@/types/decompiler'
 import { computed, reactive } from 'vue'
-import type { FileEntry } from '@/types/decompiler'
+import type { FileEntry, UnluacDialect } from '@/types/decompiler'
 
 interface TreeFolder {
   type: 'folder'

@@ -19,8 +19,8 @@ import {
   deleteFileRecords,
   type FileHistoryRecord,
   getAllFileRecords,
-  putFileRecords,
   putFileDialect,
+  putFileRecords,
 } from '@/composables/useFileHistoryDB'
 import type {
   DecompileOptions,
@@ -183,7 +183,11 @@ export const useFilesStore = defineStore('files', () => {
   }
 
   /** 原始文件与冻结参数共同产生一个新结果代次，旧异步任务不得向该代次提交。 */
-  function beginDecompile(id: string, defaults: DecompileOptions): FileEntry | undefined {
+  function beginDecompile(
+    id: string,
+    defaults: DecompileOptions,
+    opts: { preserveEdited?: boolean } = {},
+  ): FileEntry | undefined {
     const file = files.value.find((f) => f.id === id)
     if (!file) return undefined
     const resultOptions: DecompileOptions = JSON.parse(JSON.stringify(defaults))
@@ -196,7 +200,7 @@ export const useFilesStore = defineStore('files', () => {
       result: undefined,
       richResult: undefined,
       error: undefined,
-      editedResult: undefined,
+      editedResult: opts.preserveEdited ? file.editedResult : undefined,
     }
     files.value = files.value.map((f) => (f.id === id ? next : f))
     return next

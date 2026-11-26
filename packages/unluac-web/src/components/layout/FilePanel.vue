@@ -17,18 +17,19 @@ import {
   h,
   inject,
   onMounted,
+  onUnmounted,
   type ShallowRef,
   shallowRef,
   useTemplateRef,
   watch,
 } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useFileDecompile } from '@/composables/useFileDecompile'
-import type { UnluacDialect } from '@/types/decompiler'
 import type { useDecompiler } from '@/composables/useDecompiler'
+import { useFileDecompile } from '@/composables/useFileDecompile'
 import { matchGlob, useFileDrop } from '@/composables/useFileDrop'
 import { useFilesStore } from '@/stores/files'
 import { useSettingsStore } from '@/stores/settings'
+import type { UnluacDialect } from '@/types/decompiler'
 import { shouldIgnoreDocumentShortcutTarget } from '@/utils/keyboard'
 
 const emit = defineEmits<{ selected: [] }>()
@@ -255,7 +256,8 @@ onMounted(async () => {
   }
 })
 
-/** 非方言设置继续应用到已有文件；方言仅是新导入文件的默认值。 */
+/** 非方言设置继续应用到已有文件；防抖 250ms 并复用热 Worker，同时保留用户的手动编辑。 */
+let recompileTimer: ReturnType<typeof setTimeout> | null = null
 watch(
   () => [
     settingsStore.options.parse,
@@ -264,14 +266,35 @@ watch(
     settingsStore.options.generate,
   ],
   () => {
-    decompiler.cancelAll()
-    const filesToRecompile = filesStore.files.filter((f) => f.status !== 'skipped')
-    for (const file of filesToRecompile) {
-      decompileFile(file.id)
-    }
+    if (recompileTimer) clearTimeout(recompileTimer)
+    recompileTimer = setTimeout(() => {
+      recompileTimer = null
+      decompiler.cancelPending()
+      const filesToRecompile = filesStore.files.filter((f) => f.status !== 'skipped')
+      for (const file of filesToRecompile) {
+        void decompileFile(file.id, { preserveEdited: true })
+      }
+    }, 250)
   },
   { deep: true },
 )
+
+onUnmounted(() => {
+  if (recompileTimer) clearTimeout(recompileTimer)
+})
+
+function confirmClearWorkspace() {
+  dialog.warning({
+    title: t('filePanel.clearWorkspaceConfirm'),
+    positiveText: 'OK',
+    negativeText: t('filePanel.globDialog.cancel'),
+    onPositiveClick: () => {
+      decompiler.cancelPending()
+      filesStore.clearAllFiles()
+    },
+  })
+}
+
 function selectFile(id: string) {
   filesStore.selectFile(id)
   emit('selected')
@@ -284,6 +307,34 @@ defineExpose({ onDrop, isDragging, handleDragOver, handleDragLeave })
   <aside class="file-panel" :aria-label="t('filePanel.title')" @keydown="handleKeyNavigation">
     <div class="panel-heading">
       <span>{{ t('workspace.files') }}</span><span class="count-badge">{{ filesStore.files.length }}</span>
+      <div v-if="filesStore.files.length > 0" class="ml-auto flex items-center gap-0.5">
+        <NTooltip>
+          <template #trigger>
+            <button
+              type="button"
+              class="icon-button"
+              :aria-label="t('globalSearch.open')"
+              @click="shortcutActions.openGlobalSearch?.()"
+            >
+              <i-mdi-file-search-outline />
+            </button>
+          </template>
+          {{ t('globalSearch.openHint') }}
+        </NTooltip>
+        <NTooltip>
+          <template #trigger>
+            <button
+              type="button"
+              class="icon-button"
+              :aria-label="t('filePanel.clearWorkspace')"
+              @click="confirmClearWorkspace"
+            >
+              <i-mdi-trash-can-outline />
+            </button>
+          </template>
+          {{ t('filePanel.clearWorkspace') }}
+        </NTooltip>
+      </div>
     </div>
     <div class="import-actions">
       <NButton type="primary" @click="openFilePicker"><template #icon><i-mdi-plus /></template>{{ t('filePanel.openFile') }}</NButton>

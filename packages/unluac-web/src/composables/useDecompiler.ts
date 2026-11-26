@@ -101,6 +101,11 @@ export function useDecompiler() {
     }
   }
 
+  /** 取消所有在途请求但保留已预热的 Worker 实例（用于参数微调时的热重算） */
+  function cancelPending(message = 'Cancelled') {
+    for (const id of [...pending.keys()]) rejectRequest(id, message)
+  }
+
   onUnmounted(() => terminate())
   // 首页阅读不需要下载 WASM；首个识别/反编译请求才启动 Worker。
   return {
@@ -115,6 +120,7 @@ export function useDecompiler() {
       signal?: AbortSignal,
     ) => request('decompile-rich', id, bytes, options, signal),
     cancel,
+    cancelPending,
     cancelAll: () => terminate('Cancelled'),
     terminate,
   }

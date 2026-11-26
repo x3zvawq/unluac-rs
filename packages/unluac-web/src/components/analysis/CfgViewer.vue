@@ -3,14 +3,8 @@
  * CFG 可视化组件。
  *
  * 将选中 proto 的控制流图以有向图形式展示。
- * 每个 BasicBlock 渲染为节点（内含 Low-IR 指令列表），
- * 每条边标注类型并用颜色区分（正常灰 / 回边红 / 分支蓝绿）。
- *
- * 布局使用 dagre 自动计算 DAG 布局位置。
- *
- * 性能优化：
- * - only-render-visible-elements：视口外节点/边不渲染 DOM
- * - 缩放感知降级：zoom < 0.4 时节点只显示块 ID，不渲染指令列表
+ * 对超大 CFG（> 220 基本块）自动聚焦入口邻域，并在全图超过 300 块时使用轻量网格兜底，
+ * 避免 dagre 布局卡死主线程。
  */
 
 import dagre from '@dagrejs/dagre'
@@ -38,21 +32,19 @@ const props = defineProps<{
 const { t } = useI18n()
 const { fitView, viewport } = useVueFlow()
 
-/** 聚焦到某个块的 N 层邻居，null 表示显示全图 */
 const focusBlockId = shallowRef<number | null>(null)
 const FOCUS_HOPS = 3
-
-/** zoom 低于此阈值时节点内容简化为只显示块 ID（减少 DOM 开销） */
+const AUTO_FOCUS_THRESHOLD = 220
+const DAGRE_MAX_BLOCKS = 300
 const ZOOM_DETAIL_THRESHOLD = 0.4
 
 const NODE_WIDTH = 280
 const INSTR_LINE_HEIGHT = 18
 const NODE_PADDING = 32
 
-/** 边类型对应的颜色 */
 const EDGE_COLORS: Record<string, string> = {
-  fallthrough: '#9ca3af',
-  jump: '#6b7280',
+  fallthrough: '#8795b0',
+  jump: '#64748b',
   'branch-true': '#22c55e',
   'branch-false': '#ef4444',
   'loop-body': '#f59e0b',
@@ -66,12 +58,8 @@ function estimateNodeHeight(block: CfgBlock): number {
   return NODE_PADDING + Math.max(lines.length, 1) * INSTR_LINE_HEIGHT
 }
 
-/**
- * 从 centerId 出发，BFS 收集 N 跳内可达的所有块 id（双向）。
- */
 function collectNHopNeighbors(cfg: ProtoCfg, centerId: number, hops: number): Set<number> {
   const neighbors = new Set<number>([centerId])
-  // 构建双向邻接表
   const adj = new Map<number, number[]>()
   for (const block of cfg.blocks) {
     adj.set(block.id, [])
@@ -96,33 +84,49 @@ function collectNHopNeighbors(cfg: ProtoCfg, centerId: number, hops: number): Se
   return neighbors
 }
 
-/**
- * 使用 dagre 计算 DAG 布局。
- * 返回节点位置 map。
- */
-function computeDagreLayout(cfg: ProtoCfg): Map<number, { x: number; y: number }> {
+function computeGridFallbackLayout(blocks: CfgBlock[]): Map<number, { x: number; y: number }> {
+  const positions = new Map<number, { x: number; y: number }>()
+  const cols = Math.max(1, Math.ceil(Math.sqrt(blocks.length)))
+  for (let i = 0; i < blocks.length; i++) {
+    const col = i % cols
+    const row = Math.floor(i / cols)
+    positions.set(blocks[i].id, {
+      x: col * (NODE_WIDTH + 48),
+      y: row * 240,
+    })
+  }
+  return positions
+}
+
+function computeDagreLayout(
+  blocks: CfgBlock[],
+  edges: ProtoCfg['edges'],
+): Map<number, { x: number; y: number }> {
+  if (blocks.length > DAGRE_MAX_BLOCKS) {
+    return computeGridFallbackLayout(blocks)
+  }
+
   const g = new dagre.graphlib.Graph()
-  g.setGraph({ rankdir: 'TB', ranksep: 60, nodesep: 40 })
+  g.setGraph({ rankdir: 'TB', ranksep: 56, nodesep: 36 })
   g.setDefaultEdgeLabel(() => ({}))
 
-  for (const block of cfg.blocks) {
+  for (const block of blocks) {
     g.setNode(String(block.id), {
       width: NODE_WIDTH,
       height: estimateNodeHeight(block),
     })
   }
 
-  for (const edge of cfg.edges) {
+  for (const edge of edges) {
     g.setEdge(String(edge.from), String(edge.to))
   }
 
   dagre.layout(g)
 
   const positions = new Map<number, { x: number; y: number }>()
-  for (const block of cfg.blocks) {
+  for (const block of blocks) {
     const node = g.node(String(block.id))
     if (node) {
-      // dagre 返回中心点，转换为左上角
       positions.set(block.id, {
         x: node.x - NODE_WIDTH / 2,
         y: node.y - estimateNodeHeight(block) / 2,
@@ -132,18 +136,10 @@ function computeDagreLayout(cfg: ProtoCfg): Map<number, { x: number; y: number }
   return positions
 }
 
-// 聚焦只过滤完整布局；切换 CFG 或指令模式时才需重新运行 dagre。
-const layoutPositions = computed(() =>
-  props.cfg ? computeDagreLayout(props.cfg) : new Map<number, { x: number; y: number }>(),
-)
-
 const graphData = computed(() => {
   const cfg = props.cfg
   if (!cfg) return { nodes: [], edges: [] }
 
-  const positions = layoutPositions.value
-
-  // 聚焦模式：只显示 N 跳邻居
   const visibleIds =
     focusBlockId.value !== null ? collectNHopNeighbors(cfg, focusBlockId.value, FOCUS_HOPS) : null
 
@@ -151,6 +147,8 @@ const graphData = computed(() => {
   const filteredEdges = visibleIds
     ? cfg.edges.filter((e) => visibleIds.has(e.from) && visibleIds.has(e.to))
     : cfg.edges
+
+  const positions = computeDagreLayout(filteredBlocks, filteredEdges)
 
   const nodes = filteredBlocks.map((block) => {
     const pos = positions.get(block.id) ?? { x: 0, y: 0 }
@@ -174,8 +172,8 @@ const graphData = computed(() => {
     target: String(edge.to),
     label: edge.kind,
     animated: edge.kind === 'loop-body',
-    style: { stroke: EDGE_COLORS[edge.kind] ?? '#9ca3af' },
-    labelStyle: { fontSize: '10px', fill: EDGE_COLORS[edge.kind] ?? '#9ca3af' },
+    style: { stroke: EDGE_COLORS[edge.kind] ?? '#8795b0', strokeWidth: 1.5 },
+    labelStyle: { fontSize: '10px', fill: EDGE_COLORS[edge.kind] ?? '#8795b0' },
   }))
 
   return { nodes, edges }
@@ -188,15 +186,15 @@ watch(
   },
 )
 
-/** cfg 切换时重置聚焦状态 */
+/** cfg 切换时重置聚焦状态；超大 CFG 默认自动聚焦入口块，避免布局阻塞 */
 watch(
   () => props.cfg,
-  () => {
-    focusBlockId.value = null
+  (cfg) => {
+    focusBlockId.value = cfg && cfg.blocks.length > AUTO_FOCUS_THRESHOLD ? cfg.entryBlock : null
   },
+  { immediate: true },
 )
 
-/** 双击节点聚焦子图，再次双击同一节点取消聚焦 */
 function onNodeDoubleClick({ node }: { node: { id: string } }) {
   const blockId = Number(node.id)
   focusBlockId.value = focusBlockId.value === blockId ? null : blockId
@@ -206,10 +204,6 @@ function clearFocus() {
   focusBlockId.value = null
 }
 
-/**
- * 自定义 CFG 基本块节点渲染。
- * 显示块 ID、类型标签和指令列表。
- */
 function CfgBlockNode(nodeProps: {
   data: { block: CfgBlock; isEntry: boolean; isExit: boolean; isFocusCenter: boolean }
 }) {
@@ -217,19 +211,21 @@ function CfgBlockNode(nodeProps: {
   const isDetailView = viewport.value.zoom >= ZOOM_DETAIL_THRESHOLD
   const lines = props.instrMode === 'bytecode' ? block.rawInstructions : block.instructions
 
-  // 边框颜色：聚焦中心橙/入口绿/出口紫/普通灰
-  const borderClass = isFocusCenter
-    ? 'border-amber-500 dark:border-amber-400 ring-2 ring-amber-300/50'
+  const accentColor = isFocusCenter
+    ? '#f59e0b'
     : isEntry
-      ? 'border-green-500 dark:border-green-400'
+      ? 'var(--app-accent)'
       : isExit
-        ? 'border-purple-500 dark:border-purple-400'
-        : 'border-gray-300 dark:border-gray-600'
+        ? '#8b5cf6'
+        : 'var(--app-border)'
 
   const badge = isEntry
     ? h(
         'span',
-        { class: 'rounded bg-green-100 px-1 text-green-700 dark:bg-green-900 dark:text-green-300' },
+        {
+          class: 'rounded px-1.5 py-0.2 text-[10px] font-medium',
+          style: { background: 'var(--app-accent-soft)', color: 'var(--app-accent)' },
+        },
         t('analysis.cfgViewer.entry'),
       )
     : isExit
@@ -237,7 +233,7 @@ function CfgBlockNode(nodeProps: {
           'span',
           {
             class:
-              'rounded bg-purple-100 px-1 text-purple-700 dark:bg-purple-900 dark:text-purple-300',
+              'rounded bg-purple-100 px-1.5 py-0.2 text-[10px] font-medium text-purple-700 dark:bg-purple-900/50 dark:text-purple-300',
           },
           t('analysis.cfgViewer.exit'),
         )
@@ -247,7 +243,10 @@ function CfgBlockNode(nodeProps: {
     block.kind !== 'normal'
       ? h(
           'span',
-          { class: 'rounded bg-gray-100 px-1 text-gray-600 dark:bg-gray-700 dark:text-gray-300' },
+          {
+            class: 'rounded px-1 text-[10px]',
+            style: { background: 'var(--app-bg-hover)', color: 'var(--app-text-secondary)' },
+          },
           block.kind,
         )
       : null
@@ -255,27 +254,34 @@ function CfgBlockNode(nodeProps: {
   return h(
     'div',
     {
-      class: `rounded-lg border-2 bg-white px-2 py-1.5 shadow-sm dark:bg-gray-800 text-xs font-mono ${borderClass}`,
+      class: 'rounded-lg border px-2.5 py-2 font-mono text-xs shadow-sm',
+      style: {
+        background: 'var(--app-bg)',
+        color: 'var(--app-text)',
+        borderColor: accentColor,
+        borderTopWidth: isEntry || isExit || isFocusCenter ? '3px' : '1px',
+      },
     },
     [
-      h('div', { class: 'flex items-center gap-1 mb-1 font-sans' }, [
+      h('div', { class: 'mb-1.5 flex items-center gap-1.5 font-sans' }, [
         h('span', { class: 'font-semibold' }, `B${block.id}`),
         badge,
         kindLabel,
-        // 缩放过小时显示指令数量提示
         !isDetailView && block.instructions.length > 0
-          ? h('span', { class: 'text-gray-400 ml-auto' }, `${block.instructions.length} instrs`)
+          ? h(
+              'span',
+              { class: 'ml-auto text-[10px]', style: { color: 'var(--app-text-dim)' } },
+              `${block.instructions.length} instrs`,
+            )
           : null,
       ]),
-      // 仅在 zoom >= 阈值时渲染完整指令列表
       isDetailView
         ? block.instructions.length > 0
           ? h(
               'div',
               {
-                class:
-                  'cfg-node-scroll space-y-0 text-gray-700 dark:text-gray-300 max-h-48 overflow-y-auto',
-                // 阻止滚轮事件冒泡到 VueFlow，使节点内容可独立滚动
+                class: 'cfg-node-scroll max-h-48 space-y-0 overflow-y-auto',
+                style: { color: 'var(--app-text-secondary)' },
                 onWheel: (e: WheelEvent) => e.stopPropagation(),
               },
               lines.map((instr, i) =>
@@ -283,14 +289,14 @@ function CfgBlockNode(nodeProps: {
                   'div',
                   {
                     key: i,
-                    class: 'truncate hover:text-clip leading-[18px]',
+                    class: 'truncate leading-[18px] hover:text-clip',
                     title: instr,
                   },
                   instr,
                 ),
               ),
             )
-          : h('div', { class: 'text-gray-400 italic' }, '(empty)')
+          : h('div', { class: 'italic', style: { color: 'var(--app-text-dim)' } }, '(empty)')
         : null,
     ],
   )
@@ -298,48 +304,45 @@ function CfgBlockNode(nodeProps: {
 </script>
 
 <template>
-  <!-- 外层容器使用 flex-col 确保 toolbar 不挤占 VueFlow 空间 -->
   <div class="flex h-full w-full flex-col">
     <div v-if="!cfg" class="flex h-full items-center justify-center">
       <NEmpty :description="t('analysis.selectProto')" />
     </div>
     <template v-else>
-      <!-- 聚焦模式提示条 -->
       <div
         v-if="focusBlockId !== null"
-        class="flex shrink-0 items-center gap-2 border-b border-amber-200 bg-amber-50 px-3 py-1 text-xs dark:border-amber-800 dark:bg-amber-950"
+        class="flex shrink-0 items-center gap-2 border-b border-amber-200 bg-amber-50 px-3 py-1 text-xs dark:border-amber-800/60 dark:bg-amber-950/40"
       >
         <span class="text-amber-700 dark:text-amber-300">
           {{ t('analysis.cfgViewer.focusHint', { block: `B${focusBlockId}`, hops: FOCUS_HOPS }) }}
         </span>
         <button
-          class="rounded px-1.5 py-0.5 text-amber-600 hover:bg-amber-100 dark:text-amber-400 dark:hover:bg-amber-900"
+          type="button"
+          class="rounded px-1.5 py-0.5 text-amber-700 hover:bg-amber-100 dark:text-amber-300 dark:hover:bg-amber-900/60"
           @click="clearFocus"
         >
           {{ t('analysis.cfgViewer.clearFocus') }}
         </button>
       </div>
       <div class="min-h-0 flex-1">
-      <VueFlow
-        :nodes="graphData.nodes"
-        :edges="graphData.edges"
-        :default-viewport="{ zoom: 1, x: 0, y: 0 }"
-        :min-zoom="0.05"
-        :max-zoom="3"
-        only-render-visible-elements
-        fit-view-on-init
-        @node-double-click="onNodeDoubleClick"
-      >
-        <template #node-cfgBlock="nodeProps">
-          <CfgBlockNode :data="nodeProps.data" />
-        </template>
-        <Background />
-        <Controls />
-        <MiniMap />
-      </VueFlow>
+        <VueFlow
+          :nodes="graphData.nodes"
+          :edges="graphData.edges"
+          :default-viewport="{ zoom: 1, x: 0, y: 0 }"
+          :min-zoom="0.05"
+          :max-zoom="3"
+          only-render-visible-elements
+          fit-view-on-init
+          @node-double-click="onNodeDoubleClick"
+        >
+          <template #node-cfgBlock="nodeProps">
+            <CfgBlockNode :data="nodeProps.data" />
+          </template>
+          <Background :gap="20" :size="1" />
+          <Controls />
+          <MiniMap />
+        </VueFlow>
       </div>
     </template>
   </div>
 </template>
-
-
