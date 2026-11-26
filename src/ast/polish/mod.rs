@@ -518,11 +518,10 @@ fn polish_block(
     // 6. Lua 语法要求 `return`（以及 Lua 5.1/LuaJIT 的 `break`）必须位于所在语句块末尾；
     //    若其后存在标签或其它语句，用 `do ... end` 合法包裹以保语法通过。
     let len = block.stmts.len();
-    for idx in 0..len.saturating_sub(1) {
-        let needs_wrap = matches!(block.stmts[idx], AstStmt::Return(_) | AstStmt::Break);
-        if needs_wrap {
-            let taken = std::mem::replace(&mut block.stmts[idx], AstStmt::Break);
-            block.stmts[idx] = AstStmt::DoBlock(Box::new(AstBlock { stmts: vec![taken] }));
+    for stmt in &mut block.stmts[..len.saturating_sub(1)] {
+        if matches!(stmt, AstStmt::Return(_) | AstStmt::Break) {
+            let taken = std::mem::replace(stmt, AstStmt::Break);
+            *stmt = AstStmt::DoBlock(Box::new(AstBlock { stmts: vec![taken] }));
             changed = true;
         }
     }

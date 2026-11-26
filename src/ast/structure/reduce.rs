@@ -587,8 +587,13 @@ impl<'a> Structurer<'a> {
     fn pure_close_jump_target(&self, block: BlockId, after_close: InstrRef) -> Option<BlockId> {
         let cfg = self.cfg();
         let range = cfg.blocks[block.index()].instrs;
-        for idx in after_close.index()..range.end() {
-            match &self.proto.instrs[idx] {
+        for instr in self
+            .proto
+            .instrs
+            .get(after_close.index()..range.end())
+            .unwrap_or(&[])
+        {
+            match instr {
                 LowInstr::Jump(_) => {}
                 LowInstr::Close(c) if c.kind == CloseKind::Explicit => {}
                 _ => return None,

@@ -1,5 +1,4 @@
 import { readFile, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import process from "node:process";
@@ -7,7 +6,6 @@ import process from "node:process";
 const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const checkOnly = process.argv.includes("--check");
 const printVersion = process.argv.includes("--print-version");
-let shouldRefreshNpmLockfile = false;
 
 const rootManifestPath = resolve(repoRoot, "Cargo.toml");
 const targetFiles = [
@@ -53,9 +51,6 @@ for (const target of targetFiles) {
   if (currentVersion !== rootVersion) {
     mismatches.push(`${target.path}: ${currentVersion} -> ${rootVersion}`);
     if (!checkOnly) {
-      if (target.path === "packages/unluac-js/package.json") {
-        shouldRefreshNpmLockfile = true;
-      }
       if (target.kind === "package-lock") {
         setPackageLockVersion(packageJson, rootVersion);
       } else {
@@ -87,15 +82,10 @@ if (checkOnly) {
   process.exit(1);
 }
 
-if (shouldRefreshNpmLockfile) {
-  await runCommand("npm", ["install", "--package-lock-only"], resolve(repoRoot, "packages/unluac-js"));
-}
-
 process.stdout.write(
   [
     `synced package versions to ${rootVersion}:`,
     ...mismatches.map((entry) => `  - ${entry}`),
-    ...(shouldRefreshNpmLockfile ? ["  - refreshed packages/unluac-js/package-lock.json via npm"] : []),
     "",
   ].join("\n")
 );
@@ -145,29 +135,4 @@ function setPackageLockVersion(packageLock, nextVersion) {
   if (packageLock.packages?.[""]) {
     packageLock.packages[""].version = nextVersion;
   }
-}
-
-async function runCommand(command, args, cwd) {
-  await new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, {
-      cwd,
-      stdio: "inherit",
-    });
-
-    child.on("error", (error) => {
-      rejectPromise(
-        new Error(`failed to start ${command} ${args.join(" ")} in ${cwd}: ${error.message}`)
-      );
-    });
-
-    child.on("close", (code, signal) => {
-      if (signal) {
-        rejectPromise(new Error(`${command} ${args.join(" ")} was terminated by signal ${signal}`));
-      } else if (code !== 0) {
-        rejectPromise(new Error(`${command} ${args.join(" ")} exited with code ${code ?? "unknown"}`));
-      } else {
-        resolvePromise();
-      }
-    });
-  });
 }
