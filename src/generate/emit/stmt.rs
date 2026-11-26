@@ -6,10 +6,9 @@ use crate::ast::pretty::is_default_numeric_for_step_for_target;
 use crate::ast::{
     AstAssign, AstBlock, AstCallStmt, AstFeature, AstFunctionDecl, AstGenericFor, AstGlobalDecl,
     AstIf, AstLabel, AstLocalDecl, AstLocalFunctionDecl, AstNumericFor, AstRepeat, AstReturn,
-    AstStmt, AstWhile,
+    AstStmt, AstWhile, ProtoId,
 };
 use crate::generate::doc::Doc;
-use crate::hir::HirProtoRef;
 
 use super::super::error::GenerateError;
 use super::syntax::format_label_name;
@@ -19,7 +18,7 @@ impl<'a> Emitter<'a> {
     pub(super) fn emit_stmt(
         &self,
         stmt: &AstStmt,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         match stmt {
             AstStmt::LocalDecl(local_decl) => self.emit_local_decl(local_decl, function),
@@ -69,7 +68,7 @@ impl<'a> Emitter<'a> {
     fn emit_local_decl(
         &self,
         local_decl: &AstLocalDecl,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let bindings = local_decl
             .bindings
@@ -87,7 +86,7 @@ impl<'a> Emitter<'a> {
     fn emit_global_decl(
         &self,
         global_decl: &AstGlobalDecl,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         // Generate 只序列化 AST 上已经存在的 global decl，不替前层补猜缺失声明。
         if !self.allows_feature(AstFeature::GlobalDecl) {
@@ -132,31 +131,32 @@ impl<'a> Emitter<'a> {
         Ok(Doc::concat(parts))
     }
 
-    fn emit_assign(&self, assign: &AstAssign, function: HirProtoRef) -> Result<Doc, GenerateError> {
-        if assign.luau_compound_global {
+    fn emit_assign(&self, assign: &AstAssign, function: ProtoId) -> Result<Doc, GenerateError> {
+        if let Some(op) = assign.compound_op {
             if self.target.version != crate::ast::DecompileDialect::Luau {
                 return Err(GenerateError::UnsupportedFeature {
                     dialect: self.target.version,
                     feature: "compound assignment",
                 });
             }
-            let binary = assign
-                .compound_global_binary()
-                .ok_or(GenerateError::UnprovenCompoundAssignment)?;
+            if assign.targets.len() != 1 || assign.values.len() != 1 {
+                return Err(GenerateError::UnprovenCompoundAssignment);
+            }
             use crate::ast::AstBinaryOpKind;
-            let operator = match binary.op {
+            let operator = match op {
                 AstBinaryOpKind::Add => " += ",
                 AstBinaryOpKind::Sub => " -= ",
                 AstBinaryOpKind::Mul => " *= ",
                 AstBinaryOpKind::Div => " /= ",
                 AstBinaryOpKind::Mod => " %= ",
                 AstBinaryOpKind::Pow => " ^= ",
+                AstBinaryOpKind::Concat => " ..= ",
                 _ => return Err(GenerateError::UnprovenCompoundAssignment),
             };
             return Ok(Doc::concat([
                 self.emit_lvalue(&assign.targets[0], function)?,
                 Doc::text(operator),
-                self.emit_expr(&binary.rhs, function, 0, ExprSide::Standalone)?,
+                self.emit_expr(&assign.values[0], function, 0, ExprSide::Standalone)?,
             ]));
         }
         let targets = assign
@@ -175,12 +175,12 @@ impl<'a> Emitter<'a> {
     fn emit_call_stmt(
         &self,
         call_stmt: &AstCallStmt,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         self.emit_call_kind(&call_stmt.call, function)
     }
 
-    fn emit_return(&self, ret: &AstReturn, function: HirProtoRef) -> Result<Doc, GenerateError> {
+    fn emit_return(&self, ret: &AstReturn, function: ProtoId) -> Result<Doc, GenerateError> {
         if ret.values.is_empty() {
             return Ok(Doc::text("return"));
         }
@@ -190,7 +190,7 @@ impl<'a> Emitter<'a> {
         ]))
     }
 
-    fn emit_if(&self, ast_if: &AstIf, function: HirProtoRef) -> Result<Doc, GenerateError> {
+    fn emit_if(&self, ast_if: &AstIf, function: ProtoId) -> Result<Doc, GenerateError> {
         let cond = self.emit_expr(&ast_if.cond, function, 0, ExprSide::Standalone)?;
         let then_body = self.emit_block(&ast_if.then_block, function)?;
         let mut parts = vec![
@@ -208,7 +208,7 @@ impl<'a> Emitter<'a> {
     fn emit_if_else_chain(
         &self,
         else_block: Option<&AstBlock>,
-        function: HirProtoRef,
+        function: ProtoId,
         parts: &mut Vec<Doc>,
     ) -> Result<(), GenerateError> {
         let Some(else_block) = else_block else {
@@ -235,7 +235,7 @@ impl<'a> Emitter<'a> {
     fn emit_while(
         &self,
         ast_while: &AstWhile,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let cond = self.emit_expr(&ast_while.cond, function, 0, ExprSide::Standalone)?;
         let body = self.emit_block(&ast_while.body, function)?;
@@ -249,7 +249,7 @@ impl<'a> Emitter<'a> {
     fn emit_repeat(
         &self,
         ast_repeat: &AstRepeat,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let body = self.emit_block(&ast_repeat.body, function)?;
         let cond = self.emit_expr(&ast_repeat.cond, function, 0, ExprSide::Standalone)?;
@@ -266,7 +266,7 @@ impl<'a> Emitter<'a> {
     fn emit_numeric_for(
         &self,
         numeric_for: &AstNumericFor,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let binding = self
             .names
@@ -299,7 +299,7 @@ impl<'a> Emitter<'a> {
     fn emit_generic_for(
         &self,
         generic_for: &AstGenericFor,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let bindings = generic_for
             .bindings
@@ -331,17 +331,43 @@ impl<'a> Emitter<'a> {
         Ok(Doc::text(format!("::{}::", format_label_name(label.id))))
     }
 
-    fn emit_do_block(&self, block: &AstBlock, function: HirProtoRef) -> Result<Doc, GenerateError> {
+    fn emit_do_block(&self, block: &AstBlock, function: ProtoId) -> Result<Doc, GenerateError> {
         let body = self.emit_block(block, function)?;
         Ok(self.emit_block_stmt(Doc::text("do"), block, body))
     }
 
-    fn emit_function_decl(
+    pub(super) fn emit_function_decl(
         &self,
         function_decl: &AstFunctionDecl,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
-        let target = self.emit_function_name(&function_decl.target, function)?;
+        let inferred_method = match &function_decl.target {
+            crate::ast::AstFunctionName::Method(_, _) => true,
+            crate::ast::AstFunctionName::Plain(path)
+                if !function_decl.global_declaration
+                    && !path.fields.is_empty()
+                    && !(path.fields.len() == 1
+                        && matches!(path.root, crate::ast::AstNameRef::Environment))
+                    && function_decl.func.params.first().is_some_and(|p| {
+                        self.names
+                            .resolve_name_ref(
+                                function_decl.func.function,
+                                &crate::ast::AstNameRef::Param(*p),
+                            )
+                            .is_ok_and(|name| name == "self")
+                    }) =>
+            {
+                true
+            }
+            _ => false,
+        };
+        let target = if inferred_method
+            && let crate::ast::AstFunctionName::Plain(path) = &function_decl.target
+        {
+            self.emit_method_path(path, function)?
+        } else {
+            self.emit_function_name(&function_decl.target, function)?
+        };
         let header = Doc::concat([
             Doc::text(if function_decl.global_declaration {
                 "global function "
@@ -350,20 +376,14 @@ impl<'a> Emitter<'a> {
             }),
             target,
         ]);
-        let params = self.emit_decl_param_list(
-            &function_decl.func,
-            matches!(
-                function_decl.target,
-                crate::ast::AstFunctionName::Method(_, _)
-            ),
-        )?;
+        let params = self.emit_decl_param_list(&function_decl.func, inferred_method)?;
         self.emit_function_with_header_and_params(&function_decl.func, header, params)
     }
 
-    fn emit_local_function_decl(
+    pub(super) fn emit_local_function_decl(
         &self,
         local_function_decl: &AstLocalFunctionDecl,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let name = self
             .names
@@ -375,7 +395,7 @@ impl<'a> Emitter<'a> {
     fn emit_value_list(
         &self,
         values: &[crate::ast::AstExpr],
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let docs = values
             .iter()
@@ -385,6 +405,12 @@ impl<'a> Emitter<'a> {
     }
 
     pub(super) fn emit_parenthesized_list(&self, items: Vec<Doc>) -> Doc {
+        if items.len() <= 1 {
+            return match items.into_iter().next() {
+                Some(item) => Doc::concat([Doc::text("("), item, Doc::text(")")]),
+                None => Doc::text("()"),
+            };
+        }
         Doc::concat([
             Doc::text("("),
             Doc::indent(Doc::fill(

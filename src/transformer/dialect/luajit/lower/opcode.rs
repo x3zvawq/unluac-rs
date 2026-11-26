@@ -34,19 +34,21 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 LuaJitOpcode::Mov => {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let src = checked_reg_from_u16(raw_pc, opcode, d)?;
                     self.invalidate_written_reg(reg_from_u8(a));
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::Move(MoveInstr {
                             dst: reg_from_u8(a),
-                            src: reg_from_u16(d),
+                            src,
                         })),
                     );
                     raw_index += 1;
                 }
                 LuaJitOpcode::Not | LuaJitOpcode::Unm | LuaJitOpcode::Len => {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let src = checked_reg_from_u16(raw_pc, opcode, d)?;
                     self.invalidate_written_reg(reg_from_u8(a));
                     self.emit(
                         Some(raw_index),
@@ -54,7 +56,7 @@ impl<'a> ProtoLowerer<'a> {
                         PendingLowInstr::Ready(LowInstr::UnaryOp(UnaryOpInstr {
                             dst: reg_from_u8(a),
                             op: unary_op_kind(opcode),
-                            src: reg_from_u16(d),
+                            src,
                         })),
                     );
                     raw_index += 1;
@@ -216,7 +218,15 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 LuaJitOpcode::KNil => {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
-                    let len = range_len_inclusive(usize::from(a), usize::from(d));
+                    let end = checked_reg_from_u16(raw_pc, opcode, d)?;
+                    if end.index() < usize::from(a) {
+                        return Err(TransformError::UnexpectedOperands {
+                            raw_pc,
+                            opcode: opcode.label(),
+                            expected: "KNIL end register >= start register",
+                        });
+                    }
+                    let len = range_len_inclusive(usize::from(a), end.index());
                     self.invalidate_written_range(RegRange::new(reg_from_u8(a), len));
                     self.emit(
                         Some(raw_index),
@@ -242,12 +252,13 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 LuaJitOpcode::USetV => {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let src = checked_reg_from_u16(raw_pc, opcode, d)?;
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::SetUpvalue(SetUpvalueInstr {
                             dst: self.upvalue_ref(raw_pc, usize::from(a))?.into(),
-                            src: ValueOperand::Reg(reg_from_u16(d)),
+                            src: ValueOperand::Reg(src),
                         })),
                     );
                     raw_index += 1;
@@ -607,6 +618,7 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 LuaJitOpcode::CallT => {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let args = self.tail_call_args_pack(raw_pc, opcode, a, d)?;
                     let callee = reg_from_u8(a);
                     let (kind, method_name) = self.pending_methods.consume_call_info(
                         callee,
@@ -619,7 +631,7 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::TailCall(TailCallInstr {
                             callee,
-                            args: self.tail_call_args_pack(a, d),
+                            args,
                             kind,
                             method_name,
                         })),
@@ -664,13 +676,12 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 LuaJitOpcode::Ret => {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let values = return_pack(raw_pc, opcode, a, d)?;
                     self.pending_methods.clear();
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::Return(ReturnInstr {
-                            values: return_pack(a, d),
-                        })),
+                        PendingLowInstr::Ready(LowInstr::Return(ReturnInstr { values })),
                     );
                     raw_index += 1;
                 }
@@ -904,13 +915,14 @@ impl<'a> ProtoLowerer<'a> {
                     let helper = self.helper_jump(raw_index, opcode)?;
                     self.invalidate_bypassed_at(helper.helper_index);
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let src = checked_reg_from_u16(raw_pc, opcode, d)?;
                     let _ = a;
                     self.emit(
                         Some(raw_index),
                         vec![raw_index, helper.helper_index],
                         PendingLowInstr::Branch {
                             cond: BranchCond::truthy(
-                                CondOperand::Reg(reg_from_u16(d)),
+                                CondOperand::Reg(src),
                                 matches!(opcode, LuaJitOpcode::IsF),
                             ),
                             then_target: TargetPlaceholder::Raw(helper.jump_target),
@@ -923,6 +935,7 @@ impl<'a> ProtoLowerer<'a> {
                     let helper = self.helper_jump(raw_index, opcode)?;
                     self.invalidate_bypassed_at(helper.helper_index);
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let src = checked_reg_from_u16(raw_pc, opcode, d)?;
                     if a != NO_REG && a != (d as u8) {
                         self.invalidate_written_reg(reg_from_u8(a));
                     }
@@ -932,7 +945,7 @@ impl<'a> ProtoLowerer<'a> {
                             vec![raw_index, helper.helper_index],
                             PendingLowInstr::Branch {
                                 cond: BranchCond::truthy(
-                                    CondOperand::Reg(reg_from_u16(d)),
+                                    CondOperand::Reg(src),
                                     matches!(opcode, LuaJitOpcode::IsFC),
                                 ),
                                 then_target: TargetPlaceholder::Raw(helper.jump_target),
@@ -946,7 +959,7 @@ impl<'a> ProtoLowerer<'a> {
                             vec![raw_index, helper.helper_index],
                             PendingLowInstr::Branch {
                                 cond: BranchCond::truthy(
-                                    CondOperand::Reg(reg_from_u16(d)),
+                                    CondOperand::Reg(src),
                                     matches!(opcode, LuaJitOpcode::IsFC),
                                 ),
                                 then_target: TargetPlaceholder::Low(move_low),
@@ -958,7 +971,7 @@ impl<'a> ProtoLowerer<'a> {
                             vec![raw_index],
                             PendingLowInstr::Ready(LowInstr::Move(MoveInstr {
                                 dst: reg_from_u8(a),
-                                src: reg_from_u16(d),
+                                src,
                             })),
                         );
                         self.emit(

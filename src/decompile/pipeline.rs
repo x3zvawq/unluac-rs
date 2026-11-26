@@ -5,7 +5,7 @@
 //! 阶段读写槽位、debug dump、target-stage 停止点等编排细节集中在调度表里维护。
 
 use crate::ast::AstTargetDialect;
-use crate::timing::{TimingCollector, TimingReport};
+use super::timing::{TimingCollector, TimingReport};
 
 use super::error::DecompileError;
 use super::options::{DecompileDialect, DecompileOptions};
@@ -13,7 +13,7 @@ use super::stages::run_decompile_stages;
 use super::state::{DecompileContext, DecompileState, StageDebugOutput};
 
 /// 一次主 pipeline 调用的返回值。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct DecompileResult {
     pub state: DecompileState,
     pub debug_output: Vec<StageDebugOutput>,

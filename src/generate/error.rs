@@ -1,35 +1,22 @@
 //! Generate 层错误类型。
-//!
-//! Generate 是纯输出层，所以这里的错误大多意味着前层契约没有收敛好，
-//! 或者当前 AST 已经表达了一个生成器还不能稳定输出的形状。
 
 use thiserror::Error;
 
-use crate::ast::{AstBindingRef, AstNameRef, DecompileDialect};
-use crate::hir::HirProtoRef;
+use crate::ast::{AstBindingRef, AstNameRef, DecompileDialect, ProtoId};
 
 /// Generate 可能失败的原因。
 #[derive(Debug, Error)]
 pub enum GenerateError {
     #[error("proven Luau interpolation lost its fixed argument shape")]
     UnprovenLuauInterpolation,
-    #[error("required Luau compound assignment has lost its proven shape")]
+    #[error("required Luau compound assignment has lost its valid shape")]
     UnprovenCompoundAssignment,
-    #[error("required Luau inline frame cannot be emitted without its compiler contract")]
-    UnprovenLuauInlining,
     #[error("generate cannot find naming context for proto#{function}")]
     MissingFunctionNames { function: usize },
     #[error("generate cannot resolve name {name:?} in proto#{function}")]
     MissingName { function: usize, name: AstNameRef },
     #[error("generate cannot resolve binding {binding:?} in proto#{function}")]
     MissingBindingName {
-        function: usize,
-        binding: AstBindingRef,
-    },
-    #[error("generate encountered residual temp name {name:?} in proto#{function}")]
-    ResidualTempName { function: usize, name: AstNameRef },
-    #[error("generate encountered residual temp binding {binding:?} in proto#{function}")]
-    ResidualTempBinding {
         function: usize,
         binding: AstBindingRef,
     },
@@ -53,7 +40,7 @@ pub enum GenerateError {
 }
 
 impl GenerateError {
-    pub(crate) fn missing_function_names(function: HirProtoRef) -> Self {
+    pub(crate) fn missing_function_names(function: ProtoId) -> Self {
         Self::MissingFunctionNames {
             function: function.index(),
         }

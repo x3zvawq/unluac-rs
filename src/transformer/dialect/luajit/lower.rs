@@ -279,7 +279,7 @@ impl<'a> ProtoLowerer<'a> {
             LuaJitOpcode::IsLt | LuaJitOpcode::IsGe | LuaJitOpcode::IsLe | LuaJitOpcode::IsGt => {
                 let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                 let lhs = CondOperand::Reg(reg_from_u8(a));
-                let rhs = CondOperand::Reg(reg_from_u16(d));
+                let rhs = CondOperand::Reg(checked_reg_from_u16(raw_pc, opcode, d)?);
                 let (predicate, negated) = match opcode {
                     LuaJitOpcode::IsLt => (BranchPredicate::Lt, false),
                     LuaJitOpcode::IsGe => (BranchPredicate::Lt, true),
@@ -294,7 +294,7 @@ impl<'a> ProtoLowerer<'a> {
                 Ok(BranchCond::compare(
                     BranchPredicate::Eq,
                     CondOperand::Reg(reg_from_u8(a)),
-                    CondOperand::Reg(reg_from_u16(d)),
+                    CondOperand::Reg(checked_reg_from_u16(raw_pc, opcode, d)?),
                     matches!(opcode, LuaJitOpcode::IsNeV),
                 ))
             }
@@ -503,7 +503,7 @@ impl<'a> ProtoLowerer<'a> {
             return Ok(false);
         }
         let (a, d) = expect_ad(extra.pc, opcode, operands)?;
-        Ok(reg_from_u8(a) == dst && reg_from_u16(d) == src)
+        Ok(reg_from_u8(a) == dst && checked_reg_from_u16(extra.pc, opcode, d)? == src)
     }
 
     fn setup_has_no_external_entry(&self, setup_start: usize, end: usize) -> bool {
@@ -540,12 +540,26 @@ impl<'a> ProtoLowerer<'a> {
         }
     }
 
-    fn tail_call_args_pack(&self, a: u8, d: u16) -> ValuePack {
+    fn tail_call_args_pack(
+        &self,
+        raw_pc: u32,
+        opcode: LuaJitOpcode,
+        a: u8,
+        d: u16,
+    ) -> Result<ValuePack, TransformError> {
         let start = self.call_arg_start(a);
         if d == 0 {
-            ValuePack::Open(start)
+            Ok(ValuePack::Open(start))
         } else {
-            ValuePack::Fixed(RegRange::new(start, usize::from(d.saturating_sub(1))))
+            let count = usize::from(d.saturating_sub(1));
+            if start.index().saturating_add(count) > 256 {
+                return Err(TransformError::UnexpectedOperands {
+                    raw_pc,
+                    opcode: opcode.label(),
+                    expected: "LuaJIT register range within 256-slot frame",
+                });
+            }
+            Ok(ValuePack::Fixed(RegRange::new(start, count)))
         }
     }
 
@@ -632,8 +646,19 @@ fn reg_from_u8(index: u8) -> Reg {
     Reg(index as usize)
 }
 
-fn reg_from_u16(index: u16) -> Reg {
-    Reg(index as usize)
+fn checked_reg_from_u16(
+    raw_pc: u32,
+    opcode: LuaJitOpcode,
+    index: u16,
+) -> Result<Reg, TransformError> {
+    if index > 255 {
+        return Err(TransformError::UnexpectedOperands {
+            raw_pc,
+            opcode: opcode.label(),
+            expected: "LuaJIT register index <= 255",
+        });
+    }
+    Ok(Reg(index as usize))
 }
 
 fn range_len_inclusive(start: usize, end: usize) -> usize {
@@ -648,14 +673,24 @@ fn call_results_pack(a: u8, b: u8) -> ResultPack {
     }
 }
 
-fn return_pack(a: u8, d: u16) -> ValuePack {
+fn return_pack(
+    raw_pc: u32,
+    opcode: LuaJitOpcode,
+    a: u8,
+    d: u16,
+) -> Result<ValuePack, TransformError> {
     if d == 0 {
-        ValuePack::Open(reg_from_u8(a))
+        Ok(ValuePack::Open(reg_from_u8(a)))
     } else {
-        ValuePack::Fixed(RegRange::new(
-            reg_from_u8(a),
-            usize::from(d.saturating_sub(1)),
-        ))
+        let count = usize::from(d.saturating_sub(1));
+        if usize::from(a).saturating_add(count) > 256 {
+            return Err(TransformError::UnexpectedOperands {
+                raw_pc,
+                opcode: opcode.label(),
+                expected: "LuaJIT return register range within 256-slot frame",
+            });
+        }
+        Ok(ValuePack::Fixed(RegRange::new(reg_from_u8(a), count)))
     }
 }
 

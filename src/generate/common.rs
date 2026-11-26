@@ -3,9 +3,11 @@
 //! 这些类型需要同时被 decompile 入口、renderer 和调试输出复用，所以单独抽到这里，
 //! 避免把“生成选项”“宿主构造器配置”“注释元信息”和“最终产物”散落在 emit/render 两边。
 
+use std::collections::BTreeMap;
+
 use crate::LuaString;
-use crate::ast::DecompileDialect;
-use crate::hir::{HirModule, HirProtoRef, ProtoLineRange, ProtoSignature};
+use crate::ast::{AstModule, DecompileDialect, ProtoId};
+use crate::parser::{ProtoLineRange, ProtoSignature};
 use strum_macros::{Display, EnumString, IntoStaticStr};
 
 /// 最终生成的源码结果。
@@ -14,6 +16,8 @@ pub struct GeneratedChunk {
     pub dialect: DecompileDialect,
     pub kind: GeneratedChunkKind,
     pub source: String,
+    /// 每个 AST proto 在 `source` 中对应的 1-based `(start_line, end_line)` 区间（供 Web/IDE 精确跳转）。
+    pub proto_line_spans: BTreeMap<usize, (usize, usize)>,
 }
 
 impl Default for GeneratedChunk {
@@ -22,6 +26,7 @@ impl Default for GeneratedChunk {
             dialect: DecompileDialect::Lua51,
             kind: GeneratedChunkKind::Source,
             source: String::new(),
+            proto_line_spans: BTreeMap::new(),
         }
     }
 }
@@ -69,7 +74,7 @@ pub struct GenerateOptions {
     /// so word-like values share a common left edge. `Left`/`Right` force one
     /// direction for all kinds.
     pub table_align_cells: TableCellAlign,
-    pub comment: bool,
+    pub comment: CommentStyle,
     /// 把 Luau vector 常量重新表达成源码时使用的宿主构造器。
     pub luau_vector_constructor: Option<LuauVectorConstructor>,
 }
@@ -90,8 +95,58 @@ impl Default for GenerateOptions {
             table_align_width: None,
             table_align_string_width: 16,
             table_align_cells: TableCellAlign::Auto,
-            comment: true,
+            comment: CommentStyle::Minimal,
             luau_vector_constructor: None,
+        }
+    }
+}
+
+/// 生成阶段注释的详细程度。
+///
+/// - `None`（兼容 `false`）：不输出文件头和函数注释；
+/// - `Minimal`（默认）：输出精简文件头，仅在存在源码行号/文件名信息时标注函数行号，避免满屏全零 proto 统计；
+/// - `Full`（兼容 `true`）：额外为每个函数输出完整 `proto#N params=... locals=... upvalues=...` 统计注释。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommentStyle {
+    None,
+    #[default]
+    Minimal,
+    Full,
+}
+
+impl CommentStyle {
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl From<CommentStyle> for &'static str {
+    fn from(value: CommentStyle) -> Self {
+        match value {
+            CommentStyle::None => "none",
+            CommentStyle::Minimal => "minimal",
+            CommentStyle::Full => "full",
+        }
+    }
+}
+
+impl std::fmt::Display for CommentStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(<&'static str>::from(*self))
+    }
+}
+
+impl std::str::FromStr for CommentStyle {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "false" | "off" | "0" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "full" | "true" | "on" | "1" => Ok(Self::Full),
+            _ => Err(format!(
+                "invalid comment style {s:?}; expected none, minimal, full, true, or false"
+            )),
         }
     }
 }
@@ -136,17 +191,17 @@ pub struct GenerateCommentMetadata {
 }
 
 impl GenerateCommentMetadata {
-    pub(crate) fn from_hir(hir: &HirModule, encoding: &str) -> Self {
-        let entry_source = hir
+    pub(crate) fn from_ast(ast: &AstModule, encoding: &str) -> Self {
+        let entry_source = ast
             .protos
-            .get(hir.entry.index())
+            .get(ast.entry_function.index())
             .and_then(|proto| proto.source.clone());
         Self {
             chunk: GenerateChunkCommentMetadata {
                 file_name: entry_source,
                 encoding: encoding.to_owned(),
             },
-            functions: hir
+            functions: ast
                 .protos
                 .iter()
                 .map(|proto| GenerateFunctionCommentMetadata {
@@ -161,7 +216,7 @@ impl GenerateCommentMetadata {
         }
     }
 
-    pub fn function(&self, function: HirProtoRef) -> Option<&GenerateFunctionCommentMetadata> {
+    pub fn function(&self, function: ProtoId) -> Option<&GenerateFunctionCommentMetadata> {
         self.functions.get(function.index())
     }
 }
@@ -176,7 +231,7 @@ pub struct GenerateChunkCommentMetadata {
 /// proto 级注释要展示的元信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateFunctionCommentMetadata {
-    pub function: HirProtoRef,
+    pub function: ProtoId,
     pub source: Option<LuaString>,
     pub line_range: ProtoLineRange,
     pub signature: ProtoSignature,

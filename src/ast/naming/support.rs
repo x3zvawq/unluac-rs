@@ -3,7 +3,7 @@
 //! 它们本身不参与主流程决策，但 evidence、hint、allocation、strategy
 //! 都会复用。把这些辅助函数独立出来，可以避免“公共小工具”继续把主流程文件撑大。
 
-use crate::ast::DecompileDialect;
+use crate::decompile::DecompileDialect;
 
 /// 取简单参数名候选。
 pub(super) fn alphabetical_name(index: usize) -> Option<String> {
@@ -69,7 +69,13 @@ pub(super) fn is_valid_identifier(candidate: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-/// 判断是否为 Lua 关键字（保守全集，覆盖所有方言）。
-pub(super) fn is_lua_keyword(candidate: &str) -> bool {
-    DecompileDialect::is_keyword_in_any_dialect(candidate)
+/// 判断给定目标方言下候选名是否为保留关键字；若未指定方言则回退全方言保守全集。
+pub(super) fn is_lua_keyword_for_dialect(
+    dialect: Option<DecompileDialect>,
+    candidate: &str,
+) -> bool {
+    match dialect {
+        Some(d) => d.is_keyword(candidate),
+        None => DecompileDialect::is_keyword_in_any_dialect(candidate),
+    }
 }

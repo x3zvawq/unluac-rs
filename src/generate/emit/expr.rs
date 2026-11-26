@@ -6,12 +6,11 @@ use crate::ast::pretty::preferred_negated_relational_render;
 use crate::ast::{
     AstCallExpr, AstCallKind, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName,
     AstIndexAccess, AstLValue, AstLogicalExpr, AstMethodCallExpr, AstNamePath, AstNameRef,
-    AstRecordField, AstTableConstructor, AstTableField, AstTableKey, AstUnaryOpKind,
+    AstRecordField, AstTableConstructor, AstTableField, AstTableKey, AstUnaryOpKind, ProtoId,
 };
 use crate::decompile::DecompileDialect;
 use crate::generate::LuauVectorSize;
-use crate::generate::doc::{AlignedTable, AlignedTableField, Doc};
-use crate::hir::HirProtoRef;
+use crate::generate::doc::{AlignedTable, AlignedTableField, Doc, display_width};
 
 use super::super::common::{TableCellAlign, TableStyle};
 use super::super::error::GenerateError;
@@ -23,7 +22,6 @@ use super::{
     Assoc, Emitter, ExprSide, PREC_AND, PREC_COMPARE, PREC_LITERAL, PREC_OR, PREC_PREFIX,
     PREC_UNARY,
 };
-use crate::value_semantics::table::TableExpression;
 
 fn numeric_literal(rendered: String) -> (Doc, u8, Assoc) {
     let precedence = if rendered.starts_with('-') {
@@ -76,12 +74,7 @@ fn inert_table_value(expr: &AstExpr) -> bool {
 
 /// 只省略能够证明没有求值、批写观察和整数键碰撞的显式索引；不复制或改写 AST。
 fn can_drop_index_keys(table: &AstTableConstructor) -> bool {
-    if !matches!(
-        table.allocation,
-        crate::hir::HirTableAllocation::PucBatched(_)
-    ) {
-        // 候选拒绝[ProofIncomplete]：Indexed/Template/Luau 的预分配、模板和原操作要求
-        // 尚无投影证明；不能把 PUC 的无事件标量初始化结论推广到这些协议。
+    if !table.is_puc_batched {
         return false;
     }
     let mut next_index = 1i64;
@@ -152,7 +145,7 @@ impl<'a> Emitter<'a> {
     pub(super) fn emit_call_kind(
         &self,
         call: &AstCallKind,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         match call {
             AstCallKind::Call(call) => self.emit_call_expr(call, function),
@@ -163,7 +156,7 @@ impl<'a> Emitter<'a> {
     fn emit_call_expr(
         &self,
         call: &AstCallExpr,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let callee = self.emit_expr(&call.callee, function, PREC_PREFIX, ExprSide::Left)?;
         let args = call
@@ -177,7 +170,7 @@ impl<'a> Emitter<'a> {
     fn emit_method_call_expr(
         &self,
         call: &AstMethodCallExpr,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         if let Some(segments) = &call.interpolation {
             if self.target.version != DecompileDialect::Luau {
@@ -224,7 +217,7 @@ impl<'a> Emitter<'a> {
     pub(super) fn emit_lvalue(
         &self,
         lvalue: &AstLValue,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         match lvalue {
             AstLValue::Name(name) => self.emit_name_ref(name, function),
@@ -236,7 +229,7 @@ impl<'a> Emitter<'a> {
     pub(super) fn emit_expr(
         &self,
         expr: &AstExpr,
-        function: HirProtoRef,
+        function: ProtoId,
         parent_prec: u8,
         side: ExprSide,
     ) -> Result<Doc, GenerateError> {
@@ -249,25 +242,6 @@ impl<'a> Emitter<'a> {
             ),
             AstExpr::Integer(value) => {
                 numeric_literal(format_integer(*value, self.options.number_format))
-            }
-            AstExpr::CaptureInitializer(value) => {
-                if self.target.version != crate::decompile::DecompileDialect::Luau {
-                    return Err(GenerateError::UnsupportedFeature {
-                        dialect: self.target.version,
-                        feature: "Luau capture initializer",
-                    });
-                }
-                // HIR 已证明 r0/r1 的初始化事务；不能先降成普通表达式树再折叠。
-                if let crate::hir::HirCaptureInitializer::NegatedNumericString(number) = value {
-                    let opposite = format_number(-number.to_f64(), false, false);
-                    return Ok(Doc::text(format!("(-\"{opposite}\")")));
-                }
-                let literal = format_number(value.number().to_f64(), false, false);
-                (
-                    Doc::text(format!("((...) and ({literal}) or ({literal}))")),
-                    PREC_LITERAL,
-                    Assoc::Non,
-                )
             }
             AstExpr::Number(value) => numeric_literal(format_number(
                 *value,
@@ -390,7 +364,7 @@ impl<'a> Emitter<'a> {
     fn emit_operator_expr(
         &self,
         expr: &AstExpr,
-        function: HirProtoRef,
+        function: ProtoId,
         parent_prec: u8,
         side: ExprSide,
     ) -> Result<Doc, GenerateError> {
@@ -478,7 +452,7 @@ impl<'a> Emitter<'a> {
     fn emit_logical_chain(
         &self,
         logical: &AstLogicalExpr,
-        function: HirProtoRef,
+        function: ProtoId,
         operator: LogicalOperator,
     ) -> Result<Doc, GenerateError> {
         let mut operands = Vec::new();
@@ -556,7 +530,7 @@ impl<'a> Emitter<'a> {
     pub(super) fn emit_name_ref(
         &self,
         name: &AstNameRef,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         Ok(Doc::text(self.names.resolve_name_ref(function, name)?))
     }
@@ -564,7 +538,7 @@ impl<'a> Emitter<'a> {
     fn emit_field_access(
         &self,
         access: &AstFieldAccess,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let base = self.emit_expr(&access.base, function, PREC_PREFIX, ExprSide::Left)?;
         Ok(Doc::concat([base, Doc::text(format!(".{}", access.field))]))
@@ -573,17 +547,28 @@ impl<'a> Emitter<'a> {
     fn emit_index_access(
         &self,
         access: &AstIndexAccess,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let base = self.emit_expr(&access.base, function, PREC_PREFIX, ExprSide::Left)?;
         let index = self.emit_expr(&access.index, function, 0, ExprSide::Standalone)?;
-        Ok(Doc::concat([base, Doc::text("["), index, Doc::text("]")]))
+        Ok(Doc::concat([base, self.emit_bracketed_index(index)]))
+    }
+
+    /// 包裹表下标/键表达式：若内部以 `[` 开头或以 `]` 结尾（如多行长字符串 `[[...]]`），
+    /// 必须加空格输出 `[ [[...]] ]`，避免触发 Lua 词法器 `[[[` / `]]]` 语法错误。
+    fn emit_bracketed_index(&self, index: Doc) -> Doc {
+        let needs_space = doc_starts_with_char(&index, '[') || doc_ends_with_char(&index, ']');
+        if needs_space {
+            Doc::concat([Doc::text("[ "), index, Doc::text(" ]")])
+        } else {
+            Doc::concat([Doc::text("["), index, Doc::text("]")])
+        }
     }
 
     fn emit_table_constructor(
         &self,
         table: &AstTableConstructor,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         if table.fields.is_empty() {
             return Ok(Doc::text("{}"));
@@ -608,7 +593,7 @@ impl<'a> Emitter<'a> {
                 Doc::text("}"),
             ]),
             TableStyle::Aligned => unreachable!("aligned tables use their own layout node"),
-            TableStyle::Compact | TableStyle::Balanced => {
+            TableStyle::Compact => {
                 let separator = Doc::concat([Doc::text(","), Doc::soft_line()]);
                 Doc::group(Doc::concat([
                     Doc::text("{"),
@@ -620,6 +605,26 @@ impl<'a> Emitter<'a> {
                     Doc::text("}"),
                 ]))
             }
+            TableStyle::Balanced => {
+                // 纯数组表自动多元素折行排版，避免百项配置数组竖排刷屏；
+                // 含记录键的表在单行可容纳时紧凑输出，超出预算则整洁地每项独占一行。
+                let all_array = table
+                    .fields
+                    .iter()
+                    .all(|field| matches!(table_field_view(field, drop_keys), TableFieldView::Array(_)));
+                let separator = Doc::concat([Doc::text(","), Doc::soft_line()]);
+                let body = if all_array {
+                    Doc::fill(field_docs, separator)
+                } else {
+                    Doc::join(field_docs, separator)
+                };
+                Doc::group(Doc::concat([
+                    Doc::text("{"),
+                    Doc::indent(Doc::concat([Doc::soft_line(), body])),
+                    Doc::soft_line(),
+                    Doc::text("}"),
+                ]))
+            }
         })
     }
 
@@ -627,7 +632,7 @@ impl<'a> Emitter<'a> {
         &self,
         fields: &[AstTableField],
         drop_keys: bool,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let mut docs = Vec::with_capacity(fields.len());
         let mut grid_kind = None;
@@ -651,7 +656,7 @@ impl<'a> Emitter<'a> {
                     && matches!(&value_doc, Doc::Text(text)
                         if !text.contains(['\n', '\r'])
                             && (kind != Some(AlignedCellKind::String)
-                                || text.chars().count() <= self.options.table_align_string_width));
+                                || display_width(text) <= self.options.table_align_string_width));
                 grid_kind = kind;
             }
             docs.push(AlignedTableField {
@@ -683,7 +688,7 @@ impl<'a> Emitter<'a> {
     fn emit_table_field(
         &self,
         field: TableFieldView<'_>,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         match field {
             TableFieldView::Array(value) => {
@@ -700,15 +705,14 @@ impl<'a> Emitter<'a> {
     fn emit_table_key(
         &self,
         key: &AstTableKey,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         Ok(match key {
             AstTableKey::Name(name) => Doc::text(name.clone()),
-            AstTableKey::Expr(expr) => Doc::concat([
-                Doc::text("["),
-                self.emit_expr(expr, function, 0, ExprSide::Standalone)?,
-                Doc::text("]"),
-            ]),
+            AstTableKey::Expr(expr) => {
+                let index = self.emit_expr(expr, function, 0, ExprSide::Standalone)?;
+                self.emit_bracketed_index(index)
+            }
         })
     }
 
@@ -749,7 +753,7 @@ impl<'a> Emitter<'a> {
     pub(super) fn emit_function_name(
         &self,
         function_name: &AstFunctionName,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         match function_name {
             AstFunctionName::Plain(path) => self.emit_name_path(path, function),
@@ -760,10 +764,26 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    pub(super) fn emit_method_path(
+        &self,
+        path: &AstNamePath,
+        function: ProtoId,
+    ) -> Result<Doc, GenerateError> {
+        let Some((method, prefix_fields)) = path.fields.split_last() else {
+            return self.emit_name_path(path, function);
+        };
+        let mut parts = vec![self.emit_name_ref(&path.root, function)?];
+        for field in prefix_fields {
+            parts.push(Doc::text(format!(".{field}")));
+        }
+        parts.push(Doc::text(format!(":{method}")));
+        Ok(Doc::concat(parts))
+    }
+
     fn emit_name_path(
         &self,
         path: &AstNamePath,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         let mut parts = vec![self.emit_name_ref(&path.root, function)?];
         for field in &path.fields {
@@ -796,7 +816,7 @@ impl<'a> Emitter<'a> {
         parts.push(body);
         parts.push(Doc::line());
         parts.push(Doc::text("end"));
-        Ok(Doc::concat(parts))
+        Ok(Doc::proto_span(func.function.index(), Doc::concat(parts)))
     }
 
     pub(super) fn emit_decl_param_list(
@@ -862,6 +882,30 @@ fn neg_operand_starts_with_minus(expr: &AstExpr) -> bool {
         AstExpr::Number(value) => value.is_sign_negative(),
         AstExpr::Int64(value) => value.is_negative(),
         AstExpr::Unary(unary) => unary.op == AstUnaryOpKind::Neg,
+        _ => false,
+    }
+}
+
+fn doc_starts_with_char(doc: &Doc, expected: char) -> bool {
+    match doc {
+        Doc::Text(text) => text.starts_with(expected),
+        Doc::Concat(parts) => parts.iter().find_map(|p| match p {
+            Doc::Text(t) if t.is_empty() => None,
+            other => Some(doc_starts_with_char(other, expected)),
+        }).unwrap_or(false),
+        Doc::Indent(inner) | Doc::Group(inner) => doc_starts_with_char(inner, expected),
+        _ => false,
+    }
+}
+
+fn doc_ends_with_char(doc: &Doc, expected: char) -> bool {
+    match doc {
+        Doc::Text(text) => text.ends_with(expected),
+        Doc::Concat(parts) => parts.iter().rev().find_map(|p| match p {
+            Doc::Text(t) if t.is_empty() => None,
+            other => Some(doc_ends_with_char(other, expected)),
+        }).unwrap_or(false),
+        Doc::Indent(inner) | Doc::Group(inner) => doc_ends_with_char(inner, expected),
         _ => false,
     }
 }

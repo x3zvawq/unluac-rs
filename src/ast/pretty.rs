@@ -31,15 +31,6 @@ pub(crate) fn preferred_negated_relational_render(
     })
 }
 
-#[cfg(feature = "decompile-debug")]
-pub(crate) fn is_default_numeric_for_step(step: &AstExpr) -> bool {
-    match step {
-        AstExpr::Integer(1) => true,
-        AstExpr::Number(value) => *value == 1.0,
-        _ => false,
-    }
-}
-
 pub(crate) fn is_default_numeric_for_step_for_target(
     step: &AstExpr,
     dialect: DecompileDialect,

@@ -3,8 +3,9 @@
 //! 这里还不做最终冲突消解，只回答“这个槽位现在最像什么名字”。
 //! 真正的唯一化和祖先作用域避让由 allocation 阶段完成。
 
-use crate::ast::AstSyntheticLocalId;
-use crate::hir::{HirBinding, HirProto, HirProtoRef, LocalId, ParamId};
+use crate::ast::{
+    AstCaptureBinding, AstProtoMeta, AstSyntheticLocalId, LocalId, ParamId, ProtoId,
+};
 
 use super::NamingError;
 use super::ast_facts::FunctionAstNamingFacts;
@@ -17,7 +18,8 @@ use super::support::{alphabetical_name, as_valid_name};
 
 /// 选择参数候选名。
 pub(super) fn choose_param_candidate(
-    proto: &HirProto,
+    proto: &AstProtoMeta,
+    debug_like_function_index: usize,
     param: ParamId,
     index: usize,
     hints: &FunctionHints,
@@ -41,7 +43,7 @@ pub(super) fn choose_param_candidate(
     if options.mode == NamingMode::DebugLike {
         return mode_fallback_candidate(
             options,
-            proto.id,
+            debug_like_function_index,
             "p",
             index,
             alphabetical_name(index).unwrap_or_else(|| format!("arg{}", index + 1)),
@@ -59,20 +61,38 @@ pub(super) fn choose_param_candidate(
         .and_then(HintChoice::candidate)
         && accepts_hint(options.mode, hint.source)
     {
-        return hint.clone();
+        if hint.source == NameSource::HeuristicSelfParam && proto_has_other_debug_self(proto, index)
+        {
+            // 保留其它形参或局部变量显式的 debug 名字 `self`，不与之争抢。
+        } else {
+            return hint.clone();
+        }
     }
     mode_fallback_candidate(
         options,
-        proto.id,
+        debug_like_function_index,
         "p",
         index,
         alphabetical_name(index).unwrap_or_else(|| format!("arg{}", index + 1)),
     )
 }
 
+fn proto_has_other_debug_self(proto: &AstProtoMeta, skip_param_index: usize) -> bool {
+    proto
+        .param_debug_hints
+        .iter()
+        .enumerate()
+        .any(|(i, h)| i != skip_param_index && h.as_deref() == Some("self"))
+        || proto
+            .local_debug_hints
+            .iter()
+            .any(|h| h.as_deref() == Some("self"))
+}
+
 /// 选择 local 候选名。
 pub(super) fn choose_local_candidate(
-    proto: &HirProto,
+    proto: &AstProtoMeta,
+    debug_like_function_index: usize,
     local: LocalId,
     hints: &FunctionHints,
     ast_facts: &FunctionAstNamingFacts,
@@ -109,7 +129,7 @@ pub(super) fn choose_local_candidate(
         let visible_count = ast_facts.debug_like_binding_order.len();
         return mode_fallback_candidate(
             options,
-            proto.id,
+            debug_like_function_index,
             "r",
             debug_like_binding_index(ast_facts, crate::ast::AstBindingRef::Local(local))
                 .unwrap_or(visible_count + index),
@@ -124,12 +144,19 @@ pub(super) fn choose_local_candidate(
     {
         return hint.clone();
     }
-    mode_fallback_candidate(options, proto.id, "l", index, "value".to_owned())
+    mode_fallback_candidate(
+        options,
+        debug_like_function_index,
+        "l",
+        index,
+        "value".to_owned(),
+    )
 }
 
 /// 选择 upvalue 候选名。
 pub(super) fn choose_upvalue_candidate(
-    proto: &HirProto,
+    proto: &AstProtoMeta,
+    debug_like_function_index: usize,
     index: usize,
     capture_evidence: Option<&ClosureCaptureEvidence<'_>>,
     options: NamingOptions,
@@ -156,7 +183,7 @@ pub(super) fn choose_upvalue_candidate(
     if options.mode == NamingMode::DebugLike {
         return Ok(mode_fallback_candidate(
             options,
-            proto.id,
+            debug_like_function_index,
             "u",
             index,
             "up".to_owned(),
@@ -164,7 +191,7 @@ pub(super) fn choose_upvalue_candidate(
     }
     Ok(mode_fallback_candidate(
         options,
-        proto.id,
+        debug_like_function_index,
         "u",
         index,
         "up".to_owned(),
@@ -173,7 +200,8 @@ pub(super) fn choose_upvalue_candidate(
 
 /// 选择 synthetic local 候选名。
 pub(super) fn choose_synthetic_local_candidate(
-    proto: &HirProto,
+    proto: &AstProtoMeta,
+    debug_like_function_index: usize,
     local: AstSyntheticLocalId,
     synthetic_order: usize,
     hints: &FunctionHints,
@@ -181,22 +209,11 @@ pub(super) fn choose_synthetic_local_candidate(
     options: NamingOptions,
 ) -> CandidateHint {
     let index = local.index();
-    if let AstSyntheticLocalId::HirTemp(temp) = local
-        && let Some(name) = proto
-            .temp_debug_locals
-            .get(temp.index())
-            .and_then(as_valid_name)
-    {
-        return CandidateHint {
-            text: name,
-            source: NameSource::Debug,
-        };
-    }
     if options.mode == NamingMode::DebugLike {
         let visible_count = ast_facts.debug_like_binding_order.len();
         return mode_fallback_candidate(
             options,
-            proto.id,
+            debug_like_function_index,
             "r",
             debug_like_binding_index(ast_facts, crate::ast::AstBindingRef::SyntheticLocal(local))
                 .unwrap_or(visible_count + proto.local_count + synthetic_order),
@@ -217,7 +234,13 @@ pub(super) fn choose_synthetic_local_candidate(
     {
         return hint.clone();
     }
-    mode_fallback_candidate(options, proto.id, "sl", index, "value".to_owned())
+    mode_fallback_candidate(
+        options,
+        debug_like_function_index,
+        "sl",
+        index,
+        "value".to_owned(),
+    )
 }
 
 fn debug_like_binding_index(
@@ -236,7 +259,7 @@ fn accepts_hint(mode: NamingMode, source: NameSource) -> bool {
 }
 
 pub(super) fn resolve_visible_binding_name(
-    function: HirProtoRef,
+    function: ProtoId,
     binding: VisibleBinding,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<&str, NamingError> {
@@ -271,25 +294,25 @@ pub(super) fn resolve_visible_binding_name(
 }
 
 fn resolve_captured_name(
-    function: HirProtoRef,
-    parent: HirProtoRef,
-    binding: HirBinding,
+    function: ProtoId,
+    parent: ProtoId,
+    binding: AstCaptureBinding,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<CandidateHint, NamingError> {
     let binding = match binding {
-        HirBinding::Param(param) => VisibleBinding::Param {
+        AstCaptureBinding::Param(param) => VisibleBinding::Param {
             function: parent,
             param,
         },
-        HirBinding::Local(local) => VisibleBinding::Local {
+        AstCaptureBinding::Local(local) => VisibleBinding::Local {
             function: parent,
             local,
         },
-        HirBinding::Temp(temp) => VisibleBinding::SyntheticLocal {
+        AstCaptureBinding::SyntheticLocal(local) => VisibleBinding::SyntheticLocal {
             function: parent,
-            local: AstSyntheticLocalId::HirTemp(temp),
+            local,
         },
-        HirBinding::Upvalue(upvalue) => VisibleBinding::Upvalue {
+        AstCaptureBinding::Upvalue(upvalue) => VisibleBinding::Upvalue {
             function: parent,
             upvalue,
         },
@@ -302,14 +325,14 @@ fn resolve_captured_name(
 
 fn mode_fallback_candidate(
     options: NamingOptions,
-    function: HirProtoRef,
+    debug_like_function_index: usize,
     prefix: &str,
     index: usize,
     simple_base: String,
 ) -> CandidateHint {
     match options.mode {
         NamingMode::DebugLike => CandidateHint {
-            text: debug_like_name(options, function, prefix, index),
+            text: debug_like_name(options, debug_like_function_index, prefix, index),
             source: NameSource::DebugLike,
         },
         NamingMode::Simple | NamingMode::Heuristic => CandidateHint {
@@ -321,12 +344,12 @@ fn mode_fallback_candidate(
 
 fn debug_like_name(
     options: NamingOptions,
-    function: HirProtoRef,
+    debug_like_function_index: usize,
     prefix: &str,
     index: usize,
 ) -> String {
     if options.debug_like_include_function {
-        format!("{prefix}{}_{}", function.index(), index)
+        format!("{prefix}{debug_like_function_index}_{index}")
     } else {
         format!("{prefix}{index}")
     }

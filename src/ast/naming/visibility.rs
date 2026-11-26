@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use crate::hir::HirProtoRef;
+use crate::ast::ProtoId;
 
 use super::NamingError;
 use super::common::FunctionNameMap;
@@ -20,7 +20,7 @@ pub(super) struct VisibleNames {
 impl VisibleNames {
     pub(super) fn publish(
         &mut self,
-        function: HirProtoRef,
+        function: ProtoId,
         lexical: &FunctionLexicalContext,
         assigned_functions: &[FunctionNameMap],
     ) -> Result<(), NamingError> {

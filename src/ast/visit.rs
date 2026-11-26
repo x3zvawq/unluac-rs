@@ -71,12 +71,9 @@ pub(super) fn visit_stmt(stmt: &AstStmt, visitor: &mut impl AstVisitor) {
     let _ = visit_stmt_impl(stmt, visitor);
 }
 
-pub(super) fn visit_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) {
-    let _ = visit_expr_impl(expr, visitor);
-}
-
 /// 当前函数中被重新写入的 local，包含子闭包的捕获写；不混入 child 的同号身份。
-pub(crate) fn written_locals(block: &AstBlock) -> std::collections::BTreeSet<crate::hir::LocalId> {
+#[allow(dead_code)]
+pub(crate) fn written_locals(block: &AstBlock) -> std::collections::BTreeSet<crate::ast::LocalId> {
     written_names(block)
         .into_iter()
         .filter_map(|name| match name {
@@ -105,30 +102,6 @@ pub(crate) fn written_names(block: &AstBlock) -> std::collections::BTreeSet<AstN
     let mut writes = Writes::default();
     visit_block(block, &mut writes);
     writes.0
-}
-
-/// 当前函数语句骨架的先序查询；表达式、函数体和 capture 不含本域的 label/goto。
-pub(super) fn any_stmt_structure(
-    stmt: &AstStmt,
-    predicate: &mut impl FnMut(&AstStmt) -> bool,
-) -> bool {
-    if predicate(stmt) {
-        return true;
-    }
-    traverse_stmt_children!(
-        stmt, iter = iter, opt = as_ref, borrow = [&],
-        expr(_expr) => {},
-        lvalue(_lvalue) => {},
-        block(block) => {
-            if block.stmts.iter().any(|stmt| any_stmt_structure(stmt, predicate)) {
-                return true;
-            }
-        },
-        function(_function) => {},
-        condition(_condition) => {},
-        call(_call) => {}
-    );
-    false
 }
 
 fn visit_block_with_kind(

@@ -4,8 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::AstSyntheticLocalId;
-use crate::hir::{HirProtoRef, LocalId, ParamId};
+use crate::ast::{AstCapture, AstSyntheticLocalId, LocalId, ParamId, ProtoId};
 use strum_macros::{Display, EnumString, IntoStaticStr};
 
 /// Naming 模式。
@@ -15,9 +14,9 @@ pub enum NamingMode {
     /// 优先保留 debug 名，缺失时使用稳定的函数/绑定编号。
     DebugLike,
     /// 使用通用递增名以及循环、函数等基本语法角色，不推断业务用途。
-    #[default]
     Simple,
     /// 在通用策略上利用表达式形状、字段用途和调用线索推断名字。
+    #[default]
     Heuristic,
 }
 
@@ -31,7 +30,7 @@ pub struct NamingOptions {
 impl Default for NamingOptions {
     fn default() -> Self {
         Self {
-            mode: NamingMode::Simple,
+            mode: NamingMode::Heuristic,
             debug_like_include_function: true,
         }
     }
@@ -46,6 +45,7 @@ pub enum NameSource {
     Debug,
     CaptureProvenance,
     SelfParam,
+    HeuristicSelfParam,
     LoopRole,
     FieldName,
     TableShape,
@@ -84,28 +84,28 @@ pub struct FunctionNameMap {
 /// Naming 阶段产出的整模块名字表。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NameMap {
-    pub entry_function: HirProtoRef,
+    pub entry_function: ProtoId,
     pub mode: NamingMode,
     pub functions: Vec<FunctionNameMap>,
 }
 
 impl NameMap {
-    pub fn function(&self, function: HirProtoRef) -> Option<&FunctionNameMap> {
+    pub fn function(&self, function: ProtoId) -> Option<&FunctionNameMap> {
         self.functions.get(function.index())
     }
 }
 
-/// 借用当前 HIR 模块的捕获来源；存活期间源 HIR 不可修改，调试提示仍查询同一模块。
+/// 借用当前 AST 模块的捕获来源；存活期间源 AST 不可修改，调试提示仍查询同一模块。
 #[derive(Debug, Clone, Default)]
-pub struct NamingEvidence<'hir> {
-    pub(super) functions: Vec<Option<ClosureCaptureEvidence<'hir>>>,
+pub struct NamingEvidence<'ast> {
+    pub(super) functions: Vec<Option<ClosureCaptureEvidence<'ast>>>,
 }
 
 /// 单次 closure 的父级来源；借用完整 capture，但命名一致性只比较有序 binding，不比较 mode。
 #[derive(Debug, Clone)]
-pub(super) struct ClosureCaptureEvidence<'hir> {
-    pub(super) parent: HirProtoRef,
-    pub(super) captures: &'hir [crate::hir::HirCapture],
+pub(super) struct ClosureCaptureEvidence<'ast> {
+    pub(super) parent: ProtoId,
+    pub(super) captures: &'ast [AstCapture],
 }
 
 /// 从 AST 结构收集到的 naming hint。

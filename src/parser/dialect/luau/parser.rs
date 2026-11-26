@@ -665,8 +665,15 @@ impl LuauParserState {
         if word_pc_by_raw.is_empty() {
             return Ok(Vec::new());
         }
+        if line_gap_log2 >= 32 {
+            return Err(ParseError::UnsupportedValue {
+                field: "luau line_gap_log2",
+                value: u64::from(line_gap_log2),
+            });
+        }
 
         let intervals = ((code_word_count - 1) >> line_gap_log2) + 1;
+        let _ = reader.checked_count_capacity(code_word_count, 1)?;
         let mut relative_offsets = vec![0u8; code_word_count];
         let mut last_offset = 0u8;
         for item in &mut relative_offsets {
@@ -674,10 +681,11 @@ impl LuauParserState {
             *item = last_offset;
         }
 
+        let _ = reader.checked_count_capacity(intervals, 4)?;
         let mut absolute_lines = vec![0i32; intervals];
         let mut last_line = 0i32;
         for item in &mut absolute_lines {
-            last_line += reader.read_i32_le()?;
+            last_line = last_line.wrapping_add(reader.read_i32_le()?);
             *item = last_line;
         }
 
@@ -688,7 +696,7 @@ impl LuauParserState {
                 let interval = word_pc >> line_gap_log2;
                 let base = absolute_lines.get(interval).copied().unwrap_or_default();
                 let delta = i32::from(relative_offsets.get(word_pc).copied().unwrap_or_default());
-                (base + delta).max(0) as u32
+                base.wrapping_add(delta).max(0) as u32
             })
             .collect())
     }

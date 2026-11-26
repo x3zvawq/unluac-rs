@@ -6,8 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::transformer::TableAllocation;
-use crate::value_semantics::table::allocation::TablePreallocation;
+use crate::transformer::{TableAllocation, TablePreallocation};
 
 use crate::parser::{Lua51Opcode, Lua51Operands, RawChunk, RawProto};
 use crate::transformer::dialect::lowering::{
@@ -607,13 +606,22 @@ impl<'a> ProtoLowerer<'a> {
                     } else {
                         ValuePack::Fixed(RegRange::new(Reg(usize::from(a) + 1), usize::from(b)))
                     };
+                    let start_index = list_chunk
+                        .saturating_sub(1)
+                        .checked_mul(LFIELDS_PER_FLUSH)
+                        .and_then(|base| base.checked_add(1))
+                        .ok_or(TransformError::UnexpectedOperands {
+                            raw_pc,
+                            opcode: "SETLIST",
+                            expected: "setlist start index fits u32",
+                        })?;
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::SetList(SetListInstr {
                             base: reg_from_u8(a),
                             values,
-                            start_index: ((list_chunk.saturating_sub(1)) * LFIELDS_PER_FLUSH) + 1,
+                            start_index,
                         })),
                     );
                     raw_index += 1;

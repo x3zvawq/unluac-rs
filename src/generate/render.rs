@@ -2,8 +2,10 @@
 //!
 //! 消费缩进和行宽选项，保持 emitter 已确定的语法结构。
 
+use std::collections::BTreeMap;
+
 use super::common::GenerateOptions;
-use super::doc::{AlignedTable, AlignedTableField, Doc};
+use super::doc::{AlignedTable, AlignedTableField, Doc, display_width};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutMode {
@@ -13,17 +15,26 @@ enum LayoutMode {
 
 /// 把 Doc 渲染成最终源码字符串。
 pub fn render_doc(doc: &Doc, options: &GenerateOptions) -> String {
+    render_doc_with_proto_spans(doc, options).0
+}
+
+/// 把 Doc 渲染成最终源码字符串，并同步记录每个 `Doc::ProtoSpan` 对应的 1-based 起止行号。
+pub fn render_doc_with_proto_spans(
+    doc: &Doc,
+    options: &GenerateOptions,
+) -> (String, BTreeMap<usize, (usize, usize)>) {
     let mut renderer = Renderer {
         output: String::new(),
         line: 0,
         column: 0,
         options,
+        proto_spans: BTreeMap::new(),
     };
     renderer.render(doc, LayoutMode::Break, 0);
     if !renderer.output.ends_with('\n') {
         renderer.output.push('\n');
     }
-    renderer.output
+    (renderer.output, renderer.proto_spans)
 }
 
 struct Renderer<'a> {
@@ -31,6 +42,7 @@ struct Renderer<'a> {
     line: usize,
     column: usize,
     options: &'a GenerateOptions,
+    proto_spans: BTreeMap<usize, (usize, usize)>,
 }
 
 impl Renderer<'_> {
@@ -58,6 +70,12 @@ impl Renderer<'_> {
                 self.render(inner, child_mode, indent);
             }
             Doc::AlignedTable(table) => self.render_aligned_table(table, indent),
+            Doc::ProtoSpan { id, inner } => {
+                let start_line = self.line + 1;
+                self.render(inner, mode, indent);
+                let end_line = self.line + 1;
+                self.proto_spans.entry(*id).or_insert((start_line, end_line));
+            }
         }
     }
 
@@ -132,7 +150,7 @@ impl Renderer<'_> {
                 let Doc::Text(text) = &field.value else {
                     unreachable!("grid eligibility requires Text fields");
                 };
-                (text.as_ref(), text.chars().count())
+                (text.as_ref(), display_width(text))
             })
             .collect::<Vec<_>>();
         let max_cell_width = cells
@@ -208,7 +226,12 @@ impl Renderer<'_> {
 
     fn push_text(&mut self, text: &str) {
         self.output.push_str(text);
-        self.column += text.chars().count();
+        if let Some(last_nl) = text.rfind('\n') {
+            self.line += text.bytes().filter(|&b| b == b'\n').count();
+            self.column = display_width(&text[last_nl + 1..]);
+        } else {
+            self.column += display_width(text);
+        }
     }
 
     fn push_line(&mut self, indent: usize) {
@@ -231,9 +254,13 @@ fn flat_end(doc: &Doc, column: usize, limit: usize, table_limit: usize) -> Optio
         (end <= limit).then_some(end)
     };
     match doc {
-        Doc::Text(text) => text
-            .chars()
-            .try_fold(column, |column, _| (column < limit).then_some(column + 1)),
+        Doc::Text(text) => {
+            if text.contains(['\n', '\r']) {
+                None
+            } else {
+                advance(display_width(text), limit)
+            }
+        }
         Doc::Line => None,
         Doc::SoftLine => advance(1, limit),
         Doc::Concat(parts) => parts.iter().try_fold(column, |column, part| {
@@ -251,7 +278,64 @@ fn flat_end(doc: &Doc, column: usize, limit: usize, table_limit: usize) -> Optio
                     flat_end(doc, column, limit, table_limit)
                 })
         }
-        Doc::Indent(inner) | Doc::Group(inner) => flat_end(inner, column, limit, table_limit),
+        Doc::Indent(inner) | Doc::Group(inner) | Doc::ProtoSpan { inner, .. } => {
+            flat_end(inner, column, limit, table_limit)
+        }
         Doc::AlignedTable(table) => advance(table.content_width? + 4, limit.min(table_limit)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiline_text_breaks_group_and_tracks_line_spans() {
+        let opts = GenerateOptions::default();
+        let doc = Doc::concat(vec![
+            Doc::text("local s = "),
+            Doc::group(Doc::concat(vec![
+                Doc::text("[[line1\nline2]]"),
+                Doc::soft_line(),
+                Doc::text(".. x"),
+            ])),
+            Doc::line(),
+            Doc::proto_span(
+                1,
+                Doc::concat(vec![
+                    Doc::text("local function f()"),
+                    Doc::line(),
+                    Doc::text("  return 1"),
+                    Doc::line(),
+                    Doc::text("end"),
+                ]),
+            ),
+        ]);
+        let (out, spans) = render_doc_with_proto_spans(&doc, &opts);
+        // `[[line1\nline2]]` contains '\n', so `flat_end` must refuse flat layout and break the soft_line.
+        assert!(out.contains("[[line1\nline2]]\n.. x\n"), "output:\n{out}");
+        // Line 1: local s = [[line1
+        // Line 2: line2]]
+        // Line 3: .. x
+        // Line 4: local function f()
+        // Line 5:   return 1
+        // Line 6: end
+        assert_eq!(spans.get(&1), Some(&(4, 6)));
+    }
+
+    #[test]
+    fn cjk_display_width_breaks_overlong_group() {
+        let opts = GenerateOptions {
+            max_line_length: 10,
+            ..GenerateOptions::default()
+        };
+        // 6 CJK chars = 12 display columns > 10, even though char count is 6.
+        let doc = Doc::group(Doc::concat(vec![
+            Doc::text("你好世界"),
+            Doc::soft_line(),
+            Doc::text("测试"),
+        ]));
+        let rendered = render_doc(&doc, &opts);
+        assert_eq!(rendered, "你好世界\n测试\n");
     }
 }

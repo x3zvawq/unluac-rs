@@ -2,8 +2,7 @@
 
 use super::*;
 
-use crate::transformer::TableAllocation;
-use crate::value_semantics::table::allocation::TablePreallocation;
+use crate::transformer::{TableAllocation, TablePreallocation};
 
 impl<'a> ProtoLowerer<'a> {
     pub(super) fn lower(mut self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
@@ -306,13 +305,24 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 FamilyOpcode::NewTable => {
                     let (a, b, c, k) = self.table_operands(raw_pc, opcode, operands)?;
-                    let array_capacity = u32::from(c)
-                        + if k {
-                            self.extra_arg(raw_pc, opcode, extra.extra_arg)?
-                                * self.dialect.extraarg_scale()
-                        } else {
-                            0
-                        };
+                    let extra_array = if k {
+                        self.extra_arg(raw_pc, opcode, extra.extra_arg)?
+                            .checked_mul(self.dialect.extraarg_scale())
+                            .ok_or(TransformError::UnexpectedOperands {
+                                raw_pc,
+                                opcode: "NEWTABLE",
+                                expected: "table preallocation fits u32",
+                            })?
+                    } else {
+                        0
+                    };
+                    let array_capacity = u32::from(c).checked_add(extra_array).ok_or(
+                        TransformError::UnexpectedOperands {
+                            raw_pc,
+                            opcode: "NEWTABLE",
+                            expected: "table preallocation fits u32",
+                        },
+                    )?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
                     self.emit(
@@ -880,13 +890,25 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 FamilyOpcode::SetList => {
                     let (a, b, c, k) = self.table_operands(raw_pc, opcode, operands)?;
-                    let base_index = u32::from(c)
-                        + if k {
-                            self.extra_arg(raw_pc, opcode, extra.extra_arg)?
-                                * self.dialect.extraarg_scale()
-                        } else {
-                            0
-                        };
+                    let extra_base = if k {
+                        self.extra_arg(raw_pc, opcode, extra.extra_arg)?
+                            .checked_mul(self.dialect.extraarg_scale())
+                            .ok_or(TransformError::UnexpectedOperands {
+                                raw_pc,
+                                opcode: "SETLIST",
+                                expected: "setlist base index fits u32",
+                            })?
+                    } else {
+                        0
+                    };
+                    let start_index = u32::from(c)
+                        .checked_add(extra_base)
+                        .and_then(|base| base.checked_add(1))
+                        .ok_or(TransformError::UnexpectedOperands {
+                            raw_pc,
+                            opcode: "SETLIST",
+                            expected: "setlist start index fits u32",
+                        })?;
                     let values = if b == 0 {
                         ValuePack::Open(Reg(usize::from(a) + 1))
                     } else {
@@ -898,7 +920,7 @@ impl<'a> ProtoLowerer<'a> {
                         PendingLowInstr::Ready(LowInstr::SetList(SetListInstr {
                             base: reg_from_u8(a),
                             values,
-                            start_index: base_index + 1,
+                            start_index,
                         })),
                     );
                     raw_index += 1;

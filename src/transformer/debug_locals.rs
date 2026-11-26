@@ -27,26 +27,12 @@ impl Deref for DebugLocals {
 }
 
 impl DebugLocals {
-    /// 是否存在该寄存器的非空 source scope；不重扫原调试表。
-    pub(crate) fn has_source_scope(&self, reg: Reg) -> bool {
-        self.source_boundaries.contains_key(&reg)
-    }
-
     /// 返回该位置首个活动 source scope，保留原始半开区间与表顺序优先级。
     pub fn source_at(&self, reg: Reg, pc: u32) -> Option<(usize, &DebugLocalFact)> {
         let boundaries = self.source_boundaries.get(&reg)?;
         let end = boundaries.partition_point(|&(start, _)| start <= pc);
         let scope = boundaries.get(end.checked_sub(1)?)?.1?;
         Some((scope, &self.entries[scope]))
-    }
-
-    /// 一条 low 指令映射的任一 PC 是否处于 source scope；无 PC 时不证明不可见。
-    pub(crate) fn source_visible_at(&self, reg: Reg, pcs: &[u32]) -> bool {
-        if pcs.is_empty() {
-            self.has_source_scope(reg)
-        } else {
-            pcs.iter().any(|pc| self.source_at(reg, *pc).is_some())
-        }
     }
 
     fn new(entries: Vec<DebugLocalFact>) -> Self {

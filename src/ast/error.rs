@@ -1,88 +1,41 @@
-//! AST lowering 的错误类型。
+//! AST 阶段错误类型。
 
 use thiserror::Error;
 
-use crate::ast::{AstBindingRef, AstLabelId, DecompileDialect};
+use crate::decompile::DecompileDialect;
 
-/// HIR -> AST lowering 可能失败的原因。
-#[derive(Debug, Clone, Error)]
+use super::common::{AstBindingRef, AstLabelId};
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AstLowerError {
-    #[error("HIR proto#{proto} capture initializer requires its proven Luau entry frame")]
-    InvalidCaptureInitializer { proto: usize },
-    #[error(
-        "target dialect `{dialect}` does not support feature `{feature}` required by {context}"
-    )]
+    #[error("target dialect `{dialect}` does not support feature `{feature}` required by {context}")]
     UnsupportedFeature {
         dialect: DecompileDialect,
         feature: &'static str,
         context: &'static str,
     },
-    #[error("HIR exit proto#{proto} retains unresolved phi{phi} at #{block} register r{register}")]
-    UnresolvedHirValue {
-        proto: usize,
-        phi: usize,
-        block: usize,
-        register: usize,
-    },
-    #[error("HIR proto#{proto} still contains residual {kind} during AST lowering")]
-    ResidualHir { proto: usize, kind: &'static str },
-    #[error("HIR proto#{proto} references missing child proto#{child}")]
+    #[error("proto#{proto} references missing child proto#{child}")]
     MissingChildProto { proto: usize, child: usize },
-    #[error("HIR proto#{proto} marks a named vararg table but has no recoverable entry binding")]
-    MissingNamedVarargBinding { proto: usize },
-    #[error("HIR proto#{proto} has unsupported to-be-closed shape: {reason}")]
-    InvalidToBeClosed { proto: usize, reason: &'static str },
-    #[error(
-        "HIR proto#{proto} still contains explicit close semantics that AST lowering cannot absorb yet"
-    )]
-    UnsupportedClose { proto: usize },
-    #[error("HIR proto#{proto} contains err-nnil that cannot be matched to a global declaration")]
-    InvalidGlobalDeclPattern { proto: usize },
-    #[error(
-        "HIR proto#{proto} global declaration name `{name}` is not a legal identifier for target dialect `{dialect}`"
-    )]
-    InvalidGlobalDeclName {
-        proto: usize,
-        dialect: DecompileDialect,
-        name: String,
-    },
-    #[error(
-        "HIR proto#{proto} global key {key} is not a legal identifier for target dialect `{dialect}`"
-    )]
-    InvalidGlobalName {
-        proto: usize,
-        dialect: DecompileDialect,
-        key: String,
-    },
-    #[error("HIR proto#{proto} has invalid method call lowering shape: {reason}")]
-    InvalidMethodCallPattern { proto: usize, reason: &'static str },
-    #[error(
-        "AST function#{function} closure captures local binding {binding:?} before its declaration"
-    )]
-    InvalidForwardLocalCapture {
-        function: usize,
-        binding: AstBindingRef,
-    },
-    #[error("AST function#{function} defines goto label#{label} more than once")]
+    #[error("proto#{function} defines duplicate goto label `{label}`")]
     DuplicateGotoLabel { function: usize, label: AstLabelId },
-    #[error("AST function#{function} goto references missing label#{label} in the same function")]
+    #[error("proto#{function} jumps to missing goto label `{label}`")]
     MissingGotoLabel { function: usize, label: AstLabelId },
-    #[error("AST function#{function} goto label#{label} is not visible from its lexical block")]
+    #[error("proto#{function} jumps to invisible goto label `{label}`")]
     InvisibleGotoLabel { function: usize, label: AstLabelId },
-    #[error("AST function#{function} goto label#{label} enters local binding {binding:?} scope")]
+    #[error("proto#{function} goto `{label}` enters scope of local {binding:?}")]
     GotoEntersLocalScope {
         function: usize,
         label: AstLabelId,
         binding: AstBindingRef,
     },
-    #[error(
-        "AST function#{function} goto label#{label} enters to-be-closed binding {binding:?} scope"
-    )]
+    #[error("proto#{function} goto `{label}` enters scope of to-be-closed local {binding:?}")]
     GotoEntersToBeClosedScope {
         function: usize,
         label: AstLabelId,
         binding: AstBindingRef,
     },
-    #[error("AST function#{function} has an inconsistent goto scope tree")]
+    #[error("proto#{function} has an invalid goto scope tree")]
     InvalidGotoScopeTree { function: usize },
+    #[error("proto#{proto} structuring failed: {detail}")]
+    StructureFailure { proto: usize, detail: String },
 }

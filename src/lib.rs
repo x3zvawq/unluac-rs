@@ -1,26 +1,16 @@
 #![forbid(unsafe_code)]
 
-//! 这个 crate 提供反编译流水线的库接口。
+//! unluac-rs 核心库：多方言 Lua 字节码反编译器。
 //!
-//! 单独保留库层的原因是让 parser、transformer 和后续分析层在 CLI 稳定前
-//! 就可以被单测、集成测试和调试工具直接复用。
+//! 流水线固定为五阶段：`Parser -> Transformer -> Analysis -> Ast -> Generate`。
 
+pub mod analysis;
 pub mod ast;
 pub mod debug;
 pub mod decompile;
 pub mod generate;
-mod graph;
-pub mod hir;
 mod lua_string;
 pub mod parser;
-pub mod recovery;
-pub(crate) mod scheduler;
-pub mod structure;
-mod timing;
 pub mod transformer;
-mod value_semantics;
 
 pub use lua_string::LuaString;
-
-/// Lua/Luau 编译器普遍把单函数局部槽限制在 200 左右；留出参数与控制变量余量。
-pub(crate) const SOURCE_LOCAL_LIMIT: usize = 180;

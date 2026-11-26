@@ -10,12 +10,8 @@ pub enum NamingError {
         function: usize,
         reason: &'static str,
     },
-    #[error("ast references function proto#{function}, but that function does not exist in HIR")]
+    #[error("ast references function proto#{function}, but that proto metadata does not exist")]
     MissingFunction { function: usize },
-    #[error(
-        "naming requires readability output without raw temp bindings, but proto#{function} still contains temp t{temp}"
-    )]
-    UnexpectedTemp { function: usize, temp: usize },
     #[error(
         "closure capture evidence mismatch: parent proto#{parent} captures {captures} values for child proto#{child}, but child declares {upvalues} upvalues"
     )]
@@ -25,10 +21,6 @@ pub enum NamingError {
         captures: usize,
         upvalues: usize,
     },
-    #[error(
-        "closure capture evidence is ambiguous: child proto#{child} was observed with incompatible capture sources"
-    )]
-    ConflictingCaptureEvidence { child: usize },
     #[error(
         "upvalue naming for proto#{function} needs parent proto#{parent}, but that function has not been assigned yet"
     )]

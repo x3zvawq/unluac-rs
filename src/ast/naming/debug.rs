@@ -123,7 +123,8 @@ fn write_sparse_section<'a>(
         let source = <&'static str>::from(info.source);
         let _ = writeln!(
             output,
-            "    {prefix}{index:?} -> {} (source={source}{rename_note})",
+            "    {prefix}{} -> {} (source={source}{rename_note})",
+            index.index(),
             info.text,
         );
     }

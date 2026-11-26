@@ -6,8 +6,10 @@
 //! - 参数对外层当前可见绑定的避让
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
-use crate::hir::{HirProto, HirProtoRef, LocalId};
+use crate::ast::{AstProtoMeta, LocalId, ProtoId};
+use crate::decompile::DecompileDialect;
 
 use super::NamingError;
 use super::ast_facts::{AstNamingFacts, FunctionAstNamingFacts};
@@ -19,7 +21,7 @@ use super::strategy::{
     choose_local_candidate, choose_param_candidate, choose_synthetic_local_candidate,
     choose_upvalue_candidate,
 };
-use super::support::{alphabetical_name, is_lua_keyword};
+use super::support::{alphabetical_name, is_lua_keyword_for_dialect};
 use super::visibility::VisibleNames;
 
 impl ModuleNameAllocator {
@@ -63,11 +65,13 @@ impl ModuleNameAllocator {
 }
 
 pub(super) struct FunctionAssignContext<'a> {
-    pub proto: &'a HirProto,
+    pub proto: &'a AstProtoMeta,
+    pub debug_like_function_index: usize,
     pub capture_evidence: Option<&'a ClosureCaptureEvidence<'a>>,
     pub hints: &'a FunctionHints,
     pub ast_facts: &'a FunctionAstNamingFacts,
     pub module_ast_facts: &'a AstNamingFacts<'a>,
+    pub target_dialect: Option<DecompileDialect>,
     pub options: NamingOptions,
     pub visible_names: &'a VisibleNames,
     pub definition_position: usize,
@@ -77,34 +81,71 @@ pub(super) struct FunctionAssignContext<'a> {
 
 struct FunctionNameAllocator<'a> {
     ast_facts: &'a AstNamingFacts<'a>,
-    function: HirProtoRef,
+    function: ProtoId,
+    target_dialect: Option<DecompileDialect>,
+    mode: NamingMode,
     visible_names: &'a VisibleNames,
     definition_position: usize,
+    /// 贯穿整个函数作用域的全局占用名（参数、upvalue、环境局部或 DebugLike 模式）。
     used: BTreeSet<String>,
+    /// 按词法区间记录的局部占用名，严格不相交块之间可安全复用 `i`、`k`、`v` 或同名 debug 局部。
+    scoped_used: BTreeMap<String, Vec<Range<usize>>>,
     next_suffix_by_base: BTreeMap<String, usize>,
 }
 
 impl<'a> FunctionNameAllocator<'a> {
     fn new(
         ast_facts: &'a AstNamingFacts<'a>,
-        function: HirProtoRef,
+        function: ProtoId,
+        target_dialect: Option<DecompileDialect>,
+        mode: NamingMode,
         visible_names: &'a VisibleNames,
         definition_position: usize,
     ) -> Self {
         Self {
             ast_facts,
             function,
+            target_dialect,
+            mode,
             visible_names,
             definition_position,
             used: BTreeSet::new(),
+            scoped_used: BTreeMap::new(),
             next_suffix_by_base: BTreeMap::new(),
         }
     }
 
     fn is_used(&self, name: &str) -> bool {
-        is_lua_keyword(name)
+        self.is_used_in(name, None)
+    }
+
+    fn is_used_in(&self, name: &str, scope: Option<&Range<usize>>) -> bool {
+        if is_lua_keyword_for_dialect(self.target_dialect, name)
             || self.used.contains(name)
             || self.ast_facts.reserves_global_name(self.function, name)
+        {
+            return true;
+        }
+        let Some(ranges) = self.scoped_used.get(name) else {
+            return false;
+        };
+        if self.mode == NamingMode::DebugLike {
+            return !ranges.is_empty();
+        }
+        match scope {
+            Some(iv) => ranges.iter().any(|r| r.start < iv.end && iv.start < r.end),
+            None => !ranges.is_empty(),
+        }
+    }
+
+    fn record_name(&mut self, name: String, scope: Option<Range<usize>>) {
+        if self.mode != NamingMode::DebugLike
+            && let Some(iv) = scope
+        {
+            self.scoped_used.entry(name).or_default().push(iv);
+        } else {
+            self.used.insert(name);
+        }
     }
 
     fn is_outer_visible(&self, name: &str) -> bool {
@@ -112,6 +153,16 @@ impl<'a> FunctionNameAllocator<'a> {
     }
 
     fn allocate(&mut self, candidate: CandidateHint) -> NameInfo {
+        self.allocate_scoped(candidate, false, None, false)
+    }
+
+    fn allocate_scoped(
+        &mut self,
+        candidate: CandidateHint,
+        forbid_env: bool,
+        scope: Option<Range<usize>>,
+        is_unreferenced_discard: bool,
+    ) -> NameInfo {
         if matches!(
             candidate.source,
             NameSource::LegacyArg | NameSource::LexicalEnvironment
@@ -123,7 +174,10 @@ impl<'a> FunctionNameAllocator<'a> {
                 renamed: false,
             };
         }
-        if candidate.source == NameSource::Discard && !self.is_used(&candidate.text) {
+        if (candidate.source == NameSource::Discard || is_unreferenced_discard)
+            && candidate.text == "_"
+            && !self.is_used_in(&candidate.text, scope.as_ref())
+        {
             return NameInfo {
                 text: candidate.text,
                 source: candidate.source,
@@ -132,8 +186,8 @@ impl<'a> FunctionNameAllocator<'a> {
         }
 
         let base = candidate.text;
-        if !self.is_used(&base) {
-            self.used.insert(base.clone());
+        if !self.is_used_in(&base, scope.as_ref()) && !(forbid_env && base == "_ENV") {
+            self.record_name(base.clone(), scope);
             return NameInfo {
                 text: base,
                 source: candidate.source,
@@ -141,13 +195,19 @@ impl<'a> FunctionNameAllocator<'a> {
             };
         }
 
-        let mut suffix = self.next_suffix_by_base.get(&base).copied().unwrap_or(2);
+        let mut suffix = if scope.is_some() && self.mode != NamingMode::DebugLike {
+            2
+        } else {
+            self.next_suffix_by_base.get(&base).copied().unwrap_or(2)
+        };
         loop {
             let renamed = format!("{base}{suffix}");
             suffix = suffix.saturating_add(1);
-            if !self.is_used(&renamed) {
-                self.next_suffix_by_base.insert(base, suffix);
-                self.used.insert(renamed.clone());
+            if !self.is_used_in(&renamed, scope.as_ref()) && !(forbid_env && renamed == "_ENV") {
+                if scope.is_none() || self.mode == NamingMode::DebugLike {
+                    self.next_suffix_by_base.insert(base, suffix);
+                }
+                self.record_name(renamed.clone(), scope);
                 return NameInfo {
                     text: renamed,
                     source: candidate.source,
@@ -164,10 +224,12 @@ pub(super) fn assign_names_for_function(
 ) -> Result<FunctionNameMap, NamingError> {
     let FunctionAssignContext {
         proto,
+        debug_like_function_index,
         capture_evidence,
         hints,
         ast_facts,
         module_ast_facts,
+        target_dialect,
         options,
         visible_names,
         definition_position,
@@ -177,6 +239,8 @@ pub(super) fn assign_names_for_function(
     let mut names = FunctionNameAllocator::new(
         module_ast_facts,
         proto.id,
+        target_dialect,
+        options.mode,
         visible_names,
         definition_position,
     );
@@ -185,7 +249,14 @@ pub(super) fn assign_names_for_function(
         .iter()
         .enumerate()
         .map(|(index, _upvalue)| {
-            choose_upvalue_candidate(proto, index, capture_evidence, options, assigned_functions)
+            choose_upvalue_candidate(
+                proto,
+                debug_like_function_index,
+                index,
+                capture_evidence,
+                options,
+                assigned_functions,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -218,26 +289,78 @@ pub(super) fn assign_names_for_function(
         .map(|(index, param)| {
             allocate_param_name(
                 module_names.reserve_function_shape_name(
-                    choose_param_candidate(proto, *param, index, hints, ast_facts, options),
+                    choose_param_candidate(
+                        proto,
+                        debug_like_function_index,
+                        *param,
+                        index,
+                        hints,
+                        ast_facts,
+                        options,
+                    ),
                     &names,
                     options.mode,
                 ),
                 index,
                 options,
+                ast_facts.forbids_env_params.contains(param),
                 &mut names,
             )
         })
         .collect::<Vec<_>>();
 
-    let locals = (0..proto.local_count)
-        .map(LocalId)
-        .map(|local| {
-            names.allocate(module_names.reserve_function_shape_name(
-                choose_local_candidate(proto, local, hints, ast_facts, options),
-                &names,
-                options.mode,
-            ))
+    // 按“活动显式 debug/语义名 → 活动启发式/通用名 → 未发射死 LocalId”三档顺序分配，
+    // 防止匿名启发式猜测（如 `value`）或死 LocalId 抢占真实源码 debug 局部变量的原名。
+    let local_candidates: Vec<(bool, CandidateHint)> = (0..proto.local_count)
+        .map(|index| {
+            let local = LocalId(index);
+            let is_live = ast_facts
+                .debug_like_binding_order
+                .contains_key(&crate::ast::AstBindingRef::Local(local));
+            let candidate = choose_local_candidate(
+                proto,
+                debug_like_function_index,
+                local,
+                hints,
+                ast_facts,
+                options,
+            );
+            (is_live, candidate)
         })
+        .collect();
+    let mut local_slots: Vec<Option<NameInfo>> = vec![None; proto.local_count];
+    for tier in 0..3u8 {
+        for (index, (is_live, candidate)) in local_candidates.iter().enumerate() {
+            let is_explicit = matches!(
+                candidate.source,
+                NameSource::LegacyArg | NameSource::LexicalEnvironment | NameSource::Debug
+            );
+            let item_tier = if *is_live && is_explicit {
+                0
+            } else if *is_live {
+                1
+            } else {
+                2
+            };
+            if item_tier != tier {
+                continue;
+            }
+            let binding_ref = crate::ast::AstBindingRef::Local(LocalId(index));
+            let forbid_env = ast_facts.forbids_env_bindings.contains(&binding_ref);
+            let scope = ast_facts.binding_scope_intervals.get(&binding_ref).cloned();
+            let is_unreferenced_discard = candidate.text == "_"
+                && !ast_facts.mentioned_bindings.contains(&binding_ref);
+            local_slots[index] = Some(names.allocate_scoped(
+                module_names.reserve_function_shape_name(candidate.clone(), &names, options.mode),
+                forbid_env,
+                scope,
+                is_unreferenced_discard,
+            ));
+        }
+    }
+    let locals = local_slots
+        .into_iter()
+        .map(|slot| slot.expect("every local assigned"))
         .collect::<Vec<_>>();
 
     let mut upvalues = Vec::with_capacity(proto.upvalues.len());
@@ -261,9 +384,13 @@ pub(super) fn assign_names_for_function(
         .copied()
         .enumerate()
         .map(|(synthetic_order, local)| {
-            let info = names.allocate(module_names.reserve_function_shape_name(
+            let binding_ref = crate::ast::AstBindingRef::SyntheticLocal(local);
+            let forbid_env = ast_facts.forbids_env_bindings.contains(&binding_ref);
+            let scope = ast_facts.binding_scope_intervals.get(&binding_ref).cloned();
+            let cand = module_names.reserve_function_shape_name(
                 choose_synthetic_local_candidate(
                     proto,
+                    debug_like_function_index,
                     local,
                     synthetic_order,
                     hints,
@@ -272,7 +399,10 @@ pub(super) fn assign_names_for_function(
                 ),
                 &names,
                 options.mode,
-            ));
+            );
+            let is_unreferenced_discard =
+                cand.text == "_" && !ast_facts.mentioned_bindings.contains(&binding_ref);
+            let info = names.allocate_scoped(cand, forbid_env, scope, is_unreferenced_discard);
             (local, info)
         })
         .collect();
@@ -289,20 +419,26 @@ fn allocate_param_name(
     candidate: CandidateHint,
     index: usize,
     options: NamingOptions,
+    forbid_env: bool,
     names: &mut FunctionNameAllocator<'_>,
 ) -> NameInfo {
     if options.mode == NamingMode::DebugLike || candidate.source != NameSource::Simple {
-        return names.allocate(candidate);
+        return names.allocate_scoped(candidate, forbid_env, None, false);
     }
     if !names.is_outer_visible(&candidate.text) {
-        return names.allocate(candidate);
+        return names.allocate_scoped(candidate, forbid_env, None, false);
     }
 
     let replacement = next_available_simple_param_name(index, names);
-    names.allocate(CandidateHint {
-        text: replacement,
-        source: candidate.source,
-    })
+    names.allocate_scoped(
+        CandidateHint {
+            text: replacement,
+            source: candidate.source,
+        },
+        forbid_env,
+        None,
+        false,
+    )
 }
 
 fn next_available_simple_param_name(mut index: usize, names: &FunctionNameAllocator<'_>) -> String {

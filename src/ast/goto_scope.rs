@@ -44,21 +44,216 @@ pub(super) fn verify_or_diagnose(
     module: &mut AstModule,
     mode: GenerateMode,
 ) -> Result<(), AstLowerError> {
-    let result = verify_function(module.entry_function.index(), &module.body);
+    verify_or_diagnose_function(module.entry_function.index(), &mut module.body, mode)
+}
+
+fn verify_or_diagnose_function(
+    function: usize,
+    body: &mut AstBlock,
+    mode: GenerateMode,
+) -> Result<(), AstLowerError> {
+    let result = verify_function_shallow(function, body);
     match (mode, result) {
-        (_, Ok(())) => Ok(()),
-        (GenerateMode::Strict, Err(error)) => Err(error),
+        (_, Ok(())) => {}
+        (GenerateMode::Strict, Err(error)) => return Err(error),
         (GenerateMode::Permissive, Err(error)) => {
-            module
-                .body
-                .stmts
-                .insert(0, AstStmt::Error(error.to_string()));
-            Ok(())
+            body.stmts.insert(0, AstStmt::Error(error.to_string()));
+        }
+    }
+    verify_or_diagnose_nested_in_block(body, mode)
+}
+
+fn verify_or_diagnose_nested_in_block(
+    block: &mut AstBlock,
+    mode: GenerateMode,
+) -> Result<(), AstLowerError> {
+    for stmt in &mut block.stmts {
+        verify_or_diagnose_nested_in_stmt(stmt, mode)?;
+    }
+    Ok(())
+}
+
+fn verify_or_diagnose_nested_in_stmt(
+    stmt: &mut AstStmt,
+    mode: GenerateMode,
+) -> Result<(), AstLowerError> {
+    match stmt {
+        AstStmt::LocalDecl(d) => {
+            for v in &mut d.values {
+                verify_or_diagnose_nested_in_expr(v, mode)?;
+            }
+        }
+        AstStmt::GlobalDecl(d) => {
+            for v in &mut d.values {
+                verify_or_diagnose_nested_in_expr(v, mode)?;
+            }
+        }
+        AstStmt::Assign(a) => {
+            for t in &mut a.targets {
+                verify_or_diagnose_nested_in_lvalue(t, mode)?;
+            }
+            for v in &mut a.values {
+                verify_or_diagnose_nested_in_expr(v, mode)?;
+            }
+        }
+        AstStmt::CallStmt(c) => verify_or_diagnose_nested_in_call(&mut c.call, mode)?,
+        AstStmt::Return(r) => {
+            for v in &mut r.values {
+                verify_or_diagnose_nested_in_expr(v, mode)?;
+            }
+        }
+        AstStmt::If(branch) => {
+            verify_or_diagnose_nested_in_expr(&mut branch.cond, mode)?;
+            verify_or_diagnose_nested_in_block(&mut branch.then_block, mode)?;
+            if let Some(else_block) = &mut branch.else_block {
+                verify_or_diagnose_nested_in_block(else_block, mode)?;
+            }
+        }
+        AstStmt::While(w) => {
+            verify_or_diagnose_nested_in_expr(&mut w.cond, mode)?;
+            verify_or_diagnose_nested_in_block(&mut w.body, mode)?;
+        }
+        AstStmt::Repeat(r) => {
+            verify_or_diagnose_nested_in_block(&mut r.body, mode)?;
+            verify_or_diagnose_nested_in_expr(&mut r.cond, mode)?;
+        }
+        AstStmt::NumericFor(nf) => {
+            verify_or_diagnose_nested_in_expr(&mut nf.start, mode)?;
+            verify_or_diagnose_nested_in_expr(&mut nf.limit, mode)?;
+            verify_or_diagnose_nested_in_expr(&mut nf.step, mode)?;
+            verify_or_diagnose_nested_in_block(&mut nf.body, mode)?;
+        }
+        AstStmt::GenericFor(gf) => {
+            for e in &mut gf.iterator {
+                verify_or_diagnose_nested_in_expr(e, mode)?;
+            }
+            verify_or_diagnose_nested_in_block(&mut gf.body, mode)?;
+        }
+        AstStmt::DoBlock(b) => verify_or_diagnose_nested_in_block(b, mode)?,
+        AstStmt::FunctionDecl(d) => {
+            verify_or_diagnose_function(d.func.function.index(), &mut d.func.body, mode)?;
+        }
+        AstStmt::LocalFunctionDecl(d) => {
+            verify_or_diagnose_function(d.func.function.index(), &mut d.func.body, mode)?;
+        }
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
+    }
+    Ok(())
+}
+
+fn verify_or_diagnose_nested_in_lvalue(
+    target: &mut AstLValue,
+    mode: GenerateMode,
+) -> Result<(), AstLowerError> {
+    match target {
+        AstLValue::Name(_) => Ok(()),
+        AstLValue::FieldAccess(f) => verify_or_diagnose_nested_in_expr(&mut f.base, mode),
+        AstLValue::IndexAccess(ia) => {
+            verify_or_diagnose_nested_in_expr(&mut ia.base, mode)?;
+            verify_or_diagnose_nested_in_expr(&mut ia.index, mode)
         }
     }
 }
 
-fn verify_function(function: usize, body: &AstBlock) -> Result<(), AstLowerError> {
+fn verify_or_diagnose_nested_in_call(
+    call: &mut AstCallKind,
+    mode: GenerateMode,
+) -> Result<(), AstLowerError> {
+    match call {
+        AstCallKind::Call(c) => {
+            verify_or_diagnose_nested_in_expr(&mut c.callee, mode)?;
+            for arg in &mut c.args {
+                verify_or_diagnose_nested_in_expr(arg, mode)?;
+            }
+        }
+        AstCallKind::MethodCall(m) => {
+            verify_or_diagnose_nested_in_expr(&mut m.receiver, mode)?;
+            for arg in &mut m.args {
+                verify_or_diagnose_nested_in_expr(arg, mode)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_or_diagnose_nested_in_expr(
+    expr: &mut AstExpr,
+    mode: GenerateMode,
+) -> Result<(), AstLowerError> {
+    match expr {
+        AstExpr::FunctionExpr(func) => {
+            verify_or_diagnose_function(func.function.index(), &mut func.body, mode)
+        }
+        AstExpr::Unary(u) => verify_or_diagnose_nested_in_expr(&mut u.expr, mode),
+        AstExpr::Binary(b) => {
+            verify_or_diagnose_nested_in_expr(&mut b.lhs, mode)?;
+            verify_or_diagnose_nested_in_expr(&mut b.rhs, mode)
+        }
+        AstExpr::LogicalAnd(l) | AstExpr::LogicalOr(l) => {
+            verify_or_diagnose_nested_in_expr(&mut l.lhs, mode)?;
+            verify_or_diagnose_nested_in_expr(&mut l.rhs, mode)
+        }
+        AstExpr::IfExpr(ie) => {
+            verify_or_diagnose_nested_in_expr(&mut ie.cond, mode)?;
+            verify_or_diagnose_nested_in_expr(&mut ie.then_expr, mode)?;
+            verify_or_diagnose_nested_in_expr(&mut ie.else_expr, mode)
+        }
+        AstExpr::FieldAccess(f) => verify_or_diagnose_nested_in_expr(&mut f.base, mode),
+        AstExpr::IndexAccess(ia) => {
+            verify_or_diagnose_nested_in_expr(&mut ia.base, mode)?;
+            verify_or_diagnose_nested_in_expr(&mut ia.index, mode)
+        }
+        AstExpr::Call(c) => {
+            verify_or_diagnose_nested_in_expr(&mut c.callee, mode)?;
+            for arg in &mut c.args {
+                verify_or_diagnose_nested_in_expr(arg, mode)?;
+            }
+            Ok(())
+        }
+        AstExpr::MethodCall(m) => {
+            verify_or_diagnose_nested_in_expr(&mut m.receiver, mode)?;
+            for arg in &mut m.args {
+                verify_or_diagnose_nested_in_expr(arg, mode)?;
+            }
+            Ok(())
+        }
+        AstExpr::TableConstructor(tc) => {
+            for field in &mut tc.fields {
+                match field {
+                    super::AstTableField::Array(e) => {
+                        verify_or_diagnose_nested_in_expr(e, mode)?;
+                    }
+                    super::AstTableField::Record(r) => {
+                        if let super::AstTableKey::Expr(k) = &mut r.key {
+                            verify_or_diagnose_nested_in_expr(k, mode)?;
+                        }
+                        verify_or_diagnose_nested_in_expr(&mut r.value, mode)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        AstExpr::SingleValue(inner) => verify_or_diagnose_nested_in_expr(inner, mode),
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Number(_)
+        | AstExpr::Vector(_)
+        | AstExpr::String(_)
+        | AstExpr::VarArg
+        | AstExpr::Var(_)
+        | AstExpr::Error(_) => Ok(()),
+    }
+}
+
+pub(super) fn verify_function_only(function: usize, body: &AstBlock) -> Result<(), AstLowerError> {
+    verify_function_shallow(function, body)
+}
+
+fn verify_function_shallow(function: usize, body: &AstBlock) -> Result<(), AstLowerError> {
     let mut verifier = FunctionVerifier {
         function,
         block_parents: Vec::new(),
@@ -192,8 +387,8 @@ impl FunctionVerifier {
         scope
     }
 
-    fn visit_function(&self, function: &AstFunctionExpr) -> Result<(), AstLowerError> {
-        verify_function(function.function.index(), &function.body)
+    fn visit_function(&self, _function: &AstFunctionExpr) -> Result<(), AstLowerError> {
+        Ok(())
     }
 
     fn visit_exprs(&self, exprs: &[AstExpr]) -> Result<(), AstLowerError> {
@@ -340,5 +535,89 @@ impl TreeIntervals {
                     ancestor_enter <= node_enter && node_exit <= ancestor_exit
                 },
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::ast::{
+        AstGoto, AstLabel, AstLocalBinding, AstLocalDecl, AstLocalFunctionDecl, AstReturn, LocalId,
+        ProtoId,
+    };
+
+    fn make_module_with_broken_child_goto() -> AstModule {
+        let child_body = AstBlock {
+            stmts: vec![
+                AstStmt::Goto(Box::new(AstGoto {
+                    target: AstLabelId(0),
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(0)),
+                        attr: AstLocalAttr::None,
+                        is_debug_hinted: false,
+                    }],
+                    values: vec![AstExpr::Integer(1)],
+                })),
+                AstStmt::Label(Box::new(AstLabel { id: AstLabelId(0) })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Integer(2)],
+                })),
+            ],
+        };
+        let child_func = AstFunctionExpr {
+            function: ProtoId(1),
+            params: Vec::new(),
+            is_vararg: false,
+            named_vararg: None,
+            body: child_body,
+            captured_bindings: BTreeSet::new(),
+            captured_params: BTreeSet::new(),
+            capture_write_names: BTreeSet::new(),
+        };
+        AstModule {
+            entry_function: ProtoId(0),
+            body: AstBlock {
+                stmts: vec![AstStmt::LocalFunctionDecl(Box::new(
+                    AstLocalFunctionDecl {
+                        name: AstBindingRef::Local(LocalId(0)),
+                        func: child_func,
+                    },
+                ))],
+            },
+            ..AstModule::default()
+        }
+    }
+
+    #[test]
+    fn permissive_inserts_goto_scope_error_into_offending_child_function() {
+        let mut module = make_module_with_broken_child_goto();
+        verify_or_diagnose(&mut module, GenerateMode::Permissive).expect("permissive succeeds");
+        assert!(
+            !matches!(module.body.stmts.first(), Some(AstStmt::Error(_))),
+            "root function should stay clean"
+        );
+        let AstStmt::LocalFunctionDecl(decl) = &module.body.stmts[0] else {
+            panic!("expected local function decl");
+        };
+        assert!(
+            matches!(decl.func.body.stmts.first(), Some(AstStmt::Error(msg)) if msg.contains("proto#1")),
+            "expected diagnostic inserted at start of child function body, got {:?}",
+            decl.func.body.stmts.first()
+        );
+    }
+
+    #[test]
+    fn strict_rejects_child_goto_entering_local_scope() {
+        let mut module = make_module_with_broken_child_goto();
+        let err = verify_or_diagnose(&mut module, GenerateMode::Strict)
+            .expect_err("strict must reject");
+        assert!(matches!(
+            err,
+            AstLowerError::GotoEntersLocalScope { function: 1, .. }
+        ));
     }
 }

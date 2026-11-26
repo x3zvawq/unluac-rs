@@ -1,7 +1,4 @@
-//! 主反编译流水线的阶段调度表。
-//!
-//! 消费单次调用的状态与选项，统一阶段顺序、完成标记、停止点、计时和 dump 分派；
-//! 各层自行组织内部步骤并发布产物。
+//! 主反编译流水线的五阶段固定调度表。
 
 use super::error::DecompileError;
 use super::options::DebugOptions;
@@ -25,14 +22,9 @@ const PIPELINE_STAGES: &[StageDescriptor] = &[
         dump: crate::transformer::dump_lir,
     },
     StageDescriptor {
-        stage: DecompileStage::Structure,
-        run: crate::structure::analyze_structure_stage,
-        dump: crate::structure::dump_structure,
-    },
-    StageDescriptor {
-        stage: DecompileStage::Hir,
-        run: crate::hir::analyze_hir,
-        dump: crate::hir::dump_hir,
+        stage: DecompileStage::Analysis,
+        run: crate::analysis::analyze_stage,
+        dump: crate::analysis::dump_analysis,
     },
     StageDescriptor {
         stage: DecompileStage::Ast,

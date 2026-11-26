@@ -23,7 +23,6 @@ pub(super) fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNa
         AstExpr::Nil => "nil".to_owned(),
         AstExpr::Boolean(value) => value.to_string(),
         AstExpr::Integer(value) => value.to_string(),
-        AstExpr::CaptureInitializer(value) => format!("capture-init({value:?})"),
         AstExpr::Number(value) => value.to_string(),
         AstExpr::String(value) => value.debug_literal(),
         AstExpr::Int64(value) => format!("{value}LL"),
@@ -182,7 +181,6 @@ pub(super) fn format_name_ref(name: &AstNameRef, names: &FunctionRenderNames) ->
     match name {
         AstNameRef::Param(param) => format!("p{}", param.index()),
         AstNameRef::Local(local) => format!("l{}", local.index()),
-        AstNameRef::Temp(temp) => format!("t{}", temp.index()),
         AstNameRef::SyntheticLocal(local) => format!("l{}", display_synthetic_local(*local, names)),
         AstNameRef::Upvalue(upvalue) => format!("u{}", upvalue.index()),
         AstNameRef::Environment => "_ENV".to_owned(),
@@ -218,7 +216,6 @@ pub(super) fn format_function_name(
 pub(super) fn format_binding_ref(binding: AstBindingRef, names: &FunctionRenderNames) -> String {
     match binding {
         AstBindingRef::Local(local) => format!("l{}", local.index()),
-        AstBindingRef::Temp(temp) => format!("t{}", temp.index()),
         AstBindingRef::SyntheticLocal(local) => {
             format!("l{}", display_synthetic_local(local, names))
         }

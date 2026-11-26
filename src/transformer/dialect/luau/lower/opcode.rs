@@ -315,7 +315,7 @@ impl<'a> ProtoLowerer<'a> {
                         PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
                             dst,
                             allocation: crate::transformer::TableAllocation::Luau(
-                                crate::value_semantics::table::allocation::TablePreallocation::exact(
+                                crate::transformer::TablePreallocation::exact(
                                     required_aux(raw_pc, opcode, extra)?, b,
                                 ).ok_or(TransformError::UnexpectedOperands {
                                     raw_pc, opcode: "NEWTABLE", expected: "table preallocation fits u32",
@@ -755,13 +755,7 @@ impl<'a> ProtoLowerer<'a> {
                     let values = if c == 0 {
                         ValuePack::Open(reg_from_u8(b))
                     } else {
-                        ValuePack::Fixed(RegRange::new(
-                            reg_from_u8(b),
-                            range_len_inclusive(
-                                usize::from(b),
-                                usize::from(b) + usize::from(c) - 2,
-                            ),
-                        ))
+                        ValuePack::Fixed(RegRange::new(reg_from_u8(b), usize::from(c - 1)))
                     };
                     self.emit(
                         Some(raw_index),

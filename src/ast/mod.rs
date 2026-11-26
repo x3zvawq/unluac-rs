@@ -1,32 +1,30 @@
-//! AST 层入口。
+//! AST 阶段入口：串联控制流结构化、直接表达式提升、轻量语法整形与命名。
 
-mod build;
-mod capture_scope;
 mod common;
 #[cfg(feature = "decompile-debug")]
 mod debug;
 mod error;
 mod features;
 mod goto_scope;
+pub mod lift;
 mod naming;
+pub mod polish;
 pub(crate) mod pretty;
-mod readability;
-mod table_layout;
+pub mod structure;
 pub(crate) mod traverse;
 mod visit;
 
 pub use crate::decompile::{DecompileDialect, ReadabilityOptions};
-pub use build::lower_ast;
 pub use common::{
     AstAssign, AstBinaryExpr, AstBinaryOpKind, AstBindingRef, AstBlock, AstCallExpr, AstCallKind,
-    AstCallStmt, AstDialectCaps, AstExpr, AstFeature, AstFieldAccess, AstFunctionDecl,
-    AstFunctionExpr, AstFunctionName, AstGenericFor, AstGlobalAttr, AstGlobalBinding,
-    AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstIfExpr,
-    AstIndexAccess, AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
-    AstLocalFunctionDecl, AstLocalOrigin, AstLogicalExpr, AstMethodCallExpr, AstModule,
-    AstNamePath, AstNameRef, AstNumericFor, AstRecordField, AstRepeat, AstReturn,
-    AstRewriteAuthority, AstStmt, AstSyntheticLocalId, AstTableConstructor, AstTableField,
-    AstTableKey, AstTargetDialect, AstUnaryExpr, AstUnaryOpKind, AstWhile,
+    AstCallStmt, AstCapture, AstCaptureBinding, AstCaptureMode, AstDialectCaps, AstExpr,
+    AstFeature, AstFieldAccess, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGenericFor,
+    AstGlobalAttr, AstGlobalBinding, AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto,
+    AstIf, AstIfExpr, AstIndexAccess, AstLValue, AstLabel, AstLabelId, AstLocalAttr,
+    AstLocalBinding, AstLocalDecl, AstLocalFunctionDecl, AstLogicalExpr, AstMethodCallExpr,
+    AstModule, AstNamePath, AstNameRef, AstNumericFor, AstProtoMeta, AstRecordField, AstRepeat,
+    AstReturn, AstStmt, AstSyntheticLocalId, AstTableConstructor, AstTableField, AstTableKey,
+    AstTargetDialect, AstUnaryExpr, AstUnaryOpKind, AstWhile, LocalId, ParamId, ProtoId, UpvalueId,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_ast;
@@ -42,33 +40,34 @@ pub use naming::{
     FunctionNameMap, NameInfo, NameMap, NameSource, NamingError, NamingEvidence, NamingMode,
     NamingOptions, assign_name_map, assign_names_with_evidence, collect_naming_evidence,
 };
-pub(crate) use visit::{written_locals, written_names};
 
+/// 主流水线 AST 阶段入口：Structure + Lift → Polish + Goto Scope → Naming。
 pub(crate) fn analyze_ast_stage(
     state: &mut crate::decompile::DecompileState,
     context: &crate::decompile::DecompileContext<'_>,
 ) -> Result<(), crate::decompile::DecompileError> {
-    {
-        let _timing = context.timings.scope("build");
-        build::lower_ast_for_generate(state, context)?;
-    }
-    {
-        let _timing = context.timings.scope("readability");
-        readability::make_readable(state, context)?;
-    }
-    {
-        let _timing = context.timings.scope("goto-scope");
-        let Some(readability) = state.readability.as_mut() else {
-            return Err(crate::decompile::DecompileError::MissingStageOutput {
-                stage: crate::decompile::DecompileStage::Ast,
-            });
-        };
-        goto_scope::verify_or_diagnose(readability, context.options.generate.mode)?;
-    }
-    {
-        let _timing = context.timings.scope("naming");
-        naming::assign_names(state, context)?;
-    }
+    let lowered = state.require_lowered()?;
+    let analysis = state.require_analysis()?;
 
+    let mut ast = {
+        let _timing = context.timings.scope("structure-and-lift");
+        lift::lift_module(
+            lowered,
+            analysis,
+            context.requested_target,
+            context.options.generate.mode,
+        )?
+    };
+    {
+        let _timing = context.timings.scope("polish");
+        polish::polish_module(&mut ast, context.requested_target, context.options.generate.mode)?;
+    }
+    let names = {
+        let _timing = context.timings.scope("naming");
+        naming::assign_name_map(&ast, context.options.naming)?
+    };
+
+    state.ast = Some(ast);
+    state.naming = Some(names);
     Ok(())
 }

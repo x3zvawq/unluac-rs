@@ -19,18 +19,18 @@ mod debug {
 pub(crate) use common::instantiate_closure_children;
 
 pub use common::{
-    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchPredicate,
-    BranchSubject, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, CloseKind,
-    ClosureCreation, ClosureInstr, ConcatInstr, CondOperand, ConstRef, DebugLocalFact,
+    AccessBase, AccessKey, ArraySizing, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr,
+    BranchPredicate, BranchSubject, CallInstr, CallKind, Capture, CaptureSource, CloseInstr,
+    CloseKind, ClosureCreation, ClosureInstr, ConcatInstr, CondOperand, ConstRef, DebugLocalFact,
     DebugLocalKind, ErrNilInstr, FastCallProtocol, GenericForCallInstr, GenericForLoopInstr,
     GenericForPrepInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, JumpInstr,
     LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,
     LoweredChunk, LoweredProto, LoweringMap, MethodNameHint, MoveInstr, NewTableInstr,
     NumberLiteral, NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange,
     ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr,
-    SharedClosureRef, TableAllocation, TableTemplate, TailCallInstr, TbcInstr, TypeGuardInstr,
-    TypeGuardKind, UnaryOpInstr, UnaryOpKind, UpvalueOperand, UpvalueRef, ValueOperand, ValuePack,
-    VarArgInstr,
+    SharedClosureRef, TableAllocation, TablePreallocation, TableTemplate, TailCallInstr, TbcInstr,
+    TypeGuardInstr, TypeGuardKind, UnaryOpInstr, UnaryOpKind, UpvalueOperand, UpvalueRef,
+    ValueOperand, ValuePack, VarArgInstr,
 };
 pub use debug::dump_lir;
 pub use debug_locals::DebugLocals;

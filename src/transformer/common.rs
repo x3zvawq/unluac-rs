@@ -720,12 +720,67 @@ pub struct NewTableInstr {
     pub allocation: TableAllocation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArraySizing {
+    /// Lua 5.1–5.3 的浮点字节计数，容量可能因编码取整而扩大。
+    FloatingByte,
+    /// Lua 5.4–5.5 与 Luau 的精确数组计数。
+    Exact,
+}
+
+/// PUC/Luau 建表指令携带的预分配容量事实。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TablePreallocation {
+    pub array_capacity: u32,
+    pub hash_capacity: u32,
+    pub array_sizing: ArraySizing,
+}
+
+impl TablePreallocation {
+    pub(crate) fn floating_byte(array: u32, hash: u32) -> Option<Self> {
+        Some(Self {
+            array_capacity: decode_floating_byte(array)?,
+            hash_capacity: hash_capacity(decode_floating_byte(hash)?)?,
+            array_sizing: ArraySizing::FloatingByte,
+        })
+    }
+
+    pub(crate) fn exact(array_capacity: u32, hash_log_plus_one: u8) -> Option<Self> {
+        Some(Self {
+            array_capacity,
+            hash_capacity: if hash_log_plus_one == 0 {
+                0
+            } else {
+                1_u32.checked_shl(u32::from(hash_log_plus_one - 1))?
+            },
+            array_sizing: ArraySizing::Exact,
+        })
+    }
+}
+
+fn decode_floating_byte(value: u32) -> Option<u32> {
+    let exponent = (value >> 3) & 31;
+    if exponent == 0 {
+        Some(value)
+    } else {
+        (value & 7).checked_add(8)?.checked_mul(1 << (exponent - 1))
+    }
+}
+
+fn hash_capacity(entries: u32) -> Option<u32> {
+    if entries == 0 {
+        Some(0)
+    } else {
+        entries.checked_next_power_of_two()
+    }
+}
+
 /// 分配与初始化是一条 VM 事件。模板里的 nil 槽和 hash key 是初始布局事实，
 /// 不能展开为有独立求值/观察语义的普通 SetTable 再让后层恢复。
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum TableAllocation {
-    PucBatched(crate::value_semantics::table::allocation::TablePreallocation),
-    Luau(crate::value_semantics::table::allocation::TablePreallocation),
+    PucBatched(TablePreallocation),
+    Luau(TablePreallocation),
     /// Luau DUPTABLE 按原顺序预置键；None 是 VM 的数值 0 占位，不是 nil。
     /// 模板复制是一条分配事件，不能拆成后续普通字段写入。
     LuauTemplate(Vec<(ConstRef, Option<ConstRef>)>),
@@ -864,14 +919,6 @@ pub struct NumericForInitInstr {
     pub exit_target: InstrRef,
 }
 
-impl NumericForInitInstr {
-    /// 只回答该原物理槽的全正常路径保证，不表示异常路径或整个对象已退休。
-    pub(crate) fn normalizes_slot(self, reg: Reg) -> bool {
-        (self.normalizes_controls && (reg == self.index || reg == self.limit || reg == self.step))
-            || (self.normalizes_binding && reg == self.binding)
-    }
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct NumericForLoopInstr {
     pub index: Reg,
@@ -890,16 +937,6 @@ pub struct GenericForPrepInstr {
     pub closing_source: Reg,
     pub control_target: Reg,
     pub closing_target: Reg,
-}
-
-impl GenericForPrepInstr {
-    pub(crate) fn source_for_target(self, target: Reg) -> Option<Reg> {
-        match target {
-            target if target == self.control_target => Some(self.control_source),
-            target if target == self.closing_target => Some(self.closing_source),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

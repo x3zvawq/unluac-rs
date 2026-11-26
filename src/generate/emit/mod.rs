@@ -5,22 +5,24 @@
 //! 布局意图，以及基于稳定 metadata 的可选注释输出。
 
 mod expr;
-mod luau_inlining;
 mod names;
 mod stmt;
 mod syntax;
 
-use crate::ast::{AstBlock, AstFeature, AstModule, AstTargetDialect, collect_ast_features};
-use crate::decompile::{DecompileContext, DecompileDialect, DecompileError, DecompileState};
+use crate::ast::{
+    AstBlock, AstExpr, AstFeature, AstFunctionDecl, AstFunctionExpr, AstLocalFunctionDecl,
+    AstModule, AstStmt, AstTargetDialect, ProtoId, collect_ast_features,
+};
+use crate::decompile::{DecompileContext, DecompileError, DecompileResult, DecompileState};
 use crate::generate::doc::Doc;
-use crate::hir::HirProtoRef;
 use names::NameResolver;
 
 use super::common::{
-    GenerateCommentMetadata, GenerateMode, GenerateOptions, GeneratedChunk, GeneratedChunkKind,
+    CommentStyle, GenerateCommentMetadata, GenerateMode, GenerateOptions, GeneratedChunk,
+    GeneratedChunkKind,
 };
 use super::error::GenerateError;
-use super::render::render_doc;
+use super::render::{render_doc, render_doc_with_proto_spans};
 
 const PREC_OR: u8 = 1;
 const PREC_AND: u8 = 2;
@@ -65,19 +67,11 @@ pub(crate) fn generate_chunk(
         .header
         .puc_lua_layout()
         .is_some_and(|layout| !layout.integral_number && layout.number_size == 4);
-    let hir = state.require_hir()?;
-    let module = state.require_readability()?;
-    let required_inlining = !hir.required_luau_inlining.is_empty();
-    let unproven_inlining = required_inlining
-        && (context.requested_target.version != DecompileDialect::Luau
-            || !luau_inlining::validate(module, hir));
-    if unproven_inlining && options.mode != GenerateMode::Permissive {
-        return Err(GenerateError::UnprovenLuauInlining.into());
-    }
+    let module = state.require_ast()?;
     let names = state.require_naming()?;
-    let metadata = if options.comment {
-        Some(GenerateCommentMetadata::from_hir(
-            hir,
+    let metadata = if options.comment.is_enabled() {
+        Some(GenerateCommentMetadata::from_ast(
+            module,
             context.options.parse.string_encoding.as_str(),
         ))
     } else {
@@ -88,7 +82,7 @@ pub(crate) fn generate_chunk(
         .into_iter()
         .filter(|feature| !context.requested_target.supports_feature(*feature))
         .collect::<Vec<_>>();
-    let diagnostic = has_errors || !unsupported.is_empty() || unproven_inlining;
+    let diagnostic = has_errors || !unsupported.is_empty();
     let generated = {
         let emitter = Emitter {
             number_is_f32,
@@ -98,23 +92,14 @@ pub(crate) fn generate_chunk(
             options,
         };
         let mut doc = emitter.emit_module(module)?;
-        if required_inlining && !unproven_inlining {
-            doc = Doc::concat([Doc::text("--!optimize 2"), Doc::line(), doc]);
-        }
         if diagnostic {
             let features = format_ast_features(&unsupported);
-            let mut reason = match (unsupported.is_empty(), has_errors) {
+            let reason = match (unsupported.is_empty(), has_errors) {
                 (false, true) => format!("unsupported {features} and recovery errors"),
                 (false, false) => format!("unsupported {features}"),
                 (true, true) => "recovery errors".to_owned(),
                 (true, false) => String::new(),
             };
-            if unproven_inlining {
-                if !reason.is_empty() {
-                    reason.push_str(" and ");
-                }
-                reason.push_str("unproven Luau inline compiler contract");
-            }
             doc = Doc::concat([
                 Doc::text(format!(
                     "-- [unluac error] diagnostic pseudocode: {reason}; output may not recompile or preserve behavior"
@@ -124,6 +109,11 @@ pub(crate) fn generate_chunk(
                 doc,
             ]);
         }
+        let (source, mut proto_line_spans) = render_doc_with_proto_spans(&doc, options);
+        let total_lines = source.lines().count().max(1);
+        proto_line_spans
+            .entry(module.entry_function.index())
+            .or_insert((1, total_lines));
         GeneratedChunk {
             dialect: context.requested_target.version,
             kind: if diagnostic {
@@ -131,11 +121,493 @@ pub(crate) fn generate_chunk(
             } else {
                 GeneratedChunkKind::Source
             },
-            source: render_doc(&doc, options),
+            source,
+            proto_line_spans,
         }
     };
     state.generated = Some(generated);
     Ok(())
+}
+
+/// 收集 AST 中包含 `AstStmt::Error` 或 `AstExpr::Error` 恢复占位符的 proto 序号列表（升序去重）。
+pub fn collect_error_protos(module: &AstModule) -> Vec<usize> {
+    let mut protos = std::collections::BTreeSet::new();
+    collect_error_protos_in_block(&module.body, module.entry_function, &mut protos);
+    protos.into_iter().collect()
+}
+
+fn collect_error_protos_in_block(
+    block: &AstBlock,
+    function: ProtoId,
+    out: &mut std::collections::BTreeSet<usize>,
+) {
+    for stmt in &block.stmts {
+        match stmt {
+            AstStmt::Error(_) => {
+                out.insert(function.index());
+            }
+            AstStmt::LocalDecl(d) => {
+                for v in &d.values {
+                    collect_error_protos_in_expr(v, function, out);
+                }
+            }
+            AstStmt::GlobalDecl(d) => {
+                for v in &d.values {
+                    collect_error_protos_in_expr(v, function, out);
+                }
+            }
+            AstStmt::Assign(a) => {
+                for t in &a.targets {
+                    match t {
+                        crate::ast::AstLValue::Name(_) => {}
+                        crate::ast::AstLValue::FieldAccess(f) => {
+                            collect_error_protos_in_expr(&f.base, function, out);
+                        }
+                        crate::ast::AstLValue::IndexAccess(ia) => {
+                            collect_error_protos_in_expr(&ia.base, function, out);
+                            collect_error_protos_in_expr(&ia.index, function, out);
+                        }
+                    }
+                }
+                for v in &a.values {
+                    collect_error_protos_in_expr(v, function, out);
+                }
+            }
+            AstStmt::CallStmt(c) => match &c.call {
+                crate::ast::AstCallKind::Call(call) => {
+                    collect_error_protos_in_expr(&call.callee, function, out);
+                    for a in &call.args {
+                        collect_error_protos_in_expr(a, function, out);
+                    }
+                }
+                crate::ast::AstCallKind::MethodCall(m) => {
+                    collect_error_protos_in_expr(&m.receiver, function, out);
+                    for a in &m.args {
+                        collect_error_protos_in_expr(a, function, out);
+                    }
+                }
+            },
+            AstStmt::Return(r) => {
+                for v in &r.values {
+                    collect_error_protos_in_expr(v, function, out);
+                }
+            }
+            AstStmt::If(i) => {
+                collect_error_protos_in_expr(&i.cond, function, out);
+                collect_error_protos_in_block(&i.then_block, function, out);
+                if let Some(eb) = &i.else_block {
+                    collect_error_protos_in_block(eb, function, out);
+                }
+            }
+            AstStmt::While(w) => {
+                collect_error_protos_in_expr(&w.cond, function, out);
+                collect_error_protos_in_block(&w.body, function, out);
+            }
+            AstStmt::Repeat(r) => {
+                collect_error_protos_in_block(&r.body, function, out);
+                collect_error_protos_in_expr(&r.cond, function, out);
+            }
+            AstStmt::NumericFor(nf) => {
+                collect_error_protos_in_expr(&nf.start, function, out);
+                collect_error_protos_in_expr(&nf.limit, function, out);
+                collect_error_protos_in_expr(&nf.step, function, out);
+                collect_error_protos_in_block(&nf.body, function, out);
+            }
+            AstStmt::GenericFor(gf) => {
+                for e in &gf.iterator {
+                    collect_error_protos_in_expr(e, function, out);
+                }
+                collect_error_protos_in_block(&gf.body, function, out);
+            }
+            AstStmt::DoBlock(b) => collect_error_protos_in_block(b, function, out),
+            AstStmt::FunctionDecl(decl) => {
+                collect_error_protos_in_block(&decl.func.body, decl.func.function, out);
+            }
+            AstStmt::LocalFunctionDecl(decl) => {
+                collect_error_protos_in_block(&decl.func.body, decl.func.function, out);
+            }
+            AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+        }
+    }
+}
+
+fn collect_error_protos_in_expr(
+    expr: &AstExpr,
+    function: ProtoId,
+    out: &mut std::collections::BTreeSet<usize>,
+) {
+    match expr {
+        AstExpr::Error(_) => {
+            out.insert(function.index());
+        }
+        AstExpr::FunctionExpr(func) => {
+            collect_error_protos_in_block(&func.body, func.function, out);
+        }
+        AstExpr::Unary(u) => collect_error_protos_in_expr(&u.expr, function, out),
+        AstExpr::Binary(b) => {
+            collect_error_protos_in_expr(&b.lhs, function, out);
+            collect_error_protos_in_expr(&b.rhs, function, out);
+        }
+        AstExpr::LogicalAnd(l) | AstExpr::LogicalOr(l) => {
+            collect_error_protos_in_expr(&l.lhs, function, out);
+            collect_error_protos_in_expr(&l.rhs, function, out);
+        }
+        AstExpr::FieldAccess(f) => collect_error_protos_in_expr(&f.base, function, out),
+        AstExpr::IndexAccess(ia) => {
+            collect_error_protos_in_expr(&ia.base, function, out);
+            collect_error_protos_in_expr(&ia.index, function, out);
+        }
+        AstExpr::Call(c) => {
+            collect_error_protos_in_expr(&c.callee, function, out);
+            for a in &c.args {
+                collect_error_protos_in_expr(a, function, out);
+            }
+        }
+        AstExpr::MethodCall(m) => {
+            collect_error_protos_in_expr(&m.receiver, function, out);
+            for a in &m.args {
+                collect_error_protos_in_expr(a, function, out);
+            }
+        }
+        AstExpr::TableConstructor(t) => {
+            for field in &t.fields {
+                match field {
+                    crate::ast::AstTableField::Array(e) => {
+                        collect_error_protos_in_expr(e, function, out);
+                    }
+                    crate::ast::AstTableField::Record(r) => {
+                        if let crate::ast::AstTableKey::Expr(k) = &r.key {
+                            collect_error_protos_in_expr(k, function, out);
+                        }
+                        collect_error_protos_in_expr(&r.value, function, out);
+                    }
+                }
+            }
+        }
+        AstExpr::SingleValue(inner) => collect_error_protos_in_expr(inner, function, out),
+        AstExpr::IfExpr(ie) => {
+            collect_error_protos_in_expr(&ie.cond, function, out);
+            collect_error_protos_in_expr(&ie.then_expr, function, out);
+            collect_error_protos_in_expr(&ie.else_expr, function, out);
+        }
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Var(_)
+        | AstExpr::VarArg => {}
+    }
+}
+
+enum FoundProtoNode<'a> {
+    FunctionDecl(&'a AstFunctionDecl, ProtoId),
+    LocalFunctionDecl(&'a AstLocalFunctionDecl, ProtoId),
+    FunctionExpr(&'a AstFunctionExpr),
+}
+
+/// 仅针对已反编译结果中的单个 `proto_id` 生成独立可读源码，完整保留模块级命名与上值解析。
+pub fn generate_proto_source(
+    result: &DecompileResult,
+    proto_id: usize,
+    options: &GenerateOptions,
+    encoding: &str,
+) -> Result<Option<String>, GenerateError> {
+    let Some(module) = result.state.ast.as_ref() else {
+        return Ok(None);
+    };
+    let Some(names) = result.state.naming.as_ref() else {
+        return Ok(None);
+    };
+    if proto_id >= module.protos.len() {
+        return Ok(None);
+    }
+    if proto_id == module.entry_function.index() {
+        return Ok(result.state.generated.as_ref().map(|g| g.source.clone()));
+    }
+    let Some(found) = find_proto_node_in_block(&module.body, module.entry_function, ProtoId(proto_id))
+    else {
+        return Ok(None);
+    };
+    let number_is_f32 = result
+        .state
+        .raw_chunk
+        .as_ref()
+        .and_then(|c| c.header.puc_lua_layout())
+        .is_some_and(|layout| !layout.integral_number && layout.number_size == 4);
+    let target = AstTargetDialect::new(result.state.dialect);
+    let metadata = if options.comment.is_enabled() {
+        Some(GenerateCommentMetadata::from_ast(module, encoding))
+    } else {
+        None
+    };
+    let emitter = Emitter {
+        number_is_f32,
+        names: NameResolver::new(names),
+        target,
+        metadata: metadata.as_ref(),
+        options,
+    };
+    let body_doc = match found {
+        FoundProtoNode::FunctionDecl(decl, parent) => emitter.emit_function_decl(decl, parent)?,
+        FoundProtoNode::LocalFunctionDecl(decl, parent) => {
+            emitter.emit_local_function_decl(decl, parent)?
+        }
+        FoundProtoNode::FunctionExpr(func) => {
+            emitter.emit_function_with_header(func, Doc::text("function"))?
+        }
+    };
+    let doc = if options.comment.is_enabled() {
+        let header = Doc::text(format!(
+            "-- proto#{} | dialect: {} | decompiled by unluac-rs v{}",
+            proto_id,
+            <&'static str>::from(target.version),
+            env!("CARGO_PKG_VERSION"),
+        ));
+        Doc::concat([header, Doc::line(), Doc::line(), body_doc])
+    } else {
+        body_doc
+    };
+    Ok(Some(render_doc(&doc, options)))
+}
+
+fn find_proto_node_in_block<'a>(
+    block: &'a AstBlock,
+    parent: ProtoId,
+    target: ProtoId,
+) -> Option<FoundProtoNode<'a>> {
+    for stmt in &block.stmts {
+        match stmt {
+            AstStmt::FunctionDecl(decl) => {
+                if decl.func.function == target {
+                    return Some(FoundProtoNode::FunctionDecl(decl, parent));
+                }
+                if let Some(found) =
+                    find_proto_node_in_block(&decl.func.body, decl.func.function, target)
+                {
+                    return Some(found);
+                }
+            }
+            AstStmt::LocalFunctionDecl(decl) => {
+                if decl.func.function == target {
+                    return Some(FoundProtoNode::LocalFunctionDecl(decl, parent));
+                }
+                if let Some(found) =
+                    find_proto_node_in_block(&decl.func.body, decl.func.function, target)
+                {
+                    return Some(found);
+                }
+            }
+            AstStmt::LocalDecl(d) => {
+                for v in &d.values {
+                    if let Some(found) = find_proto_node_in_expr(v, target) {
+                        return Some(found);
+                    }
+                }
+            }
+            AstStmt::GlobalDecl(d) => {
+                for v in &d.values {
+                    if let Some(found) = find_proto_node_in_expr(v, target) {
+                        return Some(found);
+                    }
+                }
+            }
+            AstStmt::Assign(a) => {
+                for t in &a.targets {
+                    match t {
+                        crate::ast::AstLValue::Name(_) => {}
+                        crate::ast::AstLValue::FieldAccess(f) => {
+                            if let Some(found) = find_proto_node_in_expr(&f.base, target) {
+                                return Some(found);
+                            }
+                        }
+                        crate::ast::AstLValue::IndexAccess(ia) => {
+                            if let Some(found) = find_proto_node_in_expr(&ia.base, target)
+                                .or_else(|| find_proto_node_in_expr(&ia.index, target))
+                            {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+                for v in &a.values {
+                    if let Some(found) = find_proto_node_in_expr(v, target) {
+                        return Some(found);
+                    }
+                }
+            }
+            AstStmt::CallStmt(c) => match &c.call {
+                crate::ast::AstCallKind::Call(call) => {
+                    if let Some(found) = find_proto_node_in_expr(&call.callee, target) {
+                        return Some(found);
+                    }
+                    for a in &call.args {
+                        if let Some(found) = find_proto_node_in_expr(a, target) {
+                            return Some(found);
+                        }
+                    }
+                }
+                crate::ast::AstCallKind::MethodCall(m) => {
+                    if let Some(found) = find_proto_node_in_expr(&m.receiver, target) {
+                        return Some(found);
+                    }
+                    for a in &m.args {
+                        if let Some(found) = find_proto_node_in_expr(a, target) {
+                            return Some(found);
+                        }
+                    }
+                }
+            },
+            AstStmt::Return(r) => {
+                for v in &r.values {
+                    if let Some(found) = find_proto_node_in_expr(v, target) {
+                        return Some(found);
+                    }
+                }
+            }
+            AstStmt::If(i) => {
+                if let Some(found) = find_proto_node_in_expr(&i.cond, target)
+                    .or_else(|| find_proto_node_in_block(&i.then_block, parent, target))
+                {
+                    return Some(found);
+                }
+                if let Some(eb) = &i.else_block
+                    && let Some(found) = find_proto_node_in_block(eb, parent, target)
+                {
+                    return Some(found);
+                }
+            }
+            AstStmt::While(w) => {
+                if let Some(found) = find_proto_node_in_expr(&w.cond, target)
+                    .or_else(|| find_proto_node_in_block(&w.body, parent, target))
+                {
+                    return Some(found);
+                }
+            }
+            AstStmt::Repeat(r) => {
+                if let Some(found) = find_proto_node_in_block(&r.body, parent, target)
+                    .or_else(|| find_proto_node_in_expr(&r.cond, target))
+                {
+                    return Some(found);
+                }
+            }
+            AstStmt::NumericFor(nf) => {
+                if let Some(found) = find_proto_node_in_expr(&nf.start, target)
+                    .or_else(|| find_proto_node_in_expr(&nf.limit, target))
+                    .or_else(|| find_proto_node_in_expr(&nf.step, target))
+                    .or_else(|| find_proto_node_in_block(&nf.body, parent, target))
+                {
+                    return Some(found);
+                }
+            }
+            AstStmt::GenericFor(gf) => {
+                for e in &gf.iterator {
+                    if let Some(found) = find_proto_node_in_expr(e, target) {
+                        return Some(found);
+                    }
+                }
+                if let Some(found) = find_proto_node_in_block(&gf.body, parent, target) {
+                    return Some(found);
+                }
+            }
+            AstStmt::DoBlock(b) => {
+                if let Some(found) = find_proto_node_in_block(b, parent, target) {
+                    return Some(found);
+                }
+            }
+            AstStmt::Break
+            | AstStmt::Continue
+            | AstStmt::Goto(_)
+            | AstStmt::Label(_)
+            | AstStmt::Error(_) => {}
+        }
+    }
+    None
+}
+
+fn find_proto_node_in_expr<'a>(expr: &'a AstExpr, target: ProtoId) -> Option<FoundProtoNode<'a>> {
+    match expr {
+        AstExpr::FunctionExpr(func) => {
+            if func.function == target {
+                return Some(FoundProtoNode::FunctionExpr(func));
+            }
+            find_proto_node_in_block(&func.body, func.function, target)
+        }
+        AstExpr::Unary(u) => find_proto_node_in_expr(&u.expr, target),
+        AstExpr::Binary(b) => {
+            find_proto_node_in_expr(&b.lhs, target).or_else(|| find_proto_node_in_expr(&b.rhs, target))
+        }
+        AstExpr::LogicalAnd(l) | AstExpr::LogicalOr(l) => {
+            find_proto_node_in_expr(&l.lhs, target).or_else(|| find_proto_node_in_expr(&l.rhs, target))
+        }
+        AstExpr::FieldAccess(f) => find_proto_node_in_expr(&f.base, target),
+        AstExpr::IndexAccess(ia) => find_proto_node_in_expr(&ia.base, target)
+            .or_else(|| find_proto_node_in_expr(&ia.index, target)),
+        AstExpr::Call(c) => {
+            if let Some(found) = find_proto_node_in_expr(&c.callee, target) {
+                return Some(found);
+            }
+            for a in &c.args {
+                if let Some(found) = find_proto_node_in_expr(a, target) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        AstExpr::MethodCall(m) => {
+            if let Some(found) = find_proto_node_in_expr(&m.receiver, target) {
+                return Some(found);
+            }
+            for a in &m.args {
+                if let Some(found) = find_proto_node_in_expr(a, target) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        AstExpr::TableConstructor(t) => {
+            for field in &t.fields {
+                match field {
+                    crate::ast::AstTableField::Array(e) => {
+                        if let Some(found) = find_proto_node_in_expr(e, target) {
+                            return Some(found);
+                        }
+                    }
+                    crate::ast::AstTableField::Record(r) => {
+                        if let crate::ast::AstTableKey::Expr(k) = &r.key
+                            && let Some(found) = find_proto_node_in_expr(k, target)
+                        {
+                            return Some(found);
+                        }
+                        if let Some(found) = find_proto_node_in_expr(&r.value, target) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        AstExpr::SingleValue(inner) => find_proto_node_in_expr(inner, target),
+        AstExpr::IfExpr(ie) => find_proto_node_in_expr(&ie.cond, target)
+            .or_else(|| find_proto_node_in_expr(&ie.then_expr, target))
+            .or_else(|| find_proto_node_in_expr(&ie.else_expr, target)),
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Var(_)
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => None,
+    }
 }
 
 fn format_ast_features(features: &[AstFeature]) -> String {
@@ -174,7 +646,7 @@ impl<'a> Emitter<'a> {
         Ok(Doc::concat([header, Doc::line(), Doc::line(), body]))
     }
 
-    fn emit_block(&self, block: &AstBlock, function: HirProtoRef) -> Result<Doc, GenerateError> {
+    fn emit_block(&self, block: &AstBlock, function: ProtoId) -> Result<Doc, GenerateError> {
         let mut docs = block
             .stmts
             .iter()
@@ -193,7 +665,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_chunk_comment(&self) -> Option<Doc> {
-        if !self.options.comment {
+        if !self.options.comment.is_enabled() {
             return None;
         }
 
@@ -216,43 +688,71 @@ impl<'a> Emitter<'a> {
                 <&'static str>::from(self.target.version)
             )),
             Doc::text(format!("-- encoding: {encoding}")),
-            Doc::text("-- decompiled by unluac-rs (https://github.com/x3zvawq/unluac-rs)"),
+            Doc::text(format!(
+                "-- decompiled by unluac-rs v{} (https://github.com/x3zvawq/unluac-rs)",
+                env!("CARGO_PKG_VERSION")
+            )),
         ]);
         Some(Doc::join(comments, Doc::line()))
     }
 
-    fn emit_function_comment(&self, function: HirProtoRef) -> Option<Doc> {
-        if !self.options.comment {
-            return None;
-        }
-
+    fn emit_function_comment(&self, function: ProtoId) -> Option<Doc> {
         let metadata = self.metadata?.function(function)?;
-        let mut proto_meta = format!(
-            "-- proto#{} params={} locals={} upvalues={} vararg={}",
-            metadata.function.index(),
-            metadata.signature.num_params,
-            metadata.local_count,
-            metadata.upvalue_count,
-            metadata.signature.is_vararg,
-        );
-        if metadata.signature.named_vararg_table {
-            proto_meta.push_str(" named_vararg=true");
-        }
-        if metadata.signature.has_vararg_param_reg {
-            proto_meta.push_str(" vararg_reg=true");
-        }
-        if let Some(source) = metadata.source.as_ref() {
-            proto_meta.push_str(" source=");
-            push_comment_text(&mut proto_meta, &source.display_text());
-        }
+        match self.options.comment {
+            CommentStyle::None => None,
+            CommentStyle::Minimal => {
+                let has_lines = metadata.line_range.defined_start != 0
+                    || metadata.line_range.defined_end != 0;
+                let distinct_source = metadata.source.as_ref().filter(|src| {
+                    self.metadata
+                        .and_then(|m| m.chunk.file_name.as_ref())
+                        .is_none_or(|chunk_file| chunk_file != *src)
+                });
+                if !has_lines && distinct_source.is_none() {
+                    return None;
+                }
+                let mut text = String::from("--");
+                if let Some(source) = distinct_source {
+                    text.push_str(" source=");
+                    push_comment_text(&mut text, &source.display_text());
+                }
+                if has_lines {
+                    text.push_str(&format!(
+                        " lines={}-{}",
+                        metadata.line_range.defined_start, metadata.line_range.defined_end
+                    ));
+                }
+                Some(Doc::text(text))
+            }
+            CommentStyle::Full => {
+                let mut proto_meta = format!(
+                    "-- proto#{} params={} locals={} upvalues={} vararg={}",
+                    metadata.function.index(),
+                    metadata.signature.num_params,
+                    metadata.local_count,
+                    metadata.upvalue_count,
+                    metadata.signature.is_vararg,
+                );
+                if metadata.signature.named_vararg_table {
+                    proto_meta.push_str(" named_vararg=true");
+                }
+                if metadata.signature.has_vararg_param_reg {
+                    proto_meta.push_str(" vararg_reg=true");
+                }
+                if let Some(source) = metadata.source.as_ref() {
+                    proto_meta.push_str(" source=");
+                    push_comment_text(&mut proto_meta, &source.display_text());
+                }
 
-        if metadata.line_range.defined_start != 0 || metadata.line_range.defined_end != 0 {
-            proto_meta.push_str(&format!(
-                " lines={}-{}",
-                metadata.line_range.defined_start, metadata.line_range.defined_end
-            ));
+                if metadata.line_range.defined_start != 0 || metadata.line_range.defined_end != 0 {
+                    proto_meta.push_str(&format!(
+                        " lines={}-{}",
+                        metadata.line_range.defined_start, metadata.line_range.defined_end
+                    ));
+                }
+                Some(Doc::text(proto_meta))
+            }
         }
-        Some(Doc::text(proto_meta))
     }
 
     fn emit_stmt_separator(&self, prev: &crate::ast::AstStmt, next: &crate::ast::AstStmt) -> Doc {

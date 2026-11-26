@@ -7,13 +7,13 @@ use std::ops::ControlFlow;
 use crate::ast::traverse::BlockKind;
 use crate::ast::visit::{AstVisitor, NameAccess, visit_stmt};
 use crate::ast::{
-    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstLocalAttr, AstNameRef, AstStmt,
+    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstLocalAttr, AstNameRef, AstProtoMeta,
+    AstStmt, LocalId,
 };
-use crate::hir::{HirProto, LocalId};
 
 use super::NamingError;
 
-pub(super) fn validate(body: &AstBlock, proto: &HirProto) -> Result<(), NamingError> {
+pub(super) fn validate(body: &AstBlock, proto: &AstProtoMeta) -> Result<(), NamingError> {
     let Some(local) = proto.lexical_environment_local else {
         return Ok(());
     };

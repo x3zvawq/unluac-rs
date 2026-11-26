@@ -1,15 +1,10 @@
-//! 这个子模块负责把 AST 中的 name/binding 引用解析成最终文本。
-//!
-//! 它依赖 AST naming 已经产出的 `NameMap`，只做查表和错误暴露，不会在这里临时发明兜底名。
-//! 例如：残留的 `TempRef` 若没被命名收掉，这里会直接报错而不是静默生成假名字。
+//! 将 AST 中的 name/binding 引用解析成最终文本。
 
-use crate::ast::NameMap;
 use crate::ast::{
     AstBindingRef, AstFeature, AstGlobalBinding, AstGlobalBindingTarget, AstLocalAttr,
-    AstLocalBinding, AstNameRef,
+    AstLocalBinding, AstNameRef, NameMap, ProtoId,
 };
 use crate::generate::doc::Doc;
-use crate::hir::HirProtoRef;
 
 use super::super::error::GenerateError;
 use super::Emitter;
@@ -25,16 +20,12 @@ impl<'a> NameResolver<'a> {
 
     pub(super) fn resolve_name_ref(
         &self,
-        function: HirProtoRef,
+        function: ProtoId,
         name: &AstNameRef,
     ) -> Result<String, GenerateError> {
         match name {
             AstNameRef::Environment => Ok("_ENV".to_owned()),
             AstNameRef::Global(global) => Ok(global.text.clone()),
-            AstNameRef::Temp(_) => Err(GenerateError::ResidualTempName {
-                function: function.index(),
-                name: name.clone(),
-            }),
             _ => {
                 let function_names = self
                     .names
@@ -57,9 +48,7 @@ impl<'a> NameResolver<'a> {
                         .upvalues
                         .get(id.index())
                         .map(|info| info.text.clone()),
-                    AstNameRef::Environment | AstNameRef::Global(_) | AstNameRef::Temp(_) => {
-                        unreachable!()
-                    }
+                    AstNameRef::Environment | AstNameRef::Global(_) => unreachable!(),
                 };
                 text.ok_or_else(|| GenerateError::MissingName {
                     function: function.index(),
@@ -71,36 +60,27 @@ impl<'a> NameResolver<'a> {
 
     pub(super) fn resolve_binding_ref(
         &self,
-        function: HirProtoRef,
+        function: ProtoId,
         binding: &AstBindingRef,
     ) -> Result<String, GenerateError> {
-        match binding {
-            AstBindingRef::Temp(_) => Err(GenerateError::ResidualTempBinding {
-                function: function.index(),
-                binding: *binding,
-            }),
-            _ => {
-                let function_names = self
-                    .names
-                    .function(function)
-                    .ok_or_else(|| GenerateError::missing_function_names(function))?;
-                let text = match binding {
-                    AstBindingRef::Local(id) => function_names
-                        .locals
-                        .get(id.index())
-                        .map(|info| info.text.clone()),
-                    AstBindingRef::SyntheticLocal(id) => function_names
-                        .synthetic_locals
-                        .get(id)
-                        .map(|info| info.text.clone()),
-                    AstBindingRef::Temp(_) => unreachable!(),
-                };
-                text.ok_or_else(|| GenerateError::MissingBindingName {
-                    function: function.index(),
-                    binding: *binding,
-                })
-            }
-        }
+        let function_names = self
+            .names
+            .function(function)
+            .ok_or_else(|| GenerateError::missing_function_names(function))?;
+        let text = match binding {
+            AstBindingRef::Local(id) => function_names
+                .locals
+                .get(id.index())
+                .map(|info| info.text.clone()),
+            AstBindingRef::SyntheticLocal(id) => function_names
+                .synthetic_locals
+                .get(id)
+                .map(|info| info.text.clone()),
+        };
+        text.ok_or_else(|| GenerateError::MissingBindingName {
+            function: function.index(),
+            binding: *binding,
+        })
     }
 }
 
@@ -108,7 +88,7 @@ impl<'a> Emitter<'a> {
     pub(super) fn emit_local_binding(
         &self,
         binding: &AstLocalBinding,
-        function: HirProtoRef,
+        function: ProtoId,
     ) -> Result<Doc, GenerateError> {
         match binding.attr {
             AstLocalAttr::Const if !self.allows_feature(AstFeature::LocalConst) => {

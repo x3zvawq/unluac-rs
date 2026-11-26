@@ -13,9 +13,10 @@ mod error;
 mod render;
 
 pub use common::{
-    GenerateChunkCommentMetadata, GenerateCommentMetadata, GenerateFunctionCommentMetadata,
-    GenerateMode, GenerateOptions, GeneratedChunk, GeneratedChunkKind, LuauVectorConstructor,
-    LuauVectorSize, NumberFormat, QuoteStyle, TableCellAlign, TableStyle,
+    CommentStyle, GenerateChunkCommentMetadata, GenerateCommentMetadata,
+    GenerateFunctionCommentMetadata, GenerateMode, GenerateOptions, GeneratedChunk,
+    GeneratedChunkKind, LuauVectorConstructor, LuauVectorSize, NumberFormat, QuoteStyle,
+    TableCellAlign, TableStyle,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_generate;
@@ -26,4 +27,5 @@ mod debug {
 #[cfg(not(feature = "decompile-debug"))]
 pub use debug::dump_generate;
 pub(crate) use emit::generate_chunk;
+pub use emit::{collect_error_protos, generate_proto_source};
 pub use error::GenerateError;

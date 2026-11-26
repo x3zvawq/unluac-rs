@@ -65,21 +65,6 @@ impl LuaString {
         &self.bytes
     }
 
-    /// 从同一字符串导出的片段沿用已解析的编码，不重新猜测短片段的字符集。
-    pub(crate) fn derived_bytes(&self, bytes: Vec<u8>) -> Self {
-        let text = self.encoding.and_then(|encoding| {
-            encoding
-                .decode(0, &bytes, crate::parser::StringDecodeMode::Strict)
-                .ok()
-                .map(|(_, text)| Arc::from(text))
-        });
-        Self {
-            bytes: bytes.into(),
-            text,
-            encoding: self.encoding,
-        }
-    }
-
     pub fn decoded_text(&self) -> Option<&str> {
         self.text.as_deref()
     }

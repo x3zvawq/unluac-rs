@@ -2,8 +2,7 @@
 
 use super::*;
 
-use crate::transformer::TableAllocation;
-use crate::value_semantics::table::allocation::TablePreallocation;
+use crate::transformer::{TableAllocation, TablePreallocation};
 
 impl<'a> ProtoLowerer<'a> {
     pub(super) fn lower(mut self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {

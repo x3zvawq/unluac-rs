@@ -15,7 +15,6 @@ mod support;
 mod validate;
 mod visibility;
 
-pub(crate) use assign::assign_names;
 pub use assign::{assign_name_map, assign_names_with_evidence};
 pub use common::{
     FunctionNameMap, NameInfo, NameMap, NameSource, NamingEvidence, NamingMode, NamingOptions,

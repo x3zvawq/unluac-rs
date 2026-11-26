@@ -1,25 +1,22 @@
-//! 这个文件负责 Naming 前的 AST 结构校验。
+//! Naming 前的 AST 结构校验。
 //!
-//! Naming 假定 Readability 已经把 raw temp 完全物化掉，所以这里先把这些边界钉死。
-//! 一旦检测到 temp 泄漏或函数引用缺失，就直接报结构错误，而不是让 Naming 继续兜底。
+//! 确保所有嵌套函数引用均存在于 `module.protos`，并校验局部环境 `_ENV` 活动范围。
 
 use crate::ast::traverse::{
     traverse_call_children, traverse_lvalue_children, traverse_stmt_children,
 };
 use crate::ast::visit::{ExprNode, expr_nodes};
 use crate::ast::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstModule, AstNameRef, AstStmt,
+    AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt, ProtoId,
 };
-use crate::hir::{HirModule, HirProtoRef};
 
 use super::NamingError;
 
 mod environment;
 
 /// 确保函数 proto 存在。
-fn ensure_function_exists(hir: &HirModule, function: HirProtoRef) -> Result<(), NamingError> {
-    if hir.protos.get(function.index()).is_some() {
+fn ensure_function_exists(module: &AstModule, function: ProtoId) -> Result<(), NamingError> {
+    if module.protos.get(function.index()).is_some() {
         Ok(())
     } else {
         Err(NamingError::MissingFunction {
@@ -28,176 +25,79 @@ fn ensure_function_exists(hir: &HirModule, function: HirProtoRef) -> Result<(), 
     }
 }
 
-/// 校验 Readability 输出可以安全进入 Naming。
-pub(super) fn validate_readability_ast(
-    module: &AstModule,
-    hir: &HirModule,
-) -> Result<(), NamingError> {
+/// 校验 AST 输出可以安全进入 Naming。
+pub(super) fn validate_ast(module: &AstModule) -> Result<(), NamingError> {
     let function = module.entry_function;
-    ensure_function_exists(hir, function)?;
-    environment::validate(&module.body, &hir.protos[function.index()])?;
-    validate_block_has_no_temps(&module.body, function, hir)
+    ensure_function_exists(module, function)?;
+    environment::validate(&module.body, &module.protos[function.index()])?;
+    validate_block(&module.body, module)
 }
 
-fn validate_block_has_no_temps(
-    block: &AstBlock,
-    function: HirProtoRef,
-    hir: &HirModule,
-) -> Result<(), NamingError> {
+fn validate_block(block: &AstBlock, module: &AstModule) -> Result<(), NamingError> {
     for stmt in &block.stmts {
-        validate_stmt_has_no_temps(stmt, function, hir)?;
+        validate_stmt(stmt, module)?;
     }
     Ok(())
 }
 
-fn validate_stmt_has_no_temps(
-    stmt: &AstStmt,
-    function: HirProtoRef,
-    hir: &HirModule,
-) -> Result<(), NamingError> {
-    // 只有少数变体有自定义 temp 检查，先处理
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => {
-            for binding in &local_decl.bindings {
-                validate_binding_has_no_temp(binding.id, function)?;
-            }
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            validate_binding_has_no_temp(numeric_for.binding, function)?;
-        }
-        AstStmt::GenericFor(generic_for) => {
-            for &binding in &generic_for.bindings {
-                validate_binding_has_no_temp(binding, function)?;
-            }
-        }
-        AstStmt::FunctionDecl(function_decl) => {
-            validate_function_name_has_no_temps(&function_decl.target, function)?;
-        }
-        AstStmt::LocalFunctionDecl(local_function_decl) => {
-            validate_binding_has_no_temp(local_function_decl.name, function)?;
-        }
-        _ => {}
-    }
-    // 子节点递归全部交给宏
+fn validate_stmt(stmt: &AstStmt, module: &AstModule) -> Result<(), NamingError> {
     traverse_stmt_children!(
         stmt,
         iter = iter,
         opt = as_ref,
         borrow = [&],
         expr(expr) => {
-            validate_expr_has_no_temps(expr, function, hir)?;
+            validate_expr(expr, module)?;
         },
         lvalue(lvalue) => {
-            validate_lvalue_has_no_temps(lvalue, function, hir)?;
+            validate_lvalue(lvalue, module)?;
         },
         block(block) => {
-            validate_block_has_no_temps(block, function, hir)?;
+            validate_block(block, module)?;
         },
         function(func) => {
-            validate_function_expr_has_no_temps(func, function, hir)?;
+            validate_function_expr(func, module)?;
         },
         condition(cond) => {
-            validate_expr_has_no_temps(cond, function, hir)?;
+            validate_expr(cond, module)?;
         },
         call(call) => {
-            validate_call_has_no_temps(call, function, hir)?;
+            validate_call(call, module)?;
         }
     );
     Ok(())
 }
 
-fn validate_function_expr_has_no_temps(
+fn validate_function_expr(
     function_expr: &AstFunctionExpr,
-    parent_function: HirProtoRef,
-    hir: &HirModule,
+    module: &AstModule,
 ) -> Result<(), NamingError> {
-    ensure_function_exists(hir, function_expr.function)?;
+    ensure_function_exists(module, function_expr.function)?;
     environment::validate(
         &function_expr.body,
-        &hir.protos[function_expr.function.index()],
+        &module.protos[function_expr.function.index()],
     )?;
-    if let Some(named_vararg) = function_expr.named_vararg {
-        validate_binding_has_no_temp(named_vararg, function_expr.function)?;
-    }
-    for &binding in &function_expr.captured_bindings {
-        validate_binding_has_no_temp(binding, parent_function)?;
-    }
-    validate_block_has_no_temps(&function_expr.body, function_expr.function, hir)
+    validate_block(&function_expr.body, module)
 }
 
-fn validate_binding_has_no_temp(
-    binding: AstBindingRef,
-    function: HirProtoRef,
-) -> Result<(), NamingError> {
-    let AstBindingRef::Temp(temp) = binding else {
-        return Ok(());
-    };
-    Err(NamingError::UnexpectedTemp {
-        function: function.index(),
-        temp: temp.index(),
-    })
-}
-
-fn validate_function_name_has_no_temps(
-    target: &AstFunctionName,
-    function: HirProtoRef,
-) -> Result<(), NamingError> {
-    let path = match target {
-        AstFunctionName::Plain(path) => path,
-        AstFunctionName::Method(path, _) => path,
-    };
-    if let AstNameRef::Temp(temp) = path.root {
-        return Err(NamingError::UnexpectedTemp {
-            function: function.index(),
-            temp: temp.index(),
-        });
-    }
-    Ok(())
-}
-
-fn validate_call_has_no_temps(
-    call: &AstCallKind,
-    function: HirProtoRef,
-    hir: &HirModule,
-) -> Result<(), NamingError> {
+fn validate_call(call: &AstCallKind, module: &AstModule) -> Result<(), NamingError> {
     traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
-        validate_expr_has_no_temps(expr, function, hir)?;
+        validate_expr(expr, module)?;
     });
     Ok(())
 }
 
-fn validate_lvalue_has_no_temps(
-    target: &AstLValue,
-    function: HirProtoRef,
-    hir: &HirModule,
-) -> Result<(), NamingError> {
-    if let AstLValue::Name(AstNameRef::Temp(temp)) = target {
-        return Err(NamingError::UnexpectedTemp {
-            function: function.index(),
-            temp: temp.index(),
-        });
-    }
+fn validate_lvalue(target: &AstLValue, module: &AstModule) -> Result<(), NamingError> {
     traverse_lvalue_children!(target, borrow = [&], expr(expr) => {
-        validate_expr_has_no_temps(expr, function, hir)?;
+        validate_expr(expr, module)?;
     });
     Ok(())
 }
 
-fn validate_expr_has_no_temps(
-    expr: &AstExpr,
-    function: HirProtoRef,
-    hir: &HirModule,
-) -> Result<(), NamingError> {
+fn validate_expr(expr: &AstExpr, module: &AstModule) -> Result<(), NamingError> {
     for node in expr_nodes(expr) {
-        match node {
-            ExprNode::Expr(AstExpr::Var(AstNameRef::Temp(temp))) => {
-                return Err(NamingError::UnexpectedTemp {
-                    function: function.index(),
-                    temp: temp.index(),
-                });
-            }
-            ExprNode::Function(func) => validate_function_expr_has_no_temps(func, function, hir)?,
-            _ => {}
+        if let ExprNode::Function(func) = node {
+            validate_function_expr(func, module)?;
         }
     }
     Ok(())

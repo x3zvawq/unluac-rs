@@ -6,9 +6,8 @@ use std::collections::BTreeSet;
 use crate::ast::visit::{AstVisitor, visit_block};
 use crate::ast::{
     AstCallExpr, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstGlobalBindingTarget,
-    AstLValue, AstModule, AstNameRef, AstStmt,
+    AstLValue, AstModule, AstNameRef, AstStmt, ProtoId,
 };
-use crate::hir::HirProtoRef;
 
 use super::{
     FunctionHints, NameSource, final_binding_from_name_ref, register_binding_hint,
@@ -149,18 +148,16 @@ fn direct_global(expr: &AstExpr) -> Option<&AstNameRef> {
 struct SignatureHints<'a> {
     hints: &'a mut [FunctionHints],
     writes: &'a LibraryWrites,
-    functions: Vec<HirProtoRef>,
+    functions: Vec<ProtoId>,
 }
 
 impl SignatureHints<'_> {
     fn call(&mut self, call: &AstCallExpr) {
-        if call.method_key.is_some()
-            || matches!(
-                call.args.last(),
-                Some(AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg)
-            )
-        {
-            // 开放尾包宽度未知，不能据 AST operand 数判断重载；也不把 colon 的接收者算成普通实参。
+        if matches!(
+            call.args.last(),
+            Some(AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg)
+        ) {
+            // 开放尾包宽度未知，不能据 AST operand 数判断重载。
             return;
         }
         let Some((root, member)) = direct_call_path(&call.callee) else {

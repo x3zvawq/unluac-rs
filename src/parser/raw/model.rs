@@ -2,7 +2,13 @@
 //!
 //! 保存原始编码事实及共享 payload，具体 opcode 和方言扩展由各自 wrapper 承载。
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
+use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
+use encoding_rs::Encoding;
 
 use crate::decompile::DecompileDialect;
 use crate::parser::StringEncoding;
@@ -31,6 +37,222 @@ impl RawChunk {
         }
         self.main = Arc::unwrap_or_clone(strip_proto_graph(Arc::new(self.main)));
         self
+    }
+
+    /// 在 `StringEncoding::Auto` 模式下对整份 chunk 的非 UTF-8 文本样本做联合编码探测。
+    ///
+    /// 仅当聚合样本达到足够证据且命中多字节 CJK 编码时，才对不含二进制控制字节、
+    /// 且可无损重编码回原始字节的字符串填充可读文本视图；单字节代码页（如 windows-1252、
+    /// IBM866）绝不参与自动改写，从而保证二进制字节串零损往返。
+    pub(crate) fn resolve_auto_string_encoding(mut self) -> Self {
+        let Some(enc) = detect_chunk_auto_cjk_encoding(&self) else {
+            return self;
+        };
+        let target_enc = StringEncoding::EncodingRs(enc);
+        match &mut self.header.extra {
+            DialectHeaderExtra::LuaJit(extra) => {
+                if let Some(name) = &mut extra.chunk_name {
+                    try_decode_auto_string(name, enc, target_enc);
+                }
+            }
+            DialectHeaderExtra::Luau(extra) => {
+                for name in extra.userdata_type_names.iter_mut().flatten() {
+                    try_decode_auto_string(name, enc, target_enc);
+                }
+            }
+            _ => {}
+        }
+        self.main =
+            Arc::unwrap_or_clone(decode_auto_proto_graph(Arc::new(self.main), enc, target_enc));
+        self
+    }
+}
+
+fn is_auto_text_candidate(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && !bytes
+            .iter()
+            .any(|&b| b == 0 || (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7F)
+}
+
+fn is_multibyte_cjk_encoding(enc: &'static Encoding) -> bool {
+    std::ptr::eq(enc, encoding_rs::GBK)
+        || std::ptr::eq(enc, encoding_rs::GB18030)
+        || std::ptr::eq(enc, encoding_rs::BIG5)
+        || std::ptr::eq(enc, encoding_rs::SHIFT_JIS)
+        || std::ptr::eq(enc, encoding_rs::EUC_JP)
+        || std::ptr::eq(enc, encoding_rs::EUC_KR)
+        || std::ptr::eq(enc, encoding_rs::ISO_2022_JP)
+}
+
+fn detect_chunk_auto_cjk_encoding(chunk: &RawChunk) -> Option<&'static Encoding> {
+    let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
+    let mut candidate_count = 0usize;
+    let mut total_bytes = 0usize;
+    let mut feed_str = |s: &RawString| {
+        if s.text.is_none() && is_auto_text_candidate(&s.bytes) {
+            detector.feed(&s.bytes, false);
+            detector.feed(b"\n", false);
+            candidate_count += 1;
+            total_bytes += s.bytes.len();
+        }
+    };
+
+    match &chunk.header.extra {
+        DialectHeaderExtra::LuaJit(extra) => {
+            if let Some(name) = &extra.chunk_name {
+                feed_str(name);
+            }
+        }
+        DialectHeaderExtra::Luau(extra) => {
+            for name in extra.userdata_type_names.iter().flatten() {
+                feed_str(name);
+            }
+        }
+        _ => {}
+    }
+
+    let mut visited: HashSet<*const RawProto> = HashSet::new();
+    let mut stack: Vec<&RawProto> = vec![&chunk.main];
+    while let Some(proto) = stack.pop() {
+        if !visited.insert(proto as *const RawProto) {
+            continue;
+        }
+        if let Some(source) = &proto.common.source {
+            feed_str(source);
+        }
+        for lit in proto.common.constants.common.literals.iter() {
+            if let RawLiteralConst::String(s) = lit {
+                feed_str(s);
+            }
+        }
+        for local in &proto.common.debug_info.common.local_vars {
+            feed_str(&local.name);
+        }
+        for up in proto.common.debug_info.common.upvalue_names.iter().flatten() {
+            feed_str(up);
+        }
+        if let DialectProtoExtra::Luau(extra) = &proto.extra
+            && let Some(name) = &extra.debug_name
+        {
+            feed_str(name);
+        }
+        for child in &proto.common.children {
+            stack.push(child.as_ref());
+        }
+    }
+
+    // 单条极短字节串（例如 4 字节字面量）不足以在 Auto 模式下安全区分二进制与旧编码文本；
+    // 已知编码时由调用方显式传 `-e gbk` 等参数精确解码。
+    if candidate_count == 0 || (candidate_count < 2 && total_bytes < 8) {
+        return None;
+    }
+    detector.feed(b"", true);
+    let enc = detector.guess(None, Utf8Detection::Allow);
+    is_multibyte_cjk_encoding(enc).then_some(enc)
+}
+
+fn try_decode_auto_string(
+    raw: &mut RawString,
+    enc: &'static Encoding,
+    target_enc: StringEncoding,
+) {
+    if raw.text.is_some() || !is_auto_text_candidate(&raw.bytes) {
+        return;
+    }
+    let Some(decoded) = enc.decode_without_bom_handling_and_without_replacement(&raw.bytes) else {
+        return;
+    };
+    let (reencoded, _, had_encode_errors) = enc.encode(&decoded);
+    if had_encode_errors || reencoded.as_ref() != raw.bytes.as_ref() {
+        return;
+    }
+    raw.text = Some(DecodedText {
+        encoding: target_enc,
+        value: decoded.into(),
+    });
+}
+
+fn decode_auto_proto_graph(
+    root: Arc<RawProto>,
+    enc: &'static Encoding,
+    target_enc: StringEncoding,
+) -> Arc<RawProto> {
+    let mut memo: HashMap<*const RawProto, Arc<RawProto>> = HashMap::new();
+    let mut frames = vec![StripFrame {
+        children: Vec::with_capacity(root.common.children.len()),
+        source: root,
+        next_child: 0,
+    }];
+
+    loop {
+        let Some(frame) = frames.last_mut() else {
+            unreachable!("root frame exists");
+        };
+        if let Some(child) = frame.source.common.children.get(frame.next_child).cloned() {
+            frame.next_child += 1;
+            let key = Arc::as_ptr(&child);
+            if let Some(transformed) = memo.get(&key) {
+                frame.children.push(Arc::clone(transformed));
+            } else {
+                frames.push(StripFrame {
+                    children: Vec::with_capacity(child.common.children.len()),
+                    source: child,
+                    next_child: 0,
+                });
+            }
+            continue;
+        }
+
+        let frame = frames.pop().expect("root frame exists");
+        let key = Arc::as_ptr(&frame.source);
+        let mut proto = Arc::unwrap_or_clone(frame.source);
+        if let Some(source) = &mut proto.common.source {
+            try_decode_auto_string(source, enc, target_enc);
+        }
+        let has_undecoded_literal = proto
+            .common
+            .constants
+            .common
+            .literals
+            .iter()
+            .any(|lit| matches!(lit, RawLiteralConst::String(s) if s.text.is_none()));
+        if has_undecoded_literal {
+            let mut literals = proto.common.constants.common.literals.to_vec();
+            for lit in &mut literals {
+                if let RawLiteralConst::String(s) = lit {
+                    try_decode_auto_string(s, enc, target_enc);
+                }
+            }
+            proto.common.constants.common.literals = literals.into();
+        }
+        for local in &mut proto.common.debug_info.common.local_vars {
+            try_decode_auto_string(&mut local.name, enc, target_enc);
+        }
+        for up in proto
+            .common
+            .debug_info
+            .common
+            .upvalue_names
+            .iter_mut()
+            .flatten()
+        {
+            try_decode_auto_string(up, enc, target_enc);
+        }
+        if let DialectProtoExtra::Luau(extra) = &mut proto.extra
+            && let Some(name) = &mut extra.debug_name
+        {
+            try_decode_auto_string(name, enc, target_enc);
+        }
+        proto.common.children = frame.children;
+        let transformed = Arc::new(proto);
+        memo.insert(key, Arc::clone(&transformed));
+
+        if let Some(parent) = frames.last_mut() {
+            parent.children.push(transformed);
+        } else {
+            return transformed;
+        }
     }
 }
 
