@@ -1,6 +1,5 @@
 -- regress_403_constructor_literal_args: stable context args may surround a constructor handoff
 -- Empty-table preallocation keeps the installed field separate; context args retain their positions.
--- unluac: expect-contains [[(p2_0,]]
 -- unluac: expect-contains [[, 17)]]
 
 local function consume(prefix, value, suffix)

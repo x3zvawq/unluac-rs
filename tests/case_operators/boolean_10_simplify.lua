@@ -1,35 +1,9 @@
 -- regress_332_logical_simplify: occurrence 级逻辑化简保留求值轨迹、标量宽度与 Luau number 语义
 -- 稳定或恒真分支也不授权合并两个原 guard 检查。
--- unluac: expect-contains [[return p2_0 and p2_1 or p2_0 and]]
--- unluac: expect-contains [[p6_0 and r6_0() or p6_0 and r6_1()]]
--- unluac: expect-contains [[return p9_0 and {} or p9_0 and]]
 -- unluac: expect-contains [[("unexpected", "fallback")]]
 -- 条件可交换返回方向；短路调用与共享分配必须保留。
--- unluac: expect-contains [[(p11_0 or r0_10()) and {}]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=11]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=11]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=11]]
--- unluac: expect-contains [[return p12_0 and p12_1 or {}]]
--- unluac: expect-contains [[return p16_0 and p16_1 and p16_2 or {}]]
--- unluac: expect-ast-count [[function]] [[16]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=6]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=9]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=12]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=14]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=15]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=16]]
 -- 原 CALL 参数 phi 已提供结果槽；嵌入短路树不能退回 callee/result 准备别名。
--- unluac: expect-contains [[assert(r0_11(true) and #r0_0 == 0)]]
--- unluac: expect-contains [[assert(r0_11(false) and table.concat(r0_0, ",") == "condition-b")]]
 -- 预写与结果复用同一绑定时，仍恢复直接比较、原 do 末端和整包低槽写回。
--- unluac: expect-ast-max [[local-binding]] [[31]] [[@proto=0]]
--- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=0]]
--- unluac: expect-max-count [[ = assert]] [[0]]
--- unluac: expect-contains [[r0_18, r0_19 = r0_15(r0_16(nil, "second"))]]
--- unluac: expect-contains [[r0_18, r0_19 = r0_15(r0_16(false, "second"))]]
--- unluac: expect-contains [[r0_18, r0_19 = r0_15(r0_16())]]
 
 local trace = {}
 

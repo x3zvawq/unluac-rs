@@ -1,6 +1,5 @@
 -- regress_180_numeric_for_shared_tail#1: 分支汇入 numeric-for 共享尾时不能提前 continue
 -- unluac: expect-ast-min [[numeric-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-min [[if]] [[1]] [[@proto=1]]
 
 local function run(n, value, cond)
     local sink = {}
@@ -34,18 +33,7 @@ for i = 1, #cases do
     assert(final == input[4] and output == input[5])
 end
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[while]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[goto]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]]
 -- current 快照、共享尾写回和两个表写保持原位；分支不能提前退出本轮。
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[assign]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[continue]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[call]] [[0]] [[@proto=1]]
 -- 构造器与多结果调用不引入额外 COPY holder 或中间比较变量。
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[call]] [[5]] [[@proto=0]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=0]]

@@ -1,7 +1,6 @@
 -- regress_35_multi_entry_loop_state#1: 多入口 while 应复用共同入口初值作为 loop state
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-min [[while]] [[1]] [[@proto=1]]
 
 local function count_previous_levels(meta, start_index, unlocked)

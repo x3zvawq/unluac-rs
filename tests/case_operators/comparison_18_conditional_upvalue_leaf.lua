@@ -1,8 +1,4 @@
 -- 条件比较可改写上值，取值叶必须在比较之后重新读取，不能复用谓词的旧快照。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=2]]
 local current, replacement
 local gate = true
 local calls = 0

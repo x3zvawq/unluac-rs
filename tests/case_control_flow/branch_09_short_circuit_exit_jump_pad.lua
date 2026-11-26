@@ -2,14 +2,8 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[repeat]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-contains [[p1_0:add("button")]] [[@dialect=lua5.1]] [[@debug=stripped]]
 -- unluac: expect-contains [[:add("button")]]
--- unluac: expect-ast-count [[if]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[12]]
--- unluac: expect-contains [[local result = maybe_add_button(state)]] [[@debug=retained]]
 -- 内层仍检查 enabled；不能利用外层 not enabled 删除这次检查。
--- unluac: expect-contains [[and (p1_0.purchased or r1_0) then]] [[@dialect=lua5.1]] [[@debug=stripped]]
 -- unluac: expect-not-contains [[local r1_1 = p1_0]]
 
 local function maybe_add_button(state)

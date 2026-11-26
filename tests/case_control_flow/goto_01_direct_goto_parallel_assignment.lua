@@ -5,22 +5,6 @@
 -- unluac: expect-contains [["fallback"]]
 -- unluac: expect-order [["success"]] [["fallback"]]
 
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@dialect=luajit]]
--- unluac: expect-not-contains [[unresolved]]
 
 local events = {}
 

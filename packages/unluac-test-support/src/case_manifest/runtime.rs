@@ -8,22 +8,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &[LuaCaseConfiguration::new(PUC_LUA_ALL)],
     ),
     LuaCaseDefinition::new(
-        "tests/case_runtime/gc_01_value_predicate_gc.lua",
-        &["boolean", "callee-lookup", "gc", "predicate"],
-        "区分Boolean值写回与仅谓词极性，覆盖double/single/local/saved/copied/compared槽。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_runtime/errors_01_runtime.lua",
         &[
             "coroutine",

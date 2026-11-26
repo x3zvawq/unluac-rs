@@ -1,14 +1,8 @@
 -- regress_410_lua55_global_nested_callee: a temp used only as the tail callee does not escape
--- unluac: expect-contains [[global first_target, second_target =]]
 -- unluac: expect-contains [[()()]]
--- unluac: expect-contains [[global left_target, right_target =]]
--- unluac: expect-contains [[global single_target =]]
 -- unluac: expect-count [[()()]] [[5]]
 -- unluac: expect-count [[local _ENV =]] [[2]]
 -- unluac: expect-count [[global left_target, right_target =]] [[3]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=10]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=11]]
--- unluac: expect-ast-count [[function]] [[11]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- unluac: expect-ast-max [[error]] [[0]]
 

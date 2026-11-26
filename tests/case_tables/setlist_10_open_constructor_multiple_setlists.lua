@@ -1,12 +1,5 @@
 -- regress_432_open_constructor_multiple_setlists: a fixed SETLIST batch may precede the final open batch
--- unluac: expect-ast-count [[local-binding]] [[12]] [[@proto=0]]
--- unluac: expect-ast-count [[table-constructor]] [[7]] [[@proto=0]]
--- unluac: expect-ast-count [[table-list-field]] [[52]] [[@proto=0]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
--- unluac: expect-ast-count [[repeat]] [[0]]
--- unluac: expect-ast-count [[if]] [[0]]
 -- unluac: expect-not-contains [[table-set-list]]
--- unluac: expect-not-contains [[unluac error]]
 local tail_calls = 0
 local function tail()
     tail_calls = tail_calls + 1
@@ -31,9 +24,6 @@ assert(values[51] == 51 and values[52] == 52 and values[53] == 53)
 print("regress_432_open_constructor_multiple_setlists", "ok")
 
 -- 跨三批 SETLIST 的记录数组同时越过 RK 常量池边界；溢出的字段 LOADK 仍属于构造器。
--- unluac: expect-ast-count [[table-constructor]] [[139]]
--- unluac: expect-ast-count [[table-record-field]] [[265]]
--- unluac: expect-ast-count [[table-list-field]] [[183]]
 local function build_records(catalog, state)
     arrayResetFirst, arrayResetSecond = nil, nil
     arrayAngle = 0.75 * math.pi

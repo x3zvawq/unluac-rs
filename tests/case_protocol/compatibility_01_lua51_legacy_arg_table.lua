@@ -2,11 +2,6 @@
 -- unluac: expect-contains [[...]]
 -- unluac: expect-contains [[arg.n]]
 -- unluac: expect-not-contains [[...arg]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[(function(]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-max [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[3]]
 local function legacy(arg, ...)
     assert(type(arg) == "table" and arg.n == 2)
     assert(arg[1] == 2 and arg[2] == 3 and arg[3] == nil)

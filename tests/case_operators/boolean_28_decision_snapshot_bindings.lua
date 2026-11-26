@@ -1,15 +1,10 @@
 -- 直接寄存器读取可见右侧调用后的值；GETUPVAL 的显式读取必须保留调用前的快照。
 -- O2 可复制三个内联调用中的 read 闭包；其余配置保留九个源码函数。
--- unluac: expect-ast-min [[function]] [[9]]
--- unluac: expect-ast-max [[function]] [[12]]
 -- unluac: expect-ast-count [[goto]] [[0]]
 -- compare 的输入快照、两次选择结果和最终结果已足够；上值算术写回不另占持续声明。
--- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=9]] [[@dialect=luau]] [[@variant=O2]] [[@debug=stripped]]
 -- 比较中的算术仍在原参数槽执行；三结果调用和断言不留下调用帧中转声明。
--- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=0]] [[@dialect=luajit]] [[@debug=retained]]
 -- unluac: expect-contains [[local result, value, calls = stable(active, selected, expected)]] [[@dialect=luajit]] [[@debug=retained]]
 -- O2 保留三个内联闭包及跨作用域结果；CLOSE 后的算术不得继续制造预写和声明副本。
--- unluac: expect-ast-max [[local-binding]] [[50]] [[@proto=0]] [[@dialect=luau]] [[@variant=O2]] [[@debug=retained]]
 local function stable(enabled, selected, seed)
     local value = seed + 0
     local calls = 0

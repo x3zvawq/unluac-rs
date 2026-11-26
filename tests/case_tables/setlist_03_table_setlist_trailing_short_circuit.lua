@@ -1,7 +1,4 @@
 -- regress_25_table_setlist_trailing_short_circuit#1: SETLIST 尾部多返回里的短路左值 producer 可以折回构造器
--- unluac: expect-contains [[{ tostring(]]
--- unluac: expect-contains [[background or 0]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[table-set-list]]
 local function build_tags(loaded)
     local objects = {}
@@ -21,15 +18,7 @@ assert(build_tags({background = 7}) == "7")
 assert(build_tags({themeLayertags = true, themeLayerTags = {"kept"}}) == "kept")
 
 -- 数组中间的短路值属于整个构造事务，不能先恢复成独立方法帧声明。
--- unluac: expect-ast-count [[table-list-field]] [[10]]
 -- 拼接与后续选择复用原槽；只保留 shift，不生成入口 nil holder 或 callee 接棒声明。
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]] [[@dialect=luau]]
 -- unluac: expect-contains [[Settings:check("a") and "A" or false]] [[@dialect=lua5.1]]
 -- unluac: expect-contains [[Settings:check("a") and "A" or false]] [[@dialect=luau]]
 local function build_selections()

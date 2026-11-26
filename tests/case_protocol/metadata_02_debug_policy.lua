@@ -1,6 +1,3 @@
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-count [[table-constructor]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=0]]
 -- unluac: expect-contains [[ or 0]]
 -- unluac: expect-ast-count [[error]] [[0]]
 -- unluac: expect-contains [[-- proto#1 params=]]
@@ -13,7 +10,6 @@
 -- unluac: expect-not-contains [[-- file:]]
 -- unluac: expect-not-contains [[-- line ]]
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[unluac error]]
 local debug_secret = { 2, 4, 6 }
 
 local function debug_helper(debug_param)

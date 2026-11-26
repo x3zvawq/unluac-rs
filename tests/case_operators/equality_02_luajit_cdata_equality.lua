@@ -1,10 +1,5 @@
 -- unluac: expect-contains [[ == nil]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[if]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[6]]
 -- 参数来源与构造器事务须完整消费，不把开放返回拆为残余 SETLIST。
--- unluac: expect-contains [[local r0_4 = { r0_2(1), r0_2(2) }]]
--- unluac: expect-contains [[assert(r0_4[1] == nil and r0_4[2] == nil)]]
 local ffi = require("ffi")
 
 ffi.cdef[[

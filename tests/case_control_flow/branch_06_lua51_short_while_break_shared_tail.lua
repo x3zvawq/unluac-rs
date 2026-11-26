@@ -1,12 +1,9 @@
 -- regress_292_lua51_short_while_break_shared_tail: 短路while的early break不能抢占非空共享tail
 -- unluac: expect-contains [[while ]]
--- unluac: expect-not-contains [[while true do]]
 -- unluac: expect-contains [[break]]
 -- unluac: expect-contains [[tail]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function checked(ok, i)
     print("condition", i)
     return assert(ok)

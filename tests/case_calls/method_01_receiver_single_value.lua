@@ -1,5 +1,4 @@
 -- regress_07_method_receiver_single_value#1: receiver-only method chain should not treat receiver as final arg
--- unluac: expect-not-contains [[(function()]]
 -- unluac: expect-min-count [[:]] [[2]]
 -- unluac: expect-ast-min [[method-call]] [[2]] [[@proto=1]]
 local function test_method_receiver_chain()

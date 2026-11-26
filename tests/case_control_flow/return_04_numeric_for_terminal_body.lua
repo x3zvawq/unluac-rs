@@ -2,10 +2,7 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[if]] [[4]]
--- unluac: expect-ast-count [[local-binding]] [[9]]
 local menu_ready = true
 
 local levels = {

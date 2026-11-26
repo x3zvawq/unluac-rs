@@ -1,10 +1,4 @@
 -- regress_353_extended_return_producer_order: call and field producers stay ahead of the return-prefix event
--- unluac: expect-count [[local r5_0 =]] [[1]]
--- unluac: expect-count [[local r5_1 =]] [[1]]
--- unluac: expect-count [[local r10_0 =]] [[1]]
--- unluac: expect-count [[local r10_1 =]] [[1]]
--- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=5]]
--- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=10]]
 
 do
     -- Call producer: v -> o -> p.

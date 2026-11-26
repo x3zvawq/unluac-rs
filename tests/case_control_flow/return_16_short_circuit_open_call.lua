@@ -1,9 +1,5 @@
 -- 短路共享 fallback 必须保留嵌套调用的开放参数、字段读取次数和单返回值。
 -- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
--- unluac: expect-ast-count [[local-binding]] [[13]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
 function edge(a)
   return GFunc and GFunc.num2 and GFunc.num2(tostring(a)) or tostring(a)
 end

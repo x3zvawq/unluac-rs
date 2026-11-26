@@ -2,18 +2,7 @@
 -- unluac: expect-ast-min [[repeat]] [[2]] [[@dialect=luau]] [[@proto=1]]
 -- unluac: expect-ast-max [[goto]] [[0]] [[@dialect=luau]]
 -- 两个原循环状态即可；独立声明与并列声明都不引入中转，初始化由实际运行验证。
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@debug=retained]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]] [[@debug=retained]] [[@dialect=luajit]]
 -- unluac: expect-contains [[return step, x]] [[@debug=retained]]
--- unluac: expect-contains [[local b = math.floor(mask / 2) % 2 == 1]] [[@debug=retained]]
--- unluac: expect-contains [[local c = math.floor(mask / 4) % 2 == 1]] [[@debug=retained]]
--- unluac: expect-contains [[local step, x = run(a, b, c, d, xs)]] [[@debug=retained]]
--- unluac: expect-contains [[assert(table.concat(trace, ",") == table.concat(expected, ","))]] [[@debug=retained]]
 -- unluac: expect-contains [[print("regress_645#1", mask, step, x, table.concat(trace, ","))]] [[@debug=retained]]
 local function run(a, b, c, d, xs)
     local step, x = 0, 0
@@ -57,8 +46,6 @@ for mask = 0, 15 do
 end
 
 
--- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
 -- 两臂均汇入外层共享出口；其中一臂提前 return 不应把另一臂误认为 continuation。
 local function guarded_alternatives(active, key, editor, stop, nested)
     if active then

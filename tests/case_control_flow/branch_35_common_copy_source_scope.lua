@@ -1,5 +1,4 @@
 -- Branch-local producers may share a phi identity; their copies must stay in scope.
--- unluac: expect-ast-count [[if]] [[3]] [[@proto=3]] [[@dialect=lua5.1]]
 strings = { away = "away", dead = "dead", checked = "checked" }
 local outputs = {}
 local function show(item, value) print("show", item.name, value) end

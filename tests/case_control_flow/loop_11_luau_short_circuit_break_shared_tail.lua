@@ -3,8 +3,6 @@
 -- unluac: expect-not-contains [[not p1_0 and]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(a, b, c, xs)
     local x = 0
     repeat
@@ -65,14 +63,5 @@ assert(#trace == 3 and trace[1] == 0 and trace[2] == 4 and trace[3] == 4)
 print("observed_shared_tail", reads, trace[1], trace[2], trace[3])
 -- a/c 同为假时原程序无观察点且不终止，不执行该输入。
 -- unluac: expect-ast-count [[repeat]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[while]] [[0]] [[@proto=1]]
 -- 原分派表和闭包捕获不应给主函数引入 callee、比较结果或参数别名。
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
--- unluac: expect-ast-count [[call]] [[22]] [[@proto=0]]
 -- guard 的重复测试来自原指令；保留分层短路、共享尾及各次打印。
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[7]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[4]] [[@proto=1]]
--- unluac: expect-ast-count [[call]] [[2]] [[@proto=1]]

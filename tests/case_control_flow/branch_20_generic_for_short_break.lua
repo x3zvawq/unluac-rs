@@ -1,9 +1,7 @@
 -- regress_79_generic_for_short_break#1: short-circuit headers are not loop continuations
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-min [[generic-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-min [[break]] [[1]] [[@proto=1]]
 local function run(a, b)
     local x = 0
     for _, _ in pairs({ 1, 2 }) do

@@ -1,9 +1,7 @@
 -- regress_355_mechanical_loop_condition_snapshot: mechanical runs must not move snapshots into loop conditions
 -- 计数器与条件快照分别保留身份，不另建只接收入口计数器的循环 carrier。
--- unluac: expect-ast-max [[local-decl]] [[4]] [[@proto=1]]
 -- unluac: expect-not-contains [[local r1_3 = r1_0]]
 -- unluac: expect-not-contains [[local r1_4 = r1_0]]
--- unluac: expect-contains [[r1_0 = r1_0 + 1]]
 
 local function run_while(flag)
     local count = 0

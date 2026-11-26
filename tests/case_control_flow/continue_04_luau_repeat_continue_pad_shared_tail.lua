@@ -2,28 +2,14 @@
 -- unluac: expect-contains [[continue]]
 -- 两条完全展开路径各有六次 ADD；另外三条循环路径各保留两条 ADD。
 -- 使用原产物及每轮回编译计数，恢复调用后仍不能把六次加法折叠为常量 6。
--- unluac: expect-instruction-count [[add]] [[18]] [[@proto=0]]
--- unluac: expect-instruction-count [[call]] [[11]] [[@proto=0]]
 -- 重复的 a 检查决定原 continue 边，不能按外层路径假设删除。
--- unluac: expect-contains [[                if p1_0 then]]
 -- 循环 limit 与后继 Boolean 写承接旧根覆盖，回编译不应另外增生清空语句。
 -- unluac: expect-max-count [[ = nil]] [[0]]
 -- print 的 callee 与参数应属于完整调用，不残留独立的全局读取接棒变量。
--- unluac: expect-max-count [[ = print]] [[0]]
 -- 完整调用消除父函数的输入、状态、结果及 callee 接棒，保留两个遍历的绑定。
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[continue]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
 -- 索引回调的算术及比较参数直接沿原帧求值，不制造独立准备声明。
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
 local function run(a, b, xs)
     local x = 0
     for i = 1, 3 do

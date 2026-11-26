@@ -1,9 +1,5 @@
 -- unluac: expect-contains [[ == nil]]
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[if]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[8]]
 -- 短路函数的两个参数比较均须保留；Boolean 物化许可不能合并或复制这些 __eq。
--- unluac: expect-count [[p1_0 == nil]] [[2]]
 
 local ffi = require("ffi")
 

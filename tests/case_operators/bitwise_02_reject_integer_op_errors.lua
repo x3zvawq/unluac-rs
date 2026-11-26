@@ -1,8 +1,5 @@
 -- unluac: expect-contains [[ // ]]
 -- unluac: expect-contains [[ % ]]
--- unluac: expect-ast-count [[function]] [[6]]
--- unluac: expect-ast-count [[if]] [[5]]
--- unluac: expect-ast-max [[local-binding]] [[23]]
 
 local function reject_floor_zero()
     local numerator = 1

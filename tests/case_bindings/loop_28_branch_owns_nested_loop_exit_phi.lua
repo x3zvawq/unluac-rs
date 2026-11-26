@@ -1,7 +1,5 @@
 -- regress_73_branch_owns_nested_loop_exit_phi#1: outer branch owns the nested loop exit phi
--- unluac: expect-contains [[return r1_0 .. ":tail"]]
 -- unluac: expect-not-contains [[local r1_2]]
--- unluac: expect-not-contains [[unluac error]]
 
 local function loop_exit_phi_owner(enabled, values)
     local result = "start"

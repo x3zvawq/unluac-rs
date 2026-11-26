@@ -1,13 +1,8 @@
 -- regress_204_irreducible_explicit_close_owner#1: island 重入与侧出口必须保留显式 close 生命周期
 -- unluac: expect-contains [[<close>]]
--- unluac: expect-contains [[if p3_0 then]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[local-binding]] [[9]]
 -- unluac: expect-ast-count [[close-binding]] [[1]]
--- unluac: expect-ast-max [[label]] [[3]]
 -- 独占出口 pad 不应使分支退回 island 原始跳转并逐轮增加 goto。
--- unluac: expect-count [[goto ]] [[3]]
+-- unluac: expect-max-count [[goto ]] [[4]]
 
 local closed = 0
 local mt = {

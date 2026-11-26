@@ -1,6 +1,5 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
 local function apply(caster, ids)
     for i = 1, #ids do

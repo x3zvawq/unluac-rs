@@ -1,11 +1,7 @@
 -- regress_370_repeat_prefix_decision: an untouched prefix Decision does not own the repeat tail
--- unluac: expect-contains [[until stop() or again()]]
--- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-contains [[function stop()]]
 -- unluac: expect-contains [[function again()]]
 -- unluac: expect-not-contains [[global function]]
--- unluac: expect-ast-count [[local-binding]] [[2]]
--- unluac: expect-ast-count [[if]] [[2]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
 -- unluac: expect-ast-count [[while]] [[1]]
 

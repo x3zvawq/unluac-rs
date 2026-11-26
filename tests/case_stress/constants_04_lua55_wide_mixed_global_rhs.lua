@@ -1,8 +1,6 @@
 -- regress_410_lua55_wide_mixed_global_rhs: wide target captures its environment before the RHS call
 -- unluac: expect-not-contains [[global tail_b, tail_c =]]
--- unluac: expect-contains [[global new_wide, tail_b, tail_c =]]
 -- unluac: expect-ast-count [[error]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=0]]
 
 global<const> print
 

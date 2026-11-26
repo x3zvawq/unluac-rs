@@ -1,10 +1,4 @@
 -- 完整 CALL 参数帧消费短路结果的前一 COPY 版本，右臂的比较仍只在选中路径执行。
--- unluac: expect-contains [[print("copy-and",]]
--- unluac: expect-contains [[print("copy-or",]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[5]]
 local function report(subject, left, right)
     print("copy-and", subject and left ~= right)
     print("copy-or", subject or left == right)

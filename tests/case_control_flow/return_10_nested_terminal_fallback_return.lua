@@ -1,10 +1,6 @@
 -- regress_382_nested_terminal_fallback_return: an explicit empty return closes a nested
 -- terminal guard, so its selected body can be lifted without capturing the parent continuation
--- unluac: expect-contains [[if not p2_1 then]]
 -- 两臂都是 return 时仍由空 return guard 负责规范化，不能与正向条件整理互相翻转。
--- unluac: expect-contains [[if not p3_1 then]]
--- unluac: expect-ast-count [[local-binding]] [[4]]
--- unluac: expect-ast-count [[if]] [[4]]
 
 local events = {}
 

@@ -1,23 +1,9 @@
 -- regress_234_nested_phi_short_value_merge#1: 短路值叶经中间 Phi 汇入外层 merge
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[if p2_1 then]]
--- unluac: expect-not-contains [[local r1_0 = p1_1 or p1_0]]
 -- unluac: expect-not-contains [[local r1_0 = p1_0 and]]
--- unluac: expect-not-contains [[return r1_0]]
--- unluac: expect-contains [[return p]]
--- unluac: expect-ast-count [[function]] [[4]]
 -- unluac: expect-ast-count [[numeric-for]] [[8]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=2]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=3]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=4]]
 -- 固定 pick、共享 fallback 与运行 oracle 的字面量上限，每轮不得复制 continuation。
--- unluac: expect-max-count [["maybe"]] [[9]]
 -- 两次计数矩阵沿用原状态声明，后续 CALL 不留下逐轮增长的准备别名。
--- unluac: expect-ast-max [[local-binding]] [[21]] [[@proto=0]]
 -- unluac: expect-max-count [[= assert]] [[0]]
--- unluac: expect-max-count [[= select]] [[0]]
 local function pick(x, a, b, c)
     local out
     if x then

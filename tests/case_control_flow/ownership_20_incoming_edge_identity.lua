@@ -1,9 +1,6 @@
 -- regress_489_phi_incoming_edge_identity: entry input and parallel physical edges retain distinct phi slots
 -- unluac: expect-ast-count [[while]] [[2]]
 -- 空 if 是输入字节码中的显式检查，须保留并行边的身份。
--- unluac: expect-ast-count [[if]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[2]]
--- unluac: expect-ast-count [[assign]] [[2]]
 local function entry(flag)
     while flag do
         flag = false

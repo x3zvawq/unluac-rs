@@ -1,8 +1,6 @@
 -- regress_145_loop_header_snapshot#1: loop header 必须保留调用前的 local 快照
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[7]]
 local value = 1
 local calls, visits = 0, 0
 

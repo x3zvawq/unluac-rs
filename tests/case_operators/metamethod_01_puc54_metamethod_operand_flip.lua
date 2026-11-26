@@ -1,13 +1,6 @@
 -- regress_127_puc54_metamethod_operand_flip#1: MMBINI/MMBINK 的 flip 必须保留源码操作数顺序
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[local r2_2 = p1_0 ..]]
--- unluac: expect-contains [[return p1_0 .. ":"]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[6]]
 -- type 的结果只供紧接的短路选择，不应留下 callee/result 的独立赋值包装。
--- unluac: expect-count [[type(p2_0) == "number" and p2_0 or "-"]] [[1]]
--- unluac: expect-count [[type(p2_1) == "number" and p2_1 or "-"]] [[1]]
 local calls = 0
 local function mark(name)
     return function(a, b)

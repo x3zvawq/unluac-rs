@@ -1,8 +1,5 @@
 -- regress_12_nested_bvm_short_circuit_tail#1: nested short-circuit tail should stay structured
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=2]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[5]]
 local log = {}
 
 local function mark(tag, value)

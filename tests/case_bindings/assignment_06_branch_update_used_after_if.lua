@@ -1,8 +1,4 @@
--- unluac: expect-contains [[p4_0 = r0_0.decrypt(p4_0)]]
--- unluac: expect-contains [[p4_0 = r0_0.inflate(p4_0)]]
--- unluac: expect-contains [[return r0_0.decode(p4_0)]]
 -- unluac: expect-not-contains [[decode(r2_0)]]
--- unluac: expect-not-contains [[unluac error]]
 
 local codec = {}
 

@@ -1,7 +1,4 @@
 -- 完整值决策保留原 phi 结果，条件重赋值不能引入额外身份并抬高后继调用前缀。
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[local-binding]] [[21]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 local function exercise(flag, replace)
     local function run() print("old") end
     if flag then run = replace(run) end

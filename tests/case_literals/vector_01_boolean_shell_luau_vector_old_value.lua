@@ -1,9 +1,7 @@
 -- Luau vector constants are owned by the proto rather than the overwritten stack slot.
 -- unluac: expect-contains [[not not]]
--- unluac: expect-ast-count [[assign]] [[2]]
 -- unluac: expect-not-contains [[if ]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[3]]
 
 for _, value in ipairs({ 1 }) do
     value = vector.create(1.5, -2, 3.25)

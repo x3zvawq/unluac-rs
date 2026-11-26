@@ -438,158 +438,112 @@ pub(super) fn run_unsupported_island_contract(
     patch_lua51_main_jump(&mut chunk, jump_pc, target_pc).map_err(|detail| {
         TestFailure::new(
             FailureKind::StructureContractAssertionFailed,
-            "prepare unsupported island fixture failed",
+            "prepare irreducible Lua 5.1 fixture failed",
             detail,
         )
     })?;
 
-    let mut structure_options = decompile_options(entry);
-    structure_options.target_stage = DecompileStage::Structure;
-    let structure = decompile(&chunk, structure_options).map_err(|error| {
-        structure_contract_failure(format!(
-            "unsupported island fixture failed before the frozen StructurePlan: {error}"
-        ))
-    })?;
-    let facts =
-        structure.state.structure_facts.as_ref().ok_or_else(|| {
-            structure_contract_failure("structure stage returned no StructureFacts")
-        })?;
-    let ready = facts.ready().ok_or_else(|| {
-        structure_contract_failure("structure fixture unexpectedly produced a failed proto")
-    })?;
-    let has_island = ready
-        .plan()
-        .regions()
-        .any(|(_, region)| matches!(region, RegionPlan::Unstructured { .. }));
-    let requires_goto = ready
-        .plan()
-        .requirements()
-        .unavailable_features()
-        .contains(&ControlFlowFeature::GotoLabel);
-    if !has_island || !requires_goto {
-        return Err(structure_contract_failure(format!(
-            "mutated Lua 5.1 fixture did not freeze an unavailable goto island: island={has_island}, requires_goto={requires_goto}"
-        )));
-    }
-
-    let mut hir_options = decompile_options(entry);
-    hir_options.target_stage = DecompileStage::Hir;
-    let hir_result = decompile(&chunk, hir_options).map_err(|error| {
-        structure_contract_failure(format!(
-            "unsupported island fixture failed before the frozen HIR exit diagnostic: {error}"
-        ))
-    })?;
-    let hir = hir_result
-        .state
-        .hir
-        .as_ref()
-        .ok_or_else(|| structure_contract_failure("HIR stage returned no HirModule"))?;
-    match lower_ast(
-        hir,
-        AstTargetDialect::new(DecompileDialect::Lua51),
-        GenerateMode::Strict,
-    ) {
-        Err(AstLowerError::UnsupportedFeature {
-            dialect: DecompileDialect::Lua51,
-            feature: "goto/label",
-            context: "HIR exit diagnostics",
-        }) => {}
-        Err(error) => {
-            return Err(structure_contract_failure(format!(
-                "direct HIR-to-AST lowering returned the wrong unsupported-island error: {error}"
-            )));
-        }
-        Ok(_) => {
-            return Err(structure_contract_failure(
-                "direct HIR-to-AST lowering accepted an unavailable goto island",
-            ));
-        }
-    }
-    lower_ast(
-        hir,
-        AstTargetDialect::new(DecompileDialect::Lua52),
-        GenerateMode::Strict,
-    )
-    .map_err(|error| {
-        structure_contract_failure(format!(
-            "direct HIR-to-AST lowering rejected the same required goto for a capable target: {error}"
-        ))
-    })?;
-    let direct_permissive = lower_ast(
-        hir,
-        AstTargetDialect::new(DecompileDialect::Lua51),
-        GenerateMode::Permissive,
-    )
-    .map_err(|error| {
-        structure_contract_failure(format!(
-            "direct permissive HIR-to-AST lowering rejected an unsupported island: {error}"
-        ))
-    })?;
-    let direct_diagnostic = match direct_permissive.body.stmts.first() {
-        Some(AstStmt::Error(diagnostic)) if diagnostic.starts_with("HIR exit diagnostics:") => {
-            diagnostic
-        }
-        _ => {
-            return Err(structure_contract_failure(
-                "direct permissive HIR-to-AST lowering did not preserve the HIR exit diagnostic",
-            ));
-        }
-    };
-
+    // 契约：Lua 5.1 面对真正不可规约多入口图，使用局部状态机兜底，
+    // 绝不向 Lua 5.1 源码注入非法 goto/::label::，且在 Strict 模式下也能产出合法源码。
     let mut strict_options = decompile_options(entry);
     strict_options.generate.mode = GenerateMode::Strict;
-    match decompile(&chunk, strict_options) {
-        Err(DecompileError::Ast(AstLowerError::UnsupportedFeature {
-            dialect: DecompileDialect::Lua51,
-            feature: "goto/label",
-            context: "HIR exit diagnostics",
-        })) => {}
-        Err(error) => {
-            return Err(structure_contract_failure(format!(
-                "strict mode returned the wrong unsupported-island error: {error}"
-            )));
-        }
-        Ok(_) => {
-            return Err(structure_contract_failure(
-                "strict mode accepted an unavailable goto island",
-            ));
-        }
-    }
-
-    let mut permissive_options = decompile_options(entry);
-    permissive_options.generate.mode = GenerateMode::Permissive;
-    let permissive = decompile(&chunk, permissive_options).map_err(|error| {
+    let strict = decompile(&chunk, strict_options).map_err(|error| {
         structure_contract_failure(format!(
-            "permissive mode rejected an unsupported island: {error}"
+            "Lua 5.1 irreducible state-machine fallback failed under Strict mode: {error}"
         ))
     })?;
-    let generated =
-        permissive.state.generated.as_ref().ok_or_else(|| {
-            structure_contract_failure("permissive mode returned no generated chunk")
-        })?;
-    if generated.kind != GeneratedChunkKind::DiagnosticPseudocode
-        || !generated
-            .source
-            .contains("-- [unluac error] diagnostic pseudocode:")
-        || !generated.source.contains("HIR exit diagnostics:")
-        || !generated.source.contains(direct_diagnostic)
-    {
+    let generated = strict.state.generated.as_ref().ok_or_else(|| {
+        structure_contract_failure("strict mode returned no generated chunk for irreducible graph")
+    })?;
+    if generated.kind != GeneratedChunkKind::Source {
         return Err(structure_contract_failure(format!(
-            "permissive mode did not preserve the plan diagnostic contract: kind={:?}\n{}",
-            generated.kind, generated.source
+            "expected valid Lua 5.1 Source via state-machine fallback, got {:?}",
+            generated.kind
+        )));
+    }
+    if generated.source.contains("goto ") || generated.source.contains("::") {
+        return Err(structure_contract_failure(format!(
+            "Lua 5.1 output leaked illegal goto/label:\n{}",
+            generated.source
+        )));
+    }
+    let state_machine_total: usize = strict
+        .state
+        .ast
+        .as_ref()
+        .map(|ast| ast.protos.iter().map(|p| p.state_machine_count).sum())
+        .unwrap_or(0);
+    if state_machine_total == 0 {
+        return Err(structure_contract_failure(format!(
+            "expected irreducible Lua 5.1 fixture to trigger state-machine fallback, got 0:\n{}",
+            generated.source
+        )));
+    }
+    let patched_chunk_path = suite_artifact_path("irreducible", entry, "patched-chunk", "luac");
+    write_output_file(&patched_chunk_path, &chunk).map_err(structure_contract_failure)?;
+    let generated_source_path = write_generated_case_source(entry, "irreducible", &generated.source)
+        .map_err(structure_contract_failure)?;
+    let (compiled_path, compile_output) = compile_generated_source_to_suite_artifact(
+        entry,
+        "irreducible",
+        &generated_source_path,
+        true,
+    )
+    .map_err(structure_contract_failure)?;
+    if !compile_output.success() {
+        return Err(structure_contract_failure(format!(
+            "generated Lua 5.1 state-machine source failed to compile:\n{}\n{}",
+            compile_output.render(),
+            generated.source
         )));
     }
 
-    let assertions = read_readability_assertions(entry.path)?;
-    assert_readability(
-        "permissive",
-        &generated.source,
-        permissive.state.readability.as_ref(),
-        permissive.state.naming.as_ref(),
-        entry,
-        &assertions,
-        true,
-    )?;
+    // 验证状态机产出的字节码在两个入口分支（enter_body=nil / true）上与原始 patched chunk 运行输出一致。
+    let runtime = lua_tool_path("lua5.1", "lua").map_err(structure_contract_failure)?;
+    for (case_label, enter_body) in [("enter_body=nil", false), ("enter_body=true", true)] {
+        let run_chunk = |path: &Path| -> Result<LuaCommandOutput, TestFailure> {
+            if enter_body {
+                run_command(
+                    &runtime,
+                    [
+                        OsStr::new("-e"),
+                        OsStr::new("enter_body = true"),
+                        path.as_os_str(),
+                    ],
+                    "lua",
+                )
+                .map_err(structure_contract_failure)
+            } else {
+                run_lua_file("lua5.1", path).map_err(structure_contract_failure)
+            }
+        };
+        let expected_output = run_chunk(&patched_chunk_path)?;
+        if !expected_output.success() {
+            return Err(structure_contract_failure(format!(
+                "patched irreducible chunk failed to run ({case_label}):\n{}",
+                expected_output.render()
+            )));
+        }
+        let actual_output = run_chunk(&compiled_path)?;
+        if !actual_output.success() {
+            return Err(structure_contract_failure(format!(
+                "generated Lua 5.1 state-machine artifact failed to run ({case_label}):\n{}\n{}",
+                actual_output.render(),
+                generated.source
+            )));
+        }
+        if let Some(diff) = diff_command_outputs(
+            "patched-chunk",
+            &expected_output,
+            "state-machine-artifact",
+            &actual_output,
+        ) {
+            return Err(structure_contract_failure(format!(
+                "Lua 5.1 state-machine output mismatch ({case_label}):\n{diff}\n{}",
+                generated.source
+            )));
+        }
+    }
 
     Ok(TestSuccess { proto_count: 1 })
 }
@@ -597,7 +551,7 @@ pub(super) fn run_unsupported_island_contract(
 pub(super) fn structure_contract_failure(detail: impl Into<String>) -> TestFailure {
     TestFailure::new(
         FailureKind::StructureContractAssertionFailed,
-        "StructurePlan strict/permissive contract failed",
+        "irreducible Lua 5.1 state-machine contract failed",
         detail,
     )
 }

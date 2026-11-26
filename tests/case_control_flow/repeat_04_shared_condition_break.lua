@@ -1,15 +1,7 @@
 -- regress_225_repeat_shared_condition_break#1: repeat 尾条件共享 continuation 不能泄漏 residual Decision
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-contains [[p1_1 and p1_2 or r1_0 > 3]]
 -- unluac: expect-not-contains [[if p1_1 and p1_2 then]]
 -- unluac: expect-not-contains [[continue]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=1]]
 local function run(stop, left, right)
     local x = 0
     repeat

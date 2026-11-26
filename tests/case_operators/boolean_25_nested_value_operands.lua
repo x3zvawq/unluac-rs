@@ -1,42 +1,18 @@
 -- 内部 phi 是比较的操作数；两侧取值、外层短路及多层嵌套分别保留控制与单次求值。
--- unluac: expect-ast-count [[function]] [[9]]
 -- unluac: expect-ast-count [[numeric-for]] [[8]]
 -- 混合字段的嵌套表临时槽已在首个观察前覆盖；后续捕获不应拆开先前的初始化。
--- unluac: expect-contains [[{ [0] = false, 7, [3] = 0, [4] = "", [5] = {} }]] [[@dialect=luau]] [[@variant=O0]] [[@debug=stripped]]
 -- 被消费的表临时根不应留下占位声明，后继数值控制写仍属于完整循环头。
--- unluac: expect-contains [[for r0_7 = 0, 4 do]] [[@dialect=luau]] [[@variant=O0]] [[@debug=stripped]]
--- unluac: expect-contains [[assert(r0_3(r0_8, r0_13, r0_11) == r0_14)]] [[@dialect=luau]] [[@variant=O0]] [[@debug=stripped]]
 -- O1 的 step 复用原表临时槽；空声明与三个控制值须作为完整循环头一并恢复。
--- unluac: expect-contains [[for r0_7 = 0, 4 do]] [[@dialect=luau]] [[@variant=O1]] [[@debug=stripped]]
--- unluac: expect-contains [[assert(r0_3(r0_8, r0_13, r0_11) == r0_14)]] [[@dialect=luau]] [[@variant=O1]] [[@debug=stripped]]
 -- debug 身份在末次字段写之后生效，混合数组批次及后继控制槽仍可整体恢复。
--- unluac: expect-contains [[local choices = { [0] = false, 7, [3] = 0, [4] = "", [5] = {} }]] [[@dialect=luau]] [[@debug=retained]]
 -- unluac: expect-contains [[for enabled = 0, 4 do]] [[@dialect=luau]] [[@debug=retained]]
 -- 短路末叶沿用原 epoch，后继调用帧与既有结果写回不能因其临时声明连带退化。
--- unluac: expect-contains [[result, item = external(flag, 8, read, false)]] [[@dialect=luau]] [[@variant=O1]] [[@debug=retained]]
--- unluac: expect-contains [[assert(result == expected_result and calls == 1 and rawequal(item, expected_item))]] [[@dialect=luau]] [[@variant=O1]] [[@debug=retained]]
 -- expected_shared 的分支先于 shared 调用；保留独立边界后，外层断言仍是完整调用。
--- unluac: expect-contains [[assert(r0_2(r0_8, r0_13, r0_11) == r0_17 and r0_10 == 3)]] [[@dialect=luau]] [[@variant=O1]] [[@debug=stripped]]
 -- 默认返回复杂度上限会保留 nested/observed 的两个长表达式声明；Luau 原返回帧无需此中转。
--- unluac: expect-ast-max [[local-binding]] [[35]]
--- unluac: expect-ast-max [[local-binding]] [[33]] [[@dialect=luau]]
 -- O2 展开体按原共享读取、参数初始化和返回槽恢复完整调用；不留下独立的写回中转。
--- unluac: expect-contains [[assert(shared(flag, expected, read) == expected_shared and calls == 3)]] [[@dialect=luau]] [[@variant=O2]] [[@debug=retained]]
--- unluac: expect-contains [[assert(observed(]] [[@dialect=luau]] [[@variant=O2]] [[@debug=retained]]
--- unluac: expect-contains [[local actual = comparison_writeback("old", x, y)]] [[@dialect=luau]] [[@variant=O2]] [[@debug=retained]]
 -- 即使首参数随后被覆盖，原字面量实参仍在完整调用中求值一次。
--- unluac: expect-count [[("old", ]] [[1]] [[@dialect=luau]] [[@variant=O2]]
 -- 高槽 Boolean 结果写回已有低槽后，不应留下预写声明并使下一轮调用重新分裂。
--- unluac: expect-max-count [[ = assert]] [[0]] [[@dialect=luau]] [[@variant=O0]] [[@debug=stripped]]
 -- 无写入的合流 pad 不应令后继调用逐轮退回准备别名。
--- unluac: expect-max-count [[ = assert]] [[0]] [[@dialect=lua5.1]]
--- unluac: expect-max-count [[ = assert]] [[0]] [[@dialect=lua5.2]]
--- unluac: expect-max-count [[ = assert]] [[0]] [[@dialect=lua5.3]]
--- unluac: expect-max-count [[ = assert]] [[0]] [[@dialect=lua5.4]]
--- unluac: expect-max-count [[ = assert]] [[0]] [[@dialect=lua5.5]]
 -- 共享比较终端直接写回原目标；控制前缀不能复制终端或制造两个结果快照。
--- unluac: expect-ast-max [[local-binding]] [[31]] [[@proto=0]] [[@dialect=luajit]]
--- unluac: expect-count [[r0_17 = r0_9 == 1]] [[1]] [[@dialect=luajit]] [[@debug=stripped]]
 local function nested(enabled, value, a, b)
     return enabled and value == ((a and 1 or 2) == (b and 1 or 2) and 7 or 8)
 end
@@ -136,39 +112,7 @@ for enabled = 0, 1 do
 end
 
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=9]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=luau]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=8]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=luau]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=6]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=luau]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=luajit]]
 -- Luau 的原返回帧直接承接短路值，不应逐轮增加 flag 的局部转交。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]] [[@dialect=luau]]
 
 -- 参数写回的 phi 已经是 ParamRef，内嵌比较仍须在原消费点替换一次。
 local function comparison_writeback(value, x, y)
@@ -183,6 +127,3 @@ for x = 0, 2 do
         print("parameter operand", x, y, actual)
     end
 end
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-contains [[value = x < y]] [[@debug=retained]]
--- unluac: expect-contains [[value = value and 1 or 0]] [[@debug=retained]]

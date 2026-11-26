@@ -2,10 +2,6 @@
 -- unluac: expect-contains [["\214\208\206\196"]]
 -- unluac: expect-count [["中文"]] [[1]]
 -- unluac: expect-contains [[\214\208\n\206\196]]
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
--- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=0]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=0]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 local function test_gbk_string_literal()

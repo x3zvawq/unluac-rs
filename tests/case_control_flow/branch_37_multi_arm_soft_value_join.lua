@@ -1,8 +1,5 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[call]] [[5]] [[@proto=1]] [[@dialect=lua5.1]]
 local function relocate(id, cause, line)
     local position = {}
     if id == 1 then

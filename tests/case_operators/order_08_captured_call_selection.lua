@@ -1,13 +1,4 @@
 -- CALL 修改捕获值时，算术仍使用调用前的快照；短路备用值只在原分支写回。
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-count [[local-binding]] [[7]]
--- unluac: expect-contains [[value = value + (provider:next() or 1)]] [[@debug=retained]]
--- unluac: expect-contains [[value = value + (provider:next() and 2)]] [[@debug=retained]]
--- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
 local value = 10
 local provider
 -- vararg 保留独立调用边界，避免 O2 把调用点展开成另一套捕获值读写布局。

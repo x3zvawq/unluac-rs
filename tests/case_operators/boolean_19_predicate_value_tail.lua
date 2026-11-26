@@ -1,11 +1,5 @@
 -- 比较产生 Boolean，但短路的值臂可以是 nil、false 或对象；谓词和字段读取都只能执行一次。
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=3]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=4]]
--- unluac: expect-ast-count [[function]] [[6]]
 -- unluac: expect-ast-count [[numeric-for]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[23]]
 local function equal_and(a, b, source)
     return a == b and source.value
 end

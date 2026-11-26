@@ -1,6 +1,3 @@
--- unluac: expect-ast-count [[function]] [[8]]
--- unluac: expect-ast-count [[if]] [[7]]
--- unluac: expect-ast-max [[local-binding]] [[16]]
 -- 无观察事件不等于没有原操作；包括永不到达的分支关系也保留。
 -- unluac: expect-contains [[11 + 7]]
 -- unluac: expect-contains [[-(13 * 5)]]

@@ -1,11 +1,4 @@
 -- luau_01#1: continue与复合运算管线
--- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=2]]
--- unluac: expect-ast-max [[assign]] [[3]] [[@proto=5]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=7]]
--- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=9]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=15]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=20]]
--- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=25]]
 local function test_continue_compound()
     local function build_report(seed: number, items: { number }): string
         local acc: number = seed

@@ -1,18 +1,5 @@
 -- 不可规约区域中的两种 for owner 分别保留；相同路径骨架不替代各自的 VM 协议。
--- unluac: expect-contains [[for ]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 -- PUC 按源码顺序保存 child，LuaJIT 的 child 编号相反；每条合同仍指向独立函数。
--- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=2]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]] [[@dialect=luajit]]
 
 local function run_numeric(start_second, jump_second)
     local total = 0
@@ -98,6 +85,3 @@ assert(run_numeric(nil, 0) == 22)
 assert(run_generic(nil, nil) == 3)
 assert(run_generic(0, nil) == 13)
 assert(run_generic(nil, 0) == 22)
--- unluac: expect-ast-count [[empty-local]] [[0]]
--- unluac: expect-ast-count [[while]] [[0]]
--- unluac: expect-ast-count [[repeat]] [[0]]

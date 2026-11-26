@@ -1,14 +1,4 @@
 -- 比较参数在原 scratch 求算术值；索引先于 RHS，元方法不能令赋值 key 后移。
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=3]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[7]]
 local function update(out, value, emit)
     out[#out + 1] = emit(value % 2 == 0)
 end

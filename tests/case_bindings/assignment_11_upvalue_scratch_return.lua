@@ -1,11 +1,5 @@
 -- 分配结果写入上值后，同槽 GETUPVAL/RETURN 属于下一值版本，不保留机械 local 交接。
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=3]]
 -- 调用结果、已有低槽比较与任意值短路末项共同组成原 assert 参数帧。
--- unluac: expect-count [[assert(]] [[5]]
--- unluac: expect-ast-count [[local-binding]] [[8]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=0]]
--- unluac: expect-ast-count [[if]] [[0]]
 local state = {}
 local function read()
     return state

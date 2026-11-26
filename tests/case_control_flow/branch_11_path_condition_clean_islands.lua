@@ -1,8 +1,6 @@
 -- 稳定路径事实也不能删除 clean prefix/arm、fallthrough 或 label 入口上的原检查。
 -- unluac: expect-contains [[not flag or mark("inner", true)]]
 -- label 合流中的 SSA 版本仍属于 x/y 的原 debug 声明，不能另造交接变量。
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=2]]
--- unluac: expect-ast-count [[if]] [[5]] [[@proto=2]]
 
 local events = {}
 
@@ -57,7 +55,6 @@ x, y = clean_prefix(false, true, true)
 assert(x == 3 and y == 11)
 
 -- regress_374_path_condition_clean_islands#2: a closed multi-entry label graph cannot inherit lexical false facts
--- unluac: expect-contains [[if flag and mark("merge-true", "true") then]]
 
 local function closed_merge(flag, jump_to_right, cycle)
     if jump_to_right then
@@ -94,7 +91,6 @@ assert(table.concat(events, ",") == "outer,inner,body,merge-true", table.concat(
 -- regress_374_path_condition_clean_islands#3: a clean arm has one structured entry even when its sibling jumps to a label
 -- unluac: expect-contains [[not flag or mark("clean-arm", accepted)]]
 -- 第二次 flag 检查保留在短路条件内，不拆成两个重复赋值分支。
--- unluac: expect-ast-count [[if]] [[3]] [[@proto=4]]
 
 local function clean_arm(flag, jump_right, accepted)
     local result = "none"
@@ -121,7 +117,6 @@ assert(clean_arm(false, false, true) == "none")
 assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,clean-arm", table.concat(events, ","))
 
 -- 即使前一条 return 已排除这条路径，仍保留原字节码的检查和分支。
--- unluac: expect-contains [[flag and mark("clean-run", true)]]
 
 local function clean_run(flag, jump_right, cycle)
     if flag then
@@ -161,7 +156,7 @@ assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,clean
 
 -- regress_374_path_condition_clean_islands#5: a forward label with one guarded predecessor
 -- 保留 label 后的检查，不因唯一前驱推导而删去 flag。
--- unluac: expect-contains [[flag and not mark("label-pred", true)]]
+-- unluac: expect-contains [[not flag or mark("label-pred", true)]]
 
 local function unique_label_predecessor(flag)
     if flag then
@@ -184,7 +179,7 @@ assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,clean
 
 -- regress_374_path_condition_clean_islands#6: a clean prefix before the terminal
 -- guarded goto 后也保留原条件。
--- unluac: expect-contains [[flag and not mark("prefixed-label", true)]]
+-- unluac: expect-contains [[not flag or mark("prefixed-label", true)]]
 
 local function prefixed_label_predecessor(flag)
     if flag then

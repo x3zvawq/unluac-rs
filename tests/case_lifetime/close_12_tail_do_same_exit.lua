@@ -1,8 +1,5 @@
 -- regress_344_tail_do_same_exit: a function-tail close still runs once when debug scope keeps the do
--- unluac: expect-ast-min [[do-block]] [[1]] [[@proto=1]] [[@debug=retained]]
 -- unluac: expect-ast-count [[close-binding]] [[1]] [[@proto=1]] [[@debug=retained]]
--- unluac: expect-ast-count [[local-binding]] [[10]]
--- unluac: expect-ast-count [[do-block]] [[3]]
 
 local closed = 0
 

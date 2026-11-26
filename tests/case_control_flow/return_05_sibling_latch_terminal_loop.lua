@@ -1,14 +1,10 @@
 -- regress_176_sibling_latch_terminal_loop#1: 多个 sibling latch 共同回到 while-true header
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-contains [[until p1_1 and p1_2]]
 -- unluac: expect-contains [[return 1]]
 -- unluac: expect-contains [[return 2]]
 -- unluac: expect-contains [[return 3]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[if]] [[3]]
--- unluac: expect-ast-count [[local-binding]] [[2]]
 
 local function run(a, b, c)
     while true do

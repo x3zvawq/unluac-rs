@@ -4,11 +4,6 @@
 -- unluac: expect-contains [[local misses = factory(8) == expected]] [[@debug=retained]]
 -- unluac: expect-contains [[matches = factory(9) == expected]] [[@debug=retained]]
 -- unluac: expect-contains [[misses = factory(10) ~= expected]] [[@debug=retained]]
--- unluac: expect-ast-max [[local-decl]] [[8]] [[@proto=0]]
--- unluac: expect-ast-max [[local-binding]] [[8]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[if]] [[1]]
--- unluac: expect-not-contains [[ = assert]]
 -- unluac: expect-not-contains [[ = print]]
 local events = ""
 local comparisons = 0

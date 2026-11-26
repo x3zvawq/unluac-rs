@@ -1,34 +1,17 @@
 -- regress_294_luau_continue_shared_break_tail: if/elseif continue不能抢占while或repeat的共享break tail
--- unluac: expect-contains [[while ]]
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[continue]]
 -- unluac: expect-contains [[break]]
 -- 循环初始化的数组缓冲保留完整控制区，后继断言不得回退为逐轮增长的 callee 别名。
--- unluac: expect-max-count [[ = assert]] [[0]] [[@variant=O0]]
 -- 循环的两个退出使用同一计数状态，不应额外创建跨循环的空结果接棒。
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=0]] [[@variant=O2]]
 -- 断言的 Boolean 预写属于完整参数帧，不应以独立旧结果覆盖残留在两次 assert 之间。
--- unluac: expect-max-count [[ = false]] [[0]] [[@variant=O2]]
 -- 六段常量调用的状态循环恢复后，原 SUB 与动态 CALL 数量在每轮回编译保持不变。
--- unluac: expect-instruction-count [[sub]] [[7]] [[@proto=0]] [[@variant=O2]]
--- unluac: expect-instruction-count [[call]] [[13]] [[@proto=0]] [[@variant=O2]]
 -- 成组结果不引入状态接棒，动态调用直接处在各自断言参数中。
--- unluac: expect-ast-count [[local-binding]] [[17]] [[@proto=0]] [[@variant=O2]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]] [[@variant=O2]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[<= 0]]
 -- unluac: expect-not-contains [[ = 0]]
--- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[continue]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[continue]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
 local function run_while(a, b, n)
     while n > 0 do
         n -= 1

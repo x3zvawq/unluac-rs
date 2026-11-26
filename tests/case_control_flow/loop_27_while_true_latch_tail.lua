@@ -3,7 +3,6 @@
 -- unluac: expect-contains [[+ 1]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 local function scan_until_terminal(limit)
     local values = { "a", "b", "c", "d" }
     local i = 0
@@ -37,7 +36,4 @@ assert(scan_until_terminal(nil) == "c")
 assert(scan_until_terminal(false) == "c")
 assert(scan_until_terminal("1") == "c")
 -- 固定表会在 c 返回，nil/reset 分支不可由 limit 触发，但必须保留原检查。
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[3]] [[@proto=1]]

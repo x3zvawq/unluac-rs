@@ -271,7 +271,6 @@ impl AstMetricSummary {
             | AstExpr::Boolean(_)
             | AstExpr::Integer(_)
             | AstExpr::Number(_)
-            | AstExpr::CaptureInitializer(_)
             | AstExpr::String(_)
             | AstExpr::Int64(_)
             | AstExpr::UInt64(_)

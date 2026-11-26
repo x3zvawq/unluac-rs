@@ -1,17 +1,8 @@
 -- lua53_01#1: 位运算与整除
--- unluac: expect-ast-count [[function]] [[18]]
 -- unluac: expect-ast-count [[numeric-for]] [[4]]
 -- unluac: expect-ast-count [[while]] [[1]]
 -- 索引写入和多结果返回的准备不能成为额外的源码绑定。
--- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=4]]
--- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=6]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=8]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=11]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=14]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=18]]
 -- 运算准备不能复用结果变量形成接棒赋值；只保留分支状态更新和最终字段写。
--- unluac: expect-ast-count [[assign]] [[3]] [[@proto=8]]
--- unluac: expect-ast-count [[assign]] [[3]] [[@proto=18]]
 local function test_bitwise_idiv()
     local a = (15 // 2) + (5 << 1)
     local b = (0x3F & 0x0F) ~ 0x02

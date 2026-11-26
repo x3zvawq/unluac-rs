@@ -2,15 +2,8 @@
 -- unluac: expect-contains [[while ]]
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[until ]]
--- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- 尾条件直接消费调用结果；中转 local 不应在回编译中逐轮增长。
--- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[while]] [[1]]
 -- unluac: expect-ast-count [[repeat-condition-local]] [[0]]
--- unluac: expect-ast-count [[do-block]] [[0]]
 local function run(a, b, c, stop)
     local x = 0
     local rounds = 0

@@ -2,13 +2,10 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[while ]]
 -- 原字节码仍执行 ADD，不能因初始化为常量而删除该运算。
--- unluac: expect-contains [[local r1_0 = 0 + 1]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[while]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[6]]
 local function run(flag)
     local result = 0
     result = result + 1

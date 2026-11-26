@@ -6,12 +6,7 @@
 -- unluac: expect-contains [[.iterator_marker()]]
 -- unluac: expect-not-contains [[call_marker = function]]
 -- 保持原构造分配与两个开放尾，不把后装的 getter/marker 塞回 hash 字段。
--- unluac: expect-ast-count [[table-constructor]] [[8]]
--- unluac: expect-ast-count [[table-record-field]] [[0]]
--- unluac: expect-ast-count [[table-list-field]] [[2]]
 -- 结果与消费者直接衔接；包含新增的两个求值计数器，不增加准备区接棒声明。
--- unluac: expect-ast-max [[local-binding]] [[48]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=3]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 

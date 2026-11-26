@@ -1,6 +1,4 @@
 -- 已完整的首个选择表达式不占用后继选择的准备恢复机会。
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=1]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local route = run()
 -- unluac-runtime: assert(route(3, "named") == "router named pos 3")

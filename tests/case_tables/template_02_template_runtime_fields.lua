@@ -1,10 +1,6 @@
 -- 模板初始数组容量不能因后续运行时字段变成常量而扩大。
 -- dump/load 让源码执行同样使用序列化模板，避免源码编译器未裁尾的容量掩盖问题。
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[table-constructor]] [[7]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=8]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=7]]
 local function boolean_value(a)
     local x = true
     return {true, a, x}

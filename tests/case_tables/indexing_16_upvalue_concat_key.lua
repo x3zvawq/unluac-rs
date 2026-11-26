@@ -1,8 +1,5 @@
 -- 拼接键在原缓冲区读取上值；记录元方法改写来源时各方言原生的表读取时点。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=luau]]
 -- PUC 5.4/5.5 后读的上值表也应由同一索引过程消费，不能复用键缓冲留下接棒变量。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]] [[@dialect=lua5.5]]
 local events = ""
 local original = setmetatable({}, {__index = function(_, key)
     events = events .. "lookup:" .. key .. ";"

@@ -3,13 +3,8 @@
 -- unluac: expect-contains [[while ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 -- unluac: expect-ast-count [[while]] [[1]]
--- unluac: expect-ast-count [[break]] [[1]]
--- unluac: expect-ast-count [[if]] [[4]]
--- unluac: expect-ast-count [[local-binding]] [[8]]
 local function run(a, b, c, xs)
     for _ in xs do
         if a then

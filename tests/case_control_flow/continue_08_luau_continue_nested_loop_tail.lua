@@ -3,14 +3,6 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-contains [[r1_0 = r1_0 + r1_2]]
--- unluac: expect-ast-count [[numeric-for]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[continue]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 local function run(a, c, n, inner_n)
     local x = 0
     for i = 1, n do

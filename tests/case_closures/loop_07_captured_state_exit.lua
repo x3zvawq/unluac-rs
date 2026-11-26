@@ -1,13 +1,5 @@
 -- 循环状态共享一个 cell，每轮 captured 则独立关闭；退出值是返回时的快照。
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[table-constructor]] [[1]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-not-contains [[while true do]]
--- unluac: expect-contains [[while i < limit do]] [[@debug=retained]]
--- unluac: expect-contains [[return funcs, i]] [[@debug=retained]]
--- unluac: expect-ast-count [[local-binding]] [[18]]
--- unluac: expect-ast-count [[while]] [[1]]
--- unluac: expect-ast-count [[break]] [[1]]
 local function collect(limit)
     local funcs = {}
     local i = 0

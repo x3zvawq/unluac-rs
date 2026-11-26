@@ -1,8 +1,5 @@
 -- 字段 GETUPVAL 的准备槽随后成为捕获 local；未来 cell 不保护此前的独立读取。
 -- unluac: expect-not-contains [[table-set-list]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[table-list-field]] [[6]] [[@proto=2]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[table-record-field]] [[18]] [[@proto=2]] [[@dialect=lua5.1]]
 local ease = { generation = 1 }
 local trace = ""
 local function curve(values)

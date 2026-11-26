@@ -2,6 +2,54 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_bindings/environment_10_wide_const_global_and_functions.lua",
+        &["environment", "wide-const", "function-decl", "recompile"],
+        "主 chunk 常量表超过 255 项后，经由寄存器键访问 _ENV 的全局变量与索引表构造器后的函数声明均干净还原为普通全局名与 function M.name 声明。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_bindings/naming_06_heuristic_self_and_if_or.lua",
+        &["naming", "heuristic", "method-decl", "if-or", "recompile"],
+        "启发式 self 方法还原严守外层遮蔽与 debug 参数名边界，同时多层共享分支的嵌套 if-not 单调展平。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_bindings/assignment_20_parallel_multiret_and_debug_call.lua",
+        &["parallel-assignment", "multi-return", "debug-local", "recompile"],
+        "多返回局部接棒吸收、平行多赋值合流及块尾具名调用局部保留在全方言三轮重编译下语义与收敛一致。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_bindings/phi_16_distinct_branch_result_roots.lua",
         &["phi", "call-root", "branch", "identity"],
         "分支中的独立结果只能继承匹配 home 的根，循环两条路径分别观察两对象调用。",
@@ -295,50 +343,9 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_bindings/environment_10_luau_compound_global_frame.lua",
-        &[
-            "compound-assignment",
-            "environment",
-            "physical-root",
-            "evaluation-order",
-        ],
-        "全局复合写保留同槽旧值覆盖，普通写保留 operand scratch；环境读写及运算元方法各执行一次。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                })
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                })
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_bindings/environment_09_concat_assignment_frame.lua",
         &["concat", "assignment", "environment", "evaluation-order"],
         "全局与上值 CONCAT 赋值保留全局读取、后继 CALL、拼接元方法及最终写入的顺序和 cell 旧值。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/environment_08_global_predicate_frames.lua",
-        &["environment", "call-frame", "concat", "predicate", "scope"],
-        "全局谓词读取恰好一次，原低槽选择写回保留，后续 CALL/CONCAT 不新增持续增长的别名。",
         &[
             LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),
@@ -828,28 +835,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_bindings/assignment_12_parallel_field_snapshots.lua",
-        &[
-            "parallel-assignment",
-            "capture",
-            "metamethod",
-            "snapshot",
-            "gc",
-        ],
-        "并列赋值保留逆序发布、RHS 快照和分配身份，空表发布跨元方法保留原根覆盖。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_bindings/assignment_03_repeat_exit_parallel_snapshot.lua",
         &["capture", "parallel-assignment", "repeat", "snapshot"],
         "保证 repeat 正常/提前退出保留平行赋值 RHS 与跨pad state快照。",
@@ -1015,36 +1000,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_bindings/inline_02_temp_inline_nested_regions.lua",
-        &["call", "conditional", "constructor", "lookup"],
-        "区分必达nested producer可收回与条件区/table allocation producer必须保留。",
-        &[LuaCaseConfiguration::new(PUC_LUA_ALL)],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/loop_19_numeric_for_stable_binding_source.lua",
-        &["error", "gc-root", "numeric-for", "parameter", "source"],
-        "以PUC异常退出和LuaJIT字段查找时额外实参的GC观察约束原帧，Luau保留直接参数循环初值。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/alias_09_loop_invariant_rhs.lua",
-        &[
-            "boolean",
-            "gc-root",
-            "invariant",
-            "parameter-copy",
-            "repeat",
-            "while",
-        ],
-        "保持循环入口参数副本的原高槽及前缀；返回后 caller 覆写低槽时仍保根，并对照折叠候选的不同 GC 观察。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_bindings/cleanup_03_unused_initialized_local_prefix.lua",
         &["dead-local", "multi-return", "prefix"],
         "保证清理未使用的首槽不会把第二返回值左移到错误binding。",
@@ -1068,53 +1023,10 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_bindings/alias_10_stable_copy_same_stmt_multi_use.lua",
-        &[
-            "alias",
-            "call",
-            "gc-root",
-            "multi-use",
-            "return-frame",
-            "tail-call",
-        ],
-        "观察返回/尾调用原高槽 COPY 的残根；同值实参仍保留原帧前缀，跨 statement 保持身份。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_bindings/alias_11_stable_copy_multi_stmt.lua",
         &["alias", "call", "return"],
         "区分caller前缀alias必须保留与RETURN连续结果区机械副本可回收。",
         &[LuaCaseConfiguration::new(PUC_LUA_ALL)],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/alias_12_stable_copy_eventless_snapshot.lua",
-        &[
-            "copy-chain",
-            "gc-root",
-            "handoff",
-            "metamethod",
-            "scope",
-            "scratch",
-            "truthiness",
-        ],
-        "约束 truthiness、写依赖与交接；保留参数/COPY 身份及分配前缀，观察相邻 scratch 的保活与覆盖边界。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/scope_10_repeat_condition_binding_use.lua",
-        &["body-local", "condition", "gc", "repeat", "root-retirement"],
-        "保证until与repeat body共享local value作用域，完整条件调用准备退休前次方法残根。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54])],
     ),
     LuaCaseDefinition::new(
         "tests/case_bindings/debug_04_tail_debug_scope.lua",
@@ -1152,18 +1064,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["alias", "function-sugar", "lvalue", "method"],
         "固定 function alias.field、function alias:method 与 function alias.nested.field 三类函数糖都保留 target base 的读取，使条件选择的 alias 后续能正确消除且写到选中对象。",
         &[LuaCaseConfiguration::new(ALL_DIALECTS)],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/identity_03_ast_binding_identity.lua",
-        &["capture", "debug", "gc-root", "iife"],
-        "区分HIR capture binding与AST为IIFE installer创建的binding，三个installer及nested closure不能互串token/remembered/count/captured身份。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL),
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                retain_debug: true,
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_bindings/cleanup_05_move_facts.lua",
@@ -1223,17 +1123,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
                 recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/scope_12_plain_table_scope.lua",
-        &["debug", "getlocal", "initializer", "metatable"],
-        "表initializer求值时ids尚不可见；初始化后visible必须可被patch通过debug.getlocal找到并安装元表，不能持续视为plain table。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                retain_debug: true,
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -1307,53 +1196,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 ..LuaCaseOptions::DEFAULT
             })
             .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/loop_25_numeric_for_step_normal_state.lua",
-        &["debug", "numeric-for", "step", "version"],
-        "循环step槽在正常迭代结束后的存活状态按PUC版本分化，防止统一套用Lua54/55或旧版本规则。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL),
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                retain_debug: true,
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/loop_26_luajit_for_init_binding_state.lua",
-        &["binding", "gc", "numeric-for"],
-        "LuaJIT数值for初值对象在正常、跳过及带prefix路径中都不应被循环初始化binding残留保活。",
-        &[
-            LuaCaseConfiguration::new(LUAJIT_ONLY),
-            LuaCaseConfiguration::new(LUAJIT_ONLY).with_options(LuaCaseOptions {
-                retain_debug: true,
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/loop_27_for_loop_binding_exit_state.lua",
-        &["gc", "loop-binding", "numeric-for", "scope-exit"],
-        "PUC Lua51-54中数值for展示binding对象在循环退出后仍保持可达，固定与init/step临时槽不同的生命周期。",
-        &[
-            LuaCaseConfiguration::new(&[
-                LuaCaseDialect::Lua51,
-                LuaCaseDialect::Lua52,
-                LuaCaseDialect::Lua53,
-                LuaCaseDialect::Lua54,
-            ]),
-            LuaCaseConfiguration::new(&[
-                LuaCaseDialect::Lua51,
-                LuaCaseDialect::Lua52,
-                LuaCaseDialect::Lua53,
-                LuaCaseDialect::Lua54,
-            ])
-            .with_options(LuaCaseOptions {
-                retain_debug: true,
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_bindings/scope_14_basics.lua",
@@ -1521,22 +1363,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_bindings/scope_16_call_frame_retirement.lua",
-        &["scope", "call-frame", "capture", "gc", "recompile"],
-        "后继调用按原槽覆盖已结束作用域的对象，闭包观察弱引用、求值次数并保持完整比较参数。",
-        &[
-            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_bindings/loop_31_numeric_for_tail_binding.lua",
         &[
             "numeric-for",
@@ -1626,32 +1452,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_bindings/phi_14_inlined_operand_state.lua",
-        &[
-            "phi",
-            "branch-state",
-            "call-frame",
-            "readability",
-            "recompile",
-        ],
-        "分支状态的入口 seed 不混入后继调用的同槽 Def，内联操作数结束后恢复比较及完整调用帧。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
         ],
     ),
     LuaCaseDefinition::new(

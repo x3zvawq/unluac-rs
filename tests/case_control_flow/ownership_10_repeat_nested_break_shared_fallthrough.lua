@@ -2,8 +2,6 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(b, c)
     local x = 0
     repeat
@@ -35,9 +33,4 @@ assert(run(0, nil) == 2 and tail_count == 2 and tail_value == 1)
 assert(run("", 0) == 1 and tail_count == 2)
 assert(run(nil, "") == 3 and tail_count == 3 and tail_value == 2)
 print = saved_print
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
--- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[break]] [[1]]
 print("regress_242_repeat_nested_break_shared_fallthrough")

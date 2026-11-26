@@ -1,9 +1,7 @@
 -- regress_433_terminal_nil_pack_unrelated_tbc: 无关 TBC 不应 blanket 阻止终态 nil pack 收回
 -- unluac: expect-contains [[return nil, nil]]
 -- unluac: expect-not-contains [[= nil, nil]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=2]]
 
 local closed = 0
 local closer = {

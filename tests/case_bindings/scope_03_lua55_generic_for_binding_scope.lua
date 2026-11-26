@@ -1,9 +1,7 @@
 -- regress_154_lua55_generic_for_binding_scope#1: 自动关闭迭代器的物理出口不扩张for binding词法域
 -- unluac: expect-contains [[for ]]
--- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-contains [[, nil, nil, ]]
 -- unluac: expect-not-contains [[ = nil, nil]]
 local function iter(values)

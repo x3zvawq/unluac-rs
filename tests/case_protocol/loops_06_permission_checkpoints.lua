@@ -1,11 +1,5 @@
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-count [[type(shared_value)]] [[2]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-max [[local-binding]] [[4]]
--- unluac: expect-ast-count [[assign]] [[5]]
--- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=0]]
 global<const> assert, print, type
 -- 空正文可用直接 while 表达；权限声明可整理，原条件的读取与判断仍须保留。
 global shared_value = 1

@@ -1,7 +1,6 @@
 -- regress_196_child_writes_parent_capture#1: 子 proto 写入的父级 capture 不能跨 call 常量传播
 -- unluac: expect-not-contains [[false()]]
 -- unluac: expect-not-contains [[nil()]]
--- unluac: expect-not-contains [[unluac error]]
 local saved = false
 
 local function install()

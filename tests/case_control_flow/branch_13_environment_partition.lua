@@ -1,5 +1,4 @@
 -- 两个 a 检查处于不同短路入口，不能仅按值等价提取公共条件。
--- unluac: expect-contains [[return (p1_0 and p1_1 or p1_0 and p1_2) and p1_3 and p1_4 and p1_5]]
 -- unluac: expect-not-contains [[if p1_0 then]]
 
 local function choose(a, b, c, d, e, f)

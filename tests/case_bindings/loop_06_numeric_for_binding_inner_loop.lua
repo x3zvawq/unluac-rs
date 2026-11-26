@@ -3,7 +3,6 @@
 -- unluac: expect-contains [[while ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[            r1_2 = r1_1]]
 local function run(limit)
     local total = 0

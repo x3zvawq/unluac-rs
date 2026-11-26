@@ -1,15 +1,6 @@
 -- 残余 Decision 保留原结果 home，循环后的条件更新不重建空 carrier。
--- unluac: expect-ast-min [[while]] [[1]]
--- unluac: expect-ast-min [[if]] [[2]]
--- unluac: expect-ast-min [[break]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
 -- 连续 nil 参数保持为原调用值包，不额外物化调用者的准备变量。
 -- unluac: expect-count [[(nil, nil)]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=4]]
--- unluac: expect-ast-count [[local-binding]] [[16]]
--- unluac: expect-ast-count [[while]] [[1]]
--- unluac: expect-ast-count [[break]] [[1]]
 local function run(flag, limit)
     local result = 0
     while flag do

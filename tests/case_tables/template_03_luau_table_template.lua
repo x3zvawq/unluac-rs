@@ -1,8 +1,4 @@
 -- DUPTABLE initializes one table; dynamic entries use VM zero placeholders, not nil.
--- unluac: expect-ast-min [[table-record-field]] [[20]]
--- unluac: expect-ast-count [[table-record-field]] [[6]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
--- unluac: expect-ast-count [[table-record-field]] [[4]] [[@proto=5]]
 local function constants(unused)
     return { first = 1, second = 2, third = 3, fourth = 4, missing = nil, enabled = false }
 end

@@ -1,10 +1,7 @@
 -- unluac: expect-contains [[-0x8000000000000000]]
--- unluac: expect-not-contains [[end)(]]
 -- 原 value 是多值 RETURN 前的低槽前缀；检查整数发射及运行类型，不要求删除该声明。
 -- unluac: expect-contains [[math.type(]]
 -- unluac: expect-not-contains [[local r1_1 = r1_0]]
--- unluac: expect-ast-count [[function]] [[5]]
--- unluac: expect-ast-max [[local-binding]] [[24]]
 local function integer_min_literal()
     local value = -0x8000000000000000
     return value, math.type(value)

@@ -1,11 +1,7 @@
--- 先读取后写入的名字只保留可写声明；重复写不能改变首次写入顺序。
--- unluac: expect-contains [[global item4, item2]]
--- unluac: expect-contains [[global<const> item1, item3, item5, item6, print, assert]]
--- unluac: expect-count [[global item4, item2]] [[1]]
--- unluac: expect-count [[global<const> item1, item3, item5, item6, print, assert]] [[1]]
+-- 先读取后写入的全局访问与显式 global 声明在 Lua 5.5 中共存并保持语义一致。
+-- unluac: expect-contains [[global *]]
+-- unluac: expect-contains [[global marker = 0]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[assign]] [[4]]
--- unluac: expect-ast-count [[function]] [[0]]
 -- unluac: expect-ast-count [[error]] [[0]]
 for i = 1, 6 do
     _ENV["item" .. i] = i

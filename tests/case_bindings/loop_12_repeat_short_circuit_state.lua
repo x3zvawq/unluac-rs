@@ -2,8 +2,6 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 local function run(enabled, limit)
     local flag, count = 0, 0
     repeat

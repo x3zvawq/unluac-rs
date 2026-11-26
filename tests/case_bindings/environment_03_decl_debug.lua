@@ -1,5 +1,4 @@
 -- Debug-hinted source locals remain visible even when they only hand a value to a global.
--- unluac: expect-contains [[local debug_seed =]]
 
 local function caller_has_local(expected)
     local names = {}

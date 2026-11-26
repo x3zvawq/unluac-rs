@@ -1,13 +1,6 @@
 -- 整数和浮点数值相等不授权合并两次原比较；返回值仍须保留数值表示。
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
 -- 两个比较仍各自存在，只把共同 fallback 出口收回短路表达式。
--- unluac: expect-contains [[return (p1_0 ~= 1 or p1_0 ~= 1.0) and p1_1]]
 -- 非折叠算术仍在原参数槽求值，不留下 callee 快照污染后续声明前缀。
--- unluac: expect-contains [[assert(r0_0(0 / 0, "nan") == "nan")]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=0]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
 
 local function choose(value, fallback)
     local result

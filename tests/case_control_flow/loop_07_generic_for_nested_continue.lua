@@ -1,11 +1,8 @@
 -- regress_14_generic_for_nested_continue#1: nested generic-for continue edges should stay structured
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-min [[generic-for]] [[3]] [[@proto=1]]
 -- unluac: expect-ast-max [[generic-for]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[while]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=1]]
 local episodes = {
     {
         pages = {

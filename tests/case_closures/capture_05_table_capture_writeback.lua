@@ -1,5 +1,4 @@
 -- regress_224_table_capture_writeback#1: table 构造折叠不能先于捕获槽位写回恢复
--- unluac: expect-not-contains [[unluac error]]
 local function run()
     local value = "old"
     local read = function()

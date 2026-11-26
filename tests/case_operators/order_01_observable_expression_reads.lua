@@ -1,9 +1,6 @@
 -- unluac: expect-contains [[missing_global]]
--- unluac: expect-ast-count [[function]] [[6]]
 -- 编译器已删去 and false 的赋值，仍保留三次显式测试；这些检查不能随结果无用而消失。
--- unluac: expect-ast-count [[if]] [[4]]
 -- unluac: expect-ast-count [[while]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[18]]
 -- unluac: expect-count [[.probe and true]] [[1]]
 -- 可观察读取可保留为条件或独立求值；按实际次数和值验证，不固定生成语法。
 

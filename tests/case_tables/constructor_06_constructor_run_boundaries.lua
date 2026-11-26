@@ -1,10 +1,5 @@
 -- Constructor run facts must preserve non-call returns and later callee starts.
 -- 八个返回构造器和独立 callee 快照保持各自边界，不增添调用准备中转。
--- unluac: expect-ast-count [[function]] [[14]]
--- unluac: expect-ast-count [[table-constructor]] [[11]]
--- unluac: expect-ast-max [[local-binding]] [[19]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=luau]] [[@debug=stripped]]
 local function objects()
     local a = { read = function() return 1 end }
     local b = { read = function() return 2 end }

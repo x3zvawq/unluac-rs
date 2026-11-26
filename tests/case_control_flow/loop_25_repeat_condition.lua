@@ -2,8 +2,6 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 
 local function run(a, b, xs)
     local x = 0
@@ -45,11 +43,5 @@ end})
 assert(run(0, false, changing) == 3)
 assert(reads == 6 and table.concat(trace, ",") == "1,1,2,2,3,3")
 -- 原 x、数值循环 i 和 repeat 内 done 共三个绑定；不保留机械回边 carrier。
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[continue]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]

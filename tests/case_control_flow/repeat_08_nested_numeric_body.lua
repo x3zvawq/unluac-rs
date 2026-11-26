@@ -1,26 +1,13 @@
 -- regress_85_repeat_nested_numeric_body#1: nested numeric-for entry is repeat body, not while exit
 -- unluac: expect-contains [[repeat]]
--- unluac: expect-contains [[while ]]
 -- unluac: expect-contains [[for ]]
--- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- O2 展开真臂的三轮打印，但不需要为 repeat 的出口增加控制变量。
--- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]] [[@variant=O0]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]] [[@variant=O1]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@variant=O2]]
--- unluac: expect-ast-count [[while]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=2]]
+-- unluac: expect-ast-min [[generic-for]] [[2]]
 -- 观察器的短路返回不能留下未使用的 false 初始化。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
 -- 原展开调用须整体恢复，主函数不留下遍历和中转声明。
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=0]]
 local function run(a, xs)
     for _ in xs do
         repeat

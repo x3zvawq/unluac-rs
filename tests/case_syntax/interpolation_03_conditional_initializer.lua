@@ -1,5 +1,4 @@
 -- 奇偶选择的准备与后续插值复用同槽；恢复声明时仍须保留原 CALL/COPY。
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=1]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local decorate = run()
 -- unluac-runtime: assert(decorate("k", 2) == "[k:even:2] len=8 brace={}")

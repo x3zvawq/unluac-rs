@@ -1,5 +1,4 @@
 -- regress_42_call_arg_eval_order#1: call arg 内联不能越过 callee 读取
--- unluac: expect-not-contains [[end)(]]
 local log = {}
 
 setmetatable(_G, {

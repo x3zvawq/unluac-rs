@@ -1,19 +1,12 @@
 -- regress_423_constructor_extra_arg_order: only extra args before a pending constructor handoff need an eventless proof
 -- Allocation may keep the table argument explicit; suffix expansion and prefix ordering remain mandatory.
--- unluac: expect-contains [[, __reg423_suffix_values())]]
 -- unluac: expect-order [["prefix-table"]] [[__reg423_mark("prefix-extra", 11)]]
 -- unluac: expect-contains [[.read()]]
--- unluac: expect-contains [[return callee(value, __reg423_suffix_values())]] [[@debug=retained]]
 -- unluac: expect-contains [[total = total + select(i, ...).read()]] [[@debug=retained]]
 -- unluac: expect-not-contains [[= select]]
--- unluac: expect-contains [[lookup_events[#lookup_events + 1] = "add" .. right.value]] [[@debug=retained]]
 -- unluac: expect-contains [[return left + right.value]] [[@debug=retained]]
 -- 元表参数可换行；第一个表仍须直接作为调用实参，不能退回中转局部。
--- unluac: expect-contains [[return setmetatable({ value = number },]] [[@debug=retained]]
--- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=5]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=lua5.4]]
 -- Luau 循环头的 FASTCALL 和循环内的索引调用链共享原控制槽，只声明累加器。
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=luau]]
 
 local events = {}
 

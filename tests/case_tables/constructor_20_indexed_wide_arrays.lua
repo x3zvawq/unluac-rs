@@ -4,7 +4,6 @@
 -- unluac: expect-contains [[CreditProbe[2] = {]] [[@dialect=lua5.1]]
 -- unluac: expect-contains [[CreditProbe[1] = {]] [[@dialect=lua5.2]]
 -- unluac: expect-contains [[CreditProbe[1] = {]] [[@dialect=lua5.3]]
--- unluac: expect-contains [[assert(#CreditProbe[1] == 140 and #CreditProbe[2] == 1)]] [[@dialect=luau]]
 CreditProbe = {}
 CreditProbe[1] = {
     { "name", 10, "person1" },

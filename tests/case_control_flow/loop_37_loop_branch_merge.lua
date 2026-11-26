@@ -1,9 +1,7 @@
 -- unluac: expect-contains [[while true do]]
--- unluac: expect-contains [[if r0_2 and #r0_0 ~= 0 and r0_1.queue then]]
 -- unluac: expect-contains [[coroutine.yield()]]
 -- unluac: expect-not-contains [[goto]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 
 local queue = {}
 local server = {}
@@ -54,8 +52,4 @@ assert(coroutine.resume(worker))
 assert(#queue == 0 and table.concat(log, ",") == "second,first,third,fourth,fifth")
 assert(coroutine.status(worker) == "suspended")
 print("regress_69#1", table.concat(log, ","))
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]

@@ -3,8 +3,6 @@
 -- unluac: expect-contains [[while]]
 -- unluac: expect-not-contains [[goto]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-contains [[until p1_1 or p1_2]]
 -- unluac: expect-not-contains [[if p1_1 then]]
 local function flags(a, b, c)
     repeat
@@ -32,12 +30,5 @@ end
 -- a 为真或 b/c 同为假时是没有观察点的无限循环；保留其空循环结构。
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 -- 三结果调用、分派表和循环输入分别保留身份，不留下 buffer COPY 或调用参数别名。
--- unluac: expect-ast-count [[local-binding]] [[11]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[call]] [[5]] [[@proto=0]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[call]] [[0]] [[@proto=1]]

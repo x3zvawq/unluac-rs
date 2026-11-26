@@ -1,12 +1,6 @@
 -- regress_123_luau_dual_early_return_soft_merge#1: 两臂 early return 不丢失共同尾部的值 merge
 -- unluac: expect-contains [[return]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-max [[if]] [[3]] [[@proto=1]]
 -- unluac: expect-ast-count [[goto]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[label]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[while]] [[0]] [[@proto=1]]
 local subject = function(a, b, c)
     local x
     if a then

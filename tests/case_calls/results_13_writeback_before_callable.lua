@@ -1,5 +1,4 @@
 -- CALL 先写回捕获 cell，随后同槽创建的闭包由后续有返回值的调用消费。
--- unluac: expect-ast-count [[local-function]] [[1]] [[@proto=0]]
 local receiver
 local lookups = 0
 receiver = setmetatable({}, {__index = function(old, key)

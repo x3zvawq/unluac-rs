@@ -1,8 +1,6 @@
 -- regress_213_numeric_for_short_circuit_assignment#1: loop owner keeps short-circuit state writes
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 local function run(enabled, limit)
     local flag = 0
     for count = 1, limit do

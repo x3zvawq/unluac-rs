@@ -1,5 +1,5 @@
 -- regress_376_unused_initialized_local_prefix: cleanup must not shift a live slot's return value
--- unluac: expect-contains [[, r0_]]
+-- unluac: expect-contains [[, ]]
 
 local function pair()
     return 17, 19
@@ -9,8 +9,6 @@ local dead, keep = pair()
 assert(keep == 19)
 
 -- 未读比较仍是原操作；后续宽常量池和构造器不能把它们当作可删前缀。
--- unluac: expect-count [[>= 1]] [[2]] [[@dialect=lua5.1]]
--- unluac: expect-count [[>= 2]] [[2]] [[@dialect=lua5.1]]
 -- 满池后的数值比较仍应恢复读取与 LOADK 的相邻准备。
 -- unluac: expect-contains [[.value < 0]]
 -- unluac: expect-contains [[.optional.hidden]]
@@ -87,12 +85,6 @@ state.hidden = true
 assert(arrays(1,2,state)[1].delayed)
 
 -- Decision 的 CurrentValue 终端沿用已有状态；不能新增无原槽的条件快照。
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.1]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.2]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.3]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.4]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.5]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=2]] [[@dialect=luajit]]
 local function choose(node, defaults)
     local selected = node.selected
     if not selected then

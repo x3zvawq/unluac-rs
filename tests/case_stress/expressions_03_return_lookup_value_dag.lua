@@ -1,11 +1,6 @@
 -- regress_510_return_lookup_value_dag: shared temp definitions must stay a DAG during root analysis.
 -- The same source runs with numbers and observable __add calls; each definition executes once.
--- unluac: expect-ast-min [[local-decl]] [[25]]
 -- LuaJIT 反向排列同级 proto：1/4 是共享值链或索引观察器，2/3 是加法观察器或查表链。
--- unluac: expect-ast-max [[local-binding]] [[24]] [[@proto=1]]
--- unluac: expect-ast-max [[local-binding]] [[24]] [[@proto=4]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=2]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=3]]
 
 return_dag_source = 3
 

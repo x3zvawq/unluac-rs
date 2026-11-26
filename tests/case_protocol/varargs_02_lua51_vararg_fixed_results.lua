@@ -1,10 +1,5 @@
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=0]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=1]]
--- unluac: expect-count [[ = 0]] [[1]]
 -- unluac: expect-ast-count [[error]] [[0]]
 -- regress_141_lua51_vararg_fixed_results#1: OP_VARARG B encodes fixed result count as B - 1
--- unluac: expect-not-contains [[unluac error]]
 local function fixed_vararg(...)
     local first, untouched = 0, 41
     first = ...

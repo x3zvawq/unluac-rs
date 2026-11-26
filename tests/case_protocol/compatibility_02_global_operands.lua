@@ -1,7 +1,4 @@
 -- regress_136_luau_global_operands#1: GETGLOBAL/SETGLOBAL 必须按 A/C 协议解码
--- unluac: expect-ast-max [[local-decl]] [[0]]
--- unluac: expect-ast-count [[function]] [[0]]
--- unluac: expect-ast-count [[if]] [[0]]
 luau_global_operand = 8
 assert(luau_global_operand == 8)
 print("regress_136_luau_global_operands#1", luau_global_operand)

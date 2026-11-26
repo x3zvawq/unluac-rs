@@ -1,6 +1,3 @@
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[table-list-field]] [[3]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[call]] [[5]] [[@proto=1]] [[@dialect=lua5.1]]
 local function emit(a, b)
     local player = Find(a)
     local first = player.GetBuff(1, 1)

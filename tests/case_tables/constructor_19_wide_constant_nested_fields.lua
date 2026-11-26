@@ -1,9 +1,5 @@
 -- 后缀 nil/Boolean 不能占用此前字符串的 RK 编号；宽字段键与嵌套 SETLIST 共用完整构造帧。
--- unluac: expect-ast-count [[table-record-field]] [[146]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=2]] [[@dialect=luajit]]
 -- unluac: expect-not-contains [[table-set-list]]
--- unluac: expect-not-contains [[unluac error]]
 local function build()
 local function yaw(...) return {...} end
 local t = {

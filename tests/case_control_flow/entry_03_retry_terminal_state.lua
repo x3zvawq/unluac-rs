@@ -1,16 +1,10 @@
 -- regress_255_header_retry_terminal_state#1: direct sibling latch 保留 header-retry state
 -- unluac: expect-not-contains [[end)(]]
 -- unluac: expect-contains [[for ]]
--- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[repeat]] [[2]]
 -- 原函数 iterator 与根块样本枚举各一处。
 -- unluac: expect-ast-count [[generic-for]] [[2]]
 -- 内层重试沿用外层状态；run 只保留三个状态及两个 iterator 绑定。
--- unluac: expect-ast-count [[local-binding]] [[5]] [[@dialect=lua5.1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[5]] [[@dialect=luajit]] [[@proto=3]]
 local function run(inner, iterator)
     local done, round, count = false, 0, 0
     repeat

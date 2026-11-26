@@ -1,5 +1,4 @@
 -- CALL 键在原算术 scratch 求值；改写同名上值不能改变各方言原生的目标读取时点。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=luau]]
 local original = {}
 local replacement = {}
 local target = original

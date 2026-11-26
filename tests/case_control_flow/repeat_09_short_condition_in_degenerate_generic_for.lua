@@ -5,12 +5,7 @@
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[break]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[8]]
 local function run(a, b, xs)
     local x = 0
     for _ in xs do

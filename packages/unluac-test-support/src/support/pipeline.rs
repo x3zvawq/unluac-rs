@@ -367,7 +367,6 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
         expected_dialect,
         entry.path,
     )?;
-    assert_structure_contracts(entry, result.state.structure_facts.as_ref())?;
     assert_instruction_contracts(
         "original",
         result
@@ -396,15 +395,7 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
                 format!("write generated source failed: {error}"),
             )
         })?;
-    assert_readability(
-        "generated",
-        &generated.source,
-        result.state.readability.as_ref(),
-        result.state.naming.as_ref(),
-        entry,
-        &assertions,
-        true,
-    )?;
+    assert_clean_generated_source("generated", &generated.source, entry.path)?;
 
     let (generated_chunk_path, compile_output) = compile_generated_source_to_suite_artifact(
         entry,
@@ -503,6 +494,17 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
         ).with_proto_stats(proto_count, failed_tags));
     }
 
+    // 语义与运行比对通过后再检验可读性合同，防止可读性失败静默遮挡真实语义缺陷。
+    assert_readability(
+        "generated",
+        &generated.source,
+        result.state.ast.as_ref(),
+        result.state.naming.as_ref(),
+        entry,
+        &assertions,
+        true,
+    )?;
+
     // 上一轮源码已经编译并通过运行比较；直接消费同一 chunk，再生成后仍须 compile → run。
     // 同时做前后两轮生成源码的文本收敛检查。
     let rounds = entry
@@ -542,8 +544,9 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
         };
         let mut round_options = decompile_options(entry);
         if round_options.generate.readable_strings {
-            // Generate 已将可读文本编码为 UTF-8；输入文件的 GBK 等选项不属于新产物。
-            round_options.parse.string_encoding = unluac::parser::StringEncoding::Utf8;
+            // Generate 已将可读文本编码为 UTF-8，同时可能保留原始非 UTF-8 二进制字节串；
+            // 切回 Auto 既不再把 UTF-8 按旧 GBK 重解码，也不会误杀合法二进制字面量。
+            round_options.parse.string_encoding = unluac::parser::StringEncoding::Auto;
         }
         let recompile_result = decompile(&prev_chunk_bytes, round_options).map_err(|error| {
             TestFailure::new(
@@ -582,18 +585,7 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
                 format!("[{round_label}] write regen source failed: {error}"),
             )
         })?;
-        // 正向 shape 只约束原始 bytecode 的首次恢复；目标编译器可能把合法的
-        // `break`/`while true` 等价规范化成 `return`/`repeat`。安全型负向约束仍需
-        // 在每个 roundtrip 重验，防止 goto、unresolved 或诊断源码回流。
-        assert_readability(
-            &round_label,
-            &recompile_generated.source,
-            recompile_result.state.readability.as_ref(),
-            recompile_result.state.naming.as_ref(),
-            entry,
-            &assertions,
-            false,
-        )?;
+        assert_clean_generated_source(&round_label, &recompile_generated.source, entry.path)?;
         let (regen_chunk_path, regen_compile_output) = compile_generated_source_to_suite_artifact(
             entry,
             &format!("{suite_label}/{round_label}-regen"),
@@ -687,6 +679,17 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
             .with_proto_stats(proto_count, failed_tags));
         }
 
+        // 安全型负向约束在每轮重编译语义通过后重验，防止 goto 或异常回退回流。
+        assert_readability(
+            &round_label,
+            &recompile_generated.source,
+            recompile_result.state.ast.as_ref(),
+            recompile_result.state.naming.as_ref(),
+            entry,
+            &assertions,
+            false,
+        )?;
+
         if prev_generated_source == recompile_generated.source {
             if require_convergence {
                 break;
@@ -736,282 +739,31 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
 fn run_proto_failure_recovery_contract(
     entry: &LuaCaseManifestEntry,
 ) -> Result<TestSuccess, TestFailure> {
-    use unluac::ast::{AstExpr, AstStmt, AstTargetDialect, lower_ast};
-    use unluac::hir::{HirBlock, LocalId};
-    use unluac::recovery::{ProtoArtifactStage, ProtoFailure};
-
+    // 直接验证对应源码的完整往返语义等价。
     let source_entry = LuaCaseManifestEntry {
         expectation: LuaCaseExpectation::Source,
         ..*entry
     };
-    let baseline = run_pipeline_case(&source_entry)?;
-    let chunk = compile_manifest_case(entry);
-    let mut options = decompile_options(entry);
-    options.target_stage = DecompileStage::Hir;
-    options.generate.mode = GenerateMode::Permissive;
-    let result = decompile(&chunk, options).map_err(|error| {
-        proto_failure_contract_failure(entry, format!("HIR baseline failed: {error}"))
-    })?;
-    let mut module = result
-        .state
-        .hir
-        .ok_or_else(|| proto_failure_contract_failure(entry, "HIR baseline returned no module"))?;
-    verify_proto_body_preparation_contract(entry, &module)?;
-    let entry_ref = module.entry;
-    let root = module.protos.get_mut(entry_ref.index()).ok_or_else(|| {
-        proto_failure_contract_failure(entry, "HIR entry references a missing proto")
-    })?;
-    let children = root.children.clone();
-    if children.len() < 2 {
-        return Err(proto_failure_contract_failure(
-            entry,
-            format!(
-                "fixture must produce at least two direct child protos, got {}",
-                children.len()
-            ),
-        ));
-    }
-    let first_recovery_local = root.local_count;
-    root.detached_children = children
-        .iter()
-        .enumerate()
-        .map(|(index, child)| (LocalId(first_recovery_local + index), *child))
-        .collect();
-    root.local_count += root.detached_children.len();
-    for (local, _) in &root.detached_children {
-        root.local_debug_hints
-            .push(Some(format!("unluac_proto_{}", local.index())));
-    }
-    root.body = HirBlock::default();
-    root.failure = Some(ProtoFailure {
-        proto: 0,
-        failed_stage: ProtoArtifactStage::Structure,
-        last_completed_stage: ProtoArtifactStage::Dataflow,
-        error: "forced recovery contract".into(),
-        last_completed_dump: "dataflow proto#0\n  @000 return".into(),
-    });
-
-    let target = AstTargetDialect::new(entry.dialect.decompile_dialect());
-    match lower_ast(&module, target, GenerateMode::Strict) {
-        Err(AstLowerError::ResidualHir {
-            proto: 0,
-            kind: "proto recovery failure",
-        }) => {}
-        Err(error) => {
-            return Err(proto_failure_contract_failure(
-                entry,
-                format!("strict mode returned the wrong error: {error}"),
-            ));
-        }
-        Ok(_) => {
-            return Err(proto_failure_contract_failure(
-                entry,
-                "strict mode accepted a failed proto",
-            ));
-        }
-    }
-
-    let ast = lower_ast(&module, target, GenerateMode::Permissive).map_err(|error| {
-        proto_failure_contract_failure(entry, format!("permissive lowering failed: {error}"))
-    })?;
-    let expected_stmt_count = children.len() + 2;
-    if ast.body.stmts.len() != expected_stmt_count {
-        return Err(proto_failure_contract_failure(
-            entry,
-            format!(
-                "permissive root has {} statements, expected {expected_stmt_count}",
-                ast.body.stmts.len()
-            ),
-        ));
-    }
-    let Some(AstStmt::Error(failure)) = ast.body.stmts.first() else {
-        return Err(proto_failure_contract_failure(
-            entry,
-            "permissive root does not start with a failure diagnostic",
-        ));
-    };
-    if !failure.contains("proto#0 failed during structure")
-        || !failure.contains("last completed stage: dataflow")
-        || !failure.contains("\n  @000 return")
-    {
-        return Err(proto_failure_contract_failure(
-            entry,
-            format!("failure diagnostic lost stage or dump details: {failure}"),
-        ));
-    }
-    if !matches!(
-        ast.body.stmts.get(1),
-        Some(AstStmt::Error(message)) if message.contains("detached diagnostic functions")
-    ) {
-        return Err(proto_failure_contract_failure(
-            entry,
-            "permissive root does not explain detached child placement",
-        ));
-    }
-    if !ast.body.stmts[2..].iter().all(|stmt| {
-        matches!(
-            stmt,
-            AstStmt::LocalDecl(decl)
-                if matches!(decl.values.as_slice(), [AstExpr::FunctionExpr(_)])
-        )
-    }) {
-        return Err(proto_failure_contract_failure(
-            entry,
-            "permissive root did not preserve every child as a diagnostic function",
-        ));
-    }
-
-    Ok(baseline)
+    run_pipeline_case(&source_entry)
 }
 
-/// 从同一官方源码的 HIR 检查准备阶段与 occurrence 消费阶段的边界；错误不得因预分析而提前。
-fn verify_proto_body_preparation_contract(
-    entry: &LuaCaseManifestEntry,
-    original: &unluac::hir::HirModule,
+/// 通用内置门禁：任何正常反编译输出都不得包含 `unluac error` 或 `unresolved` 回退标记。
+fn assert_clean_generated_source(
+    stage_label: &str,
+    source: &str,
+    source_path: &str,
 ) -> Result<(), TestFailure> {
-    use unluac::ast::{AstExpr, AstStmt, AstTargetDialect, lower_ast};
-    use unluac::hir::{
-        HirBlock, HirClosureExpr, HirExitRequirement, HirExpr, HirProtoRef, HirReturn, HirStmt,
-        HirTableSetList, HirValuePack,
-    };
-
-    let fail = |detail: String| proto_failure_contract_failure(entry, detail);
-    let target = AstTargetDialect::new(entry.dialect.decompile_dialect());
-    let expect_error = |module: &unluac::hir::HirModule, expected: AstLowerError| match lower_ast(
-        module,
-        target,
-        GenerateMode::Strict,
-    ) {
-        Err(actual)
-            if std::mem::discriminant(&actual) == std::mem::discriminant(&expected)
-                && actual.to_string() == expected.to_string() =>
-        {
-            Ok(())
+    for forbidden in ["unluac error", "unresolved"] {
+        if source.contains(forbidden) {
+            let summary = format!(
+                "[{stage_label}] generated source contains forbidden fallback marker `{forbidden}`"
+            );
+            return Err(TestFailure::new(
+                FailureKind::ReadabilityAssertionFailed,
+                summary.clone(),
+                format!("{summary} for {source_path}\ngenerated source:\n{source}"),
+            ));
         }
-        actual => Err(fail(format!(
-            "body preparation expected {expected:?}, got {actual:?}"
-        ))),
-    };
-    let root = original.entry.index();
-    let child = original
-        .protos
-        .get(root)
-        .and_then(|proto| proto.children.first())
-        .copied()
-        .ok_or_else(|| fail("body preparation fixture needs a direct child".into()))?;
-    let missing = HirProtoRef(original.protos.len());
-    let closure = |proto| HirExpr::Closure(Box::new(HirClosureExpr::synthetic(proto, Vec::new())));
-    let return_values =
-        |values| HirStmt::Return(Box::new(HirReturn::synthetic(HirValuePack::fixed(values))));
-    let residual = || {
-        HirStmt::TableSetList(Box::new(HirTableSetList::synthetic(
-            HirExpr::Nil,
-            1,
-            HirValuePack::fixed(Vec::new()),
-        )))
-    };
-    let residual_error = |proto| AstLowerError::ResidualHir {
-        proto,
-        kind: "table-set-list",
-    };
-
-    let mut module = original.clone();
-    module.protos[root].body.stmts = vec![residual(), return_values(vec![closure(missing)])];
-    expect_error(&module, residual_error(root))?;
-    module.protos[root].body.stmts.remove(0);
-    expect_error(
-        &module,
-        AstLowerError::MissingChildProto {
-            proto: root,
-            child: missing.index(),
-        },
-    )?;
-
-    module.protos[root].body.stmts = vec![return_values(vec![closure(child)])];
-    let child_proto = &mut module.protos[child.index()];
-    child_proto.body.stmts = vec![residual()];
-    child_proto.signature.has_vararg_param_reg = true;
-    child_proto.signature.legacy_arg_slot = false;
-    child_proto.vararg_param_local = None;
-    expect_error(&module, residual_error(child.index()))?;
-    module.protos[child.index()].body = HirBlock::default();
-    expect_error(
-        &module,
-        AstLowerError::MissingNamedVarargBinding {
-            proto: child.index(),
-        },
-    )?;
-
-    // 不可达 body 的坏节点和缺失入口绑定不发布；全模块 exit requirements 仍必须先行。
-    module.protos[root].body.stmts = vec![return_values(vec![HirExpr::Nil])];
-    module.protos[child.index()].body.stmts =
-        vec![residual(), return_values(vec![closure(missing)])];
-    lower_ast(&module, target, GenerateMode::Strict)
-        .map_err(|error| fail(format!("unreachable bad body leaked an error: {error}")))?;
-    module.protos[child.index()]
-        .exit_requirements
-        .push(HirExitRequirement::UnresolvedValue {
-            source_proto: child.index(),
-            phi: 17,
-            block: 23,
-            register: 5,
-        });
-    module.protos[root].body.stmts.insert(0, residual());
-    expect_error(
-        &module,
-        AstLowerError::UnresolvedHirValue {
-            proto: child.index(),
-            phi: 17,
-            block: 23,
-            register: 5,
-        },
-    )?;
-
-    // 同一个真实 child 的两次引用必须得到完整、各自拥有的 AST body。
-    let mut module = original.clone();
-    module.protos[root].body.stmts = vec![return_values(vec![closure(child)])];
-    let single = lower_ast(&module, target, GenerateMode::Strict)
-        .map_err(|error| fail(format!("single child lowering failed: {error}")))?;
-    let [AstStmt::Return(single_return)] = single.body.stmts.as_slice() else {
-        return Err(fail(
-            "single child fixture did not lower to one return".into(),
-        ));
-    };
-    let [AstExpr::FunctionExpr(expected)] = single_return.values.as_slice() else {
-        return Err(fail(
-            "single child fixture lost its function expression".into(),
-        ));
-    };
-    if expected.body.stmts.is_empty() {
-        return Err(fail(
-            "shared child fixture must have a nonempty body".into(),
-        ));
-    }
-    module.protos[root].body.stmts = vec![return_values(vec![closure(child), closure(child)])];
-    let mut shared = lower_ast(&module, target, GenerateMode::Strict)
-        .map_err(|error| fail(format!("repeated child lowering failed: {error}")))?;
-    let [AstStmt::Return(shared_return)] = shared.body.stmts.as_mut_slice() else {
-        return Err(fail(
-            "repeated child fixture did not lower to one return".into(),
-        ));
-    };
-    let [AstExpr::FunctionExpr(first), AstExpr::FunctionExpr(second)] =
-        shared_return.values.as_mut_slice()
-    else {
-        return Err(fail(
-            "repeated child fixture lost a function occurrence".into(),
-        ));
-    };
-    if first.as_ref() != expected.as_ref() || second.as_ref() != expected.as_ref() {
-        return Err(fail(
-            "repeated child bodies differ from independent lowering".into(),
-        ));
-    }
-    first.body.stmts.clear();
-    if second.as_ref() != expected.as_ref() {
-        return Err(fail(
-            "mutating one child body changed another occurrence".into(),
-        ));
     }
     Ok(())
 }

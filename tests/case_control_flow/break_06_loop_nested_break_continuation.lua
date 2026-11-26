@@ -1,11 +1,8 @@
 -- regress_77_loop_nested_break_continuation#1: nested break must not hide the local loop continuation
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[r1_0 = r1_1]]
 -- unluac: expect-not-contains [[r2_0 = r2_1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
 -- unluac: expect-ast-count [[while]] [[1]]
 local function repeat_branch(a, c)

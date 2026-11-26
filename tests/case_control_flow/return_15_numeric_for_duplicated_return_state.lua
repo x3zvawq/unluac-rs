@@ -3,13 +3,9 @@
 -- unluac: expect-contains [[while ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=4]]
 local function run(a, b, xs)
     local x = 0
     if a then

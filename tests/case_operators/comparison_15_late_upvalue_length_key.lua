@@ -1,6 +1,4 @@
 -- 动态键的一元操作先读旧表，再由原 GETUPVAL 读取回调替换后的表。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]]
 local row
 local trace = {}
 local function prepare(fail_length)

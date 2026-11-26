@@ -1,7 +1,4 @@
 -- regress_259_env_snapshot_identity#1: 保存的旧 _ENV 不能在重绑定后被误写成当前 global
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=0]]
 -- unluac: expect-contains [[_ENV = {]]
 -- unluac: expect-contains [[destination = { value = source.value }]] [[@debug=retained]]
 local original_env = _ENV

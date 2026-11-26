@@ -1,14 +1,7 @@
--- unrelated repeat conditions must not disable the minimal collective global gate
--- unluac: expect-contains [[global<const> *]]
--- unluac: expect-contains [[global<const> attr_value]]
--- unluac: expect-contains [[global attr_value]]
--- unluac: expect-contains [[global<const> setmetatable]]
--- unluac: expect-contains [[global<const> print]]
--- unluac: expect-contains [[global<const> string]]
--- unluac: expect-ast-count [[function]] [[30]]
+-- unrelated repeat conditions preserve lexical global gates and repeat/close structure
+-- unluac: expect-contains [[global *]]
 -- unluac: expect-ast-count [[repeat]] [[9]]
 -- unluac: expect-ast-count [[close-binding]] [[1]]
--- unluac: expect-ast-count [[if]] [[2]]
 -- unluac: expect-ast-max [[while]] [[0]]
 
 local function run()

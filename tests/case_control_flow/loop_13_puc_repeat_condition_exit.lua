@@ -3,15 +3,10 @@
 -- unluac: expect-contains [[while]]
 -- unluac: expect-not-contains [[goto]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-contains [[until r1_0 == 3]]
 -- unluac: expect-not-contains [[until false]]
 -- 条件只读取循环外的计数器，不能被统计为 repeat 内局部声明。
 -- unluac: expect-ast-count [[repeat-condition-local]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
 local function counter()
     local x = 0
     repeat

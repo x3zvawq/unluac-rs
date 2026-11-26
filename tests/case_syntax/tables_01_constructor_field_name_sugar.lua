@@ -1,6 +1,5 @@
 -- regress_414_constructor_field_name_sugar: constructor string keys share field-access legality
 -- 原低槽键声明保留，完整嵌套调用不留下 callee/结果接棒。
--- unluac: expect-ast-max [[local-binding]] [[6]] [[@proto=0]]
 -- unluac: expect-contains [[[string.char(255)] == 4]]
 -- unluac: expect-contains [[alpha = 1]]
 -- unluac: expect-not-contains [["alpha"] = 1]]

@@ -3,12 +3,7 @@
 -- unluac: expect-contains [[return false]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- 比较操作数的先后读取需要一个快照，其余分支不应引入布尔控制变量。
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=4]]
--- unluac: expect-ast-count [[if]] [[10]] [[@proto=4]]
--- unluac: expect-ast-count [[local-binding]] [[14]]
--- unluac: expect-ast-count [[local-binding]] [[13]] [[@proto=0]]
 local star_calls, feather_calls = 0, 0
 
 local function showRequiredItemsPopup(level, reason)

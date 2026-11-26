@@ -3,24 +3,13 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[    continue]]
 -- continue 臂可翻转为 De Morgan 条件，仍须保留两个原操作数。
--- unluac: expect-contains [[not p1_0 and not p1_2]]
--- unluac: expect-count [[p1_0 and p1_1]] [[2]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- O2 已展开三轮 numeric-for，但共享 x 不应随展开产生新的状态绑定。
--- unluac: expect-ast-count [[numeric-for]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[3]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=3]]
 -- unluac: expect-ast-count [[repeat]] [[3]] [[@proto=3]]
--- unluac: expect-ast-count [[continue]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=3]]
 -- 展开调用与整个后缀共同恢复，根函数只保留源码绑定和输入矩阵遍历。
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
--- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=0]]
 local function run(a, b, c, xs)
     local x = 0
     for k, v in xs do

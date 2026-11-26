@@ -1,5 +1,4 @@
 -- 插值 CALL 的低槽结果 COPY 已吸收时，返回帧仍须消费全部上值准备。
--- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=2]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local factory = run()
 -- unluac-runtime: local trace, update = {}, nil

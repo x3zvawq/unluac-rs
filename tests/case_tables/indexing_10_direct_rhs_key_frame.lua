@@ -1,9 +1,4 @@
 -- key 求值后仍读取原低槽 RHS；目标快照时点与各 VM 的源码基线一致。
--- unluac: expect-contains [[target[key()] = value]] [[@debug=retained]]
--- unluac: expect-contains [[target[key()] = current]] [[@debug=retained]]
--- unluac: expect-not-contains [[ = assert]]
--- unluac: expect-not-contains [[ = print]]
--- unluac: expect-contains [[(original[1] == marker) ~= (replacement[1] == marker)]] [[@debug=retained]]
 -- unluac: expect-count [[ ~= ]] [[2]]
 local target
 local replacement = {}

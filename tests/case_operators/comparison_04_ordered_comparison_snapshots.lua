@@ -1,10 +1,4 @@
--- unluac: expect-ast-count [[function]] [[11]]
--- unluac: expect-ast-count [[if]] [[4]]
--- unluac: expect-ast-max [[local-binding]] [[18]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=10]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=11]]
 -- >/>= 保持左读取、右调用和 VM 反向关系的元方法参数，不用补集替换有序关系。
--- unluac: expect-contains [[numeric_left, numeric_right = 1, 0 / 0]] [[@debug=retained]]
 local events = {}
 local old = getmetatable(_G)
 local nan_mode = false

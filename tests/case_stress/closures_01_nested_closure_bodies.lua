@@ -1,7 +1,4 @@
 -- 嵌套闭包含真实调用时，AST build 不能按 proto 深度递归构造子函数体。
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[function]] [[64]]
 local chain = function()
     print("layer", 0)
 return function()

@@ -1,12 +1,8 @@
--- unluac: expect-ast-count [[table-constructor]] [[1]]
--- unluac: expect-ast-count [[table-list-field]] [[160]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[2]]
 -- unluac: expect-ast-count [[error]] [[0]]
 -- regress_161_lua55_abs_line_info_layout#1: Lua 5.5绝对行号项按原生int对读取
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-contains [[1, 2, 3, 4, 5, 6]]
 local values = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10,

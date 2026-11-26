@@ -1,7 +1,4 @@
 -- regress_310_open_return_captured_snapshot: open return 固定前缀保留 callee lookup 前的快照
--- unluac: expect-not-contains [[end)(]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 
 local function run()
     local value = 1

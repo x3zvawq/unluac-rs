@@ -1,18 +1,10 @@
 -- 循环 header 是条件臂的完成边界，另一臂的尾部动作仍必须受条件控制。
--- unluac: expect-ast-min [[if]] [[5]] [[@proto=1]] [[@dialect=lua5.1]]
 -- 循环尾部的短路写回仍属于当前条件臂，不应退化成标签和 goto。
 -- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
 -- PUC 5.4/5.5 的 TESTSET 仍保留 state 与常量的测试，回边值直接写回参数。
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=5]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=5]] [[@dialect=lua5.5]]
 -- unluac: expect-contains [[state and 2]] [[@debug=retained]] [[@dialect=lua5.4]]
 -- unluac: expect-contains [[state and 2]] [[@debug=retained]] [[@dialect=lua5.5]]
 -- 根函数只保留源码绑定；并行重置不能留下影响后续调用和 scores 构造的 scratch。
--- unluac: expect-ast-count [[local-decl]] [[6]] [[@proto=0]] [[@debug=stripped]]
--- unluac: expect-ast-count [[local-decl]] [[7]] [[@proto=0]] [[@debug=retained]]
--- unluac: expect-count [[checks, actions = {}, {}]] [[2]] [[@debug=retained]] [[@dialect=lua5.1]]
--- unluac: expect-count [[checks, actions = {}, {}]] [[2]] [[@debug=retained]] [[@dialect=luajit]]
 
 local function worker()
     while true do

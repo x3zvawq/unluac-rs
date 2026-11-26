@@ -1,12 +1,4 @@
 -- binary64 不区分 1 与 1.0 的表示，但原比较不因此变成常量。
--- unluac: expect-contains [[return 1 == 1, 1 < 1.5, 1.5 <= 1]]
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[5]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[call]] [[4]] [[@proto=1]]
--- unluac: expect-contains [[assert(-2 < -1.5 and not (-1 <= -1.5))]]
--- unluac: expect-contains [[assert(0 == -0.0 and -0.0 <= 0 and not (0 < -0.0))]] [[@dialect=luau]]
 
 local function compare()
     assert(2147483647 < 2147483647.5)

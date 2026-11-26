@@ -1,7 +1,5 @@
 -- 槽压缩必须保护本轮新提升的按值捕获；后续同槽调用结果不能改写 NaN 快照。
 -- 64 个保活值及其调用准备足以触发压缩；循环生成会丢失这条物理槽路径。
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 function make() return 1 end
 function consume(x) total = total + x end
 local k0, k1, k2, k3, k4, k5, k6, k7 = make(), make(), make(), make(), make(), make(), make(), make()

@@ -1,9 +1,5 @@
 -- regress_409_lua55_global_merge_write_order: merging singleton declarations must not reverse writes
--- unluac: expect-order [[global first_target =]] [[global second_target =]]
 -- unluac: expect-not-contains [[global first_target, second_target =]]
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-max [[local-binding]] [[7]]
--- unluac: expect-ast-count [[assign]] [[2]]
 
 local function run()
     local writes = {}

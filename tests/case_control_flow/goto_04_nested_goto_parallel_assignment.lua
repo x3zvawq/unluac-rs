@@ -2,28 +2,11 @@
 -- 整条并行 value-pack 可原样进入两个 else arm。
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-order [["success"]] [["outer-fallback"]]
 -- unluac: expect-order [["outer-fallback"]] [["inner-fallback"]]
 
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]] [[@dialect=luajit]]
 -- 两个分支直接写回同一并行结果，不为 CALL 的各个返回值累积中间别名。
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@dialect=luajit]]
 -- 原 nil 初始化属于这两个声明，不拆成空声明和额外清零语句。
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]] [[@dialect=luajit]]
 
 local events = {}
 

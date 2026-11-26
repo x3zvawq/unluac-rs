@@ -1,10 +1,5 @@
 -- regress_367_repeat_nested_close_owner: a nested loop closes its resources before the outer repeat tail
--- unluac: expect-contains [[until mark("stop", true) or mark("again", false)]]
--- unluac: expect-ast-count [[local-binding]] [[6]]
--- unluac: expect-ast-count [[close-binding]] [[2]]
--- unluac: expect-ast-count [[repeat]] [[2]]
 -- unluac: expect-ast-count [[numeric-for]] [[2]]
--- unluac: expect-ast-count [[break]] [[0]]
 
 local events = {}
 

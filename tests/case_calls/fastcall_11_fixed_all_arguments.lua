@@ -1,8 +1,4 @@
 -- 通用 FASTCALL 的固定参数区覆盖空参数与四个有序求值的参数；fallback 保留原 callee 读取时点。
--- unluac: expect-ast-count [[local-binding]] [[0]]
--- unluac: expect-ast-count [[assign]] [[0]]
--- unluac: expect-ast-count [[call]] [[8]]
--- unluac: expect-instruction-count [[call]] [[8]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local trace = ""
 -- unluac-runtime: local bits = {

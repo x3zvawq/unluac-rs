@@ -43,11 +43,18 @@ pub(super) fn decompile_options(entry: &LuaCaseManifestEntry) -> DecompileOption
         options.generate.table_drop_index_keys = drop_keys;
     }
     // 收敛比较源码本体；来源路径和行号随每轮产物变化。由 Generate 关闭元信息注释，
-    // 避免比较器解析文本时误删 Lua 字符串；普通 debug/注释回归仍使用默认输出。
-    options.generate.comment = !entry
+    // 避免比较器解析文本时误删 Lua 字符串；普通 debug/注释回归仍使用默认输出或显式 comment_style。
+    options.generate.comment = if let Some(style) = entry.options.comment_style {
+        style
+    } else if entry
         .options
         .recompile_rounds
-        .is_some_and(|rounds| rounds > 0);
+        .is_some_and(|rounds| rounds > 0)
+    {
+        unluac::decompile::CommentStyle::None
+    } else {
+        unluac::decompile::CommentStyle::Minimal
+    };
     options.generate.luau_vector_constructor =
         entry
             .options

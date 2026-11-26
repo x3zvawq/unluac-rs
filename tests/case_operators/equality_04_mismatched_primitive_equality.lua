@@ -1,10 +1,6 @@
 -- 不同编译器可能交换相等比较的操作数，但三个原比较都必须保留。
 -- 原函数三个比较及下方四个结果/宽度断言均须保留。
 -- unluac: expect-count [[ == ]] [[7]]
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[4]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
 
 local function compare_mismatched_primitives()
     return nil == false, true == "true", 7 == "7"

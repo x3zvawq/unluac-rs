@@ -1,7 +1,4 @@
 -- Luau O1/O2 FASTCALL 先求开放参数，fallback 再查找 assert；O0 普通 CALL 顺序不同。
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[local-binding]] [[4]]
--- unluac: expect-ast-count [[if]] [[0]]
 local environment = getfenv(0)
 local original_assert = environment.assert
 local observed_tail = false

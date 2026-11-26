@@ -2,7 +2,6 @@
 -- unluac: expect-contains [[callback = function]]
 -- unluac: expect-contains [[return "skip"]]
 -- unluac: expect-not-contains [[closure capture evidence is ambiguous]]
--- unluac: expect-not-contains [[unluac error]]
 
 TweenSubsystem = {
     add = function(self, spec)

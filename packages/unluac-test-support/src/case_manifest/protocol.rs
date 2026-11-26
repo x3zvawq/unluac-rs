@@ -199,6 +199,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
                 ignore_debug: true,
+                comment_style: Some(CommentStyle::Full),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -422,13 +423,19 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_protocol/metadata_03_function_expression_comments.lua",
         &["comments", "function-expression", "iife", "metadata"],
         "九个函数定义入口都附着proto元信息，尤其表达式函数注释不得吞掉end、逗号或IIFE调用后缀。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+            comment_style: Some(CommentStyle::Full),
+            ..LuaCaseOptions::DEFAULT
+        })],
     ),
     LuaCaseDefinition::new(
         "tests/case_protocol/metadata_04_nested_function_comment_placement.lua",
         &["comments", "nested-function", "proto-order"],
         "单一父子函数树约束表达式父函数和局部child的proto注释归属及顺序，排除兄弟proto排序干扰。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+            comment_style: Some(CommentStyle::Full),
+            ..LuaCaseOptions::DEFAULT
+        })],
     ),
     LuaCaseDefinition::new(
         "tests/case_protocol/compatibility_04_table_remove.lua",

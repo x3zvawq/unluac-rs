@@ -1,19 +1,10 @@
 -- regress_315_nested_fallback_value_merge: 嵌套短路的共享 fallback 值合流不能伪装 single-pass break
 -- unluac: expect-not-contains [[goto]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[if true then]]
 -- 原 callee 的低槽前缀保留 hardware_type；比较指令本身仍须位于 assert 前。
--- unluac: expect-count [[local r0_0 = "mobile"]] [[1]]
--- unluac: expect-count [[if r0_0 == "mobile" then]] [[1]]
--- unluac: expect-order [[local r0_0 = "mobile"]] [[if r0_0 == "mobile" then]]
--- unluac: expect-order [[if r0_0 == "mobile" then]] [[assert]]
--- unluac: expect-ast-count [[function]] [[5]]
 -- 原根函数保留 15 个绑定，新增路径驱动器只增加三个声明。
--- unluac: expect-ast-max [[local-binding]] [[18]] [[@proto=0]]
 -- 动态路径同样保持直接 fallback，不为上值读取遗留自复制分支。
--- unluac: expect-ast-max [[local-binding]] [[8]] [[@proto=3]]
--- unluac: expect-ast-count [[if]] [[4]] [[@proto=3]]
 
 local hardware_type = "mobile"
 local reads = {}

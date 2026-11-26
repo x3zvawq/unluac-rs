@@ -1,13 +1,5 @@
 -- 相邻 nil 初始化可以合并为一条 LOADNIL，声明与关闭边界仍分别属于三层作用域。
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[do-block]] [[2]] [[@proto=0]]
--- unluac: expect-ast-max [[local-binding]] [[8]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=0]] [[@debug=retained]]
 -- Luau 的原字节码将 reused 的两个常量直接用于调用，不留下 stripped local。
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]] [[@dialect=luau]] [[@debug=stripped]]
 local write, read
 do
     local outer

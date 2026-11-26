@@ -15,16 +15,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use unluac::ast::{AstLowerError, AstStmt, AstTargetDialect, lower_ast};
 use unluac::decompile::{
     DecompileDialect, DecompileError, DecompileOptions, DecompileStage, decompile,
 };
 use unluac::generate::{GenerateMode, GeneratedChunkKind, LuauVectorConstructor, LuauVectorSize};
 use unluac::parser::{DialectConstPoolExtra, ParseMode};
-use unluac::structure::{
-    ControlFlowFeature, LoopVmProtocol, RegionId, RegionPlan, StructureFacts, StructurePlan,
-    UnstructuredLayoutItem,
-};
 use unluac::transformer::{
     AccessBase, AccessKey, CallKind, GetTableKind, LowInstr, LoweredChunk, LoweredProto, Reg,
     SetTableKind, TypeGuardKind, ValueOperand, ValuePack, format_low_instr,
@@ -35,10 +30,7 @@ mod case_manifest;
 pub use case_manifest::{
     LuaCaseDialect, LuaCaseId, LuaCaseManifestEntry, LuaCaseVariant, validate_case_catalog,
 };
-use case_manifest::{
-    LuaCaseExpectation, LuaCaseLoopProtocol, LuaCaseOptions, LuaCaseStructureContract,
-    manifest_cases,
-};
+use case_manifest::{LuaCaseExpectation, LuaCaseOptions, manifest_cases};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct LuaCommandOutput {

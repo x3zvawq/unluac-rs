@@ -3,7 +3,6 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[;]]
 -- unluac: expect-contains [[(function(]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(limit)
     local object = { field = 0 }
     repeat

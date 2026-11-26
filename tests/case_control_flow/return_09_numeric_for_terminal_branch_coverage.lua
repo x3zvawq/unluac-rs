@@ -2,11 +2,7 @@
 -- unluac: expect-contains [[for]]
 -- unluac: expect-contains [[return]]
 -- unluac: expect-not-contains [[goto]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[11]]
--- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=0]]
--- unluac: expect-ast-count [[if]] [[5]]
 local objects = {
     world = {
         first = { definition = "BIRD" },

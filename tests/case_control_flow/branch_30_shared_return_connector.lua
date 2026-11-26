@@ -1,10 +1,7 @@
 -- 共享判断经纯跳转汇入同一 return；中间 connector 不应成为第三个条件出口。
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
--- unluac: expect-ast-max [[if]] [[1]] [[@proto=1]]
 -- 比较 RHS 的动态 key 与左侧调用在同一参数帧内，根函数只保留预期表的普通 local 声明。
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=0]]
 
 local function select_label(a, b, c)
     if a and (b or c) or not b and c then

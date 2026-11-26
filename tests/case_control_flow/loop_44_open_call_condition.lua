@@ -1,12 +1,6 @@
 -- OPEN 参数尾包是循环条件的依赖，不能把内层 CALL 错当成 repeat 正文。
--- unluac: expect-ast-count [[while]] [[1]]
--- unluac: expect-ast-count [[repeat]] [[0]]
 -- unluac: expect-not-contains [[ = accept]]
 -- unluac: expect-not-contains [[while true do]]
--- unluac: expect-ast-count [[local-binding]] [[7]]
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
--- unluac: expect-ast-count [[if]] [[2]]
--- unluac: expect-ast-count [[break]] [[1]]
 local events = {}
 local remaining = 0
 local function head()

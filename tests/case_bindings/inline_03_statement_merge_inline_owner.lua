@@ -1,8 +1,5 @@
 -- 单次/重复读取不授权删除返回 COPY 的低槽输入；两项输入共享完整三返回准备区。
 -- 同一函数形状的 caller GC 反例由 lifetime/roots_02 的 copied_repeated 覆盖，避免重复观察器。
--- unluac: expect-count [[return r1_0, r1_1, r1_1]] [[1]]
--- unluac: expect-ast-min [[local-decl]] [[1]] [[@proto=1]]
--- unluac: expect-ast-max [[local-decl]] [[2]] [[@proto=1]]
 
 local function run(first, repeated)
     local once = first

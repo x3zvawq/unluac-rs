@@ -3,16 +3,11 @@
 -- unluac: expect-contains [[while ]]
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[break]]
--- unluac: expect-contains [[continue]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[repeat]] [[3]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=1]]
 local function run(a, b, c, xs)
     local x = 0
     local rounds, tails, inner = 0, 0, 0

@@ -1,19 +1,5 @@
 -- 无读取的结果仍来自原 NOT/比较，不能将其初始化或分支写回统一替换成 nil。
--- unluac: expect-ast-count [[function]] [[7]]
--- unluac: expect-ast-max [[local-binding]] [[20]]
 -- unluac: expect-not-contains [[ = nil]]
--- unluac: expect-count [[not ]] [[1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=3]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=4]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]]
--- unluac: expect-name [[local:0]] [[discarded]] [[@proto=3]] [[@debug=retained]]
--- unluac: expect-name [[local:0]] [[discarded]] [[@proto=4]] [[@debug=retained]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=5]] [[@debug=retained]]
--- unluac: expect-name [[local:0]] [[truth]] [[@proto=5]] [[@debug=retained]]
--- unluac: expect-name [[local:1]] [[falsity]] [[@proto=5]] [[@debug=retained]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=6]]
--- unluac: expect-name [[local:0]] [[discarded]] [[@proto=6]] [[@debug=retained]]
 local check, report, make, count, protect = assert, print, setmetatable, select, pcall
 local reads = 0
 local comparisons = 0

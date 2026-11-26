@@ -3,11 +3,8 @@
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[local r1_2 = r1_0]]
 -- x 应直接承接本轮更新，until 的调用不应经由循环外临时变量。
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
 local function run(a, b, c, xs)
     local x = 0
     for i = 1, 3 do

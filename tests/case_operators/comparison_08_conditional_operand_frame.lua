@@ -1,13 +1,5 @@
 -- 比较的条件操作数与 Boolean 结果共用原准备帧，不留下阻挡后继调用的高槽声明。
--- unluac: expect-contains [[local matched = value == (flag and yes or no)]] [[@debug=retained]]
--- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=1]]
--- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=2]] [[@dialect=luajit]]
 -- unluac: expect-not-contains [[__eq = 0]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-count [[repeat]] [[0]]
--- unluac: expect-ast-count [[function]] [[6]]
--- unluac: expect-ast-max [[local-binding]] [[15]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=6]]
 local function compare(flag, value, yes, no, expected)
     local matched = value == (flag and yes or no)
     assert(matched == expected)

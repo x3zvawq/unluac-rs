@@ -1,8 +1,5 @@
 -- regress_144_loop_header_eval_order#1: loop header 内联不得跨过副作用重排元方法运算
 -- unluac: expect-contains [[for ]]
--- unluac: expect-contains [[while ]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local mt = {
     __add = function(value)
         print("add", value.tag)

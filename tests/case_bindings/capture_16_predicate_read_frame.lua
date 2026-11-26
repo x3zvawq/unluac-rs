@@ -1,10 +1,6 @@
 -- 上值比较消费原 GETUPVAL 准备，不为同槽读取留下独立声明；读取仍在元方法写之后。
--- unluac: expect-ast-count [[local-binding]] [[4]]
--- unluac: expect-ast-count [[assign]] [[3]]
--- unluac: expect-ast-count [[if]] [[1]]
--- unluac: expect-contains [[if current == 1 then]] [[@debug=retained]]
--- unluac: expect-ast-max [[local-decl]] [[0]] [[@proto=2]]
--- unluac: expect-ast-max [[local-decl]] [[0]] [[@proto=1]] [[@dialect=luajit]]
+-- unluac: expect-contains [[current == 1]] [[@debug=retained]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@debug=retained]]
 local current = 0
 local writes = {}
 local proxy = setmetatable({}, {

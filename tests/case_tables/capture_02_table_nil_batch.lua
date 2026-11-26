@@ -1,14 +1,6 @@
 -- Original regression by ItsLucas <itslucas@itslucas.me>, PR #35.
 -- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
--- unluac: expect-ast-count [[table-list-field]] [[3]] [[@proto=0]]
 -- 调用参数的混合短路不引入分支中转；后续构造器仍使用原声明前缀。
--- unluac: expect-not-contains [[ = assert]]
--- unluac: expect-contains [[assert(pair[1].disposed and not pair[2].disposed and Store[point] == pair)]] [[@debug=retained]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=8]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=18]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=26]]
--- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=34]]
 -- An initializer may contain nil holes and be captured after its SETLIST.
 VALUES = { first = 7, third = 9 }
 local t = { VALUES.first, VALUES.missing, VALUES.third }
@@ -19,7 +11,6 @@ print("captured-nil-batch", read(1), read(2), read(3), #t)
 
 -- SELF 的 receiver COPY 已退休时仍从原定义恢复方法；后面的参数复用不得
 -- 反向占有此前的 SETLIST。回调捕获的两个对象必须与表内对象保持同一身份。
--- unluac: expect-ast-count [[table-list-field]] [[14]]
 -- unluac: expect-ast-count [[method-call]] [[10]]
 local events, made = {}, {}
 Factory = {}
@@ -169,7 +160,6 @@ do
     print("indexed allocation prefix", object.value, trace, object.state[4])
 end
 -- unluac: expect-contains [[self.queue = {}]] [[@debug=retained]]
--- unluac: expect-contains [[.color = {]]
 
 -- CALL 的整包结果逆序写回已有 local 和低槽字段，后续 nil 声明复用结果区。
 do

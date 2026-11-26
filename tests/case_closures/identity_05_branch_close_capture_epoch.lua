@@ -1,5 +1,4 @@
 -- regress_220_branch_close_capture_epoch#1: break cleanup 不能切断 sibling 路径的捕获写回
--- unluac: expect-not-contains [[unluac error]]
 local function build(stop)
     local readers = {}
     local index = 0

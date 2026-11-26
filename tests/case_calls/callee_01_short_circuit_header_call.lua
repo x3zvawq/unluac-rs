@@ -1,6 +1,5 @@
 -- unluac: expect-contains [[_G.type(]]
 -- unluac: expect-not-contains [[(function()]]
--- unluac: expect-ast-min [[if]] [[1]] [[@proto=1]]
 local function check(closeOnCancelKeyHandler)
     if _G.type(closeOnCancelKeyHandler) == "function" and closeOnCancelKeyHandler() then
         return true

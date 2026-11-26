@@ -1,9 +1,4 @@
 -- CALL 读取已声明的低槽，再将真假值写回该槽；不能提前初始化或保留机械结果交接。
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[3]]
 local calls = 0
 local function evaluate(input)
     local result

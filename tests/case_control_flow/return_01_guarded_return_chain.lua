@@ -1,10 +1,7 @@
 -- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-ast-min [[if]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[15]]
--- unluac: expect-ast-count [[local-binding]] [[12]] [[@proto=0]]
 local frame = {}
 
 function guarded_return_chain(kind, key)

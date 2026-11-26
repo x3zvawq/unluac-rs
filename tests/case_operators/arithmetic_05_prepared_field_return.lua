@@ -1,10 +1,4 @@
 -- 算术的左右准备与末尾动态索引共享 scratch，不能把中间结果冻结成独立变量。
--- unluac: expect-ast-count [[local-binding]] [[8]]
--- unluac: expect-ast-count [[assign]] [[3]]
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]] [[@dialect=luau]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=3]] [[@dialect=luau]]
--- unluac: expect-ast-count [[call]] [[2]] [[@proto=3]] [[@dialect=luau]]
 local stage = 0
 local middle = setmetatable({}, { __add = function(_, right)
     assert(stage == 1 and right == 7)

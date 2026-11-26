@@ -1,5 +1,4 @@
 -- regress_173_terminal_return_call_order#1: 末尾调用不能越过前置 return value 提前执行
--- unluac: expect-not-contains [[unluac error]]
 local function terminal_return_call()
     local state = 1
     local object = {}

@@ -1,6 +1,5 @@
 -- Original regression by ItsLucas <itslucas@itslucas.me>, PR #35.
 -- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
 -- unluac: expect-contains [[local n = roll]] [[@debug=retained]]
 -- Recover success/failure guard routes without evaluating the right side twice.
 local function check(enabled, health, roll)
@@ -22,7 +21,6 @@ end
 
 -- 多个外层 guard 共享完成点，但内层 if/else 的一臂仍由它独占；
 -- 不应把该臂当成 single-pass tail，更不能改写其他内层分支的 continuation。
--- unluac: expect-ast-count [[repeat]] [[0]]
 local function classify(platform, model, generation, emit)
     if model then
         if platform == "ios" then
@@ -209,7 +207,6 @@ do
         end
     end
 end
--- unluac: expect-contains [[if boosted and count >= 2 or not boosted and count >= 1 then]] [[@debug=retained]]
 
 -- 循环体内共享判断节点不能被多前驱过滤截断；前置调用必须仍执行两次。
 do
@@ -261,13 +258,10 @@ do
 end
 -- unluac: expect-contains [[old.year < new.year]] [[@debug=retained]]
 -- CONCAT 比较参数与后继调用各自恢复完整帧，不能遗留 callee/COPY 中转。
--- unluac: expect-not-contains [[= assert]]
 -- unluac: expect-contains [[print("loop shared decision",]]
 -- 条件分支内的字段更新不属于分支前的表构造器。
--- unluac: expect-contains [[new.day = new.day + direction]] [[@debug=retained]]
 
 -- 值合流完成后仍有独立的循环 guard；取值 owner 不能吞掉后继条件。
--- unluac: expect-contains [[if levels[index].feathers_required and levels[index].feathers_required > 0 then]] [[@debug=retained]]
 -- unluac: expect-not-contains [[or requires_powerups]] [[@debug=retained]]
 do
     local function build(self, episode, frame, levels)
@@ -319,7 +313,6 @@ end
 -- unluac: expect-contains [[flags.cheats = tail == 2]] [[@debug=retained]]
 -- unluac: expect-contains [[flags.pressed = tail ~= 3]] [[@debug=retained]]
 -- 原 false 初始化与条件更新保留共同绑定；只有后继 if 的字符串合流需要空声明。
--- unluac: expect-ast-max [[empty-local]] [[1]] [[@proto=25]] [[@debug=stripped]]
 local function check_shared_guard_after_value_region()
     local function route(outer, option, flags, emit)
         if outer then

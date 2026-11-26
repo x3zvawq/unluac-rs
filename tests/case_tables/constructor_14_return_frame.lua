@@ -1,6 +1,5 @@
 -- 前一次 CALL 的结果写入上值后，返回构造器仍应在原槽分配并直接返回。
 -- unluac: expect-contains [[return {}]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
 local count = 0
 local function next_count(value, ...)
     return value + 1

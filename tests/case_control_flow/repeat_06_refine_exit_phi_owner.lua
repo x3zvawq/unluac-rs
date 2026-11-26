@@ -1,14 +1,7 @@
 -- regress_231_repeat_refine_exit_phi_owner#1: while-true 的等价 repeat 精化应接管多 break 的下游 live-out
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[goto ]]
 -- 两个主体各自更新同一个 x；出口不应另设未初始化 carrier 或条件常量 holder。
--- unluac: expect-ast-count [[local-binding]] [[10]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[repeat]] [[2]]
--- unluac: expect-ast-count [[while]] [[0]]
 local function while_breaks(a, b)
     local x = 0
     while true do

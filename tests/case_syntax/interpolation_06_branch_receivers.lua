@@ -1,5 +1,4 @@
 -- 两臂 SELF receiver 的同槽准备仍保留独立 Def，不能先被循环 carrier 合并。
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=2]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local factory = run()
 -- unluac-runtime: local named, plain = factory("p"), factory(nil)

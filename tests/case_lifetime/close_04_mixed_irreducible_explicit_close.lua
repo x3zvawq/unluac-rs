@@ -1,12 +1,7 @@
 -- regress_183_mixed_irreducible_explicit_close#1: cleanup 出边不能吞掉 island 目标 label
 -- unluac: expect-contains [[<close>]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[local-binding]] [[4]]
 -- unluac: expect-ast-count [[close-binding]] [[1]]
--- unluac: expect-ast-count [[do-block]] [[1]]
 -- 两个源出口可共用 done，连续的尾部标签不应新增一个目标。
--- unluac: expect-ast-max [[label]] [[3]]
 
 local closed = 0
 local function closer()

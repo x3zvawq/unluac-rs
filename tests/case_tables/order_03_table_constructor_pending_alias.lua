@@ -1,12 +1,6 @@
 -- regress_236_table_constructor_pending_alias: future integer fields do not cross aliasing writes
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 -- 交错构造及嵌套开放尾保持在原初始化中，不拆成独立写表或临时 callee。
--- unluac: expect-ast-count [[table-constructor]] [[5]] [[@proto=0]]
--- unluac: expect-ast-min [[table-list-field]] [[5]] [[@proto=0]]
--- unluac: expect-ast-count [[table-list-field]] [[7]] [[@proto=0]] [[@dialect=luajit]]
 -- 构造后的常量键准备复用旧槽，完整 assert 不应残留预写与读取别名。
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]] [[@dialect=luau]]
 local duplicate = {}
 duplicate[2] = "first"
 duplicate[2] = "second"

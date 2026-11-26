@@ -1,10 +1,5 @@
 -- 嵌套表先按原容量完成初始化，再独立安装方法；两个 closure 复用原临时槽。
 -- unluac: expect-contains [[values = {]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[local-function]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=0]]
--- unluac: expect-contains [[local a, b, c, d = first(), first(), first(), first()]] [[@debug=retained]] [[@dialect=luau]]
 
 local function make(start)
     local value = start

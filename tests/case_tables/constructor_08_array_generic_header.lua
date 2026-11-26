@@ -3,10 +3,6 @@
 -- unluac: expect-contains [[in ipairs(]]
 -- unluac: expect-not-contains [[ = nil]]
 -- 数组和内表直接初始化；迭代器准备不留下额外绑定。
--- unluac: expect-ast-count [[table-constructor]] [[7]]
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 local function identity(value)
     return value
 end

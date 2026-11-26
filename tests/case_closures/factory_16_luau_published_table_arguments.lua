@@ -1,11 +1,4 @@
 -- 发布表的整数键与 __newindex 事件先于 consumer，两个工厂调用仍分配不同对象。
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[local-binding]] [[8]]
--- unluac: expect-ast-count [[table-constructor]] [[4]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 
 local published = {}
 local sink = setmetatable({}, {

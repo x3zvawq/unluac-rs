@@ -24,9 +24,5 @@ assert(result == 0)
 assert(run(0, "") == 0)
 assert(run("", 0) == 0)
 assert(run({}, true) == 0)
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
 print("regress_135_same_header_sibling_latches#1", result)

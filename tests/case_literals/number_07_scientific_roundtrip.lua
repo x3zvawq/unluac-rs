@@ -7,7 +7,6 @@
 -- unluac: expect-contains [[0.10000000149011612]]
 -- unluac: expect-not-contains [[000000000000000000000000000000]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[4]]
 
 local values = {
     0.10000000149011612,

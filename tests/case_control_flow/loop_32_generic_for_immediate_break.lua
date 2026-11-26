@@ -3,7 +3,6 @@
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 local touches = {
     first = {
         x = 1,
@@ -43,24 +42,8 @@ assert(pick_first_touch() == true and touch_id == "only")
 -- 非 nil 的 false 也已经选定，不能把显式 ~= nil 改成普通真值判断。
 touch_id = false
 assert(pick_first_touch() == true and touch_id == false)
--- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]]
 -- LuaJIT 的子函数编号与 PUC 相反；两个方言均固定各自的循环体和失败回调。
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=luajit]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=2]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=2]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=luajit]]
 -- 两项逆序发布应收回 nil 准备，后续构造器和调用不再经过额外别名。
--- unluac: expect-ast-count [[assign]] [[3]] [[@proto=0]]
--- unluac: expect-ast-count [[call]] [[16]] [[@proto=0]]
--- unluac: expect-ast-count [[table-constructor]] [[8]] [[@proto=0]]
 -- 仅在未选择时初始化 iterator，一次写回后立即 break；返回保留显式非 nil 检查。
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=2]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=2]]

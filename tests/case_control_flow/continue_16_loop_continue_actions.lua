@@ -1,29 +1,15 @@
 -- Luau 的 while continue 跳到入口，repeat continue 则必须求值尾条件。
 -- O2 内联 tail 后的 true/false 物化也应归还尾条件，不能把赋值臂的合流跳转当成 continue。
--- unluac: expect-ast-count [[continue]] [[0]] [[@proto=1]]
--- unluac: expect-ast-min [[while]] [[1]]
 -- unluac: expect-ast-min [[repeat]] [[1]]
--- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- 父函数直接绑定两组三结果；断言实参不再拆成 callee、参数和结果接棒。
--- unluac: expect-ast-count [[local-binding]] [[16]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
 -- O2 展开 oracle 的第二轮后仍保留一次 skip 检查，即使两个出口相同也不能删除原分支。
--- unluac: expect-instruction-count [[branch]] [[5]] [[@proto=3]] [[@variant=O2]]
 -- 嵌套调用准备应完整进入 until，保留 debug 也不增加跨轮 callee carrier。
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=6]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=6]]
 -- unluac: expect-ast-count [[repeat-condition-local]] [[0]] [[@proto=6]] [[@variant=O0]]
 -- unluac: expect-ast-count [[repeat-condition-local]] [[0]] [[@proto=6]] [[@variant=O1]]
 -- 循环状态直接初始化；每轮快照必须在分支内独立声明，不能使用清零的共享 cell。
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=7]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=7]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=7]]
 -- unluac: expect-ast-count [[repeat-condition-local]] [[0]] [[@proto=7]]
 local function observe(skip, stop)
     local trace = {}

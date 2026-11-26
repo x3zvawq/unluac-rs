@@ -1,5 +1,4 @@
 -- 固定 CALL 结果直接按原逆序写入环境，后续表写复用准备区。
--- unluac: expect-contains [[frame_result_a, frame_result_b, frame_result_c =]]
 local function assign(producer, target)
     frame_result_a, frame_result_b, frame_result_c = producer()
     target.saved = producer

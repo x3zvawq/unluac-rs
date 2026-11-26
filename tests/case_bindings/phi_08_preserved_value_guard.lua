@@ -1,7 +1,4 @@
--- unluac: expect-contains [[r1_1 = r1_0]]
--- unluac: expect-contains [[r1_1 = r0_0.CENTER_JUSTIFY]]
 -- unluac: expect-not-contains [[r1_1 = p1_0]]
--- unluac: expect-not-contains [[unluac error]]
 
 local text_box = {
     CENTER_JUSTIFY = "center",

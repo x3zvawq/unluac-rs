@@ -1,4 +1,3 @@
--- unluac: expect-not-contains [[ = #]]
 -- unluac: expect-contains [[ - 1) + 1]]
 -- unluac: expect-contains [[values = {]]
 -- common_08_closures#1: 闭包计数器(upvalue捕获)

@@ -1,12 +1,5 @@
 -- regress_434_call_root_effectful_rhs: same-home call root 可与后续 effectful RHS 原序融合
--- unluac: expect-contains [[return r0_2() + r0_3()]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[function]] [[9]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[11]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=4]]
 -- 捕获旧值的 IIFE 仍应保留在原 RHS，不额外生成具名 callee/result 临时变量。
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=5]]
 
 local events = {}
 

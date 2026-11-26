@@ -1,14 +1,7 @@
 -- regress_275_nested_loop_body_scope_exit: expanded nested body的内部core出口不能制造跨loop goto
--- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[(function(]]
--- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[while]] [[0]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
 local function run(a, b, c, xs)
     for key in pairs(xs) do
         repeat

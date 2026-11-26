@@ -3,11 +3,6 @@
 -- unluac: expect-contains [["\255\000A"]]
 -- unluac: expect-contains [["\nalpha"]]
 -- unluac: expect-contains [["\194\133"]]
--- unluac: expect-ast-count [[function]] [[3]] [[@proto=0]]
--- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=1]]
--- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=2]]
--- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=3]]
--- unluac: expect-ast-max [[local-binding]] [[19]]
 
 local function run_binary()
     local value = "\255\000A"

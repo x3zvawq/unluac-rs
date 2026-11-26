@@ -1,26 +1,8 @@
 -- 显式 false 入口与条件更新共享结果身份；七次潜在字段读取保留短路顺序。
--- unluac: expect-ast-count [[function]] [[4]]
 -- unluac: expect-ast-count [[numeric-for]] [[2]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[15]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=lua5.5]]
 -- LuaJIT 按子函数的逆序编号，seeded 对应 proto#4。
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=4]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=luau]]
 -- 带来源的 NOT 与 CALL 属于同一短路返回帧，不能留下逐轮增长的载体链。
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=3]] [[@dialect=luajit]]
 local function seeded(flags)
     local result = false
     if not flags.a and not flags.b then

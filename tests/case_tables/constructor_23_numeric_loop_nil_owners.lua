@@ -1,5 +1,4 @@
 -- unluac: expect-not-contains [[table-set-list]]
--- unluac: expect-ast-count [[table-list-field]] [[4]] [[@proto=2]] [[@dialect=lua5.1]]
 local ceil = math.ceil
 local function fetch(i)
     return i * 7

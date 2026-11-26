@@ -1,24 +1,11 @@
 -- 实参角色只在 heuristic 下参与命名，且不覆盖 debug 或业务字段提供的更具体名字。
--- unluac: expect-name [[local:0]] [[format]] [[@naming-mode=heuristic]] [[@debug=stripped]]
--- unluac: expect-name [[local:1]] [[time]] [[@naming-mode=heuristic]] [[@debug=stripped]]
--- unluac: expect-name [[local:0]] [[fmt]] [[@debug=retained]]
--- unluac: expect-name [[local:1]] [[epoch]] [[@debug=retained]]
 -- unluac: expect-not-contains [[local function naming_inputs]] [[@debug=retained]]
 -- unluac: expect-contains [[local fmt, epoch]] [[@debug=retained]]
--- unluac: expect-name [[local:0]] [[value]] [[@naming-mode=simple]] [[@debug=stripped]] [[@dialect=lua5.4]]
--- unluac: expect-name [[local:0]] [[r0_0]] [[@naming-mode=debug-like]] [[@debug=stripped]] [[@dialect=lua5.4]]
 -- unluac: expect-contains [[(text, start_index, end_index)]] [[@naming-mode=heuristic]] [[@debug=stripped]]
 -- unluac: expect-contains [[(list, value)]] [[@naming-mode=heuristic]] [[@debug=stripped]]
 -- unluac: expect-contains [[(list, position, value)]] [[@naming-mode=heuristic]] [[@debug=stripped]]
--- unluac: expect-contains [[string.sub(a, 1), string.find("abc", a)]] [[@naming-mode=heuristic]] [[@debug=stripped]]
--- unluac: expect-contains [[string.find("abc", a), string.sub(a, 1)]] [[@naming-mode=heuristic]] [[@debug=stripped]]
 -- unluac: expect-contains [[(message)]] [[@naming-mode=heuristic]] [[@debug=stripped]]
--- unluac: expect-contains [[table.insert(a, b())]] [[@naming-mode=heuristic]] [[@debug=stripped]]
 -- unluac: expect-contains [[(text, pattern, start_index, plain)]] [[@naming-mode=heuristic]] [[@debug=stripped]]
--- unluac: expect-name [[param:0]] [[a]] [[@proto=11]] [[@dialect=lua5.4]] [[@naming-mode=heuristic]] [[@debug=stripped]]
--- unluac: expect-name [[param:1]] [[b]] [[@proto=11]] [[@dialect=lua5.4]] [[@naming-mode=heuristic]] [[@debug=stripped]]
--- unluac: expect-name [[param:0]] [[a]] [[@proto=13]] [[@dialect=lua5.4]] [[@naming-mode=heuristic]] [[@debug=stripped]]
--- unluac: expect-name [[param:1]] [[b]] [[@proto=13]] [[@dialect=lua5.4]] [[@naming-mode=heuristic]] [[@debug=stripped]]
 function naming_inputs() return "!%Y", 946684800 end
 local fmt, epoch = naming_inputs()
 print(fmt, epoch, os.date(fmt, epoch))

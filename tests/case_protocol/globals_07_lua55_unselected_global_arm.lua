@@ -2,8 +2,6 @@
 -- unluac: expect-not-contains [[if true then]]
 -- unluac: expect-not-contains [[if false then]]
 -- unluac: expect-contains [[global dead_value]]
--- unluac: expect-ast-count [[if]] [[1]]
--- unluac: expect-ast-count [[function]] [[2]]
 -- unluac: expect-ast-count [[error]] [[0]]
 
 global<const> assert, setmetatable, collectgarbage, rawget

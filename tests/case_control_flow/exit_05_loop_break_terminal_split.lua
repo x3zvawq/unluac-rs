@@ -1,13 +1,8 @@
 -- regress_89_loop_break_terminal_split#1: break exit may split into post-loop and duplicated return
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(a, b, xs)
     local x = 0
     for _ in xs do

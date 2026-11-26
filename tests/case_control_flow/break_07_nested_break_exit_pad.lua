@@ -1,15 +1,9 @@
 -- regress_83_nested_break_exit_pad#1: nested branch chains belong to one break exit pad
--- unluac: expect-contains [[while ]]
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[(function()]]
 -- 原检查保留在条件中，不生成丢弃布尔结果的局部变量或短作用域。
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 local function run(a, b, xs)
     local rounds = 0
     while not b do

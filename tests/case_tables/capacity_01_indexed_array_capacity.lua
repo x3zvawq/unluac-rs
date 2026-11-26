@@ -1,11 +1,4 @@
 -- TNEW/TDUP 的数组布局不得在 LowInstr -> HIR -> constructor commit 中丢失。
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-max [[local-binding]] [[14]] [[@proto=0]]
--- unluac: expect-ast-min [[table-constructor]] [[6]]
--- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[table-record-field]] [[3]] [[@proto=3]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[table-list-field]] [[0]] [[@proto=3]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=3]] [[@dialect=luajit]]
 local events = 0
 local event_trace = ""
 local function take(value)

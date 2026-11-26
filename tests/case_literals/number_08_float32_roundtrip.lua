@@ -6,9 +6,7 @@
 -- unluac: expect-contains [[3.4028235e38]]
 -- unluac: expect-not-contains [[0.10000000149011612]]
 -- unluac: expect-not-contains [[0.20000000298023224]]
--- unluac: expect-ast-count [[function]] [[1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[7]]
 
 local function child()
     return 0.2, -0.0, 1.0

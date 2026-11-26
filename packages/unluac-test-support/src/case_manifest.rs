@@ -6,7 +6,7 @@
 
 use strum_macros::{Display, IntoStaticStr};
 use unluac::ast::NamingMode;
-use unluac::decompile::{DecompileDialect, TableStyle};
+use unluac::decompile::{CommentStyle, DecompileDialect, TableStyle};
 use unluac::generate::TableCellAlign;
 
 mod bindings;
@@ -198,6 +198,7 @@ pub(crate) struct LuaCaseOptions {
     pub(crate) table_drop_index_keys: Option<bool>,
     pub(crate) luau_optimization_level: Option<u8>,
     pub(crate) luau_vector: Option<LuauVectorCaseOptions>,
+    pub(crate) comment_style: Option<CommentStyle>,
     pub(crate) recompile_rounds: Option<u32>,
 }
 
@@ -218,6 +219,7 @@ impl LuaCaseOptions {
         table_drop_index_keys: None,
         luau_optimization_level: None,
         luau_vector: None,
+        comment_style: None,
         recompile_rounds: None,
     };
 }
@@ -403,6 +405,7 @@ const LUAU_OPTIMIZED_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     table_drop_index_keys: None,
     luau_optimization_level: Some(2),
     luau_vector: None,
+    comment_style: None,
     recompile_rounds: None,
 };
 const LUAU_OPTIMIZED_CONVERGENCE_OPTIONS: LuaCaseOptions = LuaCaseOptions {
@@ -429,6 +432,7 @@ const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
         constructor: "create",
         components: 3,
     }),
+    comment_style: None,
     recompile_rounds: None,
 };
 const NO_RECOMPILE_STRESS_OPTIONS: LuaCaseOptions = LuaCaseOptions {

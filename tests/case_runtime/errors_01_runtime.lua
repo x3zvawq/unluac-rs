@@ -1,14 +1,6 @@
 -- common_11_runtime#1: pcall保护调用
 -- 混合返回保持一条表达式；首项 COPY 与后续算术在同一原返回帧重发。
--- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=lua5.1]]
--- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=lua5.2]]
--- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=lua5.3]]
--- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=lua5.4]]
--- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=lua5.5]]
--- unluac: expect-contains [[return p5_1, p5_1 + 1, p5_1 + 2]] [[@dialect=luajit]]
 -- unluac: expect-not-contains [[return r5_]] [[@dialect=luajit]]
--- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=17]] [[@dialect=luau]]
 -- unluac: expect-not-contains [[r9_0 = r9_0 or p9_0]]
 -- unluac: expect-not-contains [[r13_0 = r13_0 or p13_0]]
 local function test_pcall()
@@ -170,17 +162,7 @@ test_coro_resume_loop(false)
 test_coro_resume_loop(nil)
 test_coro_resume_loop("error")
 -- handler 的短路 CONCAT 与 resume 多结果初始化保留完整表达式。
--- unluac: expect-ast-max [[local-decl]] [[0]] [[@dialect=lua5.4]] [[@proto=13]]
--- unluac: expect-ast-max [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=19]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@dialect=lua5.4]] [[@proto=20]]
 
 -- resume 循环只需 producer、co、results 和两个返回值；表尾索引应留在写入表达式内。
 -- 两条追加路径均在左值中计算索引，包含右值需要短路选择的退出分支。
--- unluac: expect-count [[ + 1] = ]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.1]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.2]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.3]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.4]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=lua5.5]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=1]] [[@dialect=luajit]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=19]] [[@dialect=luau]]

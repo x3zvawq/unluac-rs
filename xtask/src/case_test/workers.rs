@@ -229,15 +229,33 @@ pub(super) fn run_case_with_timeout(
     timeout: Duration,
 ) -> Result<CaseExecution> {
     let mut command = Command::new(runner);
-    command.args(["--report", "machine", "--id", case.id.as_str()]);
+    command.args([
+        "--report",
+        "machine",
+        "--watch-parent-stdin",
+        "--id",
+        case.id.as_str(),
+    ]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // 让每个 case_runner 成为独立进程组组长（pgid == pid），确保超时或异常退出时
+        // 能按 `-pgid` 一次性终止 runner 及其派生的所有 lua/luac/luajit/luau 孙进程。
+        command.process_group(0);
+    }
     let mut child = command
         .env(OUTPUT_ENV, output_mode)
         .env(RECOMPILE_ROUNDS_ENV, recompile_rounds.to_string())
         .current_dir(root)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn `{}`", runner.display()))?;
+    // 保持 stdin 写端存活直到 runner 退出；一旦 xtask 被中断或强杀，内核立即向 runner 投递 EOF，
+    // 触发 runner 内置 watchdog 自毁并清理全部孙进程，杜绝隔夜残留孤儿 lua 进程。
+    let stdin_guard = child.stdin.take();
     let stdout = child
         .stdout
         .take()
@@ -246,17 +264,25 @@ pub(super) fn run_case_with_timeout(
         .stderr
         .take()
         .context("case runner stderr pipe was not captured")?;
+    let mut child_guard = RunnerChildGuard::new(child, stdin_guard);
     let stdout_reader = spawn_output_reader(stdout);
     let stderr_reader = spawn_output_reader(stderr);
 
     let start = Instant::now();
     // 退出通知直接唤醒 worker，避免短 case 等待下一个固定轮询周期。
-    // 两条输出管道仍由独立 reader 持续排空；超时分支仍先终止进程树再收集输出。
-    if let Some(status) = child
+    // 两条输出管道仍由独立 reader 持续排空；超时分支仍先终止整棵进程树再收集输出。
+    if let Some(status) = child_guard
+        .child_mut()
         .wait_timeout(timeout)
         .with_context(|| format!("failed to wait for `{}`", runner.display()))?
     {
+        // 若 runner 因信号异常死亡，顺带清扫其进程组，防止孙进程 lua 继续占用管道或 CPU。
+        if status.code().is_none() {
+            let _ = terminate_process_tree(child_guard.child_mut());
+        }
+        child_guard.mark_reaped();
         let output = collect_child_output(status, stdout_reader, stderr_reader)?;
+        drop(child_guard);
         return match status.code() {
             Some(0) => {
                 let proto_count = parse_machine_success(&output);
@@ -299,12 +325,15 @@ pub(super) fn run_case_with_timeout(
         };
     }
 
-    terminate_timed_out_runner(&mut child)
+    terminate_timed_out_runner(child_guard.child_mut())
         .with_context(|| format!("failed to kill timed out `{}`", runner.display()))?;
-    let status = child
+    let status = child_guard
+        .child_mut()
         .wait()
         .with_context(|| format!("failed to wait for timed out `{}`", runner.display()))?;
+    child_guard.mark_reaped();
     let output = collect_child_output(status, stdout_reader, stderr_reader)?;
+    drop(child_guard);
     let rendered_failure = preferred_child_output(&output);
     Ok(CaseExecution {
         elapsed: start.elapsed(),
@@ -316,7 +345,44 @@ pub(super) fn run_case_with_timeout(
     })
 }
 
+struct RunnerChildGuard {
+    child: std::process::Child,
+    _stdin: Option<std::process::ChildStdin>,
+    reaped: bool,
+}
+
+impl RunnerChildGuard {
+    fn new(child: std::process::Child, stdin: Option<std::process::ChildStdin>) -> Self {
+        Self {
+            child,
+            _stdin: stdin,
+            reaped: false,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut std::process::Child {
+        &mut self.child
+    }
+
+    fn mark_reaped(&mut self) {
+        self.reaped = true;
+    }
+}
+
+impl Drop for RunnerChildGuard {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = terminate_process_tree(&mut self.child);
+            let _ = self.child.wait();
+        }
+    }
+}
+
 pub(super) fn terminate_timed_out_runner(child: &mut std::process::Child) -> Result<()> {
+    terminate_process_tree(child)
+}
+
+fn terminate_process_tree(child: &mut std::process::Child) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -337,7 +403,21 @@ pub(super) fn terminate_timed_out_runner(child: &mut std::process::Child) -> Res
             );
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        // 先向整个进程组 `-pgid`（`process_group(0)` 设定的独立组）发送 SIGKILL，
+        // 一次性终止 case_runner 与其派生的 lua/luac/luajit/luau 全部孙进程。
+        let pgid_target = format!("-{}", child.id());
+        let kill_output = Command::new("kill")
+            .args(["-s", "KILL", "--", &pgid_target])
+            .output()
+            .context("failed to spawn kill for timed out runner process group")?;
+        if !kill_output.status.success() && child.try_wait()?.is_none() {
+            // 兜底直接杀主进程，避免进程组异常导致超时阻塞
+            let _ = child.kill();
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
     child.kill()?;
     Ok(())
 }

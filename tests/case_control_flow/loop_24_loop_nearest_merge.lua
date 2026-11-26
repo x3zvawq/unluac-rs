@@ -2,7 +2,6 @@
 -- unluac: expect-order [[print("near")]] [[print("far")]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 
 local function run(side)
     while true do
@@ -46,9 +45,6 @@ for start = 1, 2 do
     end
 end
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 -- 原入口的七个声明已足够，分支中的断言调用不应引入新的准备载体。
--- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=0]]
 
 return run

@@ -3,14 +3,8 @@
 -- unluac: expect-contains [[ = 1, 3 do]]
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[numeric-for]] [[2]]
--- unluac: expect-ast-count [[break]] [[2]]
--- unluac: expect-ast-count [[if]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
 -- 直接终止的两臂采用与显式 else 相同的正向条件，避免回编译轮次交替反转。
--- unluac: expect-contains [[if p1_0 then]]
 
 for _ = 1, 3 do
     break

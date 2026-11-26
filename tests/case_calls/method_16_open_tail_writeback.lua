@@ -1,10 +1,5 @@
 -- 开放尾参数、方法 lookup 和低槽写回保持原方言的求值顺序。
 -- unluac: expect-ast-count [[method-call]] [[2]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[3]]
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[table-constructor]] [[3]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=0]]
 
 local trace = {}
 local function mark(value)

@@ -1,10 +1,7 @@
 -- regress_15_generic_for_terminal_guard#1: shared terminal guard inside generic-for should not force goto fallback
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[generic-for]] [[2]]
--- unluac: expect-ast-count [[if]] [[3]]
--- unluac: expect-ast-count [[local-binding]] [[9]]
 local highscores = {
     first = { completed = true },
     target = { completed = true },

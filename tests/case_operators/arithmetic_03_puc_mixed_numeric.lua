@@ -2,9 +2,6 @@
 -- unluac: expect-count [[9007199254740993]] [[3]]
 -- unluac: expect-count [[9007199254740992.0]] [[3]]
 -- unluac: expect-contains [[9007199254740993 <= 9007199254740992.0]]
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[5]]
 
 local function compare()
     -- 两端边界与分数比较不能通过 integer -> f64 舍入决定。

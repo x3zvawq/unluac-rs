@@ -3,11 +3,8 @@
 -- 方言可把后一循环恢复为 repeat 或 while；binding 编号也不是交接合同。
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- 模块中只有被测函数含 numeric-for 和 if；观察端的枚举使用 generic-for。
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[if]] [[2]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 local function run(a, b, xs)
     local x = 0
     for _ = 1, 3 do

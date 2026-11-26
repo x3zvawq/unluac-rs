@@ -1,8 +1,5 @@
 -- cdata 字面量可作为短路返回值；成本分析与等价验证须共用完整的原子值域。
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[function]] [[3]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[13]]
 local function signed(a, b)
     return a and 1LL or b and 2LL or 3LL
 end

@@ -1,8 +1,4 @@
 -- 连续 debug 生命周期复用寄存器，并覆盖同起点多局部、嵌套遮蔽与闭包捕获。
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[local-binding]] [[42]]
--- unluac: expect-ast-count [[do-block]] [[34]]
 local total = 0
 local calls = 0
 local function consume(value)

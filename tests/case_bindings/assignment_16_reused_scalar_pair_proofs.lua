@@ -1,7 +1,4 @@
 -- 重复快照共享相同写回合同，两个低槽目标和调用时点均保持原序。
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=2]]
--- unluac: expect-ast-count [[call]] [[2]] [[@proto=2]]
 local expected_owner = {}
 local calls = 0
 scalar_pair_observe = function(owner, value)

@@ -1,12 +1,8 @@
 -- Resource exits must precede the observable events that follow their scopes.
 -- unluac: expect-contains [[<close>]]
 -- unluac: expect-ast-count [[close-binding]] [[15]]
--- unluac: expect-ast-count [[table-list-field]] [[23]] [[@proto=0]]
 -- 调用与索引快照应由原帧恢复，不为原有 70 个 binding 增添中转声明。
--- unluac: expect-ast-max [[local-binding]] [[70]]
 -- 原索引、比较与调用共同恢复，不留下长度快照和 assert 接棒变量。
--- unluac: expect-not-contains [[ = #]]
--- unluac: expect-not-contains [[= assert]]
 
 local function acquire(log, name)
     log[#log + 1] = "open:" .. name

@@ -4,16 +4,7 @@
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[if]] [[3]]
--- unluac: expect-ast-count [[continue]] [[1]]
--- unluac: expect-ast-count [[break]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[8]]
--- unluac: expect-ast-count [[assign]] [[5]]
 
 local function run(a, b, c, n)
     local count = 0

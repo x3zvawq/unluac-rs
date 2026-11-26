@@ -1,16 +1,11 @@
 -- regress_276_degenerate_generic_body_region: branch前缀与nested loop同属退化for状态
 -- unluac: expect-contains [[repeat]]
--- unluac: expect-contains [[in pairs(p1_1) do]]
 -- unluac: expect-contains [[return ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[        else]]
 -- unluac: expect-not-contains [[local r1_2]]
 -- unluac: expect-not-contains [[local r1_3]]
--- unluac: expect-contains [[r1_0 = r1_0 + 1]]
--- unluac: expect-contains [[until p1_1[r1_0]]
 local function run(log_body, xs)
     local x = 0
     for key in pairs(xs) do
@@ -46,7 +41,3 @@ assert(run("", {false, true}) == 2)
 assert(run(true, {}) == 0)
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=0]]

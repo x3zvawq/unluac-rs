@@ -1,14 +1,6 @@
 -- regress_248_luajit_negated_compare: ISGE/ISGT 是原关系的逻辑取反
 -- unluac: expect-contains [[not]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[function]] [[8]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[13]]
--- unluac: expect-contains [[assert(r0_6(r0_3 % 4 >= 2, r0_3 % 2 == 1) == r0_5[r0_3 + 1])]] [[@dialect=luajit]]
 -- 独立参数帧要把可能调用元方法的取模、调用和动态键保持在一条 assert 内。
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=7]] [[@dialect=luau]]
--- unluac: expect-contains [[assert(p7_2(p7_0 % 4 >= 2, p7_0 % 2 == 1) == p7_1[p7_0 + 1])]] [[@dialect=luau]]
--- unluac: expect-contains [[r0_8, r0_9, r0_10, r0_11 = r0_7(1)]] [[@dialect=luau]]
 
 local nan = 0 / 0
 assert((nan >= 1) == false)

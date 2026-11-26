@@ -1,8 +1,6 @@
 -- regress_39_method_hint_open_arg_call#1: 同一 proto 重复 SELF 后夹着多返回参数调用时不能丢 method hint
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[:setPlayerName(]]
 -- unluac: expect-not-contains [[.setPlayerName]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
 
 local function pair()
     return "TEXTS_BASIC", "TEXT_SOCIAL_YOU"

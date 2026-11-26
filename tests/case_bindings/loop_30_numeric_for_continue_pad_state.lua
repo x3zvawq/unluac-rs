@@ -1,11 +1,7 @@
 -- regress_93_numeric_for_continue_pad_state#1: tail continue pad belongs to the numeric-for body
 -- regress_93_numeric_for_continue_pad_state#2: nested loop phi use must keep the outer repeat state writable
--- unluac: expect-contains [[repeat]]
--- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[r1_2 = r1_1]]
 local function empty_continue(stop)
     local x = 0

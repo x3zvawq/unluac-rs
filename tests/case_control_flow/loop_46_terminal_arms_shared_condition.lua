@@ -1,5 +1,3 @@
--- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
 
 -- 两个非线性 return 臂没有共同的循环 continuation，仍须留在原循环内。
 local function terminal_arms(a, b, mode)

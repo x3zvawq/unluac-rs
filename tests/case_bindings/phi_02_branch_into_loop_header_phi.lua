@@ -3,10 +3,7 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[r1_1 = r1_0]]
--- unluac: expect-ast-min [[if]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-min [[repeat]] [[1]] [[@proto=1]]
 local function run(a, b)
     local x = 0

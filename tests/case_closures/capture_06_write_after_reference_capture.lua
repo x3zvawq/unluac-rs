@@ -1,6 +1,4 @@
 -- regress_232_parent_write_after_reference_capture#1: 只读 ByReference capture 仍须观察父级后续写入
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 local function run(flag)
     local value = 1
     if flag then

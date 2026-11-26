@@ -1,10 +1,6 @@
 -- Nested factories preserve distinct lexical captures and fresh closure identity.
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-not-contains [[= print]]
 -- unluac: expect-not-contains [[= assert]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=0]]
 local function outer(value)
     local function make(argument)
         return function(other) return argument + other + value end

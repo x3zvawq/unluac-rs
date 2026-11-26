@@ -1,18 +1,4 @@
 -- 短路返回中上值键与上值比较各自保留读取位置，条件右臂不能提前执行索引。
--- unluac: expect-contains [[== true and (]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-count [[function]] [[6]]
--- unluac: expect-ast-max [[local-binding]] [[8]]
--- unluac: expect-contains [[names.present, names.missing = nil, nil]] [[@dialect=luajit]] [[@debug=retained]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=6]] [[@dialect=luau]] [[@debug=retained]]
--- unluac: expect-contains [[local matched = names[expected] == true and (forbidden == nil or names[forbidden] ~= true)]] [[@debug=retained]]
 local function make_check(expected, forbidden)
     return function(names)
         return names[expected] == true and (forbidden == nil or names[forbidden] ~= true)

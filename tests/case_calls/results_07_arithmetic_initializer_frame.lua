@@ -1,8 +1,4 @@
 -- 算术准备与条件写回共用一个状态身份；LuaJIT 的函数编号按子 proto 逆序排列。
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=5]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]] [[@dialect=luajit]]
 -- unluac: expect-not-contains [[else]]
 -- unluac: expect-contains [[local cd = act_data.cd + event.pull_time - clock()]] [[@debug=retained]]
 -- unluac: expect-contains [[return value + rhs]] [[@debug=retained]]

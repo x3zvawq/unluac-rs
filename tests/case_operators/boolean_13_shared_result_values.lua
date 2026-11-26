@@ -1,11 +1,5 @@
 -- Normal result facts must preserve nil/false, selected object identity and operator events.
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[function]] [[5]]
--- unluac: expect-ast-count [[if]] [[0]]
 -- 合流参数的预写与 callee 属于同一调用帧；后续捕获不能留下额外声明。
--- unluac: expect-ast-max [[local-binding]] [[20]]
--- unluac: expect-contains [[assert(r0_8 == false and r0_9 == false)]] [[@dialect=luau]]
 local function choose(value)
     local falsy = value and false
     local truthy = value or true

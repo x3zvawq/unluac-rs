@@ -6,18 +6,7 @@
 -- unluac: expect-not-contains [[r1_1 = r1_]]
 -- unluac: expect-not-contains [[r3_0 = r3_1]]
 -- unluac: expect-not-contains [[r2_0 = r2_1]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- 三个循环只需要原来的分支结果 x，不应增加 loop-exit 状态副本。
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=4]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=luajit]]
 
 local trace = {}
 

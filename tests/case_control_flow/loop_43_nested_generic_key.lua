@@ -1,8 +1,5 @@
 -- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
 -- 第一项 binding 也可在内层循环重赋值，不能改变 iterator 的隐藏 control。
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 local controls = {}

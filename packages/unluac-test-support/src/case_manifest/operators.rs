@@ -2,305 +2,19 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
-        "tests/case_operators/boolean_43_mixed_lookup_decision.lua",
-        &["short-circuit", "lookup", "call-frame", "metamethod", "gc"],
-        "嵌套查表、反向谓词及动态键比较恢复为直接短路返回和调用参数，保留 nil/false、元方法次序与原结果根替换。",
+        "tests/case_operators/folding_03_guarded_or_fallback_return.lua",
+        &["short-circuit", "falsy-trap", "nan", "single-value", "recompile"],
+        "带公共 or 兜底的双臂赋值折叠为无 falsy 陷阱短路表达式，并保持单值返回宽度、求值次数与 NaN 比较语义。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_41_inlined_ordered_condition_suffix.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "共享调用之间保留有序比较及布尔写回；原准备 Def 约束前缀，后续独立循环复用同槽不使前一只读参数视图失效。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_40_inlined_shared_result_comparison.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "动态共享调用的返回 Phi 直接参与比较；原消费位置和当前值版本共同恢复完整调用，保持急切读取、单值返回及后续槽复用。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_39_inlined_nil_result_comparison.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "内联调用的 nil 结果以原 SSA Def 直接参与比较；完整恢复调用和外层断言，保持急切读取次数及单值返回。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_38_inlined_sequential_read_frames.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "连续调用复用旧断言结果槽；原返回 COPY 与比较参数共同恢复，保持标签读取顺序、匿名闭包创建及急切读取计数。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_37_inlined_anonymous_shared_read.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "匿名读取参数保持原闭包创建、标签断言和捕获更新；动态 guard 前急切读取一次，整帧恢复调用并退休参数及断言中转。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_36_inlined_labeled_reads.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "标签 a、b 的两次捕获读取保持顺序；外层短路、嵌套选值和 EdgeCopy 结果共同恢复完整单返回调用。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_35_inlined_shared_read_guard.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "动态 guard 前急切读取一次，原共享 item 参与选值和最终比较；恢复完整单返回调用并退休中转及同批多余根。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_34_inlined_unused_shared_read.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "nil 返回仍执行急切读取；保留两臂无读写入的身份和副作用，恢复参数及局部声明中的完整单返回调用。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_33_inlined_nil_guard_copy.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "nil guard 消去读取体后，原未读取参数 COPY 与固定单返回仍由完整帧重发；观察返回数量、nil 值和捕获计数。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_32_inlined_reader_folded_pair.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "常量选择参数折叠比较后，原真值谓词、捕获读取和双返回 COPY 仍作为完整调用恢复。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_31_inlined_reader_pair.lua",
-        &[
-            "short-circuit",
-            "capture",
-            "evaluation-order",
-            "call-frame",
-            "recompile",
-        ],
-        "急切读取闭包的两层展开保留捕获更新、固定双返回及原参数 COPY，比较结果和原读取值共同恢复。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
         ],
     ),
     LuaCaseDefinition::new(
@@ -412,31 +126,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                })
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                })
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_42_inlined_seeded_predicate.lua",
-        &[
-            "short-circuit",
-            "initialization",
-            "evaluation-order",
-            "readability",
-        ],
-        "已内联字段谓词恢复独立调用和中间实参，保留字段轨迹与 Boolean 共同返回槽，验证三轮收敛。",
-        &[
             LuaCaseConfiguration::new(LUAU_ONLY)
                 .with_options(LuaCaseOptions {
                     recompile_rounds: Some(3),
@@ -610,51 +299,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/concat_05_inlined_pcall_root.lua",
-        &["concat", "gc-root", "pcall", "recompile"],
-        "已展开函数另作 pcall 首实参时仍恢复完整原帧，保持 CONCAT 临时根被 ADD 覆盖的时点。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LUAU_OPTIMIZED_OPTIONS
-            }),
-            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LUAU_OPTIMIZED_OPTIONS
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/concat_04_upvalue_scratch_return.lua",
-        &["concat", "upvalue", "metamethod", "gc-root", "recompile"],
-        "上值拼接写回与算术返回共用 scratch，验证元方法改写 cell、两次运算期间的原根和三轮收敛。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                }),
         ],
     ),
     LuaCaseDefinition::new(
@@ -986,25 +630,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_operators/equality_01_materialize_preserves_eval.lua",
-        &[
-            "arithmetic",
-            "effectful-call",
-            "equal-arms",
-            "gc-root",
-            "materialize",
-            "recompile",
-            "short-circuit",
-        ],
-        "确认同值条件保留求值和后继弱表根观察，完整算术调用帧不阻塞再编译后的表构造。",
-        &[
-            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_operators/boolean_08_fallback_value_merge.lua",
         &["fallback", "multi-return", "short-circuit", "single-pass"],
         "防止嵌套短路共享fallback值合流伪装single-pass break。",
@@ -1096,17 +721,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                     recompile_rounds: Some(3),
                     ..LuaCaseOptions::DEFAULT
                 }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/discard_03_safe_primitive_equality.lua",
-        &["dead-value", "equality", "gc-root", "nil", "primitive"],
-        "保留无读纯比较及其原槽覆盖，验证旧弱表根仍在相同时点释放。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
         ],
     ),
     LuaCaseDefinition::new(
@@ -1219,32 +833,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_operators/concat_01_operand_root_slots.lua",
-        &["concat", "gc-root", "lookup-order", "metamethod"],
-        "覆盖 CONCAT 右端槽、中间覆盖槽、后继表达式复用右端 temp，以及 alias compression 后 index 从左到右、concat metamethod 从右到左的顺序。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_11_shared_expression_value_facts.lua",
-        &["evaluation-count", "gc-root", "metamethod", "truthiness"],
-        "区分表达式正常结果事实与求值事件：保留 nil/false 差异、选择数值的 mark 次数、算术/一元/比较 metamethod 结果与次数、error 路径，以及批次临时对象跨后继比较的根。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(LUAJIT_ONLY).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_operators/boolean_13_shared_result_values.lua",
         &["identity", "metamethod", "nil", "truthiness"],
         "固定正常结果事实保留nil/false、object rawequal、0真值及not包裹算术/长度/元方法结果，不能统一折成boolean常量而跳过运算。",
@@ -1265,65 +853,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 ..LuaCaseOptions::DEFAULT
             }),
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/folding_01_short_circuit_constant_snapshot.lua",
-        &["gc-root", "metamethod", "short-circuit", "snapshot"],
-        "prefix/suffix短路常量快照跨无binding suffix保持，同时错误类型、比较元方法次数与captured参数写入不变。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/metamethod_02_result_gc_roots.lua",
-        &["binary", "concat", "gc-root", "metamethod"],
-        "binary/unary/concat/overwrite/branch/return链的元方法结果跨后继运算和观察保持正确root终点。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_14_short_circuit_root_frontier.lua",
-        &["lookup", "saved-local", "short-circuit", "trace"],
-        "直接call覆盖证书不能外推到lookup或独立saved local，并保留nil/false方向。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_15_short_circuit_frontier.lua",
-        &["lookup", "short-circuit", "trace", "two-calls"],
-        "两个CALL间TEST不写result home，覆盖证书必须覆盖所有后续路径。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
@@ -1357,22 +886,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_operators/concat_02_native_concat_frames.lua",
-        &["concat", "gc", "metamethod", "order"],
-        "concat operand左到右求值、元方法右到左合并并观察根存活及比较左值的读取时点。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_operators/comparison_04_ordered_comparison_snapshots.lua",
         &["metamethod", "nan", "operand-order", "ordered-comparison"],
         "验证大于/大于等于降为反向小于/小于等于时元方法参数翻转正确，同时覆盖普通方向与NaN结果。",
@@ -1382,86 +895,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 ..LuaCaseOptions::DEFAULT
             }),
             LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/comparison_05_comparison_upvalue_preparations.lua",
-        &["call-frame", "comparison", "numeric-for", "upvalue"],
-        "同一upvalue captured的两次比较读取必须各自绑定本轮原槽与make调用，不能按变量名复用准备证书。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/comparison_06_comparison_literal_preparations.lua",
-        &["call-frame", "comparison", "literal", "numeric-for"],
-        "比较左侧的大数值或字符串字面量占原低槽，后续tonumber/普通call准备必须覆盖此前scope观察根。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/boolean_17_operand_preparations.lua",
-        &["comparison", "gc", "metamethod", "nested-index"],
-        "比较左操作数的长度、算术和两级索引准备链在普通值及元方法两组中保持各自原槽，并在右侧CALL前后正确交接旧根。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/order_06_frame_preparations.lua",
-        &["concat", "dynamic-key", "gc", "method-call"],
-        "动态表键、拼接及SELF方法三种左操作数按原准备顺序覆盖scratch根，并以普通与元方法版本验证交接位置。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_operators/comparison_07_call_comparison_low_operand.lua",
-        &["call", "comparison", "metamethod", "physical-root"],
-        "IIFE CALL结果进入低槽比较时保留算术中间对象根，同时后续captured读取必须发生在替换CALL之后。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
                 retain_debug: true,
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT

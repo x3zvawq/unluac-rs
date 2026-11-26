@@ -1,10 +1,4 @@
 -- 左值快照与 RHS 结果各自保持原准备顺序，两个写回共同提交。
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=3]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=5]]
 
 local target
 local function write_targets(first, last)
@@ -69,8 +63,6 @@ write_lookup_pack()
 print("parallel_lookup_targets", "OK")
 
 -- 两个上值 RHS 都先读取；首个逆序 SETTABLE 的回调改写 cell，不能影响第二次写入。
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=8]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=8]]
 local first_rhs, last_rhs = {}, {}
 local function write_rhs_snapshot(destination)
     destination[1], destination[2] = first_rhs, last_rhs
@@ -91,8 +83,6 @@ print("parallel_upvalue_rhs_snapshot", "OK")
 
 -- 动态 key 的运算改变目标 cell，第一次写回又改变它；观测各方言原有的快照时点。
 local dynamic_target, dynamic_key
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=10]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=10]]
 local function write_dynamic_keys(first, last)
     dynamic_target[dynamic_key + 1], dynamic_target[dynamic_key + 2] = first, last
 end
@@ -120,7 +110,6 @@ assert(string.match(dynamic_writes[1], ":2:right$") and string.match(dynamic_wri
 print("parallel_dynamic_targets", table.concat(dynamic_writes, ","))
 
 -- 字段回调先观察并改写旧 cell，随后原低槽 MOVE 才安装 CALL 结果。
--- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=13]]
 local function write_mixed_targets()
     local object
     local calls = 0

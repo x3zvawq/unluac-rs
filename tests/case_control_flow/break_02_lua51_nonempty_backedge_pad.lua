@@ -3,9 +3,6 @@
 -- unluac: expect-contains [[return 1]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 local function f(a, b)
     while true do

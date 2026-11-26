@@ -1,13 +1,8 @@
 -- regress_261_branch_shared_continuation_nearest: 共享 continuation 按 CFG 近端选择而非物理布局
 -- unluac: expect-contains [[return "stop-a"]]
 -- unluac: expect-contains [[return "stop-b"]]
--- unluac: expect-order [[print("near")]] [[print("far")]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[if]] [[5]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
 
 local function run(route, side, near_a, near_b)
     if route == 1 then

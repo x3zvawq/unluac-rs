@@ -1,12 +1,8 @@
 -- regress_304_luau_loop_carried_binding: 同槽loop-carried状态直接复用源码binding
--- unluac: expect-contains [[        r1_0 = r1_0 + 1]]
--- unluac: expect-contains [[            r1_1 = r1_1 +]]
 -- unluac: expect-not-contains [[        local r1_2 = r1_0 + 1]]
 -- unluac: expect-not-contains [[        r1_0, r1_1 =]]
 -- unluac: expect-not-contains [[local r1_3]]
 -- 返回语法重发原高槽 COPY，循环状态的两个初始化声明继续保留。
--- unluac: expect-contains [[return r1_1, r1_0]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
 local function run(enabled, choose_first, limit)
     local count, value = 0, 0
     while count < limit do

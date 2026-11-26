@@ -1,6 +1,4 @@
 -- regress_38_method_chain_live_receiver#1: method-chain sugar 不能删掉后续仍活跃的 receiver local
--- unluac: expect-not-contains [[end)(]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[getLayoutPosition()]]
 
 local function make_child(name)
@@ -46,8 +44,6 @@ assert(visible == true and x == 15 and y == 20)
 print("regress_38_method_chain_live_receiver#1", visible, x, y)
 
 -- 带构造器参数的 CALL 结果继续参与 SELF 链，不能提前冻结成独立声明。
--- unluac: expect-contains [[:runWhile(function]]
--- unluac: expect-contains [[:wait(1):runQueues({]]
 local function schedule(self, flag)
     local a, b, c, d
     self.queue:run(function() a = self end)
@@ -121,7 +117,6 @@ end
 check_schedule(false)
 check_schedule(true)
 -- SELF 的 receiver/lookup 在比较参数之前执行；参数分支不能丢掉原方法协议。
--- unluac: expect-contains [[:setPredicate(]]
 -- unluac: expect-contains [[== true]]
 local function use_predicate_method(owner, flag)
     owner:setPredicate(flag == true)

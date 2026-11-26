@@ -1,22 +1,4 @@
 -- 私有表的字段/批次写属于一次求值；短路关闭时不分配或调用准备函数。
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=10]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=11]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=11]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-binding]] [[17]] [[@proto=0]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=luau]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=luau]]
 -- unluac: expect-not-contains [[table-set-list]]
 local function record(first, consume, key, value)
     return first() == nil and consume({[key()] = value(), tag = "record"}) == nil

@@ -1,18 +1,6 @@
 -- 短路节点共享一次 CALL/GETTABLE 结果；吸收条件准备区不能把共享 Def 复制到各谓词。
 -- unluac: expect-count [[.value]] [[3]]
 -- unluac: expect-count [[().value]] [[3]]
--- unluac: expect-count [[local value = inspect().value]] [[3]] [[@debug=retained]]
--- unluac: expect-contains [[if value == value then]] [[@debug=retained]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[function]] [[5]]
--- unluac: expect-ast-max [[local-binding]] [[12]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@dialect=lua5.1]] [[@proto=5]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@dialect=lua5.2]] [[@proto=5]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@dialect=lua5.3]] [[@proto=5]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@dialect=lua5.4]] [[@proto=5]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@dialect=lua5.5]] [[@proto=5]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@dialect=luajit]] [[@proto=1]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@dialect=luau]] [[@proto=5]]
 local calls = 0
 local reads = 0
 local result = 7

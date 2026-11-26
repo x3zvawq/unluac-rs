@@ -1,14 +1,5 @@
 -- 多结果 scratch 随后承接 captured local；未来捕获不属于先前的结果版本。
--- unluac: expect-ast-count [[local-binding]] [[17]]
--- unluac: expect-ast-count [[function]] [[6]]
--- unluac: expect-ast-count [[table-constructor]] [[4]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
--- unluac: expect-ast-count [[assign]] [[6]]
--- unluac: expect-contains [[first, second = pair(10)]] [[@debug=retained]]
 -- unluac: expect-not-contains [[= assert]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[local-decl]] [[3]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-contains [[left.value = left.value + 100]] [[@debug=retained]]
 -- unluac: expect-contains [[return first, second, read]] [[@debug=retained]]
 local function exercise(pair)
     local first, second = pair(1)

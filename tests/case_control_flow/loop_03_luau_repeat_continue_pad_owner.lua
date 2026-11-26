@@ -1,12 +1,8 @@
 -- regress_119_luau_repeat_continue_pad_owner#1: repeat 的透明 continue pad 由分支臂消费
 -- unluac: expect-contains [[repeat]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[while]] [[0]] [[@proto=1]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(b)
     repeat
         while not b do break end

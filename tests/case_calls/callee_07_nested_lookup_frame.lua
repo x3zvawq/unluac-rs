@@ -1,10 +1,5 @@
 -- 嵌套 callee 在原槽逐层读取；参数改写字段后，调用仍使用此前取得的函数。
 -- unluac: expect-count [[.nested.field(]] [[1]]
--- unluac: expect-contains [[()) == 23)]]
--- unluac: expect-ast-count [[local-function]] [[2]]
--- unluac: expect-ast-count [[function]] [[6]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-ast-count [[error]] [[0]]
 local function invoke(root, argument)
     assert(root.nested.field(argument()) == 23)

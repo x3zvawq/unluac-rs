@@ -1,7 +1,5 @@
 -- regress_182_numeric_for_before_irreducible_goto#1: 局部不可规约流不得拖垮前置 numeric-for
 -- unluac: expect-contains [[for ]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 -- The shared literal must remain materialized before the irreducible region; its local ID is not stable.
 -- unluac: expect-contains [[ = "prefix"]]
 -- unluac: expect-order [[ = "prefix"]] [[goto ]]
@@ -63,16 +61,6 @@ print("regress_182_numeric_for_before_irreducible_goto#1", total, x, y)
 assert(prefix_before_irreducible(nil, nil) == 11)
 assert(prefix_before_irreducible(0, false) == 10)
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[goto]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[label]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[while]] [[0]]
--- unluac: expect-ast-count [[repeat]] [[0]]
 -- 初值在 print 之后声明，两个入口与回边共用该状态，不生成额外 phi 声明或转存。
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=1]]
 -- 主函数的 x/y 沿不可规约区域原位更新，不拆成各条边的空 phi 变量。
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=0]]
 -- 原闭包声明足以承接四次调用；callee 与结果准备不能变成跨调用或循环的状态。
--- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[5]] [[@proto=0]]

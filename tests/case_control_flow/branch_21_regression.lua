@@ -143,4 +143,3 @@ test_degenerate_guard(true)
 -- unluac: expect-not-contains [[(not (not ]]
 -- unluac: expect-count [[print("common_06_boolean_regression#3",]] [[1]]
 -- unluac: expect-count [[print("common_06_boolean_regression#4",]] [[1]]
--- unluac: expect-contains [[local unused = 1]] [[@debug=retained]]

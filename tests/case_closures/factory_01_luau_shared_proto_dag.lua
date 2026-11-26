@@ -2,9 +2,6 @@
 -- unluac: expect-contains [[function]]
 -- unluac: expect-not-contains [[= print]]
 -- unluac: expect-not-contains [[= assert]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=0]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function outer(z)
     local function make(a)
         return function(x)

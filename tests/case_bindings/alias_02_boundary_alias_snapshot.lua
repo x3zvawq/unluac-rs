@@ -1,7 +1,4 @@
 -- regress_277_boundary_alias_snapshot: goto边界复制不把跨更新时点的快照并成同一状态
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
 -- unluac: expect-not-contains [[r1_3]] [[@debug=stripped]]
 local function run(entry, a, b, cycle)
     local value, snapshot, copied = 0, -1, -2

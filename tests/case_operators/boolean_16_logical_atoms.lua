@@ -1,9 +1,5 @@
 -- 单值短路位置的 vararg 是入口首值，参与成本与综合时应和普通 ref 一样计为一个原子。
--- unluac: expect-ast-count [[function]] [[1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-max [[local-binding]] [[9]]
 local function choose(a,b,c,d,e,...)
     return a and (...) or b and (...) or c and (...) or d and (...) or e and (...)
 end

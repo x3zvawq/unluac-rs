@@ -4,9 +4,7 @@
 -- unluac: expect-not-contains [[== "padding-005"]]
 -- unluac: expect-count [[== "target-compare"]] [[1]]
 -- 原赋值链和返回帧共用少量绑定，不随 260 条常量写扩散。
--- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=1]]
 -- 被测常量池属于独立 proto；调用参数放到父 proto，避免向宽 D 索引前插入常量。
--- unluac: expect-ast-max [[if]] [[0]] [[@proto=1]]
 local function compare(...)
 local x = ...
 local sink

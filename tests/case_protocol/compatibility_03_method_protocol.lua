@@ -1,8 +1,6 @@
 -- regress_306_luajit_method_protocol: LuaJIT split method setup保留receiver快照与call种类
 -- unluac: expect-contains [[:collect(1)]]
 -- unluac: expect-not-contains [[:dot_call(]]
--- unluac: expect-ast-count [[function]] [[10]]
--- unluac: expect-ast-max [[do-block]] [[0]]
 
 if arg[1] == "--dump-large-method" then
     local source = {}

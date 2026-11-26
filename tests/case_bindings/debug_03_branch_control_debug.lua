@@ -2,9 +2,6 @@
 -- unluac: expect-contains [[unreachable_debug]]
 -- unluac: expect-contains [[unreachable_arm]]
 -- unluac: expect-contains [[while false do]]
--- unluac: expect-ast-count [[break]] [[0]]
--- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=4]]
 -- unluac: expect-count [[return true]] [[1]]
 
 local function false_while()

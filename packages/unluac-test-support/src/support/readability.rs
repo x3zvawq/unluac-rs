@@ -524,6 +524,25 @@ pub(super) fn assert_readability(
     assertions: &[ReadabilityAssertion],
     check_positive_shape: bool,
 ) -> Result<(), TestFailure> {
+    if check_positive_shape
+        && let Some(module) = readability
+        && let Some((proto_index, proto)) = module
+            .protos
+            .iter()
+            .enumerate()
+            .find(|(_, proto)| proto.state_machine_count > 0)
+    {
+        return Err(readability_assertion_failure(
+            stage_label,
+            0,
+            format!(
+                "normal compiled case unexpectedly fell back to state machine in proto#{proto_index} (count={})",
+                proto.state_machine_count
+            ),
+            generated_source,
+        ));
+    }
+
     let mut source_counts = BTreeMap::new();
     let ast_metrics = if check_positive_shape
         && assertions.iter().any(|assertion| {
@@ -574,7 +593,6 @@ pub(super) fn assert_readability(
                             unluac::ast::AstBindingRef::SyntheticLocal(id) => {
                                 names.synthetic_locals.get(&id)
                             }
-                            unluac::ast::AstBindingRef::Temp(_) => None,
                         },
                         NamingBindingSelector::Upvalue(index) => names.upvalues.get(*index),
                     });
@@ -1019,136 +1037,6 @@ pub(super) fn assert_source_chunk(
         summary.clone(),
         format!("{summary}: case={case_path}, kind={kind:?}"),
     ))
-}
-
-pub(super) fn assert_structure_contracts(
-    entry: &LuaCaseManifestEntry,
-    facts: Option<&StructureFacts>,
-) -> Result<(), TestFailure> {
-    for contract in entry
-        .structure_contracts
-        .iter()
-        .copied()
-        .filter(|contract| contract.dialect() == entry.dialect)
-    {
-        let facts = facts.ok_or_else(|| {
-            source_structure_contract_failure(entry, "generate stage returned no StructureFacts")
-        })?;
-        if !structure_facts_match_contract(facts, contract) {
-            let LuaCaseStructureContract::MixedUnstructuredChildLoop { protocol, .. } = contract;
-            return Err(source_structure_contract_failure(
-                entry,
-                format!(
-                    "no Unstructured layout contained both a direct block and a region child whose subtree owns a {} LoopVmProtocol",
-                    loop_protocol_label(protocol)
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn structure_facts_match_contract(
-    facts: &StructureFacts,
-    contract: LuaCaseStructureContract,
-) -> bool {
-    let LuaCaseStructureContract::MixedUnstructuredChildLoop { protocol, .. } = contract;
-    facts
-        .ready()
-        .is_some_and(|ready| plan_contains_mixed_unstructured_child_loop(ready.plan(), protocol))
-        || facts
-            .children
-            .iter()
-            .any(|child| structure_facts_match_contract(child, contract))
-}
-
-pub(super) fn plan_contains_mixed_unstructured_child_loop(
-    plan: &StructurePlan,
-    protocol: LuaCaseLoopProtocol,
-) -> bool {
-    plan.regions().any(|(_, region)| {
-        let RegionPlan::Unstructured { layout, .. } = region else {
-            return false;
-        };
-        layout
-            .iter()
-            .any(|item| matches!(item, UnstructuredLayoutItem::Block(_)))
-            && layout.iter().any(|item| match item {
-                UnstructuredLayoutItem::Block(_) => false,
-                UnstructuredLayoutItem::Region(child) => {
-                    region_subtree_contains_loop_protocol(plan, *child, protocol)
-                }
-            })
-    })
-}
-
-pub(super) fn region_subtree_contains_loop_protocol(
-    plan: &StructurePlan,
-    subtree_root: RegionId,
-    protocol: LuaCaseLoopProtocol,
-) -> bool {
-    plan.loops().any(|(loop_id, _)| {
-        loop_protocol_matches(plan.loop_protocol(loop_id), protocol)
-            && plan
-                .loop_region(loop_id)
-                .is_some_and(|region| region_is_in_subtree(plan, subtree_root, region))
-    })
-}
-
-pub(super) fn region_is_in_subtree(
-    plan: &StructurePlan,
-    subtree_root: RegionId,
-    mut region: RegionId,
-) -> bool {
-    for _ in 0..plan.regions().len() {
-        if region == subtree_root {
-            return true;
-        }
-        let Some(parent) = plan.region(region).and_then(RegionPlan::parent) else {
-            return false;
-        };
-        region = parent;
-    }
-    false
-}
-
-pub(super) fn loop_protocol_matches(
-    actual: Option<&LoopVmProtocol>,
-    expected: LuaCaseLoopProtocol,
-) -> bool {
-    matches!(
-        (actual, expected),
-        (
-            Some(LoopVmProtocol::NumericFor(_)),
-            LuaCaseLoopProtocol::NumericFor
-        ) | (
-            Some(LoopVmProtocol::GenericFor(_)),
-            LuaCaseLoopProtocol::GenericFor
-        )
-    )
-}
-
-pub(super) fn loop_protocol_label(protocol: LuaCaseLoopProtocol) -> &'static str {
-    match protocol {
-        LuaCaseLoopProtocol::NumericFor => "NumericFor",
-        LuaCaseLoopProtocol::GenericFor => "GenericFor",
-    }
-}
-
-pub(super) fn source_structure_contract_failure(
-    entry: &LuaCaseManifestEntry,
-    reason: impl Into<String>,
-) -> TestFailure {
-    let dialect = <&'static str>::from(entry.dialect);
-    let reason = reason.into();
-    TestFailure::new(
-        FailureKind::StructureContractAssertionFailed,
-        "StructurePlan source contract failed",
-        format!(
-            "StructurePlan source contract failed: case={}, dialect={dialect}: {reason}",
-            entry.path
-        ),
-    )
 }
 
 pub(super) fn readability_assertion_failure(

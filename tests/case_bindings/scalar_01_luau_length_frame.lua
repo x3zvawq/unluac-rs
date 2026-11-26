@@ -1,6 +1,4 @@
 -- 长度及其数值计算不能制造保活根，阻塞同槽字段读取与后继调用帧。
--- unluac: expect-ast-max [[local-binding]] [[8]] [[@variant=O2]] [[@debug=stripped]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local base, calls = getfenv(), 0
 -- unluac-runtime: setfenv(run, setmetatable({print = function(value)

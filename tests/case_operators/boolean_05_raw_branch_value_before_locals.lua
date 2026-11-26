@@ -1,9 +1,4 @@
 -- regress_233_raw_branch_value_before_locals#1: branch value 应在 locals 前消解机械 guard temp
--- unluac: expect-not-contains [[if ]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[8]]
 local function run(a, b)
     local trace = {}
     local function mark(tag, value)

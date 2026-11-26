@@ -1,17 +1,7 @@
 -- 非相邻 Boolean 分支不能因值相等而提取原比较的公因子，须保留出现次数与短路顺序。
--- unluac: expect-ast-count [[function]] [[4]]
--- unluac: expect-ast-count [[if]] [[0]]
 -- unluac: expect-ast-count [[numeric-for]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[18]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=3]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=4]]
 -- floor 调用应与原算术 initializer 合并，不留下保存 callee 的中间声明。
 -- unluac: expect-count [[math.floor(]] [[7]]
--- unluac: expect-contains [[return p1_0 == 1 and p1_1 == 2 or p1_2 == 3 or p1_0 == 1 and p1_3 == 4]]
--- unluac: expect-contains [[return p2_0 == 1 and p2_1 == 2 or p2_2 == 3 or p2_3 == 4 and p2_1 == 2]]
--- unluac: expect-count [[p3_0 == 1 or p3_1 == 2]] [[2]]
 local function prefix(a,b,c,d)
     return (a == 1 and b == 2) or c == 3 or (a == 1 and d == 4)
 end

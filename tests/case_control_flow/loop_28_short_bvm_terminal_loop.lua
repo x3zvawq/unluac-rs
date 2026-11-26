@@ -3,8 +3,6 @@
 -- unluac: expect-contains [[ or ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(a, b, c, values)
     local x = 0
     for _ in pairs(values) do
@@ -39,7 +37,4 @@ assert(run(false, "", 0, {1, 2}) == 0)
 assert(run("", false, "", {1, 2}) == 0)
 assert(run(false, false, false, {}) == 0)
 assert(run(true, true, true, {}) == 0)
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]

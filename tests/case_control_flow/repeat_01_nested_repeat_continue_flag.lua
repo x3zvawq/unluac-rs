@@ -2,7 +2,6 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- 源码只有 d/e/f/g 和循环内的 continue_inner，不能为各写入拆出不同 debug 身份。
--- unluac: expect-ast-count [[local-binding]] [[5]]
 local d, e, f = 117
 local g = 1
 

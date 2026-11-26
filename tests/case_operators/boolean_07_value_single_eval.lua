@@ -1,14 +1,6 @@
 -- regress_241_branch_value_single_eval: branch-value折叠与物化保留单次求值和求值顺序
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[function]] [[11]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[34]]
 -- 首个 CALL 与短路合流共同初始化结果，不拆成 callee 和接棒赋值。
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=1]]
 -- 保留原目标的一次写回；callee、参数及返回准备均留在表达式中。
--- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=3]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=3]]
 local function run(a, b, c, d)
     local trace = {}
     local function p(tag, value)

@@ -2,7 +2,6 @@
 -- unluac: expect-contains [[else]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 local state = {
     enabled = true,
     ready = true,

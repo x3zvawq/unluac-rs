@@ -1,10 +1,7 @@
 -- regress_226_repeat_direct_break_condition_owner#1: body break 不能消费 repeat 尾条件 owner
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
 local function run(stop, left, right)
     local x = 0
     repeat

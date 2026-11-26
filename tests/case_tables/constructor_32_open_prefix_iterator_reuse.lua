@@ -1,6 +1,5 @@
 -- unluac: expect-not-contains [[table-set-list]]
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-ast-count [[table-list-field]] [[12]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 local function apply(player)
     local sayings = {

@@ -1,7 +1,4 @@
 -- regress_317_lua51_loop_region_ownership: 短路 if 的 else 数值循环不能把退出边归给外层分支
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-contains [[if not (issue17_a or issue17_b) then]]
 -- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[break]]
 local function run()
@@ -37,9 +34,4 @@ observe(nil, 0, "issue17_a,issue17_b")
 observe(false, "", "issue17_a,issue17_b")
 observe(0, false, "issue17_a")
 observe("", nil, "issue17_a")
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]

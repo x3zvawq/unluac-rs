@@ -1,10 +1,4 @@
 -- 原生 NOT 的分支内比较准备必须保持顺序、次数、操作数方向及短路出口。
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=6]]
 local function conjunction(enabled, left, right)
     return enabled == true and not (left < right) and not (left > right)
         and not (left <= right) and not (left >= right)

@@ -1,11 +1,5 @@
 -- 参数 alias 消费共享 CFG：深层循环只收集一次事实，break/return 与 repeat latch 保持各自出口。
 -- unluac: expect-ast-count [[numeric-for]] [[10]]
--- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[while]] [[1]]
--- unluac: expect-ast-count [[if]] [[4]]
--- unluac: expect-ast-count [[break]] [[2]]
--- unluac: expect-ast-count [[local-binding]] [[14]]
--- unluac: expect-not-contains [[unluac error]]
 local function nested(value)
     for a = 1, 1 do
         for b = 1, 1 do

@@ -1,8 +1,4 @@
 -- 短路参数与前一次调用复用匿名结果槽；callee 查找先于条件路径，结果固定为一值。
--- unluac: expect-ast-count [[local-binding]] [[3]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-count [[function]] [[5]]
 local sink = setmetatable({}, {__index = function(_, key)
     print("lookup", key)
     return function(...)

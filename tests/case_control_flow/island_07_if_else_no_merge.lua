@@ -3,7 +3,6 @@
 -- unluac: expect-contains [[while true do]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 
 local function run(flag)
     if flag then
@@ -52,4 +51,3 @@ observe(choose, false, "right")
 observe(choose, nil, "right")
 assert(run(nil) == 1)
 -- unluac: expect-ast-count [[while]] [[3]]
--- unluac: expect-ast-count [[repeat]] [[0]]

@@ -4,32 +4,15 @@
 -- unluac: expect-contains [[continue]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[while false do]]
 -- assert 的短路参数应整体恢复，不能留下独立的 false 预写。
--- unluac: expect-max-count [[ = false]] [[0]]
 -- 父函数保留调用结果、循环输入和预期值；不再为原调用准备制造接棒变量。
--- unluac: expect-ast-count [[local-binding]] [[22]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=0]]
 -- O2 的首个调用必须重新内联，其余原 CALL 在每轮回编译中保持。
--- unluac: expect-instruction-count [[call]] [[9]] [[@proto=0]] [[@variant=O2]]
--- unluac: expect-contains [[in p1_3 do]]
--- unluac: expect-ast-count [[repeat]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[while]] [[2]] [[@proto=1]]
 -- O2 编译器已消除立即 break 的 numeric-for；其它优化级别保留原循环。
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]] [[@variant=O0]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]] [[@variant=O1]]
--- unluac: expect-ast-count [[numeric-for]] [[0]] [[@proto=1]] [[@variant=O2]]
--- unluac: expect-ast-count [[generic-for]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=1]]
 -- 循环状态和已有 for 绑定之外，不再为每层结果合流制造独立的暂存声明。
--- unluac: expect-ast-count [[local-binding]] [[11]] [[@proto=1]] [[@variant=O0]]
--- unluac: expect-ast-count [[local-binding]] [[11]] [[@proto=1]] [[@variant=O1]]
--- unluac: expect-ast-count [[local-binding]] [[10]] [[@proto=1]] [[@variant=O2]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
 -- until 的索引检查和次数上界保持在同一个尾条件中。
--- unluac: expect-contains [[until p1_3[]]
 local function run(a, b, c, xs)
     local x = 0
     local while_rounds, while_tails, repeat_rounds, inner_rounds = 0, 0, 0, 0

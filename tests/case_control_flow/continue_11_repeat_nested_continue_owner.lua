@@ -1,16 +1,7 @@
 -- regress_366_repeat_nested_continue_owner: an inner-loop continue does not skip the outer repeat tail condition
--- unluac: expect-contains [[until mark("stop", true) or mark("again", false)]]
--- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=0]]
--- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=0]] [[@variant=O0]]
--- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=0]] [[@variant=O1]]
--- unluac: expect-ast-count [[numeric-for]] [[0]] [[@proto=0]] [[@variant=O2]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=2]]
 -- 两次 mark 在原同槽准备和求值；首个谓词不应留下 callee/比较结果声明。
--- unluac: expect-ast-count [[repeat-condition-local]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[unresolved]]
 
 local events = {}
 

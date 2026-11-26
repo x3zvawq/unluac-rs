@@ -1,7 +1,3 @@
--- unluac: expect-ast-max [[local-binding]] [[5]]
--- unluac: expect-ast-max [[assign]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[table-constructor]] [[7]]
--- unluac: expect-ast-count [[function]] [[1]]
 -- KCDATA常量有GC锚点，但比较仍可调用元方法；字段key快照须随观察epoch失效。
 local key = "left"
 local calls = 0

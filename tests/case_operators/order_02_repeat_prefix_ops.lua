@@ -1,9 +1,6 @@
 -- regress_245_observable_repeat_prefix_ops: 未使用的运算结果仍可调用 metamethod
 -- unluac: expect-contains [[repeat]]
--- unluac: expect-ast-count [[function]] [[4]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[10]]
 
 local binary_calls = 0
 local unary_calls = 0

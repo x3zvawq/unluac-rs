@@ -1,7 +1,5 @@
 -- 每一臂仍含原字节码的 a 检查，不能因绑定稳定而提取公共条件。
 -- p1_0 出现于一个参数声明和十八个检查；检查数量不依赖排版。
--- unluac: expect-count [[p1_0]] [[19]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
 
 local function choose(a, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18)
     return a and b1

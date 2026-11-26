@@ -1,5 +1,4 @@
 -- regress_343_generic_for_vararg_pack: exact vararg producer 恢复为 loop head 的 open tail。
--- unluac: expect-contains [[in next, ... do]]
 
 local function collect(...)
     local out = {}

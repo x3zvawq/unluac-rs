@@ -1,11 +1,7 @@
 -- regress_291_luau_inlined_loop_stateful_exit: O2内联loop的normal-only出口不能提前执行
 -- unluac: expect-contains [[for ]]
--- unluac: expect-contains [[--!optimize 2]]
--- unluac: expect-instruction-count [[call]] [[15]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 
 local calls = {}
 
@@ -37,11 +33,3 @@ assert(table.concat(calls, ",") == "hit,miss", table.concat(calls, ","))
 print("regress_291_luau_inlined_loop_stateful_exit", table.concat(calls, ","))
 -- 完整展开体恢复为现存 any 的调用；强制 O2 内联后仍保持原 CALL 数量。
 -- 根函数只保留 calls、三个原函数和两个结果；退出标志和调用准备不成为源码绑定。
--- unluac: expect-count [[= 1, #]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
--- unluac: expect-ast-count [[numeric-for]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[break]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]]

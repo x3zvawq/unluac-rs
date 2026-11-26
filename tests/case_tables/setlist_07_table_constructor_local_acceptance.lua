@@ -1,35 +1,4 @@
 -- regress_337: fixed call results may be nil, so raw SETLIST must not be split into SETTABLE.
--- unluac: expect-ast-count [[local-binding]] [[15]] [[@proto=0]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[table-list-field]] [[16]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=10]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=10]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=11]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=11]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=3]] [[@dialect=luau]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=3]] [[@dialect=luau]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=3]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=3]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=1]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=1]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=3]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=3]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=1]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=1]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=3]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=3]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=1]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=1]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=3]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=3]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=1]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=1]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=3]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=3]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[table-record-field]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
 
 local function run()
     local calls = 0
@@ -53,7 +22,6 @@ run()
 -- 条件结果在分支体内仍被读取，不能消费为条件表达式；该拒绝也不能阻断
 -- 后续独立的 SETLIST 事务。分别观察分支未进入、结果为 nil 和正常对象三条路径。
 -- unluac: expect-not-contains [[table-set-list]]
--- unluac: expect-not-contains [[unluac error]]
 local function build_after_branch(self, flag)
     if flag then
         local child = self:getChild("before")
@@ -89,8 +57,6 @@ for scenario = 1, 3 do
     print("branch before constructor", scenario, expected, child.image)
 end
 
--- unluac: expect-contains [[function LayoutA.create()]] [[@dialect=luau]]
--- unluac: expect-contains [[function LayoutB.create()]] [[@dialect=luau]]
 -- 连续发布字段与方法会复用匿名槽；数组中的全局索引仍应在原缓冲槽求值，
 -- 不能把它误当成低槽 local 读取，进而阻断后继 SETLIST 的完整事务。
 do

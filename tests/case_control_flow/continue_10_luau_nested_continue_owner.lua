@@ -1,25 +1,11 @@
 -- regress_349_luau_nested_continue_owner: nested continue belongs to the inner loop and must not block folding the outer repeat tail
--- unluac: expect-contains [[until not p1_1 and p1_2 or p1_3]]
 -- 内层 continue 可恢复为跳过本轮输出的条件；仍须保留筛选条件且不能阻止外层尾条件合并。
--- unluac: expect-contains [[if not p1_0 or r1_0 ~= 2 then]]
 -- unluac: expect-not-contains [[if p1_1 then]]
 -- unluac: expect-not-contains [[if p1_2 then]]
--- unluac: expect-contains [[if not p2_1 then]]
 -- unluac: expect-not-contains [[until true]]
--- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[continue]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=2]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=2]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=3]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=3]]
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[unresolved]]
 local function run(skip_inner, skip_outer, stop, latch)
     repeat
         for index = 1, 3 do

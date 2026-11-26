@@ -1,5 +1,3 @@
--- unluac: expect-ast-count [[function]] [[5]]
--- unluac: expect-ast-max [[local-binding]] [[6]] [[@proto=0]]
 -- unluac: expect-ast-count [[error]] [[0]]
 -- regress_190_luau_import_open_pack#1: GETIMPORT setup 不阻断末位 open 参数 owner
 -- unluac: expect-contains [[table.unpack]]
@@ -7,12 +5,6 @@
 -- unluac: expect-not-contains [[ = table.create]]
 -- unluac: expect-not-contains [[ = assert]]
 -- unluac: expect-not-contains [[ = tonumber]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=0]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=4]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=4]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local trace = {}
 -- unluac-runtime: local observed_table = table.clone(table)

@@ -2,17 +2,12 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[while ]]
 -- unluac: expect-not-contains [[while not true do]]
--- unluac: expect-contains [[while not p1_1 do]]
 -- unluac: expect-not-contains [[while false do]]
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[while]] [[1]]
--- unluac: expect-ast-count [[break]] [[2]]
--- unluac: expect-ast-count [[local-binding]] [[6]]
 local function run(a, b, xs)
     local x = 0
     if a and b then

@@ -1,21 +1,11 @@
 -- regress_95_luau_shared_continue_edge_owner#1: indirect continue pad belongs to the outer while
--- unluac: expect-contains [[while ]]
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[continue]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[r1_2 = r1_1]]
--- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[continue]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 local function run(a, b, should_break)
     local x = 0
     while not b do

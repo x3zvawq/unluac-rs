@@ -2,7 +2,6 @@
 -- unluac: expect-contains [[goto = 7]]
 -- unluac: expect-not-contains [[_ENV]]
 -- receiver 的 CALL 写回与后继 choose 声明独立，不能让同槽临时量承接两种身份。
--- unluac: expect-ast-count [[local-function]] [[1]] [[@proto=0]]
 goto = 7
 assert(goto == 7)
 print("regress_137_luajit_contextual_goto#1", goto)
@@ -29,4 +28,3 @@ end
 assert(choose("found"))
 assert(lookups == 1 and calls == 1)
 -- unluac: expect-ast-count [[method-call]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]

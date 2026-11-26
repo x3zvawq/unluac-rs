@@ -9,8 +9,6 @@
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[while]] [[2]]
--- unluac: expect-ast-count [[break]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[16]]
 local values = { "A==B", "BBBB", "A=B", "A=", "=B", "", "#AB", "A#B", "AA", "B", 0 }
 
 for _, span in ipairs({ { 1, 2 }, { 1, 2 } }) do

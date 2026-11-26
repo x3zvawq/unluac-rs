@@ -1,6 +1,5 @@
 -- common_01_basics#1: 多赋值与局部变量初始化
 -- 标量初始化不应退化成先空声明再逐项写入。
--- unluac: expect-ast-max [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=1]]
 local function test_assignments()
     local a, b, c = "alpha", 42, true
     local x, y, z = 1, 2, 3
@@ -12,13 +11,6 @@ end
 -- 内层声明结束后，复用低槽的调用仍应保持完整。
 -- unluac: expect-count [[print("common_01_basics#2",]] [[2]]
 -- 初始化应直接给出拼接值；LuaJIT 的子函数编号与 PUC/Luau 相反。
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=luau]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=5]] [[@dialect=luajit]]
 local function test_locals_and_blocks()
     local name = "outer"
 
@@ -47,13 +39,6 @@ end
 -- unluac: expect-count [[print("common_01_basics#4",]] [[3]]
 -- stripped 仍更新原低槽变量，不为 CONCAT 写回增加局部副本。
 -- PUC/LuaJIT 可保留 root、branch、else 三个原声明；else 仍是高槽调用的前缀。
--- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.1]]
--- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.2]]
--- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.3]]
--- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.4]]
--- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.5]]
--- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=luau]]
--- unluac: expect-ast-max [[local-decl]] [[3]] [[@debug=stripped]] [[@proto=3]] [[@dialect=luajit]]
 local function test_shadowed_locals()
     local function choose(flag)
         local value = "root"

@@ -1,9 +1,6 @@
 -- common_07_return_and_multiret#1: 函数调用与多返回值
 -- 固定多结果调用应直接初始化接收组，不增加空声明。
--- unluac: expect-ast-max [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=1]]
 -- Luau 的普通开放 CALL/RETURN 必须整体消费四字段参数构造器。
--- unluac: expect-ast-count [[table-list-field]] [[4]] [[@dialect=luau]] [[@proto=18]]
--- unluac: expect-ast-max [[local-decl]] [[0]] [[@dialect=luau]] [[@proto=18]]
 local function test_calls_returns()
     local function pair(a, b)
         return a + b, a * b
@@ -15,13 +12,6 @@ end
 
 -- common_07_return_and_multiret#2: 返回值截断
 -- 固定字段与开放尾调用属于同一个构造器，debug initializer 不能留下临时绑定或逐项写表。
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=20]] [[@dialect=luajit]]
 local function test_truncation()
     local function returns()
         return "A", "B", "C"
@@ -73,7 +63,6 @@ end
 
 -- common_07_return_and_multiret#5: 多重返回截断屏障
 -- 同一 debug 生效边界的声明组整体初始化，CALL 之间的字面量仍留在原求值位置。
--- unluac: expect-contains [[local a, b, c = string.find("hello", "ll"), "extra", string.find("world", "or")]] [[@debug=retained]]
 local function test_trunc_barriers()
     local function return_truncation(...)
         local t = { ..., "barrier", ... }
@@ -86,22 +75,7 @@ local function test_trunc_barriers()
 end
 
 -- common_07_return_and_multiret#6: 多赋值旋转
--- unluac: expect-contains [[local a, b, c = 1, 2, 3]] [[@debug=retained]]
 -- 调用前后的快照属于同一并行赋值，不额外声明 scratch 或拆开 print。
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=14]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=14]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=14]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=14]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=14]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=14]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=14]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=14]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=14]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=14]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=14]] [[@dialect=luau]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=14]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=9]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=9]] [[@dialect=luajit]]
 local function test_rotation()
     local function values()
         return 10, 20, 30

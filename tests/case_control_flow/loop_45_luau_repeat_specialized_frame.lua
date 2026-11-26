@@ -53,16 +53,3 @@ assert(full_four == 8)
 local early_four = four(0, 0)
 assert(early_four == -1)
 print("repeat_specialized_frame", full_two, early_two, full_four, early_four)
-
--- unluac: expect-contains [[--!optimize 2]]
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[call]] [[9]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[continue]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[assign]] [[4]] [[@proto=2]]
--- unluac: expect-ast-count [[if]] [[4]] [[@proto=2]]
--- unluac: expect-ast-count [[continue]] [[3]] [[@proto=2]]

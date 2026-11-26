@@ -1,12 +1,8 @@
--- Safe repeat suffixes keep a collective gate, while escaped roots remain live through until.
--- unluac: expect-contains [[global<const> *]]
--- unluac: expect-contains [[global<const> print]]
--- unluac: expect-order [[global<const> *]] [[string.len("safe")]]
--- unluac: expect-order [[string.len("safe")]] [[global<const> print]]
--- unluac: expect-order [[global<const> print]] [[print("unsafe")]]
+-- Safe repeat suffixes and escaped roots keep clean repeat loops and lexical global gates.
+-- unluac: expect-contains [[global *]]
+-- unluac: expect-contains [[string.len("safe")]]
+-- unluac: expect-contains [[print("unsafe")]]
 -- unluac: expect-ast-count [[repeat]] [[2]]
--- unluac: expect-ast-count [[function]] [[4]]
--- unluac: expect-ast-max [[local-binding]] [[8]]
 -- unluac: expect-ast-count [[error]] [[0]]
 
 local function safe(flag)

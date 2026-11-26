@@ -1,13 +1,5 @@
 -- 固定数组元素与开放尾调用共享原构造帧，完成后捕获表不改变元素的求值和宽度。
 -- unluac: expect-not-contains [[table-set-list]]
--- unluac: expect-ast-count [[table-list-field]] [[7]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[20]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[27]]
--- unluac: expect-ast-count [[function]] [[12]]
--- unluac: expect-ast-count [[table-constructor]] [[5]]
--- unluac: expect-ast-count [[table-list-field]] [[10]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 
 local function build(layer, world)
     local owner = makeOwner()

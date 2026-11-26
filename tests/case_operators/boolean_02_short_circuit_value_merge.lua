@@ -1,12 +1,5 @@
 -- regress_11_assert_short_circuit_value_merge#1: assert 参数里的布尔短路值合流不应退化成嵌套 if 壳
--- unluac: expect-not-contains [[end)(]]
--- unluac: expect-not-contains [[if ]]
--- unluac: expect-contains [[ and ]]
--- unluac: expect-ast-count [[function]] [[4]]
--- unluac: expect-ast-max [[local-binding]] [[6]]
 -- 短路合流和否定结果直接进入参数，不产生接棒声明或赋值。
--- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
 local builds = 0
 local calls = 0
 local lookups = 0

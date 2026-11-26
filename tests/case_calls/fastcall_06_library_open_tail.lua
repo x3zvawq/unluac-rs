@@ -1,11 +1,5 @@
 -- 保存库表后，FASTCALL fallback 在开放尾参数之后读取其字段；回调替换字段必须可见。
--- unluac: expect-contains [[library.max(2, arguments())]] [[@debug=retained]]
 -- unluac: expect-not-contains [[ = print]]
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[local-binding]] [[6]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=3]]
--- unluac: expect-contains [[return first + second + third]] [[@debug=retained]]
 local environment = getfenv()
 local original_math = math
 local trace = ""

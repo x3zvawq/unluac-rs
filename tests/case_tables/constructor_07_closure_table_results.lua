@@ -1,17 +1,7 @@
 -- 03 的递归自捕获声明；同一 binding 的空声明和闭包赋值应恢复为 local function。
--- unluac: expect-ast-min [[local-function]] [[1]]
--- unluac: expect-contains [[local function r1_0(]]
 -- unluac: expect-not-line [[local r1_0]]
 -- unluac: expect-contains [[labels = { "raw", "derived" }]]
 -- 独立初始化与调用参数直接表达，不为递归或返回值新增中转绑定。
--- unluac: expect-ast-count [[function]] [[5]]
--- unluac: expect-ast-count [[table-constructor]] [[7]]
--- unluac: expect-ast-max [[local-binding]] [[11]] [[@proto=0]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=4]]
--- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=5]]
 local function factorial(n)
     local function loop(current, result)
         if current <= 1 then

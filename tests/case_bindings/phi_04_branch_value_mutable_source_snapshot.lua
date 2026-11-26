@@ -1,7 +1,5 @@
 -- regress_267_branch_value_mutable_source_snapshot: branch value必须读取臂内改写后的loop local
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-max [[local-binding]] [[11]]
 -- unluac: expect-not-contains [[= ipairs]]
 local function run(flag)
     local total = 0

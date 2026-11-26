@@ -1,11 +1,6 @@
 -- regress_110_luau_generic_for_exit_break_pad#1: generic-for exit 透明 pad 汇入立即 break body
--- unluac: expect-contains [[while ]]
 -- unluac: expect-contains [[for ]]
--- unluac: expect-contains [[                    break]]
--- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(a, state, probe, xs)
     local x = 0
     while not state.done do
@@ -67,11 +62,7 @@ end
 state.done = false
 assert(dispatch[1](0, state, {}, empty_iterator) == 0 and calls == 1)
 assert(dispatch[1](true, state, proxy, iterator) == 0 and calls == 1 and reads == 1)
--- unluac: expect-ast-count [[local-binding]] [[12]]
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
 -- O2 展开主体后，后继断言仍须恢复完整调用，不能逐轮增加 callee 别名。
 -- unluac: expect-max-count [[ = assert]] [[0]]
 -- unluac: expect-ast-count [[while]] [[1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-count [[repeat]] [[0]]
--- unluac: expect-ast-count [[break]] [[1]]

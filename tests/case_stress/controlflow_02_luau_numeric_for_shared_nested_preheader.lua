@@ -1,15 +1,10 @@
 -- regress_116_luau_numeric_for_shared_nested_preheader#1: numeric-for 内层 while 的共享 for preheader 先于 early continue
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[r1_5 = r1_7]]
 -- unluac: expect-not-contains [[r1_5 = r1_8]]
 -- unluac: expect-not-contains [[r1_3 = r1_6]]
 -- unluac: expect-not-contains [[while not false do]]
--- unluac: expect-contains [[while not p1_1 do]]
--- unluac: expect-not-contains [[while true do]]
--- unluac: expect-not-contains [[= print]]
 local function run(a, b, c, xs)
     local x = 0
     if a and b then

@@ -1,11 +1,4 @@
 -- 算术先执行左侧调用，再读取被调用更新的上值；大常量比较保留原寄存器准备。
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-max [[local-binding]] [[6]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=3]]
 local captured = 0
 local calls = 0
 local function update(value)

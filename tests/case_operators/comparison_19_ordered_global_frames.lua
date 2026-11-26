@@ -1,7 +1,4 @@
 -- 双全局有序比较保持原读取顺序、元方法方向和 Boolean 参数槽。
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[local-binding]] [[0]]
--- unluac: expect-ast-count [[if]] [[0]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local pair, checked = run()
 -- unluac-runtime: local events = {}

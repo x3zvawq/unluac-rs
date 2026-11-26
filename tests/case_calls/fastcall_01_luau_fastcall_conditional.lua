@@ -1,9 +1,5 @@
 -- regress_358_luau_fastcall_conditional: FASTCALL 参数内部的短路 RHS 仍是条件执行区域
--- unluac: expect-contains [[local r0_3 = r0_1()]]
--- unluac: expect-contains [[type(condition and r0_2(r0_3))]]
 -- unluac: expect-not-contains [[type(condition and r0_2(r0_1()))]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-contains [[selected = type(condition and r0_2(r0_3))]]
 -- unluac: expect-not-contains [[ = assert]]
 -- unluac: expect-not-contains [[ = print]]
 

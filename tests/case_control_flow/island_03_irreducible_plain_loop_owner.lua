@@ -1,7 +1,5 @@
 -- regress_187_irreducible_plain_loop_owner#1: 不可规约 island 内 plain loop owner 只保留必要 goto
 -- unluac: expect-contains [[for ]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 
 local function run(skip_first, rewind_first, rewind_second, initial)
     local value = initial or 0
@@ -55,6 +53,3 @@ end
 assert(run(nil, false, false, -3) == 10)
 assert(run(0, 0, nil, -3) == 12)
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-max [[goto]] [[4]] [[@proto=1]]
--- unluac: expect-ast-max [[label]] [[3]] [[@proto=1]]

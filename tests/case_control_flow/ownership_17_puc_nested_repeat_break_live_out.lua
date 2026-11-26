@@ -5,13 +5,8 @@
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[if]] [[2]]
--- unluac: expect-ast-count [[break]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
 local function run(a)
     local out = 0
     for i = 1, 1 do

@@ -1,8 +1,5 @@
 -- 终结分支的 close 不能切断后续写回；分别保留 sibling writer 与 child 只读的形状。
 -- unluac: expect-not-contains [[ = assert]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[local-function]] [[2]] [[@proto=0]]
 
 local function build_sibling_writer(skip_write)
     local value

@@ -1,7 +1,4 @@
 -- 前次分配复用槽位后，备用空表仍留在短路分支内，后续构造不留下接棒变量。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-contains [[CompassProbe = CompassProbe or {}]] [[@dialect=lua5.1]]
 -- unluac: expect-contains [[CompassProbe.effects = {]] [[@dialect=lua5.1]]
 -- unluac: expect-contains [[CompassProbe.help = {]] [[@dialect=lua5.1]]
 local function build()

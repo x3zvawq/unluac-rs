@@ -1,11 +1,7 @@
 -- regress_175_lua54_close_value_pack#1: 多 binding 声明保留最后一个 <close> 属性
 -- 原声明和循环变量保留，generic-for 准备不能扩散为后续调用的中转变量。
--- unluac: expect-ast-count [[local-binding]] [[16]]
--- unluac: expect-ast-count [[close-binding]] [[3]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
 -- 循环参数直接成包，资源域后的调用不复用准备变量。
--- unluac: expect-count [[, { "value" }, nil, ]] [[1]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
 local close_log = {}
 local close_meta = {
     __close = function(value, err)

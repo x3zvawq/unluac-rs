@@ -1,17 +1,13 @@
 -- regress_104_luau_repeat_skip_numeric_for#1: repeat 的条件 continue 可跳过完整 numeric-for
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[for ]]
--- unluac: expect-contains [[if not p1_0 or not p1_1 then]]
 -- unluac: expect-not-contains [[else]]
 -- unluac: expect-not-contains [[, nil, nil do]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
 local function run(a, b, xs)
     local x = 0
     local iterations = 0

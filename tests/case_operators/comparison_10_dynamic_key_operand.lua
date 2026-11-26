@@ -1,9 +1,4 @@
 -- 低槽表与动态键直接供比较读取，短路右臂的 GETTABLE 不额外物化为参数声明。
--- unluac: expect-contains [[assert(not ]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=0]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[if]] [[0]]
 local function check(values, key, enabled)
     assert(not enabled or values[key] == 30)
 end

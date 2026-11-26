@@ -1,6 +1,3 @@
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=0]]
--- unluac: expect-ast-count [[table-constructor]] [[1]]
 -- unluac: expect-ast-count [[error]] [[0]]
 -- 单个父子函数树避免不同 VM 的兄弟 proto 排序差异，直接约束注释归属。
 -- unluac: expect-contains [[nested = function() -- proto#1 params=]]

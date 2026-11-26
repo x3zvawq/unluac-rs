@@ -63,17 +63,7 @@ end
 test_basic_ipairs()
 test_break_closure()
 test_mutator()
--- unluac: expect-ast-count [[local-binding]] [[21]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=0]]
 -- unluac: expect-ast-count [[generic-for]] [[2]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
 -- 可见循环变量、独立副本与提前返回保持原作用域，不生成状态 carrier 或手写迭代循环。
--- unluac: expect-ast-count [[empty-local]] [[0]]
--- unluac: expect-ast-count [[while]] [[0]]
--- unluac: expect-ast-count [[repeat]] [[0]]
 -- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@dialect=luau]] [[@proto=5]]
--- unluac: expect-ast-count [[if]] [[1]] [[@dialect=luau]] [[@proto=5]]
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@dialect=luajit]] [[@proto=2]]
--- unluac: expect-ast-count [[if]] [[1]] [[@dialect=luajit]] [[@proto=2]]

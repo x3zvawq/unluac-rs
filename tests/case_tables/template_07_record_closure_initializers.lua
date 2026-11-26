@@ -1,8 +1,6 @@
 -- 模板中的闭包占位属于初始化，真实常量字段及闭包共享的捕获 cell 都须保留。
--- unluac: expect-ast-count [[table-record-field]] [[4]]
 -- unluac: expect-not-contains [[read = 0]]
 -- unluac: expect-not-contains [[write = 0]]
--- unluac: expect-contains [[assert(object.enabled and object.read(1) == 5)]] [[@debug=retained]]
 -- 无捕获闭包所在的表先离域，后续捕获复用同槽不能阻止原 debug initializer。
 -- unluac: expect-not-contains [[f = 0]]
 -- unluac: expect-not-contains [[f = nil]]

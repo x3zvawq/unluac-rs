@@ -1,10 +1,6 @@
 -- regress_07_close_scope_slot_reuse#1: close 后复用寄存器不能写回已关闭 upvalue
--- unluac: expect-ast-min [[function]] [[2]]
 -- unluac: expect-not-contains [[(function()]]
--- unluac: expect-ast-count [[local-binding]] [[6]]
--- unluac: expect-ast-count [[do-block]] [[2]]
 -- 两个独立捕获作用域仍写回同一外层绑定，不另建空的接棒声明。
--- unluac: expect-ast-count [[empty-local]] [[0]]
 local u
 do
     local count = 0

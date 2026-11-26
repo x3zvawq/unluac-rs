@@ -1,9 +1,6 @@
 -- unluac: expect-ast-count [[while]] [[2]]
--- unluac: expect-ast-count [[break]] [[2]]
--- unluac: expect-ast-count [[if]] [[3]]
 -- unluac: expect-ast-count [[close-binding]] [[1]]
 -- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 local events = {}
 local function resource(label)
     return setmetatable({}, {

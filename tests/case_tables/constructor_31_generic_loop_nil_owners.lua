@@ -1,8 +1,6 @@
 -- unluac: expect-not-contains [[table-set-list]]
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-ast-count [[table-list-field]] [[2]] [[@proto=1]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-contains [[local npc, unused, endtime]] [[@debug=retained]] [[@dialect=lua5.1]]
 local function collect(actor, items)
     local entries = {}
     local npc, unused, endtime

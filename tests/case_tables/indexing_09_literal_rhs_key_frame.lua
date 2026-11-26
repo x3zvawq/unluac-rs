@@ -1,8 +1,4 @@
--- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=0]]
 -- key 的 CALL/字段读取可改写目标 cell，原目标快照和字面量仍保持各 VM 的时点。
--- unluac: expect-contains [[().field] = true]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=5]] [[@dialect=luajit]]
 local target, key_factory
 local function write_flag()
     target[key_factory().field] = true

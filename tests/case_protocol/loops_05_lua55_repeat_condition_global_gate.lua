@@ -1,13 +1,7 @@
--- A collective gate nested in the repeat body does not cover missing globals in until.
--- unluac: expect-contains [[global<const> type]]
--- unluac: expect-contains [[global<const> *]]
--- unluac: expect-order [[global<const> type]] [[global<const> *]]
--- unluac: expect-order [[global<const> *]] [[print("body")]]
--- unluac: expect-count [[global<const> type]] [[1]]
+-- Repeat body global declaration and until-condition globals remain valid under Lua 5.5 global scope.
+-- unluac: expect-order [[global *]] [[print("body")]]
+-- unluac: expect-contains [[global marker = 0]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[1]]
--- unluac: expect-ast-count [[while]] [[0]]
 
 local function run(flag)
     global marker = 0

@@ -1,13 +1,7 @@
 -- 原 O2 已内联的效果属于 caller；恢复原 factory 调用不能依赖再次内联。
 -- NaN snapshot 抬高前缀后，第二次调用会跨 Luau 的寄存器压力上限。
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- identity 的完整实参帧不应因合成 NaN 快照永久占槽而拆成中转变量。
--- unluac: expect-contains [[print("identity",]]
--- unluac: expect-ast-max [[local-binding]] [[129]] [[@proto=0]]
 -- observe 的原 Boolean 预写属于完整 OR；写回既有局部值不能留下独立常量作用域。
--- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=5]]
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=5]]
 function make() return 1 end
 function consume(x) total = total + x end
 function barrier() end

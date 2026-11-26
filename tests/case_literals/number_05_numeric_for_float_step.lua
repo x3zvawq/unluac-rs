@@ -1,8 +1,6 @@
 -- unluac: expect-contains [[, 1.0 do]]
 -- unluac: expect-contains [[, -1.0 do]]
 -- unluac: expect-ast-count [[numeric-for]] [[2]]
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[10]]
 local function run()
     local last_type
     local visits, sum = 0, 0

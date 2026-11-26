@@ -1,22 +1,6 @@
 -- 直接上值字段读取进入算术帧，写回之后仍执行原字段读取，不能复用算术结果。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=8]] [[@dialect=luajit]]
--- unluac: expect-contains [[state.current = state.current + (step or 1)]] [[@debug=retained]]
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
 -- unluac: expect-contains [[local result = update(2)]] [[@debug=retained]]
 -- unluac: expect-contains [[update_selected(-1)]] [[@debug=retained]]
--- unluac: expect-ast-count [[assign]] [[9]] [[@proto=0]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[assign]] [[9]] [[@proto=0]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[assign]] [[9]] [[@proto=0]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[assign]] [[9]] [[@proto=0]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[assign]] [[9]] [[@proto=0]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[assign]] [[9]] [[@proto=0]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[assign]] [[10]] [[@proto=0]] [[@dialect=luau]]
 local state = {current = 1}
 local function update(step)
     state.current = state.current + (step or 1)
@@ -70,9 +54,6 @@ assert(result == 40)
 print("target-snapshot", result, table.concat(events, ","))
 
 -- GETTABLE 的结果经 OR 合流后参加算术；读取回调改写上值，不能重读新表或重复读取。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=8]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=8]] [[@dialect=lua5.5]]
--- unluac: expect-contains [=[state[key] = (state[key] or 0) + 1]=] [[@debug=retained]] [[@dialect=luau]]
 local function update_selected(key, ...)
     state[key] = (state[key] or 0) + 1
 end

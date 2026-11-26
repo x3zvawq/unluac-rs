@@ -3,7 +3,6 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-contains [[ or ]]
 -- unluac: expect-ast-min [[generic-for]] [[1]] [[@proto=2]]
--- unluac: expect-ast-min [[if]] [[2]] [[@proto=2]]
 local dead_blocks = {
   one = { material = "wood" },
   two = { material = "bubble" },

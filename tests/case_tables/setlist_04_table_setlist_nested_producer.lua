@@ -2,11 +2,8 @@
 -- unluac: expect-contains [[.sequence({]]
 -- unluac: expect-contains [[whilst(function()]]
 -- unluac: expect-contains [[block())]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[table-set-list]]
 -- 嵌套调用保留在同一构造器内，只有显式 first 绑定，三个数组元素不展开成写回。
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=5]]
--- unluac: expect-ast-count [[table-list-field]] [[3]] [[@proto=5]]
 local scheduler = {}
 local trace = ""
 

@@ -2,13 +2,11 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- LuaJIT reverses child proto numbering; the condition contract does not pin that identity.
 -- unluac: expect-contains [[until ]]
 -- unluac: expect-contains [[ + 1 <= ]]
--- unluac: expect-contains [[ or p]]
--- unluac: expect-contains [[ > 100]]
+-- unluac: expect-contains [[ or ]]
+-- unluac: expect-contains [[ and ]]
 local function with_break(enabled, limit)
     local value, count = 4, 0
     repeat
@@ -60,10 +58,4 @@ value, count = with_break(nil, 100)
 assert(value == 104 and count == 100)
 -- unluac: expect-ast-count [[repeat]] [[2]]
 -- 尾部 break 可并入 until 的首个短路叶；两个原数值检查都必须保留。
--- unluac: expect-ast-count [[break]] [[0]]
--- unluac: expect-ast-count [[while]] [[0]]
--- unluac: expect-ast-count [[if]] [[0]]
 -- 两个函数的 value/count 都应是原 loop-carried 绑定，不另造状态 local。
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=0]]

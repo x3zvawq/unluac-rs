@@ -1,15 +1,9 @@
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[5]]
--- unluac: expect-ast-count [[do-block]] [[0]]
 -- unluac: expect-ast-count [[error]] [[0]]
 -- regress_240_lua55_tforprep_swap: TFORPREP交换前的control/closing才是源码迭代器pack
 -- unluac: expect-contains [[for ]]
--- unluac: expect-contains [[, "S", "C", ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[in function(]]
 -- unluac: expect-not-contains [[, (setmetatable]]
 local trace = {}

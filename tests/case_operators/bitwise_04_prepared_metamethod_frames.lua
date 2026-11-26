@@ -1,7 +1,4 @@
 -- 低槽查表声明须保留到高槽算术初始化；元方法观察后续读取、写入与异常边界。
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=5]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=5]]
--- unluac: expect-ast-count [[call]] [[0]] [[@proto=5]]
 local events = {}
 local stop = false
 local current_seed

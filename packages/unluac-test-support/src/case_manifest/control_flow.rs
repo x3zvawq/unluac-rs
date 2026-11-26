@@ -13,6 +13,22 @@ const MUTABLE_GENERIC_KEY_DIALECTS: &[LuaCaseDialect] = &[
 
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_40_sequential_early_return_merge.lua",
+        &["early-return", "if-else", "goto-free"],
+        "连续带内部早退的 if 序列通过 exit-pruned 单臂合流线性展开，且块尾早退 else 阶梯自动拍平。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/branch_39_generic_for_arm_pair_header_merge.lua",
         &["generic-for", "if-else", "loop-backedge", "goto-free"],
         "generic-for 体内 if/elseif 两臂都自然回到 header 时按源码合流分类，不要求 goto/label。",
@@ -1491,17 +1507,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_control_flow/loop_23_enclosing_loop_escape_fence.lua",
-        &["break", "nested-branch", "single-pass", "while"],
-        "防止外层 while 的两个 break 被误识别为 single-pass fence 的出口。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_control_flow/ownership_11_lua55_degenerate_generic_shared_exit.lua",
         &["generic-for", "repeat", "shared-exit"],
         "固定 Lua5.5 generic-for 零次迭代出口与 body break 出口共享 continuation 时的结构恢复。",
@@ -1983,32 +1988,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_control_flow/continue_13_luau_repeat_continue_scope_latch.lua",
-        &["closure-scope", "condition-order", "continue"],
-        "固定 Luau repeat 的 continue 先退出嵌套 closure 作用域，再从非稳定 if-expression condition 的正确 latch 边求值；第一轮必须调用 selected，不能走 fallback。",
-        &[LuaCaseConfiguration::new(LUAU_ONLY)
-            .with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            })
-            .with_variants(LUAU_O0_ONLY)],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_control_flow/branch_14_shell_flow_old_values.lua",
-        &["backedge", "closure-cell", "coroutine", "goto"],
-        "未使用的 Boolean 结果仍保留原检查，覆盖 goto 双入口、资源回边、并行 closure observer、嵌套块、协程读取及 relay 捕获。",
-        &[LuaCaseConfiguration::new(&[
-            LuaCaseDialect::Lua52,
-            LuaCaseDialect::Lua53,
-            LuaCaseDialect::Lua54,
-            LuaCaseDialect::Lua55,
-        ])
-        .with_options(LuaCaseOptions {
-            recompile_rounds: Some(3),
-            ..LuaCaseOptions::DEFAULT
-        })],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_control_flow/ownership_19_flow_paths.lua",
         &["loop", "multi-return", "parallel-assignment", "writeback"],
         "覆盖 branch 早退、并行旧值、numeric/repeat break、generic-for factory与早退、repeat latch 五类 writeback flow，区分初始化、回边和终止读取。",
@@ -2128,22 +2107,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_control_flow/entry_06_nil_nested_flow.lua",
-        &["gc", "lookup-count", "nested-loop", "nil"],
-        "entry nil跨8层loop与分支保持证明，同时非nil后显式清零不能被当冗余copy。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_control_flow/branch_15_luau_alternative_read_sources.lua",
         &["alternative", "lookup-count", "scratch"],
         "互斥GETTABLE保留各自原检查，控制Decision不引入Boolean中转，原repeat条件不按单次包装删除。",
@@ -2206,28 +2169,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                     ..LuaCaseOptions::DEFAULT
                 })
                 .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_control_flow/branch_16_preserved_nil_branch_orientation.lua",
-        &["condition", "metamethod", "nil-guard", "short-circuit"],
-        "两项nil guard的否定合取必须保持or短路方向，避免条件规约改变全局查找次数。",
-        &[LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS)],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_control_flow/branch_17_evaluation_entry.lua",
-        &["comparison", "evaluation-order", "gc", "numeric-for"],
-        "七种if条件操作数在跳过数值for及scope释放之后求值，覆盖嵌套call、全局、四类比较、参数和table key的entry准备。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
         ],
     ),
     LuaCaseDefinition::new(

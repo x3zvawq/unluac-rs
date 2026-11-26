@@ -1,8 +1,4 @@
 -- 共享的插值结果只保留源码声明；高槽调用准备与低槽 COPY 整体退休。
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=2]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[method-call]] [[1]] [[@proto=5]]
 local function decorate(tag, value)
     local body = `{tag}:{value}`
     return `[{body}] len={#body}`

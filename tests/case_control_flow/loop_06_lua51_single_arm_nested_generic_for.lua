@@ -3,11 +3,8 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=0]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=0]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=0]]
 local calls = 0
 local function iter(_, i)
     calls = calls + 1

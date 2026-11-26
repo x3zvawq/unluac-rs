@@ -1,6 +1,4 @@
 -- regress_278_conditional_captured_writeback: nested条件中的写回不是无条件carried handoff
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(entry, spin, commit)
     local state = 1
     local function get_state()

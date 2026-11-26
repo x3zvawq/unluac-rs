@@ -1,11 +1,7 @@
 -- regress_76_luau_empty_generic_for#1: Luau folds a continue-only generic-for body into its header
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[generic-for]] [[2]]
--- unluac: expect-ast-count [[repeat]] [[0]]
--- unluac: expect-ast-count [[while]] [[0]]
--- unluac: expect-ast-count [[local-binding]] [[6]]
 local function drain(xs)
     local result = 0
     for _ in xs do

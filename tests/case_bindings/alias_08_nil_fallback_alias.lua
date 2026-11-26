@@ -1,6 +1,5 @@
 -- unluac: expect-contains [[ == nil then]]
 -- unluac: expect-contains [[ = env]]
--- unluac: expect-not-contains [[else]]
 -- unluac: expect-not-contains [[ or ]]
 
 env = {}

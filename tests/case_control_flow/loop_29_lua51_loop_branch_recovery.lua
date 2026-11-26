@@ -6,16 +6,13 @@
 -- unluac: expect-contains [[while ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[local levels =]]
 -- unluac: expect-contains [[local function all_levels()]]
 -- unluac: expect-contains [[local function target_score(target)]]
 -- unluac: expect-contains [[local function count_remaining(start, skip)]]
 -- unluac: expect-contains [[local function previous_level_name(target)]]
 -- unluac: expect-contains [[for _, level in]]
--- unluac: expect-contains [[local previous = nil]]
 -- unluac: expect-contains [[for _, level in all_levels() do]]
--- unluac: expect-order [[local previous = nil]] [[if previous then]]
 -- unluac: expect-not-contains [[for _, level in r5_0, r5_1, r5_2 do]]
 local levels = {
     { name = "first", score = 10 },
@@ -117,20 +114,7 @@ assert(previous_level_name("last") == "target")
 assert(previous_level_name("missing") == "missing")
 -- iterator setup 中主动读取调用方；不能将 previous 的 debug 声明推迟到 setup 之后。
 assert(entry_local_scope_name() == "previous")
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=4]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=4]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=5]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=5]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=5]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=7]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=8]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=8]]

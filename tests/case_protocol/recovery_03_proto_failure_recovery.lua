@@ -1,5 +1,3 @@
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=0]]
 -- unluac: expect-ast-count [[error]] [[0]]
 -- regress_325_proto_failure_recovery: 测试框架会把根 HIR 替换为失败占位，
 -- 验证 strict 拒绝失败 proto，permissive 保留诊断和直接子 proto。

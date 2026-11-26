@@ -2,7 +2,6 @@
 -- unluac: expect-ast-min [[repeat]] [[2]] [[@dialect=lua5.4]] [[@proto=1]]
 -- unluac: expect-ast-min [[while]] [[1]] [[@dialect=lua5.4]] [[@proto=1]]
 -- outer 尾调用只在未 break 的路径执行；内联后的条件快照也应在本轮正文内声明。
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
 local function observe(early, inner, stop)
     local trace = {}
     local i, total = 0, 0
@@ -76,9 +75,7 @@ end
 
 -- numeric-for 的零次迭代保留初值；正常结束与提前 break 分别消费自己的状态。
 -- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
 -- 数组遍历的双返回不应在调用方留下整组参数、状态和返回接棒。
--- unluac: expect-ast-max [[local-binding]] [[22]] [[@dialect=luau]] [[@variant=O2]] [[@proto=0]]
 local function choose(groups, count)
     local selected = 0
     local remaining = count

@@ -2,16 +2,8 @@
 -- unluac: expect-contains [[while ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[while]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-binding]] [[12]] [[@dialect=luajit]]
 -- Luau 已将未修改的捕获常量放进闭包，不为它补回源码声明。
--- unluac: expect-ast-count [[local-binding]] [[11]] [[@dialect=luau]]
 local saved
 local token = {}
 

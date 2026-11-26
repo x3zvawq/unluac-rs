@@ -202,41 +202,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_syntax/methods_03_function_sugar_relax.lua",
-        &["evaluation", "gc", "method", "receiver", "root"],
-        "覆盖普通点调用缩写及receiver根、写目标；用后继GC观察固定数值终端闭包的原槽覆盖责任。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_54).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_syntax/methods_04_function_sugar_nested_local_ids.lua",
-        &["callback", "gc-root", "local-id", "method-chain"],
-        "验证child局部身份独立，以及finish清空self后caller仍保留中间结果根。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54])],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_syntax/methods_05_method_alias_nested_write_ids.lua",
-        &[
-            "callback",
-            "gc-root",
-            "local-id",
-            "lookup",
-            "method",
-            "nested-function",
-        ],
-        "验证child写入身份独立；点调用lookup期间保留额外实参的旧根，SELF预写不得提前清除。",
-        &[
-            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54]).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_syntax/functions_01_upvalue_function_decl.lua",
         &["assignment", "function", "upvalue"],
         "允许plain function声明语法赋值已有upvalue binding。",

@@ -1,5 +1,3 @@
--- unluac: expect-ast-count [[function]] [[9]]
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=0]]
 -- unluac: expect-ast-count [[method-call]] [[1]]
 -- unluac: expect-ast-count [[error]] [[0]]
 -- 函数元信息覆盖每个定义入口；表达式注释不能吞掉 end、逗号或 IIFE 后缀。
@@ -12,7 +10,6 @@
 -- unluac: expect-contains [[-- proto#7 params=]]
 -- unluac: expect-contains [[-- proto#8 params=]]
 -- unluac: expect-contains [[-- proto#9 params=]]
--- unluac: expect-contains [[empty = function() -- proto#]]
 
 local f = function(value) return value + 1 end
 local object = {

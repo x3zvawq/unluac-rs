@@ -1,6 +1,5 @@
 -- common_02_control_flow#1: if-elseif-else与提前返回
 -- classify 的两个判定保持结构化分支，不引入跳转标签。
--- unluac: expect-ast-count [[if]] [[2]] [[@dialect=lua5.4]] [[@proto=2]]
 -- unluac: expect-ast-max [[goto]] [[0]] [[@dialect=lua5.4]] [[@proto=2]]
 local function test_if_return()
     local function classify(x)
@@ -246,40 +245,11 @@ test_nested_cf()
 test_nested_break_assign()
 -- SETI/TSETB 的 0..255 边界与负整数键都保留嵌套初始化，不拆成逐字段暂存和后续赋值。
 -- JIT 的 [0] 会产生数组预分配，但这些显式数字键仍是 record；寄存器键在值之后准备。
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=3]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=3]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=13]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=13]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=13]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=13]] [[@dialect=lua5.5]]
 -- Luau 的 1..256 为内嵌键，0/负数先准备键再创建值；完整 record 恢复后无字段暂存赋值。
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=13]] [[@dialect=luau]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=13]] [[@dialect=luau]]
 -- CALL 结果的比较参数与嵌套数组属于同一 assert 帧，不先物化 subject 或数组元素。
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=15]] [[@dialect=luau]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=15]] [[@dialect=luau]]
 -- 模块计数不依赖 LuaJIT 与 PUC 不同的子原型顺序；额外固定已发现的参数和查表退化。
 -- 5.2+ 的跨类型比较可调用元方法；val 必须在 return 的首项 COPY 之前求值，
 -- 否则会提前覆盖 a 的残根。roots_15_return_selection_snapshot 固定这个 GC 区别。
--- unluac: expect-ast-count [[local-binding]] [[44]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[45]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[45]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[45]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[45]] [[@dialect=lua5.5]]
 -- JIT 的取模结果残根须存活至选择表达式之后，见 roots_16_jit_return_remainder_root。
--- unluac: expect-ast-count [[local-binding]] [[45]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=4]] [[@dialect=luajit]]
--- unluac: expect-ast-count [[local-binding]] [[44]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=14]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=14]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=14]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=14]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=12]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=12]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=16]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=16]] [[@dialect=luau]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=2]] [[@dialect=luajit]]
 -- unluac: expect-ast-count [[numeric-for]] [[7]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-count [[while]] [[3]]

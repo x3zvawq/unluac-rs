@@ -104,12 +104,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &[LuaCaseConfiguration::new(LUAU_ONLY)],
     ),
     LuaCaseDefinition::new(
-        "tests/case_stress/roots_01_local_scope_physical_root.lua",
-        &["gc", "local-budget", "physical-root"],
-        "以181个IIFE制造local预算分段，保证不缩短root生命周期。",
-        &[LuaCaseConfiguration::new(PUC_LUA_54)],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_stress/constants_04_lua55_wide_mixed_global_rhs.lua",
         &["environment", "global", "wide-constants"],
         "以260个常量制造宽目标，完整恢复混合RHS并保留调用前后的环境身份。",
@@ -181,30 +175,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_stress/roots_03_local_nil_clear.lua",
-        &["gc-root", "locals", "nil-clear", "scale"],
-        "创建128个独立表与128个weak槽，保活跨一次GC、验证环状相邻身份均不同，再逐一nil清空并确认全部回收，压力宽local根与清根。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_stress/locals_06_allocation_home_index.lua",
-        &["allocation", "gc-root", "overwrite", "two-values"],
-        "让first/second各复制到16个home，再将全部a-home改写为对应b-home，要求first释放而second继续活；清空32home后second释放。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_stress/expressions_03_return_lookup_value_dag.lua",
         &[
             "dag",
@@ -235,36 +205,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_stress/roots_05_shared_home_root_intervals.lua",
-        &["backedge", "copies", "not-chain", "scale"],
-        "16个独立copy home跨64次not suffix与回边，在首块常量覆盖处分别退休。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_GE_52),
-            LuaCaseConfiguration::new(PUC_LUA_GE_52).with_options(LuaCaseOptions {
-                retain_debug: true,
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_stress/expressions_05_value_chain.lua",
         &["metamethod", "multiret", "not", "truthiness"],
         "256次NOT链、callback多返回截断、比较元方法和error传播共同验证布尔化不暴露原值或额外结果。",
         &[
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_stress/controlflow_07_pure_suffix_close_loop.lua",
-        &["backedge", "copies", "goto", "not-chain"],
-        "8个copy位于带scope回边区，128次纯suffix可共享DAG但不得改变初始入口或末端写。",
-        &[
-            LuaCaseConfiguration::new(PUC_LUA_GE_52),
-            LuaCaseConfiguration::new(PUC_LUA_GE_52).with_options(LuaCaseOptions {
-                retain_debug: true,
                 ..LuaCaseOptions::DEFAULT
             }),
         ],

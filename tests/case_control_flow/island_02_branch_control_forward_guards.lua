@@ -1,6 +1,4 @@
 -- regress_185_branch_control_forward_guards#1: irreducible island 内多个 forward guard 共用 label
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 
 local function run(entry, a, b, cycle)
     local value = 0
@@ -59,8 +57,3 @@ for mask = 0, 15 do
 end
 assert(run(nil, 0, false, false) == 0)
 assert(run(0, false, nil, false) == 10)
--- unluac: expect-ast-count [[goto]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[label]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[4]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]

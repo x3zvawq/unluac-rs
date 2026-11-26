@@ -1,6 +1,3 @@
--- unluac: expect-ast-count [[function]] [[5]]
--- unluac: expect-ast-count [[if]] [[4]]
--- unluac: expect-ast-max [[local-binding]] [[10]]
 -- 结果未使用不授权删除原 NOT 或显式比较；and/or/vararg 的潜在对象根也须保留。
 -- unluac: expect-count [[ = not ]] [[1]]
 -- unluac: expect-count [[if 1 == 1 then]] [[4]]

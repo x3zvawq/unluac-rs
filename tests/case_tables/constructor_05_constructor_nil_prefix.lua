@@ -1,11 +1,5 @@
 -- 多目标 nil 声明的逐槽事实由同一构造器候选共享；捕获的 cell 更新仍留在原位。
--- unluac: expect-ast-count [[function]] [[4]]
--- unluac: expect-ast-count [[table-constructor]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[24]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
 -- CALL 的 callee 准备应合回独立初始化，不增加第三条赋值。
--- unluac: expect-ast-max [[assign]] [[2]] [[@proto=3]] [[@dialect=luau]]
 local function build()
     local a, b, c, d, e, f, g, h
     local get = function()

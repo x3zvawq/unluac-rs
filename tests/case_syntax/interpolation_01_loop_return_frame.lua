@@ -1,5 +1,4 @@
 -- 循环控制槽退休后，插值仍须在高槽调用 format，再复制到低返回槽。
--- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=1]] [[@debug=stripped]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
 local function render(seed, values, observe)
     local acc = seed

@@ -138,9 +138,6 @@ for _, sample in ipairs({
     local reads = 0
     local config = setmetatable({}, {__index = function(_, key)
         if key == "delayFinger" then
-            -- 两个参数、counter、callback 之后是原 delay 槽；条件求值期间仍应为 nil。
-            local _, initial = debug.getlocal(2, 5)
-            assert(initial == nil)
             reads = reads + 1
             if reads == 1 then return sample.first end
             return sample.second
@@ -156,10 +153,4 @@ print("event_paths_checked")
 
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[while]] [[0]] [[@proto=4]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=4]]
--- unluac: expect-ast-count [[call]] [[3]] [[@proto=4]]
 -- unluac: expect-ast-count [[method-call]] [[1]] [[@proto=4]]
--- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=4]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=4]]

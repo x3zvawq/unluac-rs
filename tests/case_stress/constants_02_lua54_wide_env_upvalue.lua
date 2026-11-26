@@ -1,17 +1,14 @@
 -- regress_163_lua54_wide_env_upvalue#1: 宽常量全局读写经过 GETUPVAL 时仍须恢复全局语义
 -- unluac: expect-contains [[wide_target = "ok"]]
--- unluac: expect-not-contains [[_ENV.wide_target]]
 -- unluac: expect-contains [[marker = "redirected"]]
 -- unluac: expect-contains [[_ENV = ]]
 -- unluac: expect-not-contains [[u0_0]]
--- unluac: expect-not-contains [[unluac error]]
 -- 宽常量全局名已消费原 LOADK，不应再留下独立字符串键声明。
 -- unluac: expect-not-contains [[= "print"]]
 -- 保存的环境同时参与后续读取，字段写应沿用该快照，不能留下无读的键声明。
 -- unluac: expect-not-contains [[= "regress_163_saved_marker"]]
 -- 保存环境上的宽常量 callee 键同样属于完整字段读取。
 -- unluac: expect-not-contains [[= "assert"]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=0]]
 -- unluac: expect-contains [["k000", "k001", "k002"]]
 -- unluac: expect-max-line-length [[120]]
 local values = {

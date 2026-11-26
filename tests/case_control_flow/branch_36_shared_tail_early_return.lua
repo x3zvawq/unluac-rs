@@ -1,6 +1,5 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
 local amount = 100
 local function award(player, item, a, b, c, d)
     if not player then

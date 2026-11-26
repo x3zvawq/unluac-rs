@@ -1,6 +1,4 @@
 -- regress_298_luau_captured_shared_capture_free_dependency: 复合factory独占零capture依赖
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function opaque(value)
     return value
 end

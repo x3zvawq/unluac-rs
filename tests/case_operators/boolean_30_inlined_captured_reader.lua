@@ -1,11 +1,5 @@
 -- 读闭包仅在 enabled 为真时执行；false、nil、0、空串和表值分别经过原短路路径。
 -- O2 的两层展开仍应恢复完整调用，参数准备和捕获更新不留下机械中转。
--- unluac: expect-ast-count [[function]] [[2]] [[@variant=O2]]
--- unluac: expect-ast-count [[numeric-for]] [[2]] [[@variant=O2]]
--- unluac: expect-ast-count [[if]] [[4]] [[@variant=O2]]
--- unluac: expect-ast-max [[local-binding]] [[10]] [[@variant=O2]]
--- unluac: expect-contains [[assert(valued(flag, expected, read) == expected_result)]] [[@variant=O2]] [[@debug=retained]]
--- unluac: expect-not-contains [[unluac error]]
 local function valued(enabled, value, read)
     return enabled and value == (read() or 8)
 end

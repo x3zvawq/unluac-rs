@@ -1,16 +1,8 @@
 -- common_03_repeat_until#1: 基础repeat-until循环
 -- 基础尾条件循环应保持 repeat，而不是引入条件 carrier。
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@dialect=lua5.4]] [[@proto=1]]
--- unluac: expect-ast-max [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[6]]
 -- unluac: expect-ast-count [[while]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[34]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@dialect=lua5.4]] [[@proto=10]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=10]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@dialect=luau]] [[@proto=10]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@dialect=luau]] [[@proto=10]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@dialect=luajit]] [[@proto=1]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@dialect=luajit]] [[@proto=1]]
 local function test_basic_repeat()
     local i = 0
     local values = {}

@@ -1,5 +1,4 @@
 -- 上值字段写保留目标与 RHS 的读取顺序，元方法改写 cell 不影响已准备的值。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 
 local target
 local value

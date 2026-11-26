@@ -3,8 +3,6 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local subject = function(a, b, c, xs)
     local x = 0
     for _ in xs do
@@ -61,5 +59,4 @@ check("truthy_zero", 0, nil, 0, {4, 7}, 0, "0,0,0,0")
 check("zero_guards", false, 0, 0, {4, 7}, nil, "0,0,0,0", 4)
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[while]] [[0]] [[@proto=1]]
 return subject

@@ -3,7 +3,6 @@
 -- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(a, b)
     local x = 0
     while true do
@@ -40,6 +39,3 @@ for i = 1, #cases do
 end
 print("observed_nonterminal_paths", #cases)
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]

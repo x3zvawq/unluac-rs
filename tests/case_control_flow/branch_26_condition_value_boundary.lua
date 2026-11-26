@@ -1,10 +1,6 @@
 -- 短路取值与外层条件分别拥有控制区域，字段读取保持次数与顺序。
 -- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
 -- 两次索引沿原 GETUPVAL 准备帧树化，不为只用一次的 base/key 留下载体。
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=3]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=4]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=0]]
 local calls = 0
 local trace = {}

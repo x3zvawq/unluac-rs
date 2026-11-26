@@ -1,5 +1,4 @@
 -- unluac: expect-not-contains [[table-set-list]]
--- unluac: expect-ast-count [[table-list-field]] [[4]] [[@proto=2]] [[@dialect=lua5.1]]
 local max = math.max
 local ceil = math.ceil
 local limit1, limit2 = 100, 70

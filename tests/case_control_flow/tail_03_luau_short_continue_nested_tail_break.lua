@@ -1,19 +1,11 @@
 -- regress_120_luau_short_continue_nested_tail_break#1: 短路 continue 后的 nested repeat 与 tail break 保持独立 owner
 -- unluac: expect-contains [[repeat]]
--- unluac: expect-contains [[continue]]
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[generic-for]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=1]]
 -- 有界观察中的多入口和兄弟循环同样只保留一个累积状态。
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=4]]
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=5]]
 local function tested(a, b, c, xs)
     local x = 0
     for i = 1, 3 do

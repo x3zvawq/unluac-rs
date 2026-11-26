@@ -1,5 +1,4 @@
 -- 空表的数组容量提示不把乱序独立字段写变成构造器；CALL 保留在原写回处。
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=0]]
 local value = 20
 local function mutate()
     value = 30

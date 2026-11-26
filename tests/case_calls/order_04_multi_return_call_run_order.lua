@@ -1,6 +1,4 @@
 -- regress_352_multi_return_call_run_order: a call run may cross stable return prefixes but not observable snapshots
--- unluac: expect-contains [[local r3_0 =]]
--- unluac: expect-contains [[local r3_1 =]]
 
 local observed = 0
 

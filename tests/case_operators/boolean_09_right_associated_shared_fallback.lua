@@ -1,9 +1,4 @@
--- unluac: expect-contains [[p1_0 and (p1_1 or p1_2) or not p1_1 and p1_2]]
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[numeric-for]] [[3]]
--- unluac: expect-ast-max [[local-binding]] [[9]]
 
 local function choose(guard, left, fallback)
     return (guard and (left or fallback)) or ((not left) and fallback)

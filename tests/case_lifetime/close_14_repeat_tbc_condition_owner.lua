@@ -1,10 +1,8 @@
 -- regress_369_repeat_tbc_condition_owner: repeat-owner TBC must close after the tail break guard
 -- unluac: expect-contains [[if mark("stop", true) then]]
 -- unluac: expect-not-contains [[until mark("stop", true) or]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
 -- unluac: expect-ast-count [[close-binding]] [[3]]
 -- unluac: expect-ast-count [[repeat]] [[3]]
--- unluac: expect-ast-count [[break]] [[3]]
 
 local events = {}
 

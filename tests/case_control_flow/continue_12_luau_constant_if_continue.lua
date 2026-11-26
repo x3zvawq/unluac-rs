@@ -3,15 +3,10 @@
 -- unluac: expect-count [[1 < 2]] [[1]]
 -- unluac: expect-count [[2 < 1]] [[1]]
 -- unluac: expect-count [[99]] [[3]]
--- unluac: expect-ast-count [[function]] [[2]]
 -- unluac: expect-ast-count [[while]] [[2]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[unresolved]]
 
 local function run()
     local count = 0

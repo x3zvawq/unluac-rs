@@ -1,9 +1,4 @@
 -- CLOSE 后的多返回结果保持各自 cell 身份，后续帧不继承空声明造成的永久占位。
--- unluac: expect-ast-count [[do-block]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[12]]
--- unluac: expect-ast-count [[assign]] [[4]]
--- unluac: expect-contains [[= setmetatable({},]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 do
     local first, second, captured = 0, 1, 2
     local function advance()

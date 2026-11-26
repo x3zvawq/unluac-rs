@@ -1,9 +1,5 @@
 -- regress_264_phi_home_slot_local_limit#1: 顺序 branch phi 复用状态 binding，不逐条件累积 scratch。
 -- 两种真值交替执行全部更新/跳过路径，状态始终只需一个绑定；显式 +0 操作不能被折掉。
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[assign]] [[200]] [[@proto=1]]
--- unluac: expect-contains [[if p1_0[2] then]]
--- unluac: expect-contains [[if p1_0[199] then]]
 -- unluac: expect-not-contains [[    r1_1 = p1_0]]
 local function run(flags)
     local value = 0

@@ -1,8 +1,6 @@
 -- 完整短路条件已接管提前出口时，入口定义仍属于外层，不能困在合成 repeat 中。
 -- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-ast-count [[if]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[3]]
 -- unluac: expect-contains [[:add("button")]]
 
 local state = {

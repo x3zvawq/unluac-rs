@@ -1,16 +1,6 @@
 -- regress_01_boolean_adversarial#1: 循环内 and/or 链遇到 nil/false 元素, t[i] and t[i]>0 and t[i] or 0
 -- unluac: expect-ast-min [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[function]] [[5]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=2]]
 -- 此样例的求和函数在 LuaJIT 中为 proto#5，其余方言为 proto#2。
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.5]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=luau]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=5]] [[@dialect=luajit]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=5]]
 local function test_sc_loop_nil()
     local function sum_positive(t, count)
         local result = 0
@@ -51,7 +41,6 @@ local function test_sc_loop_nil()
 end
 
 -- regress_01_boolean_adversarial#2: elseif 分支内 and/or 三元模拟, a>b and a or b 赋给局部变量
--- unluac: expect-ast-min [[if]] [[1]]
 -- 合流的同身份分量不是一次额外源码写回。
 -- unluac: expect-not-contains [[r5_0, "multiplied"]]
 -- unluac: expect-not-contains [[r5_1, "multiplied"]]

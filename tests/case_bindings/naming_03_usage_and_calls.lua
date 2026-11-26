@@ -9,9 +9,6 @@
 -- unluac: expect-contains [[local config =]] [[@naming-mode=heuristic]]
 -- unluac: expect-contains [[local result2 = getaway()]] [[@naming-mode=heuristic]]
 -- unluac: expect-contains [[local items =]] [[@naming-mode=heuristic]]
--- unluac: expect-name [[param:0]] [[a]] [[@proto=5]] [[@dialect=lua5.4]] [[@naming-mode=heuristic]]
--- unluac: expect-name [[param:1]] [[_]] [[@proto=5]] [[@dialect=lua5.4]] [[@naming-mode=heuristic]]
--- unluac: expect-name [[upvalue:0]] [[a]] [[@proto=6]] [[@dialect=lua5.4]] [[@naming-mode=heuristic]]
 local old_require = require
 require = function(path) return { path = path } end
 local cfg = require("app.data.cfg.slot")

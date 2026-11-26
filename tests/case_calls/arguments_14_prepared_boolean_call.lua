@@ -1,10 +1,4 @@
 -- 普通调用须先读取 callee，再按短路路径准备带原生 NOT 的 Boolean 参数。
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=3]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=4]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]]
 local observed, deliveries
 local function receive(value)
     observed = value

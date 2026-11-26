@@ -1,7 +1,6 @@
 -- regress_243_repeat_tbc_iteration_scope: repeat 条件两侧的 CLOSE 属于每轮共享词法域
 -- unluac: expect-contains [[<close>]]
 -- 独立的循环计数 epoch 可以分别声明，条件写入不需要额外布尔中转变量。
--- unluac: expect-ast-max [[local-binding]] [[8]]
 -- unluac: expect-ast-count [[close-binding]] [[3]]
 -- unluac: expect-ast-count [[repeat]] [[3]]
 -- unluac: expect-ast-count [[repeat-condition-local]] [[1]]

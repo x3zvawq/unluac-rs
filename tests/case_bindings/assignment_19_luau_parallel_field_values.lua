@@ -1,5 +1,4 @@
 -- 两个 RHS 先完成求值，再按 Luau 正序发布；调用与分配共用同一赋值帧。
--- unluac: expect-ast-max [[local-binding]] [[3]] [[@proto=0]]
 local events = ""
 local sink = setmetatable({}, {__newindex = function(self, key, value)
     events = events .. key .. ";"

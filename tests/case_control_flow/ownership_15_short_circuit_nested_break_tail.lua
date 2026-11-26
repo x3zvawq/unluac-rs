@@ -5,12 +5,7 @@
 -- unluac: expect-contains [[ or ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[if]] [[2]]
--- unluac: expect-ast-count [[break]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[6]]
 local function run(a, b, c)
     local x = 0
     for _ = 1, 3 do

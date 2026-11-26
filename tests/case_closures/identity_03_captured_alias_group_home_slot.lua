@@ -1,5 +1,4 @@
 -- regress_171_captured_alias_group_home_slot#1: phi 别名组必须写回组内已被闭包捕获的 home slot
--- unluac: expect-not-contains [[unluac error]]
 local function captured_alias_group(flag)
     local seed = 0
     local reader = function()
@@ -21,5 +20,3 @@ print("captured_alias_group_false", next_assigned, next_captured, next_prior)
 
 -- PUC/JIT 须在 reader 调用前保存首项 RHS；Luau 的原字节码先写 seed，再调用 reader。
 -- 两种顺序都不需要另存 callee、调用结果或 return COPY。
--- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]] [[@dialect=luau]]

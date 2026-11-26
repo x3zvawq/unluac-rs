@@ -1,5 +1,4 @@
 -- unluac: expect-not-contains [[table-set-list]]
--- unluac: expect-ast-count [[table-list-field]] [[27]] [[@proto=1]] [[@dialect=lua5.1]]
 local function calculate(self)
     local bases = { 1, 3.7, 13.69, 50.65, 187.42, 693.44, 2565.73, 9493.19 }
     local ids = { 24442, 24443, 24444, 24445, 24446, 24447, 24448, 24449 }

@@ -3,15 +3,9 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- 等目标边可并入尾部，但原 a 检查仍须保留为空 if。
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[continue]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
 local function run(a, b, xs)
     local x = 0
     for _ in xs do

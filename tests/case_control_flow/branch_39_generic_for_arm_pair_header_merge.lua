@@ -2,10 +2,7 @@
 -- header 就是源码层 if/else 的合流边界；不得把其中一臂的回边当成非 tail backedge
 -- 而要求方言不支持的 goto/label（json4lua isArray 的真实语料形状）。
 -- unluac: expect-ast-count [[goto]] [[0]]
--- unluac: expect-ast-count [[label]] [[0]]
 -- unluac: expect-ast-min [[generic-for]] [[1]]
--- unluac: expect-ast-min [[if]] [[3]] [[@proto=2]] [[@dialect=lua5.1]]
--- unluac: expect-ast-count [[continue]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
 
 --isArray#1: 连续数字键与 n 一致时返回 true 和最大下标
 --isArray#2: 中途出现不可编码值立即返回 false

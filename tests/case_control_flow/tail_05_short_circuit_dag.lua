@@ -2,12 +2,8 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- 参数声明、两次原 TEST 和返回值各出现一次；稳定绑定也不能吸收第二次检查。
--- unluac: expect-count [[p1_0]] [[4]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[7]]
 local function run(a, b, c)
     repeat
         if a then

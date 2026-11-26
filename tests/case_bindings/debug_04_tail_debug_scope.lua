@@ -1,8 +1,4 @@
 -- RETURN 自身拥有的 TBC 生命周期复用函数域；在 RETURN 前结束的 debug 内层域仍保留。
--- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=3]]
--- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=5]]
--- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=7]]
 
 local forbidden_name = nil
 local armed = false

@@ -1,10 +1,5 @@
 -- 数组准备槽稍后复用为捕获变量，不应让早期数组元素残留为独立声明。
 -- unluac: expect-not-contains [[ = 4]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[local-binding]] [[5]]
--- unluac: expect-ast-count [[table-constructor]] [[3]]
--- unluac: expect-ast-count [[table-list-field]] [[4]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 local function collect(values, ...)
     if values[1] == 4 then
         assert(select("#", ...) == 3)

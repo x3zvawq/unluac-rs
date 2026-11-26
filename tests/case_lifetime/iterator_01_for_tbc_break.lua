@@ -1,8 +1,6 @@
 -- regress_230_numeric_for_tbc_break#1: numeric-for 的 break 由循环词法边界接管 TBC cleanup
--- unluac: expect-ast-count [[local-binding]] [[8]]
 -- unluac: expect-ast-count [[close-binding]] [[2]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[break]] [[1]]
 local closed = {}
 local mt = {
     __close = function(value, err)

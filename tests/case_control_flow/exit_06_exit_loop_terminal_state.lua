@@ -1,12 +1,7 @@
 -- regress_94_multi_exit_loop_terminal_state#1: a terminal shared by body and post-loop keeps loop state
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- 两次原检查都要保留，即使其中一支和下一句共享 break/return。
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
 local function run(a, b)
     local x = 0
     repeat

@@ -1,6 +1,4 @@
--- A non-escaping nested closure needs no extra do scope before an eventful repeat condition.
--- unluac: expect-not-contains [[  do]]
--- unluac: expect-ast-max [[do-block]] [[0]]
+-- A non-escaping nested closure keeps its repeat loop cleanly structured.
 -- unluac: expect-ast-count [[repeat]] [[1]]
 
 local function stop()

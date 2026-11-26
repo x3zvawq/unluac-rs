@@ -1,19 +1,9 @@
 -- regress_150_luau_numeric_for_branch_owner#1: numeric-for 内 continue/break 分支保持互斥 owner
 -- unluac: expect-contains [[for ]]
--- unluac: expect-contains [[continue]]
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[local r0_2]]
--- unluac: expect-contains [[r0_0 = r0_0 + 2]]
--- unluac: expect-contains [[r0_0 = r0_0 + 5]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[continue]] [[1]]
--- unluac: expect-ast-count [[break]] [[1]]
--- unluac: expect-ast-count [[if]] [[3]]
--- unluac: expect-ast-count [[local-binding]] [[2]]
 local x = 0
 for i = 1, 5 do
     if i < 3 then

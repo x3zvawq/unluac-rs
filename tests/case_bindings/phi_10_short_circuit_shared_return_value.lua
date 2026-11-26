@@ -3,8 +3,6 @@
 -- unluac: expect-order [[shared-tail-marker]] [[return ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- Loop identity is allocated after HIR binding recovery; the contract is the numeric-for shape.
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[ = 1, 3 do]]

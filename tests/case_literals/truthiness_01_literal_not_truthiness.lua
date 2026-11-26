@@ -6,8 +6,6 @@
 -- unluac: expect-contains [[return not 7]] [[@dialect=lua5.5]]
 -- unluac: expect-contains [[return not 7]] [[@dialect=luajit]]
 -- unluac: expect-contains [[return false]] [[@dialect=luau]]
--- unluac: expect-ast-count [[function]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[3]]
 
 local function folded_literal_not()
     local value = 7

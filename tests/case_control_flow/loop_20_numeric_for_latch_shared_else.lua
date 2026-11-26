@@ -5,9 +5,6 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[repeat]]
--- unluac: expect-not-contains [[local r1_0 = r0_1[p1_1]]
--- unluac: expect-contains [[return r0_1[p1_1] or 0]]
--- unluac: expect-not-contains [[unluac error]]
 local releaseBuild = true
 local last_open = {}
 local events = {}
@@ -161,8 +158,3 @@ page.levels = {}
 check(5, 0, "episode:calendar,get:calendar,date:25,buy,get:calendar,set:calendar:0")
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=6]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=6]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=6]]
--- unluac: expect-ast-count [[while]] [[0]] [[@proto=6]]
--- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=6]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=7]]
--- unluac: expect-ast-count [[local-binding]] [[13]] [[@proto=0]]

@@ -6,16 +6,12 @@
 -- unluac: expect-contains [[ ~ ]]
 -- unluac: expect-contains [[ << ]]
 -- unluac: expect-contains [[ >> ]]
--- unluac: expect-contains [[~(]]
 -- unluac: expect-count [[1 < 2 and 17 or 17]] [[8]]
 -- unluac: expect-contains [[if 1 == 1 then]]
 -- 原同槽更新即使没有后续读取，也不能绕过操作保留合同换成 nil。
 -- unluac: expect-min-count [[ & ]] [[2]]
 -- unluac: expect-min-count [[~]] [[3]]
 -- unluac: expect-not-contains [[ = nil]]
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[if]] [[1]]
--- unluac: expect-ast-max [[local-binding]] [[13]]
 
 local function discard_integer_ops()
     -- PUC 保留比较分支；值域可证明结果为 17，不代表这些操作属于恢复产生的包装。

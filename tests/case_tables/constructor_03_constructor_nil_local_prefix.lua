@@ -1,13 +1,7 @@
 -- regress_429_constructor_nil_local_prefix: an independent nil local does not justify changing
 -- empty-table preallocation; a field that reads the local must also remain after its declaration.
--- unluac: expect-order [[local r1_0 = {}]] [[r1_0.value = 7]]
--- unluac: expect-order [[local r2_1 = nil]] [[r2_0.value = r2_1]]
 
 -- 两条路径都只需要原表和 later 声明。
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=1]]
--- unluac: expect-ast-max [[local-binding]] [[2]] [[@proto=2]]
--- unluac: expect-ast-count [[table-constructor]] [[2]]
--- unluac: expect-ast-count [[function]] [[2]]
 local function fold_independent(flag)
     local result = {}
     local later

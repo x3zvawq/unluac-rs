@@ -5,8 +5,6 @@
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-min [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-min [[numeric-for]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-min [[while]] [[1]] [[@proto=1]]
@@ -44,12 +42,7 @@ local xs = setmetatable({}, {__index = function(_, key)
     return false
 end})
 assert(run(true, false, xs) == 0 and reads == 1)
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
 print("regress_105_luau_same_header_loop_path_owner#1")

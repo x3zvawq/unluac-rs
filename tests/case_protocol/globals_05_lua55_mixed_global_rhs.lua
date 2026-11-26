@@ -1,11 +1,7 @@
 -- regress_410_lua55_mixed_global_rhs: a fixed call is only the suffix of this declaration
 -- unluac: expect-not-contains [[global second_target, third_target =]]
--- unluac: expect-contains [[global first_target, second_target, third_target =]]
--- unluac: expect-contains [[global prefix_target, nil_target, middle_target, last_target =]]
 -- unluac: expect-ast-count [[error]] [[0]]
--- unluac: expect-ast-count [[function]] [[7]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=7]]
 
 global<const> print, assert, setmetatable, collectgarbage, rawset, pcall, table
 

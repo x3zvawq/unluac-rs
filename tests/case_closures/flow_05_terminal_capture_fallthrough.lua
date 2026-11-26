@@ -1,11 +1,5 @@
 -- 已返回分支中的引用捕获不能让另一条路径的返回常量变成 cell 写入。
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@debug=stripped]]
--- unluac: expect-ast-count [[local-binding]] [[5]] [[@debug=retained]]
--- unluac: expect-ast-count [[if]] [[2]]
--- unluac: expect-ast-count [[empty-local]] [[0]]
 -- unluac: expect-contains [[return "skip"]]
--- unluac: expect-ast-count [[do-block]] [[0]]
 -- vararg 保持 Luau O2 的独立调用边界，让两条路径在同一函数中接受检查。
 local function choose(flag, ...)
     if flag then

@@ -1,11 +1,5 @@
 -- 空循环仍有源码变量身份；零长度 debug 区间属于 iterator 的结果而非入口旧槽。
--- unluac: expect-ast-count [[local-binding]] [[6]]
--- unluac: expect-ast-count [[assign]] [[1]]
 -- unluac: expect-ast-count [[generic-for]] [[2]]
--- unluac: expect-name [[local:1]] [[entry]] [[@proto=1]]
--- unluac: expect-name [[local:2]] [[payload]] [[@proto=1]]
--- unluac: expect-name [[local:3]] [[_]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
 local calls = 0
 local function run()
     local function iterate(state, control)

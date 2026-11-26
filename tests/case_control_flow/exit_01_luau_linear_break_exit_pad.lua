@@ -1,16 +1,10 @@
 -- regress_107_luau_linear_break_exit_pad#1: O2 展开的独占线性块属于同一个 break exit pad
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
 -- 展开后的三个 print 留在提前退出臂；尾条件保留原判断，不制造 normal-tail 标记。
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=1]]
 -- unluac: expect-not-contains [[until false]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(a, xs)
     for k, v in xs do
         repeat

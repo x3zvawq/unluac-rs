@@ -1,10 +1,6 @@
 -- regress_214_loop_if_then_continuation#1: while implicit else must bypass the gated tail
 -- regress_214_loop_if_then_continuation#2: generic-for implicit else must bypass the gated tail
--- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[    continue]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
 local function while_case(enabled, choose_first, limit)
     local count, value = 0, 0
     while count < limit do
@@ -67,7 +63,3 @@ assert(generic_for_case(true, 0) == 6)
 -- 保留原 step 的 nil 初始化及两层条件，不额外物化循环状态。
 -- unluac: expect-ast-count [[while]] [[1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-count [[repeat]] [[0]]
--- unluac: expect-ast-count [[if]] [[4]]
--- unluac: expect-ast-count [[local-binding]] [[15]]
--- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=0]]

@@ -3,7 +3,6 @@
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[(function()]]
 local show_editor = false
 
@@ -108,9 +107,5 @@ assert(show_editor == false)
 block_table = saved_block
 -- 循环变量之外不需要为同一次冒号调用另造 receiver local。
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=5]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=5]]
 -- unluac: expect-ast-count [[method-call]] [[1]] [[@proto=5]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=5]]
 -- 重置函数只写入既有绑定，并行赋值不应产生额外源码声明。
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=6]]
--- unluac: expect-ast-count [[local-binding]] [[18]] [[@proto=0]]

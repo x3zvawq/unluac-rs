@@ -1,6 +1,4 @@
 -- regress_319_luau_captured_shared_diamond: shared closure DAG 的 diamond occurrence 必须保留 alias 证明
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function opaque(value)
     return value
 end

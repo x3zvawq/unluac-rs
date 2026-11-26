@@ -1,10 +1,7 @@
 -- regress_29_lua51_retry_loop_live_out#1: retry loop should keep live-out values defined inside the loop
--- unluac: expect-contains [[while true do]]
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[(function()]]
 local counts = { 3, 0, 0 }
 local modes = { "red", "green", "blue" }
 local current_mode = 1

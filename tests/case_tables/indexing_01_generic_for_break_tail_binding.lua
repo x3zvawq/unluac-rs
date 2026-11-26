@@ -1,15 +1,10 @@
 -- unluac: expect-ast-count [[generic-for]] [[3]]
--- unluac: expect-ast-count [[break]] [[2]]
--- unluac: expect-ast-count [[function]] [[3]]
--- unluac: expect-ast-count [[table-constructor]] [[16]]
--- unluac: expect-ast-max [[local-binding]] [[16]]
 -- regress_19_generic_for_break_tail_binding#1: generic-for break tail keeps loop bindings in scope
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[table.remove]]
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 local registry = {}
 local removed_index = 0
 

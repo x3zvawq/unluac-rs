@@ -1,5 +1,4 @@
 -- 首项必须在第二项清空前保存旧 closure，完整赋值不能留下独立快照与 callee 交接。
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=1]]
 -- unluac: expect-not-contains [[ = assert]]
 local function transfer(flag)
     local left, right

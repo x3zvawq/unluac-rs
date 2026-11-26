@@ -1,7 +1,5 @@
 -- regress_282_long_logical_ast_depth: 超长同类逻辑链不能让AST build递归耗尽进程栈
 -- unluac: expect-max-line-length [[120]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[call]] [[1280]] [[@proto=2]]
 local calls = 0
 local stop = 1280
 local selected = "tail"

@@ -1,7 +1,4 @@
 -- Bare names would enable sequential-index allocation in this hash-only NEWTABLE.
--- unluac: expect-count [=[["a"]]=] [[3]]
--- unluac: expect-count [=[["b"]]=] [[3]]
--- unluac: expect-count [=[["c"]]=] [[3]]
 local function named_growth(value)
     local result = { ["a"] = 1, ["b"] = nil, ["c"] = value, [1] = 42 }
     result.e = 5

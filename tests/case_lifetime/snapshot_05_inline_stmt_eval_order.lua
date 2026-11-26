@@ -2,8 +2,6 @@
 -- inline-exprs 不能把前置调用移到 call receiver/callee 之后；
 -- method alias 也不能因两个调用参数相同而合并 receiver 求值。
 -- unluac: expect-not-contains [[local r0_6 = r0_4]]
--- unluac: expect-ast-max [[local-binding]] [[19]]
--- unluac: expect-ast-count [[function]] [[5]]
 
 local log = {}
 

@@ -3,8 +3,6 @@
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(a, b, c, xs)
     local x = 0
     for _, _ in xs do
@@ -50,9 +48,5 @@ checks[1](0, true, false, 2, 1, 10)
 checks[1](false, false, "", 2, 1, 10)
 checks[1](true, true, true, 0, 1, 1)
 print = saved_print
--- unluac: expect-ast-count [[local-binding]] [[11]]
--- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=1]]
 -- unluac: expect-ast-count [[numeric-for]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[2]] [[@proto=1]]

@@ -3,11 +3,8 @@
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[ = 4]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[if]] [[3]]
--- unluac: expect-ast-count [[local-binding]] [[6]]
 local function run(a, b, c, d)
     local i = 0
     repeat

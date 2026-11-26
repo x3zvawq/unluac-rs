@@ -1,9 +1,5 @@
 -- 同一 FASTCALL 的常量参数与 fallback COPY 必须共同恢复，不每轮再造参数 local。
 -- unluac: expect-count [[math.max(]] [[2]]
--- unluac: expect-ast-max [[local-decl]] [[4]] [[@proto=2]]
--- unluac: expect-not-contains [[ = false]]
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=0]]
--- unluac: expect-ast-count [[table-list-field]] [[1]] [[@proto=0]]
 local function check(value)
     local positive = value > 0
     assert(positive, "positive input required")

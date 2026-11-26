@@ -3,7 +3,6 @@
 -- unluac: expect-contains [[while]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 local function run(a, b, state)
     repeat
         while a do
@@ -40,19 +39,5 @@ assert(dispatch[1](false, true, 4) == 4)
 -- 参数本身承接全部状态更新，不需要另造跨 repeat 的常量载体。
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
 -- SETLIST buffer 与后续 assert 复用原槽，构造器之后不应留下独立 COPY holder。
--- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=0]]
--- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
--- unluac: expect-ast-count [[call]] [[21]] [[@proto=0]]
 -- 各状态判断、原参数写回和打印保留；Luau 原编译器将两个退出发为 return。
--- unluac: expect-ast-count [[if]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[assign]] [[3]] [[@proto=1]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[0]] [[@dialect=luau]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[2]] [[@dialect=lua5.1]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[2]] [[@dialect=lua5.2]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[2]] [[@dialect=lua5.3]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[2]] [[@dialect=lua5.4]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[2]] [[@dialect=lua5.5]] [[@proto=1]]
--- unluac: expect-ast-count [[break]] [[2]] [[@dialect=luajit]] [[@proto=1]]

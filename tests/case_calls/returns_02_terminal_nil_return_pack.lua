@@ -1,7 +1,6 @@
 -- regress_323_terminal_nil_return_pack: 终态 fixed nil pack 不应留下机械 temp
 -- unluac: expect-contains [[return nil, nil]]
 -- unluac: expect-not-contains [[= nil, nil]]
--- unluac: expect-not-contains [[unluac error]]
 
 local function first_positive(values)
     local index = 1

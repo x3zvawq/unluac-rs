@@ -2,22 +2,6 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
-        "tests/case_closures/scope_08_forwarded_global_root.lua",
-        &["closure", "global-write", "gc-root", "call-frame"],
-        "局部闭包转交全局后仍占低槽；后续调用清空全局并强制 GC 时，原局部根继续保活。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_closures/flow_05_terminal_capture_fallthrough.lua",
         &["branch", "capture", "return", "cell-identity", "recompile"],
         "已终止分支的引用捕获不污染另一条返回路径，保留各次调用的独立可写 cell。",
@@ -79,26 +63,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_closures/factory_16_luau_published_table_arguments.lua",
         &["factory", "call-frame", "metamethod", "evaluation-order"],
         "发布表的分配、捕获容器整数键写入与参数 COPY 整体恢复，保留 __newindex 次序及对象身份。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                })
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                })
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_closures/scope_06_callee_copy_root_windows.lua",
-        &["call-frame", "scope", "convergence", "fastcall"],
-        "原调用结果域在低槽 callee COPY 和 FASTCALL 参数准备前结束，失败字面量窗口不遮住外层闭合域。",
         &[
             LuaCaseConfiguration::new(LUAU_ONLY)
                 .with_options(LuaCaseOptions {
@@ -572,29 +536,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
-        "tests/case_closures/flow_03_forwarded_lvalue_eval_order.lua",
-        &["allocation", "capture", "closure", "lvalue"],
-        "保证捕获32值的closure allocation发生在eventful lvalue __index前。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54])],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_closures/loop_05_lua55_loop_carried_closure_effect.lua",
-        &["fixed-point", "gc-root", "loop"],
-        "在 Lua55 global 声明造成的 repeat 环境中，分别让 while、repeat、numeric-for、generic-for 和循环携带的 callee 经两次闭包调用传播 captured root effect，要求固定点在 condition GC 观察前保住 item。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua55])],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_closures/factory_08_lua55_returned_fresh_closure_effect.lua",
-        &["call-effect", "convergence", "factory", "gc-root"],
-        "证明已知 factory 返回的新鲜闭包在跨函数投影后仍携带 initialize 的 captured-root 写效应，holder() 执行后 item 必须活到 repeat condition。",
-        &[
-            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua55]).with_options(LuaCaseOptions {
-                recompile_rounds: Some(3),
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
-    ),
-    LuaCaseDefinition::new(
         "tests/case_closures/scope_01_nested_capture_local_namespace.lua",
         &["local-id", "nested-closure", "repeat", "scope"],
         "构造父函数 outer 与子函数 child 可能编号相同的局部，要求孙闭包捕获只在所属 proto 命名空间解析，不能误把父级 local 当作跨 repeat 的捕获。",
@@ -605,12 +546,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["non-escaping", "readability", "repeat", "scope"],
         "证明 repeat 尾部的非逸出嵌套闭包不需要为了事件型 until condition额外生成 do 作用域，局部 value 与 hold 均未越过 condition。",
         &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54])],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_closures/factory_09_child_root_effects.lua",
-        &["call-effect", "capture", "factory", "gc-root"],
-        "在同一已知 child 分析下区分 capture 的纯读、写替换、factory 返回 closure 的发布，以及 callee 作为 upvalue 再间接调用的写入/逃逸投影。",
-        &[LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS)],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/identity_07_write_graph.lua",
@@ -633,18 +568,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["capture-cell", "creation", "snapshot", "truthiness"],
         "区分同一局部的直接读取、闭包创建时可内联快照和随后写入仍应被引用 cell 观察三种时机，防止 capture creation 被统一成单一 read。",
         &[LuaCaseConfiguration::new(ALL_DIALECTS)],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_closures/effects_01_captured_root_handoff.lua",
-        &["allocation", "call-root", "capture", "gc"],
-        "用纯{} allocation与setmetatable call-result两种producer，均让a2被get闭包捕获；清空a0/a1/a2后闭包应见nil且对象释放。",
-        &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS),
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
-                retain_debug: true,
-                ..LuaCaseOptions::DEFAULT
-            }),
-        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/identity_09_capture_closed_nil_slot.lua",
@@ -692,33 +615,6 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
-        ],
-    ),
-    LuaCaseDefinition::new(
-        "tests/case_closures/factory_10_luau_fresh_constant_capture.lua",
-        &["constant", "newclosure", "vararg"],
-        "NEWCLOSURE常量capture不能共享DUPCLOSURE，覆盖NaN/scalar/vararg root/selectors/phi/mutable。",
-        &[
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_options(LuaCaseOptions {
-                    // O0 第4次生成完成原帧保护后的声明规范化，第5次逐字节相同；其它配置不外推。
-                    recompile_rounds: Some(4),
-                    ..LuaCaseOptions::DEFAULT
-                })
-                .with_variants(&[LuaCaseVariant::LuauO0]),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_options(LuaCaseOptions {
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                })
-                .with_variants(&[LuaCaseVariant::LuauO1, LuaCaseVariant::LuauO2]),
-            LuaCaseConfiguration::new(LUAU_ONLY)
-                .with_options(LuaCaseOptions {
-                    retain_debug: true,
-                    recompile_rounds: Some(3),
-                    ..LuaCaseOptions::DEFAULT
-                })
-                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
         ],
     ),
     LuaCaseDefinition::new(

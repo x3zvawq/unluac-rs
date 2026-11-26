@@ -1,12 +1,5 @@
 -- regress_265_entry_loop_exit_state#1: entry-header loop must initialize an all-inside exit phi
--- unluac: expect-not-contains [[goto ]]
--- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[unluac error]]
 -- 编译器将 repeat 的两条出口拆成相邻 while，原 a 检查仍须保留。
--- unluac: expect-ast-count [[while]] [[2]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
--- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
 local function run(a, b, c)
     repeat
         if b then

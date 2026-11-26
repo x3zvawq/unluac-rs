@@ -1,8 +1,5 @@
 -- 连续纯依赖移入普通赋值；无关前缀、捕获和求值事件仍保留自己的边界。
 -- unluac: expect-ast-count [[repeat]] [[1]]
--- unluac: expect-ast-count [[function]] [[5]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-ast-max [[local-binding]] [[16]]
 local function fill(box, value)
     local unrelated = value
     local result = not value

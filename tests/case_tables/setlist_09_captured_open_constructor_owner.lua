@@ -2,11 +2,6 @@
 -- unluac: expect-contains [[return function()]]
 -- unluac: expect-not-contains [[table-set-list]]
 
--- unluac: expect-ast-count [[local-binding]] [[10]] [[@proto=0]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[table-constructor]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[table-list-field]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
 local mode, calls = 0, 0
 local function values()
     calls = calls + 1

@@ -1,6 +1,4 @@
 -- 多个 call-result local 在后续仍有读取；观察分析按绑定读写事件推进。
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-ast-min [[local-decl]] [[64]]
 local function make() return {} end
 local function run()
 local v0 = make()

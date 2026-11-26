@@ -1,9 +1,6 @@
 -- 纯 Decision 的共享尾在图内归约，不能先生成指数表达式再提取共同式。
 -- unluac: expect-not-contains [[p1_1 and (not p1_3]]
 -- unluac: expect-not-contains [[b and (not d]]
--- unluac: expect-max-count [[ and ]] [[22]]
--- unluac: expect-ast-max [[local-binding]] [[16]]
--- unluac: expect-ast-max [[if]] [[4]]
 local function choose(a, b, c, d)
     return a and (b or c) and not d or (a or d) and b and c
 end

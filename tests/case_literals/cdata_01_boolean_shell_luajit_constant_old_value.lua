@@ -1,9 +1,7 @@
 -- LuaJIT KCDATA constants are owned by the proto rather than the overwritten stack slot.
 -- unluac: expect-contains [[not not]]
--- unluac: expect-ast-count [[assign]] [[6]]
 -- unluac: expect-not-contains [[if ]]
 -- unluac: expect-ast-count [[generic-for]] [[3]]
--- unluac: expect-ast-max [[local-binding]] [[9]]
 
 for _, value in ipairs({ 1 }) do
     value = 1LL

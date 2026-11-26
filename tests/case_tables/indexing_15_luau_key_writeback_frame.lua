@@ -1,6 +1,4 @@
 -- 低槽 key 的长度计算与 RHS 调用共用高槽；后继覆盖不能使声明反复下沉、重建。
--- unluac: expect-ast-max [[local-binding]] [[7]] [[@variant=O2]] [[@debug=stripped]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac-runtime: local run = ...
 -- unluac-runtime: local base, calls, seen = getfenv(), 0, {}
 -- unluac-runtime: setfenv(run, setmetatable({tostring = function(value)

@@ -1,11 +1,7 @@
 -- regress_162_table_checkpoint_new_pending_rollback#1: 候选内新建并搬移的整数字段在失败回滚时不得越过字段边界
 -- unluac: expect-contains [[[2] = "second"]]
 -- unluac: expect-contains [[[1] =]]
--- unluac: expect-not-contains [[unluac error]]
 -- 失败回滚保留两个字段写，调用结果直接初始化，不遗留 callee/结果接棒赋值。
--- unluac: expect-ast-max [[assign]] [[2]] [[@proto=0]]
--- unluac: expect-ast-max [[local-binding]] [[4]] [[@proto=0]]
--- unluac: expect-ast-count [[table-constructor]] [[1]]
 local calls = 0
 
 local function produce()

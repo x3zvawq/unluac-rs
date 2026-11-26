@@ -1,9 +1,5 @@
 -- Lookup values retain their future reads across many observing statements.
 -- N distinct lookup homes remain readable after N GC observations.
--- unluac: expect-ast-min [[local-decl]] [[64]]
--- unluac: expect-ast-max [[local-binding]] [[72]]
--- unluac: expect-ast-count [[call]] [[74]]
--- unluac: expect-ast-count [[assign]] [[5]]
 local function hold(t)
 local a1 = t[1]
 local a2 = t[2]

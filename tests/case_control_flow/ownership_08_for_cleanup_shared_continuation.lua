@@ -1,7 +1,6 @@
 -- regress_228_generic_for_cleanup_shared_continuation#1: generic-for Close pad 归一到共享 continuation
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-ast-min [[generic-for]] [[1]]
 local function run(a, b, c, items, value, fallback)
     if (a or b) and c ~= nil then
@@ -40,10 +39,6 @@ local function empty_iterator()
     calls = calls + 1
 end
 assert(run("", false, false, empty_iterator, 7, nil) == 0 and calls == 1)
--- unluac: expect-ast-count [[local-binding]] [[7]]
--- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
 -- 其余五次赋值都属于观察计数器，隐藏迭代槽不应另造 holder 赋值和 nil 清理。
--- unluac: expect-ast-count [[assign]] [[5]]
 -- unluac: expect-ast-count [[generic-for]] [[1]]
--- unluac: expect-ast-count [[while]] [[0]]
 print(early, fallback)

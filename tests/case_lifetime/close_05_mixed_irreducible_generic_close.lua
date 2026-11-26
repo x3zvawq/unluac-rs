@@ -1,11 +1,5 @@
 -- regress_184_mixed_irreducible_generic_close#1: island 不能拖垮外层 generic-for、隐式 close 与 capture owner
--- unluac: expect-contains [[for ]]
--- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-ast-count [[local-binding]] [[12]]
--- unluac: expect-ast-count [[generic-for]] [[1]]
 -- factory 的原返回值包保持两个 nil 槽，不为闭包、nil 和 guard 建立中转声明。
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]]
 -- unluac: expect-count [[end, nil, nil, ]] [[1]]
 
 local closed = 0

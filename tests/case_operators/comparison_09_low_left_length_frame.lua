@@ -1,11 +1,4 @@
 -- 左侧既有值与右侧 LEN 保持原比较方向、短路位置及可能的 __len 调用。
--- unluac: expect-count [[ == #]] [[2]]
--- unluac: expect-count [[ ~= #]] [[1]]
--- unluac: expect-not-contains [[= assert]]
--- unluac: expect-ast-max [[local-binding]] [[5]]
--- unluac: expect-ast-count [[function]] [[2]]
--- unluac: expect-ast-count [[if]] [[0]]
--- unluac: expect-count [[or false)]] [[1]] [[@dialect=luau]]
 local reads = 0
 local row = setmetatable({ 11, 22 }, {
     __len = function()

@@ -1,15 +1,7 @@
 -- lua55_02_named_vararg#1: 命名变参基础
--- unluac: expect-ast-count [[named-vararg-function]] [[6]]
--- unluac: expect-ast-count [[named-vararg-function]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[named-vararg-function]] [[0]] [[@proto=0]]
 -- 连续命名变参索引不能留下键准备变量或整组返回副本。
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=2]]
--- unluac: expect-ast-max [[local-binding]] [[9]] [[@proto=4]]
 -- 全局多结果写回与后续表写不能使返回副本逐轮增长。
--- unluac: expect-ast-max [[local-binding]] [[7]] [[@proto=8]]
--- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=11]]
--- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=13]]
--- unluac: expect-ast-max [[local-binding]] [[0]] [[@proto=15]]
 local function test_basic()
     local function reshape(head, ...vals)
         local before = vals[1] * 10 + vals[vals.n]

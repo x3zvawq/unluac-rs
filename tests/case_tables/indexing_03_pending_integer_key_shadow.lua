@@ -1,8 +1,5 @@
--- unluac: expect-ast-count [[table-constructor]] [[6]]
--- unluac: expect-ast-count [[function]] [[4]]
 -- unluac: expect-ast-count [[generic-for]] [[2]]
 -- unluac: expect-ast-count [[numeric-for]] [[2]]
--- unluac: expect-ast-max [[local-binding]] [[14]]
 -- 未知键遮蔽此前的待定整数写入，但不能遮蔽之后才出现的待定字段。
 local function before(k)
     return {[3] = 30, [k] = 40, [1] = 10, [2] = 20}

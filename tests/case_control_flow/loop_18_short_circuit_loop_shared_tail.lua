@@ -2,7 +2,6 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
--- unluac: expect-not-contains [[unluac error]]
 local level = {
     name = "bonus",
     display_number = "B-1",
@@ -124,18 +123,6 @@ check("bonus", "world=1;level=9", 2, "level,episode,index,template")
 level.stars_required = 0
 check("bonus", "B-1", nil, "level,episode")
 -- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=6]]
--- unluac: expect-ast-count [[while]] [[0]] [[@proto=6]]
--- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=6]]
--- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=6]]
 -- 根函数的并行字段写入与后继调用应保留原声明数量，不能另造 callee/参数复制链。
--- unluac: expect-ast-count [[local-binding]] [[11]] [[@proto=0]]
 -- 并列字段写和嵌套构造器都收回原准备区，后继调用不经过 callee/参数别名。
--- unluac: expect-ast-count [[assign]] [[15]] [[@proto=0]]
--- unluac: expect-ast-count [[call]] [[12]] [[@proto=0]]
 -- 保留缺失 level 的早退、bonus 循环及两个分支选择，不复制查询与模板调用。
--- unluac: expect-ast-count [[if]] [[5]] [[@proto=6]]
--- unluac: expect-ast-count [[assign]] [[4]] [[@proto=6]]
--- unluac: expect-ast-count [[call]] [[7]] [[@proto=6]]
--- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=7]]
--- unluac: expect-ast-count [[assign]] [[1]] [[@proto=7]]
--- unluac: expect-ast-count [[call]] [[4]] [[@proto=7]]

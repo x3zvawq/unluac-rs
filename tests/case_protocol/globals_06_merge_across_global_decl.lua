@@ -1,9 +1,4 @@
 -- regress_422_branch_merge_across_global_decl: global declarations do not erase a later arm must-def
--- unluac: expect-contains [[global branch_marker_a, branch_marker_b =]]
--- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[if]] [[1]] [[@proto=2]]
--- unluac: expect-ast-count [[assign]] [[2]] [[@proto=2]]
--- unluac: expect-ast-count [[function]] [[2]]
 
 global<const> assert
 

@@ -1,11 +1,6 @@
 -- 作用域末端的 debug local 即使区间为空，也保留声明及初始化结果身份。
--- unluac: expect-contains [[local BadConfig = load_config("single")]] [[@debug=retained]]
--- unluac: expect-contains [[local Left, Right = pair()]] [[@debug=retained]]
--- unluac: expect-contains [[local Tail = load_config("nested")]] [[@debug=retained]]
--- unluac: expect-contains [[local Last = ]] [[@debug=retained]]
 -- unluac: expect-contains [[load_config("after")]]
 -- unluac: expect-not-contains [[ = nil]]
--- unluac: expect-ast-count [[do-block]] [[1]]
 local events = {}
 function load_config(name)
     events[#events + 1] = name

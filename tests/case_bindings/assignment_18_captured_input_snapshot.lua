@@ -1,5 +1,4 @@
 -- 捕获 cell 在快照之前已由闭包改写；并行赋值仍读取当前值，不留下独立中转声明。
--- unluac: expect-ast-max [[local-binding]] [[5]] [[@proto=1]]
 local function run()
     local value = {tag = "old"}
     local trace = "old"
