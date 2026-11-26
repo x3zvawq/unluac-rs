@@ -109,11 +109,17 @@ async function buildPublishPackageJson() {
     types: "./index.d.mts",
     exports: {
       ".": {
-        types: "./index.d.mts",
-        import: "./index.mjs",
-        require: "./index.cjs",
+        import: {
+          types: "./index.d.mts",
+          default: "./index.mjs",
+        },
+        require: {
+          types: "./index.d.cts",
+          default: "./index.cjs",
+        },
         default: "./index.mjs",
       },
+      "./unluac_wasm_bg.wasm": "./unluac_wasm_bg.wasm",
     },
   };
 }

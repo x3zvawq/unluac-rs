@@ -13,14 +13,16 @@ use clap::{
     error::ErrorKind,
 };
 use unluac::decompile::{
-    DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions, DecompileStage,
-    GenerateMode, LuauVectorConstructor, LuauVectorSize, NamingMode, NumberFormat, ProtoDepth,
-    QuoteStyle, TableStyle,
+    CommentStyle, DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions,
+    DecompileStage, GenerateMode, LuauVectorConstructor, LuauVectorSize, NamingMode, NumberFormat,
+    ProtoDepth, QuoteStyle, TableStyle,
 };
 use unluac::generate::TableCellAlign;
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
-use super::{CliError, CliOptions, OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE};
+use super::{
+    CliError, CliOptions, CliPreset, OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE, OutputFormat,
+};
 
 const CLI_VERSION_TEXT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -39,8 +41,7 @@ const STAGE_VALUES: &[&str] = &[
     "parse",
     "transformer",
     "transform",
-    "structure",
-    "hir",
+    "analysis",
     "ast",
     "generate",
 ];
@@ -51,7 +52,10 @@ const QUOTE_STYLE_VALUES: &[&str] = &["prefer-double", "prefer-single", "min-esc
 const NUMBER_FORMAT_VALUES: &[&str] = &["decimal", "hex"];
 const TABLE_STYLE_VALUES: &[&str] = &["compact", "balanced", "aligned", "expanded"];
 const TABLE_ALIGN_CELLS_VALUES: &[&str] = &["auto", "left", "right"];
+const COMMENT_STYLE_VALUES: &[&str] = &["none", "minimal", "full", "true", "false"];
 const GENERATE_MODE_VALUES: &[&str] = &["strict", "permissive"];
+const PRESET_VALUES: &[&str] = &["readable", "exact", "ai"];
+const OUTPUT_FORMAT_VALUES: &[&str] = &["text", "json"];
 
 fn known_value_parser<T>(values: &'static [&'static str]) -> impl TypedValueParser<Value = T>
 where
@@ -86,6 +90,13 @@ pub(super) struct CliArgs {
 
 #[derive(Args, Debug)]
 struct InputArgs {
+    /// Compiled chunk file, directory (for recursive batch mode), or `-` for stdin.
+    #[arg(
+        value_name = "INPUT",
+        conflicts_with_all = ["input", "source"],
+        help_heading = "Input"
+    )]
+    input_pos: Option<PathBuf>,
     /// Dialect to compile or decompile against.
     #[arg(
         short = 'D',
@@ -94,12 +105,11 @@ struct InputArgs {
         help_heading = "Input"
     )]
     dialect: Option<DecompileDialect>,
-    /// Existing compiled chunk path, or `-` to read a chunk from stdin.
+    /// Existing compiled chunk path, directory (with `-o`), or `-` to read from stdin.
     #[arg(
         short = 'i',
         long,
         conflicts_with = "source",
-        required_unless_present = "source",
         help_heading = "Input"
     )]
     input: Option<PathBuf>,
@@ -109,19 +119,25 @@ struct InputArgs {
         short = 's',
         long,
         conflicts_with = "input",
-        required_unless_present = "input",
         help_heading = "Input"
     )]
     source: Option<PathBuf>,
     /// Override the external compiler path used by `--source`.
-    #[arg(short = 'l', long, help_heading = "Input")]
+    #[arg(
+        short = 'l',
+        long,
+        conflicts_with_all = ["input", "input_pos"],
+        help_heading = "Input"
+    )]
     luac: Option<PathBuf>,
     /// Whether source compilation strips debug and local-variable metadata.
     #[arg(
         long,
         value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
         value_parser = BoolishValueParser::new(),
-        conflicts_with = "input",
+        conflicts_with_all = ["input", "input_pos"],
         help_heading = "Input"
     )]
     strip: Option<bool>,
@@ -191,7 +207,8 @@ struct DebugArgs {
         help_heading = "Debug"
     )]
     color: Option<DebugColorMode>,
-    /// Restrict debug dumps to a specific proto id.
+    /// Focus a specific proto id: emits only that proto's Lua source on normal runs,
+    /// or restricts stage dumps when combined with `--dump` / `-d`.
     #[arg(long, help_heading = "Debug")]
     proto: Option<usize>,
     /// Max depth of child protos to expand in debug dumps, relative to the focused proto.
@@ -202,26 +219,27 @@ struct DebugArgs {
     /// Emit timing report.
     #[arg(short = 't', long, help_heading = "Debug")]
     timing: bool,
-    /// Dump before/after snapshots for specific passes (comma-separated names).
-    /// Supports HIR simplify passes (e.g. `carried-locals`, `temp-inline`) and
-    /// AST readability passes (e.g. `inline-exprs`, `branch-pretty`).
+    /// Dump before/after snapshots for specific internal pipeline passes (comma-separated names).
     #[arg(long, value_delimiter = ',', help_heading = "Debug")]
     dump_pass: Vec<String>,
     /// List all protos in the chunk (id, parent, lines, instrs, children) and exit.
-    /// Runs up to the parse stage only; useful for picking a `--proto` target.
+    /// Combine with `--format json` to include decoded string constants per proto.
     #[arg(long, help_heading = "Debug")]
     list_protos: bool,
 }
 
 impl DebugArgs {
-    fn apply(self, options: &mut DecompileOptions) -> bool {
+    fn apply(self, options: &mut DecompileOptions) -> (bool, Option<usize>) {
         let has_explicit_dump = !self.dump.is_empty();
-        let has_explicit_debug_output = self.debug
-            || has_explicit_dump
-            || self.detail.is_some()
-            || self.color.is_some()
-            || self.proto.is_some()
-            || self.proto_depth.is_some();
+        // `--proto-depth` 仅配合 `--dump`/`--debug` 控制调试展开深度；单独传入不强行开启 debug dump。
+        let has_explicit_debug_output =
+            self.debug || has_explicit_dump || self.detail.is_some() || self.color.is_some();
+
+        let proto_source = if !has_explicit_debug_output && !self.list_protos {
+            self.proto
+        } else {
+            None
+        };
 
         set_if_some(&mut options.debug.detail, self.detail);
         set_if_some(&mut options.debug.color, self.color);
@@ -256,7 +274,7 @@ impl DebugArgs {
             options.debug.output_stages.clear();
         }
 
-        self.list_protos
+        (self.list_protos, proto_source)
     }
 }
 
@@ -287,6 +305,8 @@ struct ReadabilityArgs {
     #[arg(
         long,
         value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
         value_parser = BoolishValueParser::new(),
         help_heading = "Generate"
     )]
@@ -321,6 +341,13 @@ impl ReadabilityArgs {
 
 #[derive(Args, Debug)]
 struct GenerateArgs {
+    /// Apply a curated option preset before explicit flags (`readable`, `exact`, or `ai`).
+    #[arg(
+        long,
+        value_parser = known_value_parser::<CliPreset>(PRESET_VALUES),
+        help_heading = "Generate"
+    )]
+    preset: Option<CliPreset>,
     /// Generated source indentation width.
     #[arg(long, help_heading = "Generate")]
     indent_width: Option<usize>,
@@ -335,7 +362,14 @@ struct GenerateArgs {
     )]
     quote_style: Option<QuoteStyle>,
     /// Emit decoded strings as readable UTF-8 text (default: true); false preserves original bytes.
-    #[arg(long, value_name = "BOOL", value_parser = BoolishValueParser::new(), help_heading = "Generate")]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = BoolishValueParser::new(),
+        help_heading = "Generate"
+    )]
     readable_strings: Option<bool>,
     /// Number literal style.
     #[arg(
@@ -356,6 +390,8 @@ struct GenerateArgs {
     #[arg(
         long,
         value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
         value_parser = BoolishValueParser::new(),
         help_heading = "Generate"
     )]
@@ -369,6 +405,8 @@ struct GenerateArgs {
     #[arg(
         long,
         value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
         value_parser = BoolishValueParser::new(),
         help_heading = "Generate"
     )]
@@ -403,14 +441,14 @@ struct GenerateArgs {
         help_heading = "Generate"
     )]
     luau_vector_size: Option<LuauVectorSize>,
-    /// Whether to emit generate-stage comments and metadata.
+    /// Comment verbosity: `minimal` (default: header + line ranges), `full` (per-proto stats), or `none` (`true`/`false` aliases supported).
     #[arg(
         long,
-        value_name = "BOOL",
-        value_parser = BoolishValueParser::new(),
+        value_name = "STYLE",
+        value_parser = known_value_parser::<CommentStyle>(COMMENT_STYLE_VALUES),
         help_heading = "Generate"
     )]
-    comment: Option<bool>,
+    comment: Option<CommentStyle>,
     /// Whether unstructured control flow may be emitted as diagnostic pseudocode.
     #[arg(
         short = 'g',
@@ -460,7 +498,9 @@ impl GenerateArgs {
             });
         }
         set_if_some(&mut options.generate.comment, self.comment);
-        options.generate.mode = self.generate_mode.unwrap_or(GenerateMode::Permissive);
+        if let Some(mode) = self.generate_mode {
+            options.generate.mode = mode;
+        }
     }
 }
 
@@ -473,14 +513,24 @@ struct OutputArgs {
         help_heading = "Output"
     )]
     stop_after: Option<DecompileStage>,
-    /// Write the final generated source to a file instead of stdout. Only available for pure final-source runs.
+    /// Output file path (single chunk or `--list-protos`) or output directory path (recursive directory batch mode).
     #[arg(
         short = 'o',
         long,
-        conflicts_with_all = ["debug", "dump", "detail", "color", "proto", "proto_depth", "timing", "dump_pass", "list_protos"],
+        conflicts_with_all = ["debug", "dump", "detail", "color", "timing", "dump_pass"],
         help_heading = "Output"
     )]
     output: Option<PathBuf>,
+    /// Output format for normal runs, `--list-protos`, and batch summaries.
+    #[arg(
+        long,
+        value_parser = known_value_parser::<OutputFormat>(OUTPUT_FORMAT_VALUES),
+        help_heading = "Output"
+    )]
+    format: Option<OutputFormat>,
+    /// Worker thread count for directory batch decompilation (defaults to CPU count).
+    #[arg(short = 'j', long, help_heading = "Output")]
+    jobs: Option<usize>,
 }
 
 impl OutputArgs {
@@ -514,22 +564,40 @@ impl CliArgs {
         decompile.debug.enable = false;
         decompile.debug.output_stages.clear();
         decompile.debug.timing = false;
+        decompile.generate.mode = GenerateMode::Permissive;
+
+        if let Some(preset) = self.generate.preset {
+            preset.apply(&mut decompile);
+        }
 
         self.input.apply(&mut decompile);
         self.output.apply(&mut decompile);
-        let list_protos = self.debug.apply(&mut decompile);
+        let (list_protos, proto_source) = self.debug.apply(&mut decompile);
         self.readability.apply(&mut decompile);
         self.generate.apply(&mut decompile);
-        validate_output_request(self.output.output.as_ref(), &decompile)?;
+
+        let input = self.input.input.or(self.input.input_pos);
+        let source = self.input.source;
+        if input.is_none() && source.is_none() {
+            return Err(CliError::Usage(
+                "missing input path (pass `<INPUT>`, `--input <PATH>`, or `--source <PATH>`)"
+                    .to_owned(),
+            ));
+        }
+
+        validate_output_request(self.output.output.as_ref(), &decompile, list_protos)?;
 
         Ok(CliOptions {
-            input: self.input.input,
-            source: self.input.source,
+            input,
+            source,
             output: self.output.output,
             luac: self.input.luac,
             strip_debug: self.input.strip.unwrap_or(true),
             decompile,
             list_protos,
+            proto_source,
+            format: self.output.format.unwrap_or(OutputFormat::Text),
+            jobs: self.output.jobs,
         })
     }
 }
@@ -543,9 +611,10 @@ fn set_if_some<T>(target: &mut T, value: Option<T>) {
 fn validate_output_request(
     output: Option<&PathBuf>,
     decompile: &DecompileOptions,
+    list_protos: bool,
 ) -> Result<(), CliError> {
     if output.is_some()
-        && (decompile.target_stage != DecompileStage::Generate
+        && ((!list_protos && decompile.target_stage != DecompileStage::Generate)
             || decompile.debug.enable
             || decompile.debug.timing
             || !decompile.debug.output_stages.is_empty())

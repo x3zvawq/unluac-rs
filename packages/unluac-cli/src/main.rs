@@ -5,11 +5,13 @@
 mod cli;
 
 fn main() {
-    if let Err(error) = cli::run(std::env::args_os()) {
-        if matches!(error, cli::CliError::HelpShown) {
-            return;
+    match cli::run(std::env::args_os()) {
+        Ok(cli::CliExit::Ok) => {}
+        Ok(cli::CliExit::PartialDiagnostic) => std::process::exit(2),
+        Err(cli::CliError::HelpShown) => {}
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
         }
-        eprintln!("error: {error}");
-        std::process::exit(1);
     }
 }

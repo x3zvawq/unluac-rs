@@ -12,8 +12,9 @@ use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
 use unluac::decompile::{
-    DecompileDialect, DecompileOptions, GenerateMode, LuauVectorConstructor, LuauVectorSize,
-    NamingMode, NumberFormat, QuoteStyle, TableStyle, decompile as run_decompile,
+    CommentStyle, DecompileDialect, DecompileOptions, GenerateMode, GeneratedChunkKind,
+    LuauVectorConstructor, LuauVectorSize, NamingMode, NumberFormat, QuoteStyle, TableCellAlign,
+    TableStyle, collect_error_protos, decompile as run_decompile, generate_proto_source,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -24,6 +25,8 @@ pub use unluac as core;
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct WasmDecompileOptions {
+    preset: Option<String>,
+    proto: Option<usize>,
     dialect: Option<String>,
     parse: Option<WasmParseOptions>,
     debug: Option<IgnoredAny>,
@@ -74,7 +77,14 @@ struct WasmGenerateOptions {
     table_align_cells: Option<String>,
     table_drop_index_keys: Option<bool>,
     luau_vector_constructor: Option<WasmLuauVectorConstructor>,
-    comment: Option<bool>,
+    comment: Option<WasmCommentOption>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WasmCommentOption {
+    Bool(bool),
+    Style(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +98,7 @@ struct WasmLuauVectorConstructor {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WasmSupportedOptionValues {
+    presets: Vec<&'static str>,
     dialects: Vec<&'static str>,
     parse_modes: Vec<&'static str>,
     string_encodings: Vec<&'static str>,
@@ -97,6 +108,18 @@ struct WasmSupportedOptionValues {
     quote_styles: Vec<&'static str>,
     number_formats: Vec<&'static str>,
     table_styles: Vec<&'static str>,
+    table_align_cells: Vec<&'static str>,
+    comment_styles: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmDecompileMetaResult {
+    source: String,
+    dialect: &'static str,
+    kind: &'static str,
+    proto_count: usize,
+    failed_protos: Vec<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,16 +146,94 @@ pub fn detect_dialect_wasm(bytes: &[u8]) -> Result<JsValue, JsValue> {
 
 #[wasm_bindgen(js_name = decompile)]
 pub fn decompile_wasm(bytes: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
-    let options = parse_wasm_options(options).map_err(WasmBridgeError::into_js_value)?;
+    let (options, proto_filter) =
+        parse_wasm_options(options).map_err(WasmBridgeError::into_js_value)?;
+    let generate_options = options.generate.clone();
+    let encoding_label = options.parse.string_encoding.as_str().to_owned();
     let result = run_decompile(bytes, options).map_err(|error| {
         WasmBridgeError::new("decompile-failed", error.to_string(), None).into_js_value()
     })?;
 
-    let generated_source = result
+    let generated_source = if let Some(pid) = proto_filter {
+        generate_proto_source(&result, pid, &generate_options, &encoding_label)
+            .map_err(|error| {
+                WasmBridgeError::new("decompile-failed", error.to_string(), None).into_js_value()
+            })?
+            .ok_or_else(|| {
+                WasmBridgeError::new(
+                    "proto-not-found",
+                    format!("proto#{pid} not found in module"),
+                    Some("proto"),
+                )
+                .into_js_value()
+            })?
+    } else {
+        result
+            .state
+            .generated
+            .map(|generated| generated.source)
+            .ok_or_else(|| {
+                WasmBridgeError::new(
+                    "missing-generated-source",
+                    "expected generate stage output, but no source was produced",
+                    None,
+                )
+                .into_js_value()
+            })?
+    };
+
+    to_js_value(&generated_source)
+}
+
+/// 轻量结构化反编译结果：返回源码、识别到的方言、`kind` 与失败 proto 列表，不附带重型 CFG。
+#[wasm_bindgen(js_name = decompileWithMeta)]
+pub fn decompile_with_meta_wasm(bytes: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
+    let (options, proto_filter) =
+        parse_wasm_options(options).map_err(WasmBridgeError::into_js_value)?;
+    let generate_options = options.generate.clone();
+    let encoding_label = options.parse.string_encoding.as_str().to_owned();
+    let result = run_decompile(bytes, options).map_err(|error| {
+        WasmBridgeError::new("decompile-failed", error.to_string(), None).into_js_value()
+    })?;
+    let proto_count = result.state.ast.as_ref().map_or(0, |a| a.protos.len());
+    let all_failed = result
         .state
-        .generated
-        .map(|generated| generated.source)
-        .ok_or_else(|| {
+        .ast
+        .as_ref()
+        .map(collect_error_protos)
+        .unwrap_or_default();
+    let (source, dialect, kind, failed_protos) = if let Some(pid) = proto_filter {
+        let src = generate_proto_source(&result, pid, &generate_options, &encoding_label)
+            .map_err(|error| {
+                WasmBridgeError::new("decompile-failed", error.to_string(), None).into_js_value()
+            })?
+            .ok_or_else(|| {
+                WasmBridgeError::new(
+                    "proto-not-found",
+                    format!("proto#{pid} not found in module"),
+                    Some("proto"),
+                )
+                .into_js_value()
+            })?;
+        let dialect = result
+            .state
+            .generated
+            .as_ref()
+            .map_or(result.state.dialect, |g| g.dialect);
+        let failed = result
+            .state
+            .ast
+            .as_ref()
+            .map(|ast| rich::filter_subtree_errors(ast, pid, &all_failed))
+            .unwrap_or_default();
+        let kind = if !failed.is_empty() || src.contains("-- [unluac error]") {
+            GeneratedChunkKind::DiagnosticPseudocode
+        } else {
+            GeneratedChunkKind::Source
+        };
+        (src, dialect, kind, failed)
+    } else {
+        let generated = result.state.generated.ok_or_else(|| {
             WasmBridgeError::new(
                 "missing-generated-source",
                 "expected generate stage output, but no source was produced",
@@ -140,8 +241,15 @@ pub fn decompile_wasm(bytes: &[u8], options: JsValue) -> Result<JsValue, JsValue
             )
             .into_js_value()
         })?;
-
-    to_js_value(&generated_source)
+        (generated.source, generated.dialect, generated.kind, all_failed)
+    };
+    to_js_value(&WasmDecompileMetaResult {
+        source,
+        dialect: <&'static str>::from(dialect),
+        kind: <&'static str>::from(kind),
+        proto_count,
+        failed_protos,
+    })
 }
 
 /// 返回结构化 JSON，包含 proto 树、CFG 和反编译源码。
@@ -150,7 +258,8 @@ pub fn decompile_wasm(bytes: &[u8], options: JsValue) -> Result<JsValue, JsValue
 /// 额外返回 proto 元数据和 CFG 拓扑，供前端可视化使用。
 #[wasm_bindgen(js_name = decompileRich)]
 pub fn decompile_rich_wasm(bytes: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
-    let options = parse_wasm_options(options).map_err(WasmBridgeError::into_js_value)?;
+    let (options, _proto_filter) =
+        parse_wasm_options(options).map_err(WasmBridgeError::into_js_value)?;
     let result = run_decompile(bytes, options).map_err(|error| {
         WasmBridgeError::new("decompile-failed", error.to_string(), None).into_js_value()
     })?;
@@ -162,6 +271,7 @@ pub fn decompile_rich_wasm(bytes: &[u8], options: JsValue) -> Result<JsValue, Js
 #[wasm_bindgen(js_name = supportedOptionValues)]
 pub fn supported_option_values() -> Result<JsValue, JsValue> {
     to_js_value(&WasmSupportedOptionValues {
+        presets: vec!["readable", "exact", "ai"],
         dialects: dialect_labels(),
         parse_modes: parse_mode_labels(),
         string_encodings: string_encoding_labels(),
@@ -171,13 +281,24 @@ pub fn supported_option_values() -> Result<JsValue, JsValue> {
         quote_styles: quote_style_labels(),
         number_formats: number_format_labels(),
         table_styles: table_style_labels(),
+        table_align_cells: table_align_cell_labels(),
+        comment_styles: comment_style_labels(),
     })
 }
 
-fn parse_wasm_options(value: JsValue) -> BridgeResult<DecompileOptions> {
+fn parse_wasm_options(value: JsValue) -> BridgeResult<(DecompileOptions, Option<usize>)> {
     let options = if value.is_undefined() || value.is_null() {
         WasmDecompileOptions::default()
     } else {
+        if !value.is_object()
+            || serde_wasm_bindgen::from_value::<Vec<IgnoredAny>>(value.clone()).is_ok()
+        {
+            return Err(WasmBridgeError::new(
+                "invalid-options",
+                "options must be a plain object",
+                None,
+            ));
+        }
         serde_wasm_bindgen::from_value(value)
             .map_err(|error| WasmBridgeError::new("invalid-options", error.to_string(), None))?
     };
@@ -186,9 +307,12 @@ fn parse_wasm_options(value: JsValue) -> BridgeResult<DecompileOptions> {
 }
 
 impl WasmDecompileOptions {
-    fn into_core_options(self) -> BridgeResult<DecompileOptions> {
+    fn into_core_options(self) -> BridgeResult<(DecompileOptions, Option<usize>)> {
         let mut options = default_wasm_decompile_options();
 
+        if let Some(preset) = self.preset {
+            apply_wasm_preset(&mut options, &preset)?;
+        }
         if let Some(value) = self.dialect {
             options.dialect = parse_option("dialect", &value)?;
         }
@@ -212,8 +336,42 @@ impl WasmDecompileOptions {
             generate.apply(&mut options)?;
         }
 
-        Ok(options)
+        Ok((options, self.proto))
     }
+}
+
+fn apply_wasm_preset(options: &mut DecompileOptions, preset: &str) -> BridgeResult<()> {
+    match preset.trim().to_ascii_lowercase().as_str() {
+        "readable" => {
+            options.naming.mode = NamingMode::Heuristic;
+            options.generate.comment = CommentStyle::Minimal;
+            options.generate.table_style = TableStyle::Aligned;
+            options.generate.table_drop_index_keys = true;
+        }
+        "exact" => {
+            options.parse.mode = ParseMode::Strict;
+            options.naming.mode = NamingMode::DebugLike;
+            options.generate.comment = CommentStyle::Full;
+            options.generate.mode = GenerateMode::Strict;
+            options.generate.readable_strings = false;
+            options.generate.table_style = TableStyle::Balanced;
+            options.generate.table_drop_index_keys = false;
+        }
+        "ai" => {
+            options.naming.mode = NamingMode::Heuristic;
+            options.generate.comment = CommentStyle::Minimal;
+            options.generate.table_style = TableStyle::Compact;
+            options.generate.table_drop_index_keys = true;
+        }
+        _ => {
+            return Err(WasmBridgeError::new(
+                "invalid-enum-value",
+                format!("unsupported value {preset:?} for `preset`"),
+                Some("preset"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl WasmParseOptions {
@@ -323,7 +481,11 @@ impl WasmGenerateOptions {
             });
         }
         if let Some(value) = self.comment {
-            options.generate.comment = value;
+            options.generate.comment = match value {
+                WasmCommentOption::Bool(false) => CommentStyle::None,
+                WasmCommentOption::Bool(true) => CommentStyle::Full,
+                WasmCommentOption::Style(style) => parse_option("generate.comment", &style)?,
+            };
         }
         Ok(())
     }
@@ -462,6 +624,28 @@ fn number_format_labels() -> Vec<&'static str> {
         .into_iter()
         .map(<&'static str>::from)
         .collect()
+}
+
+fn table_align_cell_labels() -> Vec<&'static str> {
+    [
+        TableCellAlign::Auto,
+        TableCellAlign::Left,
+        TableCellAlign::Right,
+    ]
+    .into_iter()
+    .map(<&'static str>::from)
+    .collect()
+}
+
+fn comment_style_labels() -> Vec<&'static str> {
+    [
+        CommentStyle::None,
+        CommentStyle::Minimal,
+        CommentStyle::Full,
+    ]
+    .into_iter()
+    .map(<&'static str>::from)
+    .collect()
 }
 
 fn table_style_labels() -> Vec<&'static str> {

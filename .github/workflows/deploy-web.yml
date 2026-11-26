@@ -60,9 +60,11 @@ jobs:
         working-directory: packages/unluac-web
         run: npm ci
 
-      - name: Build
+      - name: Build and test
         working-directory: packages/unluac-web
-        run: npm run build
+        run: |
+          npm run build
+          npm test
 
       - name: Deploy to Vercel
         uses: amondnet/vercel-action@v42.2.0

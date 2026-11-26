@@ -97,15 +97,17 @@ jobs:
       - name: Run Rust lint and tests
         run: |
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo test --workspace --locked
           cargo case-test --jobs 8
 
       - name: Dry-run crate publish
         run: cargo publish -p unluac --locked --dry-run
 
-      - name: Build and pack npm release
+      - name: Build, test, and pack npm release
         working-directory: packages/unluac-js
         run: |
           npm run build
+          npm test
           mkdir -p "${RUNNER_TEMP}/release-package"
           cp dist/unluac_wasm_bg.wasm "${RUNNER_TEMP}/release-package/unluac_wasm_bg.wasm"
           cd dist

@@ -30,14 +30,22 @@ export type UnluacGenerateMode = "strict" | "permissive";
 export type UnluacQuoteStyle = "prefer-double" | "prefer-single" | "min-escape";
 export type UnluacNumberFormat = "decimal" | "hex";
 export type UnluacTableStyle = "compact" | "balanced" | "aligned" | "expanded";
+export type UnluacTableCellAlign = "auto" | "left" | "right";
+export type UnluacCommentStyle = "none" | "minimal" | "full";
+
+export type UnluacPreset = "readable" | "exact" | "ai";
 
 export interface UnluacLuauVectorConstructor {
-  library?: string;
+  library?: string | null;
   constructor: string;
   size: 3 | 4;
 }
 
 export interface UnluacDecompileOptions {
+  /** Curated preset applied before explicit option overrides. */
+  preset?: UnluacPreset;
+  /** Decompile only a single DFS proto id (supported by `decompile` and `decompileWithMeta`). */
+  proto?: number;
   dialect?: UnluacDialect;
   parse?: {
     mode?: UnluacParseMode;
@@ -67,21 +75,38 @@ export interface UnluacDecompileOptions {
     readableStrings?: boolean;
     tableStyle?: UnluacTableStyle;
     /** Max rendered row width (including indentation) of aligned table grids. */
-    tableAlignWidth?: number;
+    tableAlignWidth?: number | null;
     /** Max rendered width of string literals allowed inside aligned table grids. */
     tableAlignStringWidth?: number;
     /** Align record keys by `=` in non-single-line aligned tables (default true). */
     tableAlignEq?: boolean;
     /** Max padding spaces when aligning record keys by `=` (default 8). */
     tableAlignEqMaxSpaces?: number;
+    /** Horizontal alignment of aligned table grid cells (default "auto"). */
+    tableAlignCells?: UnluacTableCellAlign;
     /** Omit contiguous `[1]..[n]` keys in safe PUC scalar constructors (default false). */
     tableDropIndexKeys?: boolean;
     luauVectorConstructor?: UnluacLuauVectorConstructor;
-    comment?: boolean;
+    /** Comment verbosity: "minimal" (default), "full", "none", or boolean alias (true=full, false=none). */
+    comment?: boolean | UnluacCommentStyle;
   };
 }
 
+export interface UnluacDecompileResult {
+  /** Generated Lua source or diagnostic pseudocode. */
+  source: string;
+  /** Resolved dialect (e.g. "lua5.1", "luajit", "luau"). */
+  dialect: Exclude<UnluacDialect, "auto">;
+  /** Whether the output is valid target source or permissive diagnostic pseudocode. */
+  kind: "source" | "diagnostic-pseudocode";
+  /** Total number of protos in the chunk. */
+  protoCount: number;
+  /** DFS proto ids that fell back to error placeholders in permissive mode. */
+  failedProtos: number[];
+}
+
 export interface UnluacSupportedOptionValues {
+  presets: UnluacPreset[];
   dialects: UnluacDialect[];
   parseModes: UnluacParseMode[];
   stringEncodings: UnluacStringEncoding[];
@@ -91,6 +116,8 @@ export interface UnluacSupportedOptionValues {
   quoteStyles: UnluacQuoteStyle[];
   numberFormats: UnluacNumberFormat[];
   tableStyles: UnluacTableStyle[];
+  tableAlignCells: UnluacTableCellAlign[];
+  commentStyles: UnluacCommentStyle[];
 }
 
 // ── 结构化反编译结果（decompileRich 返回） ──
@@ -109,8 +136,12 @@ export type UnluacEdgeKind =
 export interface UnluacRichResult {
   /** 反编译生成的源码或诊断伪源码 */
   source: string;
+  /** 识别到的方言 */
+  dialect: Exclude<UnluacDialect, "auto">;
   /** 可重编译源码或带 Error 标记的诊断伪源码 */
   kind: "source" | "diagnostic-pseudocode";
+  /** 宽容模式下产生错误占位符的 proto ID 列表 */
+  failedProtos: number[];
   /** 完整 proto 树的先序数组，ID 等于索引，根为 0 */
   protos: UnluacProtoMeta[];
   /** 每个 proto 的 CFG（与 protos 平行数组） */
@@ -120,10 +151,14 @@ export interface UnluacRichResult {
 export interface UnluacProtoMeta {
   /** 先序数组索引（0 = 主 proto） */
   id: number;
-  /** 源文件名（debug info） */
+  /** 函数声明名或 Luau debug 名（根 proto 为源文件名） */
   name: string | null;
   lineStart: number;
   lineEnd: number;
+  /** 该 proto 在生成源码中的 1-based 起始行 */
+  generatedLineStart: number | null;
+  /** 该 proto 在生成源码中的 1-based 结束行 */
+  generatedLineEnd: number | null;
   numParams: number;
   isVararg: boolean;
   numUpvalues: number;
@@ -189,8 +224,42 @@ interface WasmBindings {
   default(input?: WasmInitArgument): Promise<unknown>;
   detectDialect(bytes: Uint8Array): Exclude<UnluacDialect, "auto"> | null;
   decompile(bytes: Uint8Array, options: UnluacDecompileOptions): string;
+  decompileWithMeta(bytes: Uint8Array, options: UnluacDecompileOptions): UnluacDecompileResult;
   decompileRich(bytes: Uint8Array, options: UnluacDecompileOptions): UnluacRichResult;
   supportedOptionValues(): UnluacSupportedOptionValues;
+}
+
+/** Structured error thrown by `unluac-js` when option validation, dialect detection, or decompilation fails. */
+export class UnluacError extends Error {
+  readonly code: string;
+  readonly field?: string;
+
+  constructor(code: string, message: string, field?: string) {
+    super(message);
+    this.name = "UnluacError";
+    this.code = code;
+    if (field !== undefined) {
+      this.field = field;
+    }
+  }
+}
+
+function wrapBridgeError(error: unknown): never {
+  if (error instanceof UnluacError) {
+    throw error;
+  }
+  if (error && typeof error === "object" && "code" in error && "message" in error) {
+    const bridge = error as { code: unknown; message: unknown; field?: unknown };
+    throw new UnluacError(
+      String(bridge.code),
+      String(bridge.message),
+      typeof bridge.field === "string" ? bridge.field : undefined
+    );
+  }
+  if (error instanceof Error) {
+    throw error;
+  }
+  throw new UnluacError("unknown-error", String(error));
 }
 
 const WASM_GLUE_SPECIFIER = "./unluac_wasm.js";
@@ -217,7 +286,10 @@ function toUint8Array(bytes: UnluacBytes): Uint8Array {
 
 async function loadBindings(): Promise<WasmBindings> {
   if (!bindingsPromise) {
-    bindingsPromise = import(WASM_GLUE_SPECIFIER) as Promise<WasmBindings>;
+    bindingsPromise = (import(WASM_GLUE_SPECIFIER) as Promise<WasmBindings>).catch((error) => {
+      bindingsPromise = null;
+      throw error;
+    });
   }
   return bindingsPromise;
 }
@@ -250,7 +322,10 @@ export async function init(input?: UnluacInitInput | Promise<UnluacInitInput>): 
         return;
       }
       await bindings.default({ module_or_path: await resolvedInput });
-    })();
+    })().catch((error) => {
+      initPromise = null;
+      throw error;
+    });
   }
 
   await initPromise;
@@ -262,7 +337,25 @@ export async function decompile(
 ): Promise<string> {
   await init();
   const bindings = await loadBindings();
-  return bindings.decompile(toUint8Array(bytes), options);
+  try {
+    return bindings.decompile(toUint8Array(bytes), options);
+  } catch (error) {
+    wrapBridgeError(error);
+  }
+}
+
+/** Lightweight structured decompilation returning source, resolved dialect, kind, and failed proto ids without heavy CFG serialization. */
+export async function decompileWithMeta(
+  bytes: UnluacBytes,
+  options: UnluacDecompileOptions = {}
+): Promise<UnluacDecompileResult> {
+  await init();
+  const bindings = await loadBindings();
+  try {
+    return bindings.decompileWithMeta(toUint8Array(bytes), options);
+  } catch (error) {
+    wrapBridgeError(error);
+  }
 }
 
 /** Detect bytecode with the core parser; null means ordinary source input. */
@@ -270,7 +363,12 @@ export async function detectDialect(
   bytes: UnluacBytes
 ): Promise<Exclude<UnluacDialect, "auto"> | null> {
   await init();
-  return (await loadBindings()).detectDialect(toUint8Array(bytes));
+  const bindings = await loadBindings();
+  try {
+    return bindings.detectDialect(toUint8Array(bytes));
+  } catch (error) {
+    wrapBridgeError(error);
+  }
 }
 
 export async function decompileRich(
@@ -279,7 +377,11 @@ export async function decompileRich(
 ): Promise<UnluacRichResult> {
   await init();
   const bindings = await loadBindings();
-  return bindings.decompileRich(toUint8Array(bytes), options);
+  try {
+    return bindings.decompileRich(toUint8Array(bytes), options);
+  } catch (error) {
+    wrapBridgeError(error);
+  }
 }
 
 export async function supportedOptionValues(): Promise<UnluacSupportedOptionValues> {

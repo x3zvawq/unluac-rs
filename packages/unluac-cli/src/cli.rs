@@ -10,17 +10,95 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use unluac::decompile::{
-    DecompileDialect, DecompileOptions, DecompileStage, decompile, render_timing_report,
+    CommentStyle, DecompileDialect, DecompileError, DecompileOptions, DecompileStage, GenerateMode,
+    GeneratedChunkKind, NamingMode, TableStyle, collect_error_protos, decompile,
+    generate_proto_source, render_timing_report,
 };
+use unluac::parser::{ParseError, ParseMode};
 
 const OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE: &str = "`--output` only supports pure final generated \
 source output; remove `--output` or keep `--stop-after=generate` without debug or timing flags.";
 
 mod args;
+mod batch;
+mod json;
 
 use args::{output_argument_conflict, parse_args};
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CliExit {
+    Ok,
+    PartialDiagnostic,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            _ => Err(format!("unsupported output format: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CliPreset {
+    Readable,
+    Exact,
+    Ai,
+}
+
+impl std::str::FromStr for CliPreset {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "readable" => Ok(Self::Readable),
+            "exact" => Ok(Self::Exact),
+            "ai" => Ok(Self::Ai),
+            _ => Err(format!("unsupported preset: {s}")),
+        }
+    }
+}
+
+impl CliPreset {
+    fn apply(self, options: &mut DecompileOptions) {
+        match self {
+            Self::Readable => {
+                options.naming.mode = NamingMode::Heuristic;
+                options.generate.comment = CommentStyle::Minimal;
+                options.generate.table_style = TableStyle::Aligned;
+                options.generate.table_drop_index_keys = true;
+            }
+            Self::Exact => {
+                options.parse.mode = ParseMode::Strict;
+                options.naming.mode = NamingMode::DebugLike;
+                options.generate.comment = CommentStyle::Full;
+                options.generate.mode = GenerateMode::Strict;
+                options.generate.readable_strings = false;
+                options.generate.table_style = TableStyle::Balanced;
+                options.generate.table_drop_index_keys = false;
+            }
+            Self::Ai => {
+                options.naming.mode = NamingMode::Heuristic;
+                options.generate.comment = CommentStyle::Minimal;
+                options.generate.table_style = TableStyle::Compact;
+                options.generate.table_drop_index_keys = true;
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CompilerProtocol {
@@ -39,42 +117,134 @@ struct CliOptions {
     decompile: DecompileOptions,
     /// 请求仅打印 proto 列表后直接退出。
     list_protos: bool,
+    /// 仅输出指定 proto 的最终 Lua 源码。
+    proto_source: Option<usize>,
+    format: OutputFormat,
+    jobs: Option<usize>,
 }
 
-pub fn run<I>(args: I) -> Result<(), CliError>
+pub fn run<I>(args: I) -> Result<CliExit, CliError>
 where
     I: IntoIterator,
     I::Item: Into<std::ffi::OsString> + Clone,
 {
     let options = parse_args(args)?;
-    let input_source = resolve_input_path(&options)?;
+
+    // 目录输入触发递归并发批量模式
+    if let Some(input_path) = options.input.as_ref()
+        && input_path != Path::new("-")
+        && input_path.is_dir()
+    {
+        return run_directory_batch(&options, input_path);
+    }
+
+    let (input_source, temp_compiled) = resolve_input_path(&options)?;
+    if let (Some(in_path), Some(out_path)) = (options.input.as_deref(), options.output.as_deref())
+        && in_path != Path::new("-")
+        && paths_refer_to_same_existing_file(in_path, out_path)
+    {
+        return Err(CliError::Usage(format!(
+            "refusing to overwrite input file `{}` in place; choose a different `--output` path",
+            in_path.display()
+        )));
+    }
     let bytes = match input_source {
         None => read_stdin(std::io::stdin())?,
-        Some(path) => fs::read(&path).map_err(|source| CliError::Io {
-            action: "read input chunk",
-            path: path.clone(),
-            source,
-        })?,
+        Some(path) => {
+            let read_res = fs::read(&path).map_err(|source| CliError::Io {
+                action: "read input chunk",
+                path: path.clone(),
+                source,
+            });
+            if let Some(tmp) = temp_compiled {
+                let _ = fs::remove_file(tmp);
+            }
+            read_res?
+        }
     };
     let debug_detail = options.decompile.debug.detail;
     let debug_color = options.decompile.debug.color;
     let list_protos = options.list_protos;
+    let proto_source = options.proto_source;
+    let format = options.format;
+    let generate_options = options.decompile.generate.clone();
+    let encoding_label = options.decompile.parse.string_encoding.as_str().to_owned();
     let result = decompile(&bytes, options.decompile)?;
     if list_protos {
         let chunk = result.state.raw_chunk.as_ref().ok_or_else(|| {
             CliError::Usage("list-protos requires the parse stage to complete".into())
         })?;
-        print!("{}", render_proto_listing(chunk));
-        return Ok(());
+        let listing = match format {
+            OutputFormat::Text => render_proto_listing(chunk),
+            OutputFormat::Json => json::render_proto_listing_json(chunk, result.state.dialect),
+        };
+        if let Some(text) = emit_generated_source(&listing, options.output.as_deref())? {
+            print!("{text}");
+        }
+        return Ok(CliExit::Ok);
     }
     if result.debug_output.is_empty() && result.timing_report.is_none() {
         if let Some(generated) = result.state.generated.as_ref() {
-            if let Some(source) =
-                emit_generated_source(&generated.source, options.output.as_deref())?
-            {
-                print!("{source}");
+            let (final_source, effective_kind, failed_protos) = if let Some(pid) = proto_source {
+                let src = generate_proto_source(&result, pid, &generate_options, &encoding_label)
+                    .map_err(|err| CliError::Process(err.to_string()))?
+                    .ok_or_else(|| {
+                        CliError::Usage(format!(
+                            "proto#{pid} not found in module (use `--list-protos` to inspect available proto ids)"
+                        ))
+                    })?;
+                let subtree_failed = result
+                    .state
+                    .ast
+                    .as_ref()
+                    .map(|ast| collect_proto_subtree_error_ids(ast, pid))
+                    .unwrap_or_default();
+                let kind = if !subtree_failed.is_empty() || src.contains("-- [unluac error]") {
+                    GeneratedChunkKind::DiagnosticPseudocode
+                } else {
+                    GeneratedChunkKind::Source
+                };
+                (src, kind, subtree_failed)
+            } else {
+                let all_failed = result
+                    .state
+                    .ast
+                    .as_ref()
+                    .map(collect_error_protos)
+                    .unwrap_or_default();
+                (generated.source.clone(), generated.kind, all_failed)
+            };
+            let exit = if effective_kind == GeneratedChunkKind::DiagnosticPseudocode {
+                CliExit::PartialDiagnostic
+            } else {
+                CliExit::Ok
+            };
+            match format {
+                OutputFormat::Text => {
+                    if let Some(source) =
+                        emit_generated_source(&final_source, options.output.as_deref())?
+                    {
+                        print!("{source}");
+                    }
+                }
+                OutputFormat::Json => {
+                    let proto_count = result.state.ast.as_ref().map_or(0, |a| a.protos.len());
+                    let payload = json::render_single_result_json(
+                        generated.dialect,
+                        effective_kind,
+                        &final_source,
+                        proto_source,
+                        proto_count,
+                        &failed_protos,
+                    );
+                    if let Some(source) =
+                        emit_generated_source(&payload, options.output.as_deref())?
+                    {
+                        print!("{source}");
+                    }
+                }
             }
-            return Ok(());
+            return Ok(exit);
         }
         if options.output.is_some() {
             return Err(output_argument_conflict());
@@ -107,7 +277,52 @@ where
         }
     }
 
-    Ok(())
+    Ok(CliExit::Ok)
+}
+
+fn run_directory_batch(options: &CliOptions, input_dir: &Path) -> Result<CliExit, CliError> {
+    if options.list_protos || options.proto_source.is_some() || options.decompile.debug.enable {
+        return Err(CliError::Usage(
+            "directory batch mode does not support `--list-protos`, `--proto`, or debug dump flags"
+                .to_owned(),
+        ));
+    }
+    let output_dir = options.output.as_deref().ok_or_else(|| {
+        CliError::Usage(
+            "directory input requires `--output <OUT_DIR>` for batch decompilation".to_owned(),
+        )
+    })?;
+    let summary = batch::run_batch_directory(input_dir, output_dir, &options.decompile, options.jobs)?;
+    match options.format {
+        OutputFormat::Json => print!("{}", json::render_batch_summary_json(&summary)),
+        OutputFormat::Text => {
+            eprintln!(
+                "batch complete: {} decompiled ({} diagnostic), {} skipped, {} failed (scanned {} files -> {})",
+                summary.decompiled,
+                summary.diagnostic,
+                summary.skipped,
+                summary.failed,
+                summary.scanned,
+                summary.output_dir
+            );
+            for item in summary.failures.iter().take(20) {
+                eprintln!("  [fail] {}: {}", item.path, item.error);
+            }
+            if summary.failures.len() > 20 {
+                eprintln!("  ... and {} more failure(s)", summary.failures.len() - 20);
+            }
+        }
+    }
+    if summary.failed > 0 {
+        return Err(CliError::Process(format!(
+            "{} file(s) failed during batch decompilation",
+            summary.failed
+        )));
+    }
+    if summary.diagnostic > 0 {
+        return Ok(CliExit::PartialDiagnostic);
+    }
+    Ok(CliExit::Ok)
 }
 
 fn emit_generated_source<'a>(
@@ -138,32 +353,64 @@ fn read_stdin<R: Read>(mut reader: R) -> Result<Vec<u8>, CliError> {
     Ok(buffer)
 }
 
-fn resolve_input_path(options: &CliOptions) -> Result<Option<PathBuf>, CliError> {
+fn resolve_input_path(options: &CliOptions) -> Result<(Option<PathBuf>, Option<PathBuf>), CliError> {
     if let Some(input) = options.input.as_ref() {
-        return Ok(if Path::new("-") == input {
-            None
-        } else {
-            Some(input.clone())
-        });
+        return Ok((
+            if Path::new("-") == input {
+                None
+            } else {
+                Some(input.clone())
+            },
+            None,
+        ));
     }
 
     let source = options
         .source
         .as_ref()
         .ok_or_else(|| CliError::Usage("missing `--input` or `--source`".to_owned()))?;
-    compile_source(options, source).map(Some)
+    let compiled = compile_source(options, source)?;
+    Ok((Some(compiled.clone()), Some(compiled)))
+}
+
+fn paths_refer_to_same_existing_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
+fn collect_proto_subtree_error_ids(module: &unluac::ast::AstModule, target: usize) -> Vec<usize> {
+    let all_errors: std::collections::BTreeSet<usize> =
+        collect_error_protos(module).into_iter().collect();
+    if all_errors.is_empty() || target >= module.protos.len() {
+        return Vec::new();
+    }
+    // 收集目标 proto 及其所有后代（通过 parent_captures 链路判定）
+    let mut subtree = std::collections::BTreeSet::new();
+    subtree.insert(target);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for proto in &module.protos {
+            if let Some((parent, _)) = &proto.parent_captures
+                && subtree.contains(&parent.index())
+                && subtree.insert(proto.id.index())
+            {
+                changed = true;
+            }
+        }
+    }
+    all_errors.intersection(&subtree).copied().collect()
 }
 
 fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliError> {
     let dialect = source_compile_dialect(options.decompile.dialect)?;
     let compiler = resolve_compiler(options, dialect)?;
     let protocol = compiler_protocol(dialect);
-    let output_dir = repo_root()
-        .join("target")
-        .join("unluac-debug")
-        .join(<&'static str>::from(dialect));
+    let output_dir = env::temp_dir().join("unluac-cli-compile");
     fs::create_dir_all(&output_dir).map_err(|source_error| CliError::Io {
-        action: "create debug build directory",
+        action: "create temp compile directory",
         path: output_dir.clone(),
         source: source_error,
     })?;
@@ -173,7 +420,15 @@ fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliErr
         .and_then(OsStr::to_str)
         .unwrap_or("index")
         .to_owned();
-    let output = output_dir.join(format!("{file_stem}.{}", compiled_chunk_extension(dialect)));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let output = output_dir.join(format!(
+        "{file_stem}-{pid}-{nonce}.{}",
+        compiled_chunk_extension(dialect)
+    ));
 
     let mut command = build_compile_command(options, &compiler, protocol, source, &output);
     match protocol {
@@ -231,12 +486,24 @@ fn build_compile_command(
             command.arg("-o").arg(output).arg(source);
         }
         CompilerProtocol::LuaJitBytecodeTool => {
-            #[cfg(windows)]
-            configure_windows_luajit_compiler(&mut command, compiler);
-            command
-                .arg(if options.strip_debug { "-s" } else { "-g" })
-                .arg(source)
-                .arg(output);
+            let is_direct_luajit_bin = compiler
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .is_some_and(|stem| stem.to_ascii_lowercase().starts_with("luajit"));
+            if is_direct_luajit_bin {
+                command.arg("-b");
+                command
+                    .arg(if options.strip_debug { "-s" } else { "-g" })
+                    .arg(source)
+                    .arg(output);
+            } else {
+                #[cfg(windows)]
+                configure_windows_luajit_compiler(&mut command, compiler);
+                command
+                    .arg(if options.strip_debug { "-s" } else { "-g" })
+                    .arg(source)
+                    .arg(output);
+            }
         }
         CompilerProtocol::LuauBinaryStdout => {
             command
@@ -297,16 +564,34 @@ fn resolve_compiler(options: &CliOptions, dialect: DecompileDialect) -> Result<P
         return Ok(bundled);
     }
 
-    Ok(match dialect {
+    let candidates: &[&str] = match dialect {
         DecompileDialect::Auto => unreachable!("source compile dialect must be explicit"),
-        DecompileDialect::Lua51 => PathBuf::from(executable_name("lua5.1")),
-        DecompileDialect::Lua52 => PathBuf::from(executable_name("lua5.2")),
-        DecompileDialect::Lua53 => PathBuf::from(executable_name("lua5.3")),
-        DecompileDialect::Lua54 => PathBuf::from(executable_name("lua5.4")),
-        DecompileDialect::Lua55 => PathBuf::from(executable_name("lua5.5")),
-        DecompileDialect::Luajit => PathBuf::from(executable_name("luajit")),
-        DecompileDialect::Luau => PathBuf::from(executable_name("luau-compile")),
-    })
+        DecompileDialect::Lua51 => &["luac5.1", "luac51", "luac"],
+        DecompileDialect::Lua52 => &["luac5.2", "luac52", "luac"],
+        DecompileDialect::Lua53 => &["luac5.3", "luac53", "luac"],
+        DecompileDialect::Lua54 => &["luac5.4", "luac54", "luac"],
+        DecompileDialect::Lua55 => &["luac5.5", "luac55", "luac"],
+        DecompileDialect::Luajit => &["luajit"],
+        DecompileDialect::Luau => &["luau-compile"],
+    };
+    if let Some(found) = find_in_path(candidates) {
+        return Ok(found);
+    }
+    Ok(PathBuf::from(executable_name(candidates[0])))
+}
+
+fn find_in_path(names: &[&str]) -> Option<PathBuf> {
+    let path_var = env::var_os("PATH")?;
+    for name in names {
+        let exe = executable_name(name);
+        for dir in env::split_paths(&path_var) {
+            let candidate = dir.join(&exe);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn compiler_protocol(dialect: DecompileDialect) -> CompilerProtocol {
@@ -450,7 +735,27 @@ impl fmt::Display for CliError {
             } => write!(f, "{action} `{}` failed: {source}", path.display()),
             Self::WriteCliOutput(source) => write!(f, "write cli output failed: {source}"),
             Self::Process(message) => f.write_str(message),
-            Self::Decompile(error) => fmt::Display::fmt(error, f),
+            Self::Decompile(error) => {
+                fmt::Display::fmt(error, f)?;
+                match error {
+                    DecompileError::Parse(ParseError::InvalidSignature { .. }) => {
+                        write!(
+                            f,
+                            "\nhint: input does not look like compiled Lua/LuaJIT/Luau bytecode; \
+                             if this is plain Lua source, compile it first or pass `-s <file.lua> -D <dialect>`"
+                        )?;
+                    }
+                    DecompileError::Parse(ParseError::StringDecode { .. }) => {
+                        write!(
+                            f,
+                            "\nhint: try specifying source encoding with `-e gbk` / `-e big5` / `-e shift_jis`, \
+                             or pass `--decode-mode lossy`"
+                        )?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
         }
     }
 }
