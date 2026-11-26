@@ -16,109 +16,101 @@
 </p>
 
 <p align="center">
-  <a href="https://unluac.x3zvawq.com">在线体验</a> ·
+  <a href="https://unluac.x3zvawq.com">在线工作区</a> ·
   <a href="https://github.com/x3zvawq/unluac-rs/releases">下载 CLI</a> ·
-  <a href="https://docs.rs/unluac">API 文档</a>
+  <a href="./skills/unluac/SKILL.md">AI Agent Skill</a> ·
+  <a href="https://docs.rs/unluac">Rust API 文档</a>
 </p>
 
-## 简介
+**让 Lua 字节码重新可读。** `unluac-rs` 是一个用 Rust 编写的多方言 Lua 反编译器，可以从编译后的字节码中恢复干净、语义等价的 Lua 源码，无论自己阅读、批量逆向还是交给 AI 分析都开箱即用。
 
-**让 Lua 字节码重新可读。** unluac-rs 是一个用 Rust 编写的多方言 Lua 反编译器，从编译后的 chunk 中恢复可读源码。你可以在浏览器工作区里探索程序，也可以通过命令行和库接口将反编译能力接入自己的工具。
+## 核心特点
 
-- **统一支持 Lua 5.1–5.5、LuaJIT 2.1 与 Luau**，自动识别字节码方言。
-- **以程序分析驱动源码恢复**：利用控制流、变量绑定和值的生命周期事实，重建表达式、函数与结构化语句。
-- **适合混合版本的工作区**：导入文件或文件夹，为每个文件独立保存方言，编辑、导出源码，并查看函数、常量和控制流图。
-- **多种使用方式**：通过 WebAssembly 在浏览器本地运行，使用独立 CLI，或接入 Rust、JavaScript 应用。Web 页面在你的设备上处理文件，无需上传服务器。
+- **一套引擎覆盖 7 种方言**：支持 Lua 5.1、5.2、5.3、5.4、5.5、LuaJIT 2.1 和 Luau，按文件内容自动识别版本。
+- **开箱即读的输出质量**：默认启用启发式命名、安全的 `self` 方法语法还原（`function M:foo(...)`）、短路表达式折叠、精简注释（`minimal`），并提供面向大型配置表的网格对齐排版。
+- **为真实脚本和 AI 工作流设计**：支持目录递归并发批量反编译、单函数（`--proto`）源码导出、`--format json` 结构化输出、`readable / exact / ai` 一键预设，以及配套的 [Agent Skill](./skills/unluac/SKILL.md)。
+- **多种使用形态**：Web 浏览器本地运行（WebAssembly，不上传任何文件）、独立命令行工具、Rust 库（`unluac`）与 JavaScript/TypeScript 包（`unluac-js`）。
 
-## 使用方式
+---
 
-### Web 页面
+## 快速上手
+
+### 1. 在线工作区（Web）
 
 **[打开 unluac.x3zvawq.com →](https://unluac.x3zvawq.com)**
 
-将编译后的文件拖入工作区，或选择打开文件、文件夹。字节码按内容识别，不限扩展名；也可以打开源码文件进行阅读和编辑。
+- 直接拖入单个文件或整个文件夹即可反编译（按内容自动识别方言、跳过非字节码文件，并支持一键本地打包下载 `.zip`）。
+- 按 **`Ctrl/Cmd + Shift + F`** 可跨所有已加载文件与常量池全文搜索，点击命中行直接跳转定位。
+- 设置抽屉顶部提供 **推荐阅读 / 精确还原 / 给 AI 分析** 三个一键预设；工具栏内置 **对比视图（Diff）** 与 **复制给 AI**，一键生成精简 Markdown 代码块。
+- 展开底部 **结构分析** 面板可切换查看函数大纲 / 调用树（点击直接跳转高亮源码区间）、过滤与复制常量表，以及每个函数的控制流图（CFG）。
+- 所有解析与反编译都在本地浏览器通过 WebAssembly 完成，不会上传文件。
 
-每个文件独立保存 Lua 方言，点击版本标签即可修改；设置中的方言仅作为新导入文件的默认值。其他反编译设置会自动应用到已有文件。原始文件与方言选择保存在当前浏览器中，刷新后会重新生成结果；手动编辑的内容请在离开页面前下载保存。
+如需本地启动 Web 版，见 [packages/unluac-web/README.md](./packages/unluac-web/README.md)。
 
-通过**结构分析**面板查看函数与常量，选择函数后可以进一步浏览控制流图。专注阅读源码时，可折叠分析区以获得更多空间。
+### 2. 命令行工具（`unluac-cli`）
 
-如果当前网络无法访问站点，可以使用下面的 CLI，或[在本地运行 Web 页面](./packages/unluac-web/README.md)。
-
-### 命令行工具
-
-从 [GitHub Releases](https://github.com/x3zvawq/unluac-rs/releases) 下载适合当前平台的二进制，或在本地仓库中安装：
+从 [GitHub Releases](https://github.com/x3zvawq/unluac-rs/releases) 下载对应平台的二进制文件，或从源码安装：
 
 ```bash
 cargo install --path packages/unluac-cli
 ```
 
-自动识别方言，将字节码还原为源码：
+常用命令：
 
 ```bash
-unluac-cli -i sample.luac -o recovered.lua
-```
+# 单文件反编译（自动识别方言；位置参数与 -i 均支持）
+unluac-cli sample.luac -o recovered.lua
 
-也可以显式指定方言、从标准输入读取，或先编译源码再反编译：
+# 从标准输入读取
+cat sample.luac | unluac-cli -
 
-```bash
-unluac-cli -i sample.luac -D lua5.4
-cat sample.luac | unluac-cli -i -
+# 递归并发批量反编译整个目录（自动跳过非字节码文件）
+unluac-cli ./scripts_bin -o ./scripts_src -j 8
+
+# 使用场景预设：readable（阅读）/ exact（精确）/ ai（省 Token）
+unluac-cli sample.luac --preset readable -o recovered.lua
+unluac-cli sample.luac --preset ai
+
+# 指定旧编码读取中文脚本（如 GBK 游戏脚本）
+unluac-cli sample.luac -e gbk -o recovered.lua
+
+# 超大脚本按需定位：先导出所有函数和字符串常量摘要，再单独反编译目标函数
+unluac-cli big.luac --list-protos --format json
+unluac-cli big.luac --proto 17
+
+# 用本地编译器先编译 .lua 再反编译（用于调试/对比）
 unluac-cli -s example.lua -D lua5.4
 ```
 
-源码输入（`--source`）需要指定方言，并准备兼容的外部编译器；发布的 CLI 不附带编译器。可以用 `--luac` 指定其路径，或将它加入 PATH。源码编译默认剥离调试元数据，使用 `--strip false` 可保留；独立的 `--ignore-debug` 则让两种输入模式都不使用已有调试信息参与恢复。
+#### 常用参数与退出码
 
-需要目标方言可接受的 Lua 源码时，请使用 `--generate-mode strict`。默认的 permissive 模式可能为不可表达的结构输出诊断伪源码。`--output` 用于保存最终源码，不能与调试 dump、计时输出或提前停止流水线的选项组合。
-
-字符串默认以解码后的可读文本输出为 UTF-8（`--readable-strings true`）。例如 GBK 输入可用
-`unluac-cli -i sample.luac --encoding gbk -o recovered.lua` 直接输出中文；`auto` 对短字符串可能误判，
-已知字符集时请显式指定。需要保持字符串的原始字节、长度和二进制协议时，使用
-`--readable-strings false`。无可用解码文本时仍输出原字节转义。Rust 对应
-`options.generate.readable_strings`，JS/WASM 对应 `generate.readableStrings`，Web 的“可读字符串”开关默认开启。
-对生成的 UTF-8 源码重新编译后，应按 UTF-8 解码，不再沿用原输入的 GBK 设置。
-
-通过 `--naming-mode` / `-n` 选择后备命名策略。所有模式优先保留合法 debug 名；使用 `--ignore-debug` 可忽略它们。
-
-| 模式 | 无 debug 信息时的名字 |
-| --- | --- |
-| `debug-like`（默认） | `p1_0`、`r1_0` 等带编号名字，便于对照 |
-| `simple` | `a`、`b`、`value` 等通用名，保留基本循环和函数角色 |
-| `heuristic` | 根据表达式、字段用途、模块路径和调用名称推测，如 `arr`、`lvl`、`slot`、`user` |
-
-例如：`unluac-cli -i sample.luac -n heuristic`。启发式名字是可读性提示，不保证恢复原名或运行时类型。具体边界见 [Naming 设计](./docs/design/8.naming.md)。
-
-Heuristic 还会使用小型标准库签名表：`os.date` 的实参可提示 `format/time`，`string.sub` 可提示 `text/start_index/end_index`。更具体的字段用途优先，角色冲突时保留通用名。
-
-表构造器通过 `--table-style` 提供四种排版风格。`compact`、`balanced`（默认）与 `expanded` 保持既有行为。`aligned` 风格对每张表按顺序尝试四种布局：
-
-1. **单行** — 整个构造器放得下当前行：`local anchors = { 10, 20, 30 }`。
-2. **内容单行** — 否则先尝试把全部内容平铺进花括号内缩进一层的下一行。
-3. **对齐网格** — 否则纯数组且元素全部是同类小字面量（数字、短字符串、布尔、`nil` 或普通名字）时，按行输出多个单元格并用空格填充列；默认数字右对齐，其余原语左对齐。
-4. **逐行记录** — 其余情况（任何字典、混合数组、超宽字符串、非字面量元素）；嵌套表按自身缩进套用同样规则。多行记录带尾逗号，追加字段不会改写已有行。
-
-只作用于 `aligned` 风格的参数：
-
-| 参数 | 默认 | 作用 |
+| 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--table-align-width` | 跟随 `--max-line-length`（默认 100） | 限制 aligned 表格所有候选行的渲染宽度。 |
-| `--table-align-string-width` | 16 | 限制可进入网格的字符串渲染宽度；超宽字符串让整张表退回逐行布局。 |
-| `--table-align-cells` | `auto` | 网格单元格水平对齐：`auto` 数字右对齐、其余原语左对齐；`left`/`right` 对所有类别强制同一方向。 |
-| `--table-align-eq` | true | 多行表内按 `=` 对齐记录键。 |
-| `--table-align-eq-max-spaces` | 8 | 限制键与 `=` 之间的空格数；更宽的键开启新的对齐系列。 |
-| `--table-drop-index-keys` | false | 仅在 PUC 无事件标量初始化中省略连续 `[1]..[n]` 键；动态值、nil 洞和不支持的分配布局保留原键。 |
+| `<INPUT>` / `-i` | — | 输入字节码文件、`-`（标准输入）或目录（需配合 `-o <输出目录>`） |
+| `-D, --dialect` | `auto` | 手动指定方言（`lua5.1`..`lua5.5`、`luajit`、`luau`） |
+| `--preset` | — | `readable`（对齐表格）、`exact`（严格模式+编号命名+原字节字符串）、`ai`（紧凑表格） |
+| `-n, --naming-mode` | `heuristic` | 缺少 debug 信息时的命名：`heuristic`（启发式）、`simple`（简短通用）、`debug-like`（编号） |
+| `--comment` | `minimal` | 注释详细度：`minimal`（精简文件头与源码行号）、`full`（含每函数 proto 统计）、`none`（关闭） |
+| `-e, --encoding` | `auto` | 字符串常量解码编码（`utf-8`、`gbk`、`big5`、`shift_jis`、`euc-kr` 等） |
+| `--readable-strings` | `true` | 将已解码字符串直接输出为可读 UTF-8（关闭则保留原始字节转义） |
+| `--table-style` | `balanced` | 表排版风格：`compact`、`balanced`、`aligned`、`expanded`（详见[对齐表说明](./docs/table-alignment.md)） |
+| `-g, --generate-mode` | `permissive` | `permissive` 遇单函数失败时保留诊断注释并继续；`strict` 要求全部合法否则报错退出 |
+| `--format` | `text` | 输出格式：`text` 或 `json`（支持单文件、`--list-protos` 和批量汇总） |
+| `-j, --jobs` | CPU 核数 | 目录批量模式下的并发线程数 |
 
-网格准入规则（哪些原语参与对齐及原因）与完整示例见英文文档
-[Aligned table layout](./docs/table-alignment.md)。
+**退出码**：`0` = 干净还原为目标方言源码，`2` = 宽松模式下部分函数降级为诊断伪码（`diagnostic-pseudocode`），`1` = 硬错误（文件损坏、IO 错误或严格模式失败）。
 
-完整的格式化、命名和解码选项见 `unluac-cli --help`；查看流水线中间结果的方法见[调试手册](./docs/debug.md)。
+完整选项见 `unluac-cli --help`；查看各流水线中间产物见[调试手册](./docs/debug.md)。
 
-### Rust 库
+### 3. AI Agent Skill
+
+如果你使用 Claude Code、Codex、Antigravity、Cursor 等 AI 编程助手分析反编译脚本，可以直接使用仓库根目录提供的 [`skills/unluac/SKILL.md`](./skills/unluac/SKILL.md)。它内置了批量反编译、中文编码指定、用 `--list-protos --format json` + `--proto <id>` 按需读取超大脚本以及退出码处理等最佳实践，能显著省去反复试错与 Token 消耗。
+
+### 4. Rust 库
 
 ```bash
 cargo add unluac
 ```
-
-库接口直接接收已编译 chunk 的字节；默认选项会自动识别方言，并执行到源码生成阶段。
 
 ```rust
 use std::fs;
@@ -135,43 +127,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-选项与流水线结果的详细说明见 [Rust API 文档](https://docs.rs/unluac)。
+更多选项与流水线结构见 [Rust API 文档](https://docs.rs/unluac)。
 
-### JavaScript / TypeScript
+### 5. JavaScript / TypeScript（`unluac-js`）
 
 ```bash
 npm install unluac-js
 ```
 
-在 Node.js 中，包会自动初始化自带的 WebAssembly 模块：
-
 ```js
 import { readFile } from "node:fs/promises";
-import { decompile } from "unluac-js";
+import { decompile, decompileWithMeta } from "unluac-js";
 
 const bytes = await readFile("sample.luac");
-const source = await decompile(bytes, { dialect: "auto" });
-console.log(source);
+
+// 直接拿到 Lua 源码字符串
+const source = await decompile(bytes);
+
+// 或同时获取方言、输出类型与失败 proto 列表（不含重型 CFG）
+const meta = await decompileWithMeta(bytes, {
+  generate: { tableStyle: "aligned", comment: "minimal" },
+});
+console.log(meta.dialect, meta.kind, meta.protoCount, meta.failedProtos);
 ```
 
-此外还提供 `detectDialect()`、`decompileRich()`、`init()` 和 `supportedOptionValues()`。浏览器打包、显式 WASM 初始化与 Luau 向量构造器设置见 [JavaScript 使用说明](./packages/unluac-js/README.md)。完整的调试 dump 和计时能力由 CLI 与 Rust 库提供。
+浏览器打包、`detectDialect()`、`decompileRich()` 与完整参数列表见 [packages/unluac-js/README.md](./packages/unluac-js/README.md)。
 
-需要自行封装时，可从 [WebAssembly 包](./packages/unluac-wasm) 入手；JavaScript 场景通常直接使用 `unluac-js` 即可。
+---
+
+## 输出特性简介
+
+- **命名策略（`-n`）**：只要字节码保留了合法 debug 符号，所有模式都会优先使用原变量名（除非传入 `--ignore-debug`）。无 debug 信息时，默认 `heuristic` 会结合表达式、字段访问、标准库参数和 `self` 接收者推断易读名称；`simple` 使用简短通用名（`a`、`b`、`value` 与循环变量 `i`/`k`/`v`）；`debug-like` 使用确定性编号名（`p1_0`、`r1_0`）方便对照字节码。提示：Rust 核心库 `unluac` 默认使用 `GenerateMode::Strict`，CLI / WASM / JS 默认使用 `Permissive`。设计细节见 [Naming 与 Generate](./docs/design/6.naming-and-generate.md)。
+- **表格对齐（`--table-style aligned`）**：自动把同类字面量数组排成整齐列网格、把记录表的 `=` 纵向对齐，阅读游戏配置表非常舒服。完整示例见[表格对齐说明](./docs/table-alignment.md)。
+- **可读字符串**：默认输出可读 UTF-8 文本（`--readable-strings true`）。已知源脚本使用 GBK/Big5/Shift_JIS 时请直接用 `-e` 指定，避免 `auto` 对极短字符串误判；若需要严格保留原始字节协议，请传 `--readable-strings false`。
+
+---
 
 ## 贡献与反馈
 
-项目目前仍处于测试阶段，行为、接口和输出细节可能继续调整。欢迎提交反编译失败、效果不佳或存在兼容性问题的样本，也欢迎反馈工具使用与发布体验上的问题。
+欢迎提交真实字节码样本和问题反馈！提 [Issue](https://github.com/x3zvawq/unluac-rs/issues) 时请尽量附上：
 
-如果某个文件无法反编译，或生成代码的行为与预期不符，请[提交 issue](https://github.com/x3zvawq/unluac-rs/issues)，附上可复现样本、Lua 方言、使用的参数，以及预期和实际行为。若有原始源码，也请一并提供。真实样本是提高语义正确性与输出质量的重要依据；编译时丢弃的注释等信息无法通过反编译找回。
+- 可复现的最小字节码样本（如有原始 `.lua` 源码更好）；
+- 对应的 Lua 方言和使用的参数；
+- 预期结果与实际输出/报错。
 
-欢迎代码、文档和回归测试方面的贡献。参与开发可从[架构说明](./docs/design.md)、[测试协议](./docs/design/11.test.md)和 [Web 开发说明](./packages/unluac-web/README.md)开始。
+参与项目开发可查阅：
+
+- 架构与模块地图：[docs/design.md](./docs/design.md)
+- 流水线调试速查：[docs/debug.md](./docs/debug.md)
+- 测试与回归协议：[docs/design/7.debugging-and-test.md](./docs/design/7.debugging-and-test.md)
+- Web 工作区开发指南：[packages/unluac-web/README.md](./packages/unluac-web/README.md)
 
 ## License
 
-本项目采用 [MIT License](./LICENSE.txt)。
+采用 [MIT License](./LICENSE.txt) 开源。
 
 ## 鸣谢
 
-- [metaworms 的 Lua 反编译器](https://luadec.metaworm.site)及作者的教程，为本项目的设计与实现提供了启发。
-- 本项目大部分代码由 **ChatGPT + Codex** 协助完成。特别感谢 **Astra** 在反编译实现与大规模重构中的贡献——Astra 太强了！项目早期也曾使用 **Claude** 参与开发。
-- 感谢每一位提供测试样本、反馈问题、帮助改善源码恢复质量的使用者与贡献者。
+- 设计与实现深受 [metaworms 的 Lua 反编译器](https://luadec.metaworm.site) 及其技术文章启发。
+- 本项目经历过 **ChatGPT**、**Claude**、**Gemini** 等 Agent 的维护，当前版本由 **Gemini 4 Neon** 重构并持续进行维护。赞美 Neon 神力！
+- 感谢每一位提交真实样本与反馈的社区用户。

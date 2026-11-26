@@ -16,110 +16,101 @@
 </p>
 
 <p align="center">
-  <a href="https://unluac.x3zvawq.com">Open the Web App</a> ·
+  <a href="https://unluac.x3zvawq.com">Web Workspace</a> ·
   <a href="https://github.com/x3zvawq/unluac-rs/releases">Download CLI</a> ·
-  <a href="https://docs.rs/unluac">API Docs</a>
+  <a href="./skills/unluac/SKILL.md">AI Agent Skill</a> ·
+  <a href="https://docs.rs/unluac">Rust API Docs</a>
 </p>
 
-## Introduction
+**Lua bytecode, made readable.** `unluac-rs` is a multi-dialect Lua decompiler written in Rust. It recovers clean, semantically accurate Lua source from compiled chunks—ready for human reading, batch reverse engineering, or AI agent analysis.
 
-**Lua bytecode, made readable.** unluac-rs is a multi-dialect Lua decompiler written in Rust. It reconstructs readable source from compiled chunks, with a browser workspace for exploring the code and libraries for integrating decompilation into your own tools.
+## Highlights
 
-- **Lua 5.1–5.5, LuaJIT 2.1 and Luau** in one decompiler, with automatic bytecode dialect detection.
-- **Source recovery built on program analysis:** control flow, bindings and value lifetimes inform the reconstruction of expressions, functions and structured statements.
-- **A workspace for mixed versions:** open files or folders, keep a separate dialect per file, edit and export source, and inspect functions, constants and control-flow graphs.
-- **Runs where you need it:** locally in your browser through WebAssembly, from the command line, or inside Rust and JavaScript applications. The web app processes files on your device without uploading them to a server.
+- **7 dialects in one engine**: Lua 5.1, 5.2, 5.3, 5.4, 5.5, LuaJIT 2.1, and Luau, with automatic dialect detection from file contents.
+- **Readable out of the box**: Heuristic variable naming, safe `self` method (`function M:foo(...)`) restoration, short-circuit expression folding, clean comments (`minimal` by default), and aligned table formatting for large config tables.
+- **Built for real-world scripts & AI workflows**: Parallel directory batch decompilation, single-function (`--proto`) export, JSON metadata output (`--format json`), one-flag presets (`readable` / `exact` / `ai`), and a ready-to-use [Agent Skill](./skills/unluac/SKILL.md).
+- **Use it anywhere**: Browser workspace via WebAssembly (100% local, zero uploads), standalone CLI, Rust crate (`unluac`), or JS/TS package (`unluac-js`).
 
-## Usage
+---
 
-### Web
+## Quick Start
+
+### 1. Web Workspace
 
 **[Open unluac.x3zvawq.com →](https://unluac.x3zvawq.com)**
 
-Drop compiled files anywhere in the workspace, or open a file or folder. Bytecode is recognized by its contents, so no particular extension is required. Source files can also be opened for reading and editing.
+- Drop single files or entire folders anywhere on the page (auto-sniffs bytecode by content, skips unrelated files, and exports batch results as `.zip`).
+- Search across all decompiled files and constants with **`Ctrl/Cmd + Shift + F`**.
+- Switch output style in one click with **Presets** (*Readable*, *Exact*, *For AI*), compare edits or two files in **Diff view**, or click **Copy for AI** to copy a clean Markdown snippet.
+- Open the **Structure** panel to browse the function outline or call graph (click to jump & highlight source lines), filter/copy constants, and inspect per-function control-flow graphs (CFG).
+- Everything runs locally in your browser via WebAssembly—nothing is uploaded.
 
-Each file keeps its own Lua dialect. Click its version tag to change it; the dialect in Settings is only the default for new imports. Other decompilation settings apply to existing files automatically. File bytes and dialect choices are saved in the current browser; results are regenerated on reload, and manual edits should be downloaded before leaving.
+If you prefer running it locally, see [packages/unluac-web/README.md](./packages/unluac-web/README.md).
 
-Use the **Structure** panel to explore functions and constants, then select a function to inspect its control-flow graph. Collapse the panel when you want more room for the source.
+### 2. CLI (`unluac-cli`)
 
-If the hosted site is unavailable on your network, use the CLI below or [run the web app locally](./packages/unluac-web/README.md).
-
-### CLI
-
-Download a binary for your platform from [GitHub Releases](https://github.com/x3zvawq/unluac-rs/releases), or install from a local checkout:
+Download a prebuilt binary from [GitHub Releases](https://github.com/x3zvawq/unluac-rs/releases), or install from source:
 
 ```bash
 cargo install --path packages/unluac-cli
 ```
 
-Decompile a chunk with automatic dialect detection:
+Common workflows:
 
 ```bash
-unluac-cli -i sample.luac -o recovered.lua
-```
+# Single file (auto-detects dialect; positional path or -i both work)
+unluac-cli sample.luac -o recovered.lua
 
-Choose a dialect explicitly, read from stdin, or compile a source file before decompiling it:
+# Read from stdin
+cat sample.luac | unluac-cli -
 
-```bash
-unluac-cli -i sample.luac -D lua5.4
-cat sample.luac | unluac-cli -i -
+# Recursively decompile a directory in parallel (auto-skips non-bytecode files)
+unluac-cli ./scripts_bin -o ./scripts_src -j 8
+
+# Pick a preset: readable | exact | ai
+unluac-cli sample.luac --preset readable -o recovered.lua
+unluac-cli sample.luac --preset ai
+
+# Decode legacy CJK / non-UTF-8 string constants (e.g. GBK game scripts)
+unluac-cli sample.luac -e gbk -o recovered.lua
+
+# Large script triage: list protos + string constants as JSON, then export one proto
+unluac-cli big.luac --list-protos --format json
+unluac-cli big.luac --proto 17
+
+# Compile a .lua file with a local compiler and immediately decompile it
 unluac-cli -s example.lua -D lua5.4
 ```
 
-Source input (`--source`) requires an explicit dialect and a compatible external compiler; release binaries do not bundle one. Set `--luac` to its path, or make it available on PATH. Source compilation strips debug metadata by default; use `--strip false` to retain it. `--ignore-debug` independently excludes available debug information from recovery for either input mode.
+#### Useful CLI Options & Exit Codes
 
-Use `--generate-mode strict` when you require target-compatible Lua output. The default permissive mode can return diagnostic pseudocode for constructs that cannot be represented. `--output` writes final source and cannot be combined with debug dumps, timing output or an earlier pipeline stage.
-
-Strings default to decoded, readable UTF-8 text (`--readable-strings true`). For GBK input, use
-`unluac-cli -i sample.luac --encoding gbk -o recovered.lua` to emit Chinese directly. Auto detection can
-misidentify short strings, so specify a known input encoding. Use `--readable-strings false` to preserve
-original string bytes, byte lengths and binary protocols. Strings without decoded text retain byte escapes.
-The option is `options.generate.readable_strings` in Rust and `generate.readableStrings` in JS/WASM;
-the Web “Readable Strings” switch is enabled by default. Recompiled generated UTF-8 source should be
-decoded as UTF-8, rather than reusing the original input's GBK setting.
-
-Choose fallback names with `--naming-mode` / `-n`. All modes prefer valid debug names; use `--ignore-debug` to disregard them.
-
-| Mode | Names without debug information |
-| --- | --- |
-| `debug-like` (default) | Numbered names such as `p1_0` and `r1_0` for cross-referencing |
-| `simple` | Generic `a`, `b`, `value`, plus basic loop/function roles |
-| `heuristic` | Hints from expressions, field usage, module paths and call names, such as `arr`, `lvl`, `slot` and `user` |
-
-For example: `unluac-cli -i sample.luac -n heuristic`. Heuristic names are readability hints, not recovered original names or runtime type guarantees. See [Naming](./docs/design/8.naming.md) for the mode boundaries.
-
-Heuristic mode also uses a small standard-library signature table: arguments to `os.date` can suggest `format` and `time`, while `string.sub` suggests `text`, `start_index` and `end_index`. More specific field usage takes priority; conflicting roles keep generic names.
-
-Table constructors support four layout styles via `--table-style`. `compact`, `balanced` (default) and `expanded` keep their existing behavior. The `aligned` style picks one of four layouts per table, trying them in order:
-
-1. **Single line** — the whole constructor fits on the current line: `local anchors = { 10, 20, 30 }`.
-2. **Content on one line** — otherwise the content is kept as a single indented line between the braces whenever it fits there.
-3. **Aligned grid** — otherwise a pure array of small homogeneous primitives (numbers, short strings, booleans, `nil`, or plain names) is printed several cells per row with space-padded columns; numbers right-align by default, the other primitives left-align.
-4. **One entry per line** — everything else (any dictionary, mixed arrays, over-wide strings, non-literal elements); nested tables follow the same rules at their own indentation. Multi-line entries carry trailing commas so appending a field never rewrites earlier lines.
-
-Options tuning the `aligned` style (they do not affect the other styles):
-
-| Option | Default | Effect |
+| Flag | Default | Purpose |
 | --- | --- | --- |
-| `--table-align-width` | follows `--max-line-length` (100 by default) | Caps the rendered row width of every aligned-table row. |
-| `--table-align-string-width` | 16 | Caps the rendered width of a string allowed inside a grid; wider strings fall back to one entry per line. |
-| `--table-align-cells` | `auto` | Grid cell alignment: `auto` right-aligns numbers, left-aligns other primitives; `left`/`right` force one direction. |
-| `--table-align-eq` | true | Aligns record keys by `=` in non-single-line tables. |
-| `--table-align-eq-max-spaces` | 8 | Caps the spaces between a record key and `=`; wider keys start a new alignment run. |
-| `--table-drop-index-keys` | false | Omits contiguous `[1]..[n]` keys in safe PUC scalar constructors; dynamic values, nil holes and unsupported layouts keep their keys. |
+| `<INPUT>` / `-i` | — | Bytecode file, `-` for stdin, or a directory (with `-o <OUT_DIR>`) |
+| `-D, --dialect` | `auto` | Force a dialect (`lua5.1`..`lua5.5`, `luajit`, `luau`) |
+| `--preset` | — | `readable` (aligned tables), `exact` (strict + numbered names + raw bytes), or `ai` (compact tables) |
+| `-n, --naming-mode` | `heuristic` | Fallback names when debug symbols are stripped: `heuristic`, `simple`, or `debug-like` |
+| `--comment` | `minimal` | Comment detail: `minimal` (header + source line numbers), `full` (per-proto stats), or `none` |
+| `-e, --encoding` | `auto` | Input string encoding (`utf-8`, `gbk`, `big5`, `shift_jis`, `euc-kr`, etc.) |
+| `--readable-strings` | `true` | Emit decoded strings as UTF-8 text (`false` preserves original raw byte escapes) |
+| `--table-style` | `balanced` | Table layout: `compact`, `balanced`, `aligned`, or `expanded` ([guide](./docs/table-alignment.md)) |
+| `-g, --generate-mode` | `permissive` | `permissive` keeps going on failed protos; `strict` fails fast if any construct cannot be emitted cleanly |
+| `--format` | `text` | `text` or `json` (works for single file, `--list-protos`, and batch summaries) |
+| `-j, --jobs` | CPU count | Parallel worker threads for directory batch mode |
 
-Details, the grid qualification rules (which primitives align and why) and full
-examples live in [Aligned table layout](./docs/table-alignment.md).
+**Exit codes**: `0` = clean Lua source, `2` = partial recovery (`diagnostic-pseudocode` under permissive mode), `1` = hard error.
 
-See `unluac-cli --help` for all formatting, naming and decoding options, and the [debugging guide](./docs/debug.md) for pipeline inspection.
+Run `unluac-cli --help` for the full list, or see [docs/debug.md](./docs/debug.md) for pipeline inspection (`--dump`, `--stop-after`, `--timing`).
 
-### Rust
+### 3. AI Agent Skill
+
+If you use an AI coding agent (Claude Code, Codex, Antigravity, Cursor, etc.) to inspect compiled Lua files, this repository includes a ready-to-use skill at [`skills/unluac/SKILL.md`](./skills/unluac/SKILL.md). It teaches the agent how to batch-decompile folders, fix CJK encodings, triage huge chunks via `--list-protos --format json` + `--proto <id>`, and read exit codes without wasting context tokens.
+
+### 4. Rust Library
 
 ```bash
 cargo add unluac
 ```
-
-The library accepts bytes of a compiled chunk; default options detect the dialect and run through source generation.
 
 ```rust
 use std::fs;
@@ -136,36 +127,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See the [Rust API documentation](https://docs.rs/unluac) for options and pipeline results.
+See the [Rust API documentation](https://docs.rs/unluac) for full option structs and pipeline stages.
 
-### JavaScript / TypeScript
+### 5. JavaScript / TypeScript (`unluac-js`)
 
 ```bash
 npm install unluac-js
 ```
 
-In Node.js, the package initializes its bundled WebAssembly module automatically:
-
 ```js
 import { readFile } from "node:fs/promises";
-import { decompile } from "unluac-js";
+import { decompile, decompileWithMeta } from "unluac-js";
 
 const bytes = await readFile("sample.luac");
-const source = await decompile(bytes, { dialect: "auto" });
-console.log(source);
+
+// Plain Lua source string
+const source = await decompile(bytes);
+
+// Or lightweight metadata without full CFGs
+const meta = await decompileWithMeta(bytes, {
+  generate: { tableStyle: "aligned", comment: "minimal" },
+});
+console.log(meta.dialect, meta.kind, meta.protoCount, meta.failedProtos);
 ```
 
-The package also provides `detectDialect()`, `decompileRich()`, `init()` and `supportedOptionValues()`. See the [JavaScript guide](./packages/unluac-js/README.md) for browser bundling, explicit WASM initialization and Luau vector constructor options. Debug dumps and timing are available through the CLI and Rust library.
+See [packages/unluac-js/README.md](./packages/unluac-js/README.md) for browser bundling, `detectDialect()`, `decompileRich()`, and all options.
 
-For custom bindings, start with [the WebAssembly package](./packages/unluac-wasm); JavaScript users should normally use `unluac-js`.
+---
 
-## Contributing and Feedback
+## Key Output Features
 
-The project is still in a testing phase. Behavior, APIs and output details may evolve. Bug reports, difficult bytecode samples, compatibility findings and suggestions about the tools or releases are very welcome.
+- **Naming (`-n`)**: Original debug variable names are always preferred unless `--ignore-debug` is set. When debug info is stripped, `heuristic` (default) infers readable names from expressions, field accesses, standard library calls, and `self` method receivers; `simple` uses short generic names (`a`, `b`, `value`, loop `i`/`k`/`v`); `debug-like` uses deterministic numbered names (`p1_0`, `r1_0`) for cross-referencing bytecode. Note: the Rust crate `unluac` defaults `GenerateMode` to `Strict` (returning an error on diagnostic fallbacks), while CLI/WASM/JS default to `Permissive`. See [Naming & Generate](./docs/design/6.naming-and-generate.md).
+- **Aligned Tables (`--table-style aligned`)**: Automatically formats homogeneous literal arrays into neat columns and aligns record keys on `=`, ideal for decompiling game config tables. See [Aligned Table Layout](./docs/table-alignment.md).
+- **Readable Strings**: Decoded strings default to UTF-8 text (`--readable-strings true`). Always pass `-e <encoding>` (e.g. `-e gbk`) when you know the original encoding, since `auto` can misclassify very short strings. Pass `--readable-strings false` if you need byte-exact escapes for binary protocols.
 
-If a file fails to decompile or the result behaves differently, please [open an issue](https://github.com/x3zvawq/unluac-rs/issues) with a reproducible sample, its Lua dialect, the options used, and the expected versus actual behavior. Include the original source when available. Real-world samples help improve both semantic correctness and output quality; decompilation cannot recover comments or information that compilation discarded.
+---
 
-Code, documentation and regression tests are all welcome. For development, start with the [architecture guide](./docs/design.md), [test protocol](./docs/design/11.test.md) and [web development guide](./packages/unluac-web/README.md).
+## Contributing & Feedback
+
+Bug reports and real-world bytecode samples are always welcome! When opening an [issue](https://github.com/x3zvawq/unluac-rs/issues), please include:
+
+- A minimal reproducible bytecode sample (and original `.lua` source if available),
+- The Lua dialect and CLI options used,
+- Expected vs. actual output or behavior.
+
+For contributors working on the codebase:
+
+- Architecture overview: [docs/design.md](./docs/design.md)
+- Pipeline debugging guide: [docs/debug.md](./docs/debug.md)
+- Testing & regression protocol: [docs/design/7.debugging-and-test.md](./docs/design/7.debugging-and-test.md)
+- Web workspace development: [packages/unluac-web/README.md](./packages/unluac-web/README.md)
 
 ## License
 
@@ -173,6 +184,6 @@ Released under the [MIT License](./LICENSE.txt).
 
 ## Acknowledgements
 
-- [metaworms’s Lua decompiler](https://luadec.metaworm.site) and the author’s tutorial inspired the project’s design and implementation.
-- Most of this project’s code was developed with **ChatGPT + Codex**. A special shout-out to **Astra** for its work on the decompiler and its extensive refactoring — seriously impressive. **Claude** also contributed during an earlier stage of development.
-- Thanks to everyone sharing test cases, reporting bugs and helping make recovered Lua more readable.
+- Inspired by [metaworms's Lua decompiler](https://luadec.metaworm.site) and its technical writeups.
+- This project has been maintained across **ChatGPT**, **Claude**, and **Gemini** agents; the current version was refactored and is actively maintained by **Gemini 4 Neon**. Praise the power of Neon!
+- Thanks to every community user who shared real-world bytecode samples and bug reports.

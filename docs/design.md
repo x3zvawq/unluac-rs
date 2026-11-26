@@ -1,135 +1,37 @@
-# 维护地图
+# unluac-rs 维护地图
 
-这组文档维护各层的职责、实现导航与层间约定，帮助开发者定位事实的生产者和消费者。
-先读对应层的入口与子阶段，再沿链接进入具体实现；不依靠文档中的局部规则代替读代码。
-
-## 文档边界
-
-| 内容 | 维护位置 |
-| --- | --- |
-| 层的输入输出、子阶段、pass 职责、生产消费关系与失效边界 | `docs/design/` 对应章节 |
-| 跨层身份、协议、不变量与错误边界 | 事实所属层的设计章节；消费者链接引用 |
-| 候选树形、具体 guard、方言槽距、算法与提交原因 | 对应类型、函数或代码分支附近的 why 注释；文件头只描述职责、输入输出与必要边界 |
-| 被保护的运行行为与可读性结构 | 已注册 Lua 样例及其断言；配置与标签按测试协议维护 |
-| 本次改动、验证结果与未完成范围 | 本次任务交付；临时 dump、报告放 `tmp/` |
-
-层文档按“入口与数据流 → 子阶段/生产消费 → 稳定合同 → 排错”组织。
-修改局部实现时不追加一段 guard 解说；只有职责、事实接口、调度或层间约定变化才更新设计。
-新增 pass 或子处理层时补导航；现有文件拆分则更新链接，不复制实现全文。
-不在仓库维护不断追加的审计流水账、逐样例迁移清单或历史通过数副本。
+本目录定义 unluac-rs 的五阶段反编译流水线分层、模块职责与层间数据契约。
 
 ## Pipeline 总览
 
 ```text
-bytes ──→ Parser ──→ Transformer ──→ Structure ──→ HIR ──→ AST ──→ Generate
+bytes ──→ 1. Parser ──→ 2. Transformer ──→ 3. Analysis ──→ 4. Ast ──→ 5. Generate
+            (RawChunk)    (LoweredChunk)     (Cfg + SSA)    (Ast + Names)  (Lua Source)
 ```
 
-| 关键文件 | 作用 |
-| --- | --- |
-| `src/decompile/pipeline.rs` | 主入口 `decompile(bytes, options)`，创建一次调用的状态、上下文与结果收尾 |
-| `src/decompile/stages.rs` | 固定外层阶段调度表，统一处理阶段执行、timing、debug dump 与 target-stage 停止点 |
-| `src/decompile/state.rs` | 阶段枚举 `DecompileStage` + 状态容器 `DecompileState` |
-| `src/decompile/contracts.rs` | 层间稳定类型别名（`CfgGraph`、`HirChunk` 等） |
-| `src/decompile/options.rs` | 顶层选项 `DecompileOptions` 与 `DebugOptions`，统一默认值补齐 |
-| `src/debug/mod.rs` | 跨层 debug 公共类型、聚焦工具与 `define_stage_dump!` 宏 |
-| `src/scheduler.rs` | HIR Simplify 与 AST Readability 共用的 invalidation-driven 调度器 |
-| `src/graph.rs` / `src/graph/` | 各层共用的 DFS、SCC、支配算法与词法 label 引用索引，身份和快照仍由各层持有 |
-| `src/recovery.rs` | Structure/HIR proto 级失败事实与最后完成产物合同 |
+| # | 阶段 | 核心产出 | 主要职责 | 设计文档 |
+| --- | --- | --- | --- | --- |
+| 0 | 总览 | 语义合同 / 失败策略 | 明确“保什么、不保什么”、方言能力与降级策略 | [0.overview.md](./design/0.overview.md) |
+| 1 | Parser | `RawChunk` | 按方言保真解码字节码、常量池、proto 树与 debug 段 | [1.parser.md](./design/1.parser.md) |
+| 2 | Transformer | `LoweredChunk` | 将 7 种方言 opcode 降为统一 `LowInstr` 与标准协议 | [2.transformer.md](./design/2.transformer.md) |
+| 3 | Analysis | `AnalysisChunk` | 构建并规范化 CFG、图事实、标准 SSA、活性、副作用与捕获分析 | [3.analysis.md](./design/3.analysis.md) |
+| 4 | Ast | `AstModule` + `NameMap` | 迭代控制流结构化 → 表达式/声明提升 → 轻量语法糖 → 命名 | [4.structure.md](./design/4.structure.md) / [5.ast-lift.md](./design/5.ast-lift.md) |
+| 5 | Generate | `GeneratedChunk` | 将稳定 AST 与 `NameMap` 排版渲染为目标方言源码 | [6.naming-and-generate.md](./design/6.naming-and-generate.md) |
+| 6 | 调试与测试 | Dump / 回归矩阵 | 5 阶段调试视图、CLI 用法与分层测试协议 | [7.debugging-and-test.md](./design/7.debugging-and-test.md) |
 
-共享图与引用查询只解释调用方提供的当前快照，不替代各层的控制和词法语义。
-图边、语句位置或跳转改变后，相关事实必须失效，不能跨层沿用旧身份。
+补充专项文档：
+- 命令行排错速查：[debug.md](./debug.md)
+- 表格对齐布局说明：[table-alignment.md](./table-alignment.md)
 
-## 分层文档
+## 设计原则
 
-| # | 层 | 文档 | 关键入口函数 |
-| --- | --- | --- | --- |
-| 0 | 总览 | [0.introduce.md](./design/0.introduce.md) | — |
-| 1 | Parser | [1.parser.md](./design/1.parser.md) | `parse_input(state, context)` / `parse_chunk_with_dialect` |
-| 2 | Transformer | [2.transformer.md](./design/2.transformer.md) | `lower_chunk(state, context)` |
-| 3 | Structure | [3.structure.md](./design/3.structure.md) | `analyze_structure_stage` |
-| 5 | HIR | [5.hir.md](./design/5.hir.md) | `analyze_hir` |
-| 6 | AST | [6.ast.md](./design/6.ast.md) | `analyze_ast_stage` |
-| 9 | Generate | [9.generate.md](./design/9.generate.md) | `generate_chunk(state, context)` |
-| 10 | Debugging | [10.debugging.md](./design/10.debugging.md) | `dump_*` / `--dump-pass` |
-| 11 | Test | [11.test.md](./design/11.test.md) | `cargo case-test` |
+1. **五层边界清晰，不叠床架屋**：流水线固定为 `Parser -> Transformer -> Analysis -> Ast -> Generate`。`Analysis` 专注图与数据流，`Ast` 内部用轻量的 `RegionTree` 衔接控制流结构化与表达式提升，`Generate` 纯粹负责排版输出。
+2. **数据只向下游流动**：前层计算的协议、SSA、支配、捕获等事实通过只读结构提供给后层；后层不回扫字节码猜测前层语义。
+3. **语义精准但不过度偏执**：死守语言级可观察语义（求值顺序、元方法、多值宽度、捕获、`<close>`、NaN 比较），剥离 VM 物理栈槽、弱表 GC 残值与编译器 `-O2` 内联指令数等非源码契约。
+4. **先稳健、再美观**：任何合法字节码都必须优先产出一个**目标方言 100% 合法可编译**的源码，绝不因局部可读性优化失败而导致整函数反编译崩溃，也绝不向 Lua 5.1 输出非法 `goto`。
+5. **面向真实大型脚本**：数据结构默认使用紧凑数组索引（`Vec` + typed ID）与线性/近线性算法，针对数千指令函数与大型配置表保持低内存、低耗时与小 WASM 体积。
 
-AST 的两个子主题仍保留单独导航，方便按 pass 排错：
-[AST readability](./design/7.readability.md) / [AST naming](./design/8.naming.md)。
+## 阅读与排错路径
 
-## 推荐阅读顺序
-
-1. 先读 [0.introduce.md](./design/0.introduce.md) 了解全局边界与共享设施。
-2. 改某一层时，读对应层文档 + 它的前一层文档；AST readability / naming 只算 AST 子主题。
-3. 改跨层问题时，从最早可能持有该事实的层开始看，不要从报错位置开始补丁式修复。
-
-## 核心维护原则
-
-- **单一事实源**：某事实在前层显式保存后，后层只通过 query/accessor 消费。
-- **结构优先**：不用特判 / fallback / 后层兜底掩盖前层事实缺失。
-- **共享优先**：先复用已有 helper / macro / walker / visitor，再考虑新增。
-- **输出层纯粹**：Readability、Naming、Generate 不承担前层恢复失败的补救职责。
-
-## Pass guard 合同
-
-HIR simplify 与 AST readability 恢复原字节码的源码表示，可以消除恢复过程引入的机械包装，
-但运行结果一致不足以许可删除原字节码已有的显式检查、计算或 debug 声明。路径事实可用于
-证明恢复是否合法，不能用于额外优化原程序；此边界同样适用于表达式内部，不提供绕过开关。
-保真不要求重编译后寄存器分配、常量表或跳转编码逐字节相同。候选一旦形成，
-每个拒绝 guard 都必须在原地用一行 `候选拒绝[...]` 注释说明原因，不能只写“保守处理”。
-
-| 分类 | 含义 | 长期处理 |
-| --- | --- | --- |
-| `SemanticBarrier:<subtype>` | 已有具体输入能证明改写前后运行语义不等价 | 可以保留，但注释必须指向最小反例或回归 case |
-| `ProofIncomplete` | 候选可能等价，但当前 IR 事实或分析不足以证明 | 必须写明缺失事实，并继续增强前层事实或本 pass 证明 |
-| `ResourceLimit` | 因扫描长度、搜索空间、候选数或复杂度上限放弃 | 必须写明受限算法，并继续优化索引、窗口或搜索方法 |
-| `PolicyBoundary` | 项目明确保留的原操作、源码身份或展示边界 | 可以保留；区分保真要求与运行语义安全要求 |
-| `TargetConstraint` | 目标 Lua 方言、语法或编译器硬限制 | 可以保留，并说明对应目标约束 |
-| `LayerBoundary` | 候选明确属于另一个层或 pass，且 owner 已确定 | 可以保留，但必须指出负责消费它的 owner |
-| `ConvergenceGuard` | fixed-point 不收敛或内部不变量保护 | 属于实现正确性错误，不是候选不等价证明 |
-
-拒绝 guard 之外还必须审计候选的接受证明。若 pass 会提交改写，但所依赖的语义模型、
-provenance 或 plan/apply 不变量尚未完整证明或已知不成立，必须在提交点前写一行
-`证明缺陷[...]`，不能把它记成 `ProofIncomplete`（后者表示拒绝了尚未证明的候选）：
-
-| 分类 | 含义 | 长期处理 |
-| --- | --- | --- |
-| `PotentialUnsoundness:<subtype>` | 已有最小反例或明确的错误模型，表明当前接受路径可能生成运行语义不等价源码 | 优先修复或收紧接受条件，并补回归 case；修复前不得宣称该 pass 已精确证明 |
-| `AcceptanceProofIncomplete:<subtype>` | 接受路径仍缺少完整的语义事实，但当前没有具体不等价反例或足以确认错误的模型 | 必须补齐事实或停用该接受路径；只能用于区分待证明项，不能把它描述成已知不等价或已完成审计 |
-| `PotentialPolicyViolation` | 接受路径会删除 debug/source identity 等项目明确保留的证据，但尚无运行语义反例 | 补齐 origin/identity gate 或明确修改项目策略 |
-| `InvariantMismatch` | candidate plan 与 apply/rewrite 阶段的形状假设可能漂移，失败时仍提交部分删除 | 改为校验失败不提交，或用 assert/fail-fast 固化内部不变量 |
-
-`SemanticBarrier` 的 subtype 应说明可观察差异，例如 `EvalOrder`、`ValueArity`、
-`ControlFlow`、`Scope`、`Capture`、`Lifetime`、`Metamethod`。有效注释需要同时说明哪次
-求值、哪个值宽度或哪段生命周期发生变化，并绑定能够观察差异的 case；仅凭形状更复杂、
-存在 capture/debug 信息或“理论上可能有副作用”不能升级为语义屏障。无法给出反例时，
-应标为 `ProofIncomplete`。
-
-`DebugScope` 只保护 IR 已保留的 debug/source identity（例如 `DebugHinted` binding）。
-stripped chunk 中 `debug.getlocal/setlocal` 对数字寄存器槽的反射不属于源码等价合同：槽位
-身份已经不可恢复，否则任何 recovered local 的删除、合并或重排都会天然违反合同。
-
-普通形状不属于该 pass 时是 `NotApplicable`，不需要标记。候选尚未逐项形成但整项分析
-被停用时写 `分析停用[...]`；搜索空间被截断但已有候选仍可改写时写
-`候选搜索裁剪[...]`。这些名字用于区分真实拒绝点，避免把所有 `None` / `false` 都误报为
-可读性缺口。
-
-修改 pass 时，对涉及的候选和提交路径应用上述合同。完整 pass 审计在任务要求时开展，
-不因普通修复触及一个 guard 就自动扩大范围；保留拒绝侧的证明缺口不表示当前任务必须消除所有机械形状。
-
-完整审计按 pass 串行完成。每次先确定候选形成点和职责边界，再沿完整调用链检查其后的所有
-early return、循环跳过、helper 失败出口以及最终接受/提交点；为每个 `SemanticBarrier` 和
-`PotentialUnsoundness` 构造最小不等价反例，为其余缺口确定优化方向并补正常路径与边界测试。
-分类结论只写在对应源码 guard 或提交点，不在设计文档维护 pass 账本。
-
-以下检索是全仓库存量清单的唯一生成方式；设计文档不复制检索结果：
-
-```sh
-rg -n 'name: "' src/hir/simplify/mod.rs src/ast/readability/mod.rs
-rg -n '候选拒绝\[|分析停用\[|候选搜索裁剪\[|证明缺陷\[' \
-  src/hir/simplify src/ast/readability
-rg --no-filename -o '候选拒绝\[[^]]+\]|分析停用\[[^]]+\]|候选搜索裁剪\[[^]]+\]|证明缺陷\[[^]]+\]' \
-  src/hir/simplify src/ast/readability | sort | uniq -c
-```
-
-文本检索只负责列出标记，不能证明审计完整。只有该 pass 及其专用 helper 的拒绝出口、接受
-证明与提交阶段都已沿调用链核对并验证，才能宣称审计完成。
+- 首次上手架构：读 [0.overview.md](./design/0.overview.md) → [3.analysis.md](./design/3.analysis.md) → [4.structure.md](./design/4.structure.md) → [5.ast-lift.md](./design/5.ast-lift.md)。
+- 排查问题时，按阶段依次用 `--dump parser / transformer / analysis / ast` 定位首次出现异常的层，在对应 owner 修复，不在后层打补丁。
